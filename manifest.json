@@ -1,0 +1,10 @@
+{
+  "id": "android-ntfy-notifier",
+  "name": "Android ntfy Notifier",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Send Obsidian reminder lines to ntfy so Android can show them in the system notification shade.",
+  "author": "Codex",
+  "authorUrl": "https://ntfy.sh",
+  "isDesktopOnly": false
+}

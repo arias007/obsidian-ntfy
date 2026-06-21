@@ -1,0 +1,7 @@
+.android-ntfy-notifier-status {
+  color: var(--text-muted);
+}
+
+.android-ntfy-notifier-warning {
+  color: var(--text-warning);
+}

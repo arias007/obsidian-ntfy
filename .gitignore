@@ -1,0 +1,6 @@
+.obsidian/
+.DS_Store
+Thumbs.db
+node_modules/
+dist/
+*.log
