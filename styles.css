@@ -2,6 +2,14 @@
   color: var(--text-muted);
 }
 
+.obsidian-ntfy-status {
+  color: var(--text-muted);
+}
+
 .android-ntfy-notifier-warning {
+  color: var(--text-warning);
+}
+
+.obsidian-ntfy-warning {
   color: var(--text-warning);
 }
