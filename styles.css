@@ -13,3 +13,60 @@
 .obsidian-ntfy-warning {
   color: var(--text-warning);
 }
+
+.obsidian-ntfy-manager {
+  max-width: 760px;
+}
+
+.obsidian-ntfy-section {
+  border-top: 1px solid var(--background-modifier-border);
+  margin-top: 14px;
+  padding-top: 12px;
+}
+
+.obsidian-ntfy-muted {
+  color: var(--text-muted);
+  font-size: 0.9em;
+}
+
+.obsidian-ntfy-number {
+  max-width: 72px;
+}
+
+.obsidian-ntfy-item {
+  align-items: flex-start;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin: 8px 0;
+  padding: 10px;
+}
+
+.obsidian-ntfy-item-meta {
+  min-width: 0;
+}
+
+.obsidian-ntfy-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.obsidian-ntfy-error {
+  color: var(--text-error);
+  font-size: 0.9em;
+}
+
+@media (max-width: 600px) {
+  .obsidian-ntfy-item {
+    display: block;
+  }
+
+  .obsidian-ntfy-controls {
+    justify-content: flex-start;
+    margin-top: 8px;
+  }
+}
