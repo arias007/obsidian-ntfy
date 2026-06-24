@@ -210,6 +210,17 @@
   min-width: 1.5em;
 }
 
+.obsidian-ntfy-settings-group {
+  border-top: 1px solid var(--background-modifier-border);
+  margin-top: 14px;
+  padding-top: 12px;
+}
+
+.obsidian-ntfy-settings-group h3 {
+  font-size: 14px;
+  margin: 0 0 8px;
+}
+
 .obsidian-ntfy-item {
   align-items: flex-start;
   border-bottom: 1px solid var(--background-modifier-border);

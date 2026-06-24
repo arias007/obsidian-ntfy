@@ -27,6 +27,7 @@ const DEFAULT_SETTINGS = {
   autoScanEnabled: true,
   scanIntervalMinutes: 15,
   defaultTime: "08:00",
+  suggestionDates: "今天,明天,后天,下周一,下周五,下周日",
   suggestionTimes: "08:00,09:00,12:00,18:00,22:00,08:00,09:00,00:30,01:00",
   suggestionLabels: "今天 08:00,今天 09:00,今天 12:00,今天 18:00,今晚 22:00,明天 08:00,明天 09:00,30分钟后,1小时后",
   includeFileName: true,
@@ -46,13 +47,14 @@ const DEFAULT_SETTINGS = {
   tags: "bell",
 };
 
-const DATE_TIME_RE = /(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})(?:日)?(?:[ T　]+(\d{1,2}:\d{2}))?/;
+const DATE_TIME_RE = /(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})(?:日)?(?:[\sT　]+(\d{1,2}:\d{2}))?/;
 const TIME_PREFIX_RE = /^\s*(?:[（(])?(\d{1,2})[:：](\d{2})(?:[）)])?\s*/;
-const DATE_TIME_WITH_SEPARATOR_RE = /(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})(?:日)?(?:[ T　]+(\d{1,2}:\d{2}))?\s*[:：,，、;；]?/;
+const DATE_TIME_WITH_SEPARATOR_RE = /(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})(?:日)?(?:[\sT　]+(\d{1,2}:\d{2}))?\s*[:：,，、;；]?/;
 const DELAY_LINE_RE = /^(?:ntfy-in|notify-in|remind-in|提醒后|稍后提醒)::\s*(\S+)\s*(.*)$/i;
 const INLINE_DELAY_RE = /(?:⏲|⏱|after:|in:|后:)\s*(\d+(?::\d{1,2}){1,2}|\d+\s*(?:秒|分钟|分|小时|时|天)?后|\d+\s*(?:s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours|d|day|days|秒|分钟|分|小时|时|天)?)/i;
-const TASKS_DATE_RE = /(⏳|📅|🛫|➕|✅|✓|❌)\s*(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}:\d{2}))?/gu;
+const TASKS_DATE_RE = /(⏳|📅|🛫|➕|✅|✓|❌)\s*(\d{4})-(\d{2})-(\d{2})(?:[\sT　](\d{1,2}:\d{2}))?/gu;
 const TASKS_MAIN_DATE_ORDER = ["⏳", "📅", "🛫"];
+const DONE_DATE_RE = /\s*(?:✅|✓)\s*\d{4}-\d{2}-\d{2}(?:[\sT　]\d{1,2}:\d{2})?/gu;
 const TASKS_DATE_LABELS = {
   "⏳": "scheduled",
   "📅": "due",
@@ -525,9 +527,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const match = lines[lineIndex].match(/^(\s*[-*+]\s+\[)([^\]])(\]\s+.*)$/);
     if (!match) throw new Error("line is not a task");
     const nextMark = match[2] === "x" || match[2] === "X" ? " " : "x";
-    const body = nextMark === "x" ? this.addTasksDoneDate(match[3]) : this.removeTasksDoneDate(match[3]);
+    const doneAt = nextMark === "x" ? new Date() : null;
+    const body = nextMark === "x" ? this.addTasksDoneDate(match[3], doneAt) : this.removeTasksDoneDate(match[3]);
     lines[lineIndex] = `${match[1]}${nextMark}${body}`;
     await this.app.vault.modify(file, lines.join("\n"));
+    return { completed: nextMark === "x", doneAt };
   }
 
   queueEnsureDoneDates(file) {
@@ -538,7 +542,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const timer = window.setTimeout(() => {
       this.doneDateTimers.delete(path);
       this.ensureDoneDates(file).catch((error) => console.warn(`${PLUGIN_NAME}: failed to ensure done dates`, error));
-    }, 600);
+    }, 120);
     this.doneDateTimers.set(path, timer);
   }
 
@@ -550,10 +554,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const lines = content.split(/\r?\n/);
     let changed = false;
     const nextLines = lines.map((line) => {
-      const match = String(line || "").match(/^(\s*[-*+]\s+\[[xX]\]\s+)(.*)$/);
+      const match = String(line || "").match(/^(\s*[-*+]\s+\[([^\]])\]\s+)(.*)$/);
       if (!match) return line;
-      const nextBody = this.addTasksDoneDate(match[2]);
-      if (nextBody === match[2]) return line;
+      const isDone = match[2] === "x" || match[2] === "X";
+      const nextBody = isDone ? this.addTasksDoneDate(match[3]) : this.removeTasksDoneDate(match[3]);
+      if (nextBody === match[3]) return line;
       changed = true;
       return `${match[1]}${nextBody}`;
     });
@@ -571,22 +576,27 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return `✅ ${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
   }
 
-  addTasksDoneDate(taskBody) {
+  addTasksDoneDate(taskBody, date = new Date()) {
     const body = String(taskBody || "");
-    const doneText = this.tasksDoneDateText();
-    const stripped = body.replace(/\s*(?:✅|✓)\s*\d{4}-\d{2}-\d{2}(?:[ T]\d{1,2}:\d{2})?/gu, "").trimEnd();
-    return `${stripped} ${doneText}`.trim();
+    const doneText = this.tasksDoneDateText(date);
+    if (/(?:✅|✓)\s*\d{4}-\d{2}-\d{2}[\sT　]\d{1,2}:\d{2}/u.test(body)) return body;
+    if (/(?:✅|✓)\s*\d{4}-\d{2}-\d{2}/u.test(body)) {
+      return body.replace(DONE_DATE_RE, ` ${doneText}`).replace(/\s{2,}/g, " ").trim();
+    }
+    return `${body.trimEnd()} ${doneText}`.trim();
   }
 
   removeTasksDoneDate(taskBody) {
-    return String(taskBody || "")
-      .replace(/\s*(?:✅|✓)\s*\d{4}-\d{2}-\d{2}(?:[ T]\d{1,2}:\d{2})?/gu, "")
-      .trimEnd();
+    return String(taskBody || "").replace(DONE_DATE_RE, "").trimEnd();
   }
 
   formatDoneDateTime(date) {
     const pad = (value) => String(value).padStart(2, "0");
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}\u00a0${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  }
+
+  normalizeDoneText(value) {
+    return String(value || "").replace(DONE_DATE_RE, "").trim();
   }
 
   cleanTaskDisplayText(value) {
@@ -1691,10 +1701,11 @@ class NtfyManagerView extends ItemView {
   }
 
   renderCompletedTaskTime(containerEl, doneText) {
-    if (!doneText) return;
+    const text = this.plugin.normalizeDoneText(doneText);
+    if (!text) return;
     containerEl.createSpan({
       cls: "obsidian-ntfy-task-time obsidian-ntfy-task-time-done",
-      text: doneText,
+      text,
     });
   }
 
@@ -1712,11 +1723,25 @@ class NtfyManagerView extends ItemView {
     checkbox.addEventListener("click", async (event) => {
       event.stopPropagation();
       try {
-        await this.plugin.toggleTaskCompletion(taskLike.filePath, taskLike.lineNumber);
-        taskLike.completed = checkbox.checked;
-        line.toggleClass("is-done", checkbox.checked);
-        checkbox.setAttr("title", checkbox.checked ? "标记未完成" : "标记完成");
-        checkbox.setAttr("aria-label", checkbox.checked ? "标记未完成" : "标记完成");
+        const result = await this.plugin.toggleTaskCompletion(taskLike.filePath, taskLike.lineNumber);
+        taskLike.completed = Boolean(result.completed);
+        taskLike.doneAt = result.doneAt || null;
+        line.toggleClass("is-done", taskLike.completed);
+        checkbox.checked = taskLike.completed;
+        checkbox.setAttr("title", taskLike.completed ? "标记未完成" : "标记完成");
+        checkbox.setAttr("aria-label", taskLike.completed ? "标记未完成" : "标记完成");
+
+        const timeContainer = line.querySelector(".obsidian-ntfy-task-actions");
+        if (timeContainer) {
+          timeContainer.empty();
+          if (taskLike.completed) {
+            this.renderCompletedTaskTime(timeContainer, this.plugin.formatDoneDateTime(taskLike.doneAt || new Date()));
+          } else if (options.dueText) {
+            this.renderTaskTime(timeContainer, options.dueText, options.dueDate);
+            if (typeof options.renderActions === "function") options.renderActions(timeContainer);
+          }
+        }
+
         if (this.shouldRemoveTaskRowAfterToggle(taskLike)) this.removeTaskRow(line);
         this.refreshTaskCaches();
       } catch (error) {
@@ -2157,11 +2182,12 @@ class NtfyReminderSuggest extends EditorSuggest {
 
   onTrigger(cursor, editor) {
     const line = editor.getLine(cursor.line).slice(0, cursor.ch);
-    const match = line.match(/(?:^|\s)(ntfy|提醒|notify|remind|todo|task|待办|今天|明天|今晚|早八|上午|中午|下午|30分钟|1小时|📅|⏰|➕|⏲)\s*$/i);
+    const match = line.match(/(?:^|\s)(ntfy|提醒|notify|remind|todo|task|待办|今天|明天|后天|下周|今晚|早八|上午|中午|下午|30分钟|1小时|📅|⏰|➕|⏲)$/i);
     const taskLine = /^\s*[-*+]\s+\[[^\]]\]/.test(line);
     const emojiTrigger = line.match(/(?:📅|⏰|➕|⏲)\s*$/u);
-    const taskSpaceTrigger = taskLine && /\s$/.test(line) && !/[📅⏰➕✅]\s*\d{4}-\d{2}-\d{2}/u.test(line);
-    if (!match && !(taskLine && emojiTrigger) && !taskSpaceTrigger) return null;
+    const dateNeedsTimeTrigger = /[📅⏰]\s*\d{4}-\d{2}-\d{2}\s*$/u.test(line);
+    const taskTextTrigger = taskLine && /[\p{L}\p{N}\u4e00-\u9fff]$/u.test(line) && !/[📅⏰]\s*\d{4}-\d{2}-\d{2}/u.test(line);
+    if (!match && !(taskLine && emojiTrigger) && !taskTextTrigger && !dateNeedsTimeTrigger) return null;
     const trigger = match ? match[1] : emojiTrigger ? emojiTrigger[0].trim() : "";
     return {
       start: {
@@ -2170,6 +2196,8 @@ class NtfyReminderSuggest extends EditorSuggest {
           ? cursor.ch - match[0].length + (match[0].startsWith(" ") ? 1 : 0)
           : emojiTrigger
           ? cursor.ch - emojiTrigger[0].length
+          : dateNeedsTimeTrigger
+          ? cursor.ch
           : cursor.ch,
       },
       end: cursor,
@@ -2178,7 +2206,8 @@ class NtfyReminderSuggest extends EditorSuggest {
   }
 
   getSuggestions(context) {
-    return ntfyReminderSuggestions(this.plugin);
+    const line = context.editor.getLine(context.start.line);
+    return ntfyReminderSuggestions(this.plugin, line);
   }
 
   suggestion(label, due, hint) {
@@ -2211,7 +2240,8 @@ class NtfyReminderSuggest extends EditorSuggest {
   selectSuggestion(suggestion) {
     if (!this.context) return;
     const currentLine = this.context.editor.getLine(this.context.start.line);
-    this.context.editor.replaceRange(this.tasksFields(suggestion.due, currentLine), this.context.start, this.context.end);
+    const text = suggestion.insertText || this.tasksFields(suggestion.due, currentLine);
+    this.context.editor.replaceRange(text, this.context.start, this.context.end);
   }
 }
 
@@ -2225,7 +2255,7 @@ class NtfyReminderInsertModal extends SuggestModal {
 
   getSuggestions(query) {
     const value = String(query || "").trim();
-    const suggestions = ntfyReminderSuggestions(this.plugin);
+    const suggestions = ntfyReminderSuggestions(this.plugin, "");
     if (!value) return suggestions;
     return suggestions.filter((item) => `${item.label} ${item.hint} ${item.note}`.toLowerCase().includes(value.toLowerCase()));
   }
@@ -2239,51 +2269,84 @@ class NtfyReminderInsertModal extends SuggestModal {
   onChooseSuggestion(suggestion) {
     const cursor = this.editor.getCursor();
     const currentLine = this.editor.getLine(cursor.line);
-    const text = ntfyTasksFields(this.plugin, suggestion.due, currentLine);
+    const text = suggestion.insertText || ntfyTasksFields(this.plugin, suggestion.due, currentLine);
     this.editor.replaceRange(text, cursor);
   }
 }
 
-function ntfyReminderSuggestions(plugin) {
+function ntfyReminderSuggestions(plugin, currentLine = "") {
   const now = new Date();
+  const line = String(currentLine || "");
+  if (!/[📅⏰]\s*\d{4}-\d{2}-\d{2}/u.test(line)) {
+    return ntfyDateSuggestions(plugin, now);
+  }
+  if (/[📅⏰]\s*\d{4}-\d{2}-\d{2}[\sT　]\d{1,2}:\d{2}/u.test(line)) {
+    return ntfyDateTimeSuggestions(plugin);
+  }
+  return ntfyTimeSuggestions(plugin, line, now);
+}
+
+function ntfyDateSuggestions(plugin, now) {
+  const labels = String(plugin.settings.suggestionDates || DEFAULT_SETTINGS.suggestionDates)
+    .split(/[,，]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const dateForLabel = (label) => {
+    if (/^今天$/u.test(label)) return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+    if (/^明天$/u.test(label)) return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0, 0);
+    if (/^后天$/u.test(label)) return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 2, 0, 0, 0, 0);
+    const weekMatch = label.match(/^下周([一二三四五六日天])$/u);
+    if (weekMatch) {
+      const map = { "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 0, "天": 0 };
+      const target = map[weekMatch[1]];
+      const current = now.getDay();
+      const diff = ((target - current + 7) % 7) + 7;
+      return new Date(now.getFullYear(), now.getMonth(), now.getDate() + diff, 0, 0, 0, 0);
+    }
+    return null;
+  };
+  return labels.map((label) => {
+    const date = dateForLabel(label);
+    if (!date) return null;
+    const dateText = `${date.getFullYear()}-${plugin.pad2(date.getMonth() + 1)}-${plugin.pad2(date.getDate())}`;
+    return {
+      label,
+      hint: "选择日期",
+      note: dateText,
+      insertText: `📅 ${dateText} `,
+    };
+  }).filter(Boolean);
+}
+
+function ntfyTimeSuggestions(plugin, currentLine, now) {
   const times = String(plugin.settings.suggestionTimes || DEFAULT_SETTINGS.suggestionTimes)
     .split(/[,，]/)
     .map((item) => item.trim())
     .filter(Boolean);
-  const labels = String(plugin.settings.suggestionLabels || DEFAULT_SETTINGS.suggestionLabels)
-    .split(/[,，]/)
-    .map((item) => item.trim())
-    .filter(Boolean);
   const pickTime = (index, fallback) => times[index] || fallback;
-  const pickLabel = (index, fallback) => labels[index] || fallback;
-  const makeDate = (days, time) => {
+  const dateMatch = String(currentLine || "").match(/[📅⏰]\s*(\d{4})-(\d{2})-(\d{2})/u);
+  const makeDate = (time) => {
     const parts = String(time || "08:00").split(":");
     const hour = Math.max(0, Math.min(23, Number(parts[0]) || 0));
     const minute = Math.max(0, Math.min(59, Number(parts[1]) || 0));
     const second = Math.max(0, Math.min(59, Number(parts[2]) || 0));
-    return new Date(now.getFullYear(), now.getMonth(), now.getDate() + days, hour, minute, second, 0);
+    if (dateMatch) return new Date(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3]), hour, minute, second, 0);
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, second, 0);
   };
-  const todayEight = makeDate(0, pickTime(0, "08:00"));
-  const todayNine = makeDate(0, pickTime(1, "09:00"));
-  const todayNoon = makeDate(0, pickTime(2, "12:00"));
-  const todayAfternoon = makeDate(0, pickTime(3, "18:00"));
-  const tonight = makeDate(0, pickTime(4, "22:00"));
-  const tomorrowEight = makeDate(1, pickTime(5, "08:00"));
-  const tomorrowNine = makeDate(1, pickTime(6, "09:00"));
-  const in30 = new Date(now.getTime() + 30 * 60 * 1000);
-  const in60 = new Date(now.getTime() + 60 * 60 * 1000);
-  const make = (label, due, hint) => ({ label, due, note: plugin.formatLocalDateTime(due), hint });
-  return [
-    make(pickLabel(0, `今天 ${plugin.formatLocalDateTime(todayEight).slice(11)}`), todayEight, "今天早八"),
-    make(pickLabel(1, `今天 ${plugin.formatLocalDateTime(todayNine).slice(11)}`), todayNine, "今天上午"),
-    make(pickLabel(2, `今天 ${plugin.formatLocalDateTime(todayNoon).slice(11)}`), todayNoon, "今天中午"),
-    make(pickLabel(3, `今天 ${plugin.formatLocalDateTime(todayAfternoon).slice(11)}`), todayAfternoon, "今天下午"),
-    make(pickLabel(4, `今晚 ${plugin.formatLocalDateTime(tonight).slice(11)}`), tonight, "今晚"),
-    make(pickLabel(5, `明天 ${plugin.formatLocalDateTime(tomorrowEight).slice(11)}`), tomorrowEight, "明天早八"),
-    make(pickLabel(6, `明天 ${plugin.formatLocalDateTime(tomorrowNine).slice(11)}`), tomorrowNine, "明天上午"),
-    make(pickLabel(7, "30分钟后"), in30, "稍后提醒"),
-    make(pickLabel(8, "1小时后"), in60, "稍后提醒"),
-  ];
+  return times.slice(0, 12).map((time, index) => {
+    const due = makeDate(pickTime(index, time));
+    return {
+      label: plugin.formatLocalDateTime(due).slice(11),
+      due,
+      note: plugin.formatLocalDateTime(due),
+      hint: "选择时间",
+      insertText: plugin.formatLocalDateTime(due).slice(11),
+    };
+  });
+}
+
+function ntfyDateTimeSuggestions(plugin) {
+  return [];
 }
 
 function ntfyTasksFields(plugin, due, currentLine = "") {
@@ -2426,7 +2489,10 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    const timeGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group" });
+    timeGroup.createEl("h3", { text: "Time Defaults" });
+
+    new Setting(timeGroup)
       .setName("Default time")
       .setDesc("Used when a reminder has only a date.")
       .addText((text) =>
@@ -2439,7 +2505,20 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(timeGroup)
+      .setName("Suggestion dates")
+      .setDesc("Comma-separated date choices shown before time choices.")
+      .addText((text) =>
+        text
+          .setPlaceholder("今天,明天,后天,下周一")
+          .setValue(this.plugin.settings.suggestionDates)
+          .onChange(async (value) => {
+            this.plugin.settings.suggestionDates = value.trim() || DEFAULT_SETTINGS.suggestionDates;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(timeGroup)
       .setName("Suggestion times")
       .setDesc("Comma-separated hover suggestion times in HH:MM or HH:MM:SS, used by the reminder picker.")
       .addText((text) =>
@@ -2452,7 +2531,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(timeGroup)
       .setName("Suggestion labels")
       .setDesc("Comma-separated labels matched to the suggestion times, used in the hover picker.")
       .addText((text) =>
@@ -2465,7 +2544,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(timeGroup)
       .setName("Default delay")
       .setDesc("Default value for the manager's days/hours/minutes/seconds delay inputs. Supports HH:MM:SS.")
       .addText((text) =>
@@ -2478,7 +2557,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(timeGroup)
       .setName("Default repeat")
       .setDesc("Default repeat interval for the manager. Use 00:00:00 for one-time notifications.")
       .addText((text) =>
