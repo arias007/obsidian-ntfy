@@ -39,7 +39,7 @@ It also understands Obsidian Tasks plugin Emoji Format on open task lines. It us
 - [ ] Tasks metadata is cleaned from notification text 🔁 every week ⏳ 2026-06-24 📅 2026-06-25 ➕ 2026-06-20
 ```
 
-Dates without time use the default time from plugin settings.
+Dates without time use the default time from plugin settings. The default is `08:00`.
 
 ```md
 - [ ] Weekly review ⏰ 2026-06-28
@@ -56,17 +56,23 @@ Obsidian Ntfy: Schedule delayed notification
 
 The manager opens inside Obsidian. It does not jump to the ntfy web page.
 
-Inside the manager you can:
+The manager opens as an Obsidian main editor tab, similar to a normal plugin work view, not as a floating web page or sidebar. Three icon tabs stay visible:
 
-- Add a notification with numeric `days / hours / minutes / seconds` inputs.
-- Set a repeat interval with numeric `days / hours / minutes / seconds` inputs.
-- View the local queue.
-- Edit notification text, due time, and repeat interval.
-- Send a queued notification now.
-- Delete queued notifications.
-- Scan notes and pull matching reminders into the queue.
+- `待处理`: timed tasks scanned from notes and Tasks. It shows all timed items by due time, whether they are pending, queued, delivered, or notification-off. Each item has notification on/off controls.
+- `已完成`: completed vault tasks, grouped by timed and untimed items.
+- `整库待办`: read-only vault task summary: open tasks with time, open tasks without time, completed tasks with time, and completed tasks without time.
+
+The `设定通知` section is collapsed by default and is only for creating a manual queued notification. It uses numeric `days / hours / minutes / seconds` inputs for both delay and repeat interval.
+
+The status bar shows `ntfy local/total`, where `local` is the number of scheduled queue items not yet handed off to ntfy, and `total` is the full managed notification count.
+
+In the editor, type `ntfy `, `提醒 `, `notify `, `remind `, or `⏲ ` to open minute-level reminder suggestions such as `30m`, `1h`, today 09:00, and tomorrow 09:00.
 
 Repeating notifications are handled by Obsidian Ntfy's local queue. ntfy scheduled delivery is one-shot; after a repeating item is sent successfully, the plugin calculates and queues the next due time.
+
+Auto scan is enabled by default. While Obsidian is running, the plugin scans notes on the configured interval, keeps future reminders in the editable local queue, and hands queue items to ntfy only when they are close to due time. In daily-note folders such as `日记`, tasks without an explicit time use the date in the daily note filename plus the default time.
+
+Obsidian/plugin notices are captured by wrapping Obsidian's `Notice` API after this plugin loads. This covers most later notices, but a plugin that cached its own `Notice` reference before Obsidian Ntfy loaded may not be captured.
 
 ## Delayed Notifications
 
@@ -122,6 +128,7 @@ According to the official ntfy publish docs:
 Obsidian Ntfy uses two windows:
 
 - `Maximum future days`: how far ahead the plugin may hand off messages to ntfy. Keep this at `3` for public `ntfy.sh`.
+- `ntfy handoff lead minutes`: how close to due time a local queue item must be before it is handed off to ntfy. The default is `60`, so items stay editable inside Obsidian longer.
 - `Local queue lookahead days`: how far ahead the plugin keeps future reminders in Obsidian's editable local queue.
 
 For long-term reminders, keep them in the local queue and let later scans hand them off when they enter the ntfy scheduled-delivery window.
@@ -138,8 +145,10 @@ For long-term reminders, keep them in the local queue and let later scans hand t
 3. Open plugin settings and set:
    - ntfy server, usually `https://ntfy.sh`
    - topic, a long random private topic
+   - auto scan, enabled by default
    - scan interval
    - maximum future days, usually `3` for public `ntfy.sh`
+   - ntfy handoff lead minutes
    - local queue lookahead days
 4. Run command `Obsidian Ntfy: Send test notification`.
 
@@ -169,10 +178,15 @@ Set `AI webhook token` if the receiving service expects a Bearer token.
 - Keeps the plugin id `android-ntfy-notifier` for existing installs.
 - Supports `YYYY-MM-DD`, `YYYY/MM/DD`, `YYYY.MM.DD`, and Chinese date separators.
 - Supports Tasks plugin Emoji Format dates on open task lines.
+- Daily-note tasks without explicit time use the daily note date and the default `08:00` time.
 - Supports delayed notifications such as `ntfy-in:: 00:30:00 message`.
 - Status bar item opens the internal Obsidian notification manager.
-- Supports editable local queue items with days/hours/minutes/seconds inputs.
+- Opens the manager as an Obsidian main editor tab with three persistent icon tabs.
+- Supports editable local queue items with days/hours/minutes/seconds inputs in the manager.
+- Shows explicit day/hour/minute/second labels next to duration inputs.
+- Auto scan is enabled by default.
 - Supports local repeating notifications.
+- Uses clear manager states: pending, queued, plugin notices, and delivered.
 - Keeps future reminders in a local queue before handing them off to ntfy.
 - Prevents overlapping scans on mobile.
 - Skips unreadable files instead of failing the whole scan.
@@ -182,8 +196,9 @@ Set `AI webhook token` if the receiving service expects a Bearer token.
 ## Important Limitations
 
 - A pure Obsidian plugin cannot directly post Android local notifications.
-- Scheduled notifications are delegated to ntfy using the `At` header when they are inside the configured handoff window. The public `ntfy.sh` service defaults to a 3-day maximum scheduled delay, so the plugin defaults to scheduling only the next 3 days.
+- Scheduled notifications are delegated to ntfy using the `At` header when local queue items are inside the configured handoff window. The public `ntfy.sh` service defaults to a 3-day maximum scheduled delay, so the plugin defaults to scheduling only the next 3 days.
 - Obsidian must run periodically for local long-term and repeating queue items to be handed off to ntfy.
 - Items already handed off to ntfy are outside the local editable queue in this version.
+- Captured Obsidian/plugin notices depend on plugins using Obsidian's current `Notice` API after Obsidian Ntfy has loaded.
 - ntfy scheduled delivery currently requires at least 10 seconds of delay. Shorter delays are raised to 10 seconds before publishing.
 - Data sent to ntfy or AI webhooks may pass through the configured server. Use a private topic, token, or self-hosted server for sensitive content.
