@@ -190,7 +190,7 @@ Set `AI webhook token` if the receiving service expects a Bearer token.
 - Date-only and overdue unsent tasks are grouped into the daily batch time, default `08:00`, then handed off to ntfy when inside the scheduling window.
 - Sent scheduled ntfy messages can be refreshed and cancelled from the manager when the ntfy server supports scheduled message listing and delete.
 - Turning off a reminder or editing the same task line cancels the previous scheduled ntfy message when possible.
-- Settings include two optional local support QR image fields; they stay in local plugin settings and are not bundled in the release.
+- Settings include the same two built-in support QR codes used by the mobile PDF exporter plugin.
 - Supports local repeating notifications.
 - Uses clear manager states: pending, queued, plugin notices, and delivered.
 - Keeps future reminders in a local queue before handing them off to ntfy.

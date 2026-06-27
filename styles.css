@@ -221,19 +221,32 @@
   margin: 0 0 8px;
 }
 
-.obsidian-ntfy-qr-preview {
-  margin: 6px 0 12px;
+.obsidian-ntfy-qr-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 180px));
+  margin: 10px 0 12px;
 }
 
-.obsidian-ntfy-qr-preview img {
+.obsidian-ntfy-qr-card {
   background: var(--background-secondary);
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
+  padding: 8px;
+}
+
+.obsidian-ntfy-qr-card img {
   display: block;
-  max-height: 180px;
-  max-width: 180px;
+  height: 150px;
+  width: 100%;
   object-fit: contain;
-  padding: 6px;
+}
+
+.obsidian-ntfy-qr-label {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 6px;
+  text-align: center;
 }
 
 .obsidian-ntfy-item {

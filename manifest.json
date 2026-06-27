@@ -1,7 +1,7 @@
 {
   "id": "android-ntfy-notifier",
   "name": "Ntfy Notifications",
-  "version": "0.5.26",
+  "version": "0.5.27",
   "minAppVersion": "1.5.0",
   "description": "Send vault reminders and captured app notices to ntfy with auto scan, editable queues, delayed notifications, repeats, and optional AI webhooks.",
   "author": "Codex",
