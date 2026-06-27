@@ -87,6 +87,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.doneDateWriteGuards = new Set();
     this.doneDateTimers = new Map();
     this.reminderScanTimer = null;
+    this.statusCountTimer = null;
     this.dailyBatchTimer = null;
     this.installNoticeCapture();
     this.statusBar = this.addStatusBarItem();
@@ -152,17 +153,27 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       Math.max(1, Number(this.settings.scanIntervalMinutes || 15)) * 60 * 1000
     );
     this.registerInterval(this.scanTimer);
+    this.statusCountScanTimer = window.setInterval(
+      () => this.queueStatusCountRefresh(),
+      Math.max(1, Number(this.settings.scanIntervalMinutes || 15)) * 60 * 1000
+    );
+    this.registerInterval(this.statusCountScanTimer);
     this.scheduleDailyBatchScan();
     this.register(() => {
       this.clearDailyBatchScan();
       this.clearQueuedReminderScan();
+      this.clearStatusCountRefresh();
     });
     this.registerEvent(this.app.vault.on("modify", (file) => {
       this.queueEnsureDoneDates(file);
       this.queueReminderScan(file);
+      this.queueStatusCountRefresh(file);
     }));
 
-    this.runAutoScan();
+    this.app.workspace.onLayoutReady(() => {
+      this.queueStatusCountRefresh();
+      this.runAutoScan();
+    });
   }
 
   onunload() {
@@ -185,6 +196,20 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   clearQueuedReminderScan() {
     if (this.reminderScanTimer) window.clearTimeout(this.reminderScanTimer);
     this.reminderScanTimer = null;
+  }
+
+  clearStatusCountRefresh() {
+    if (this.statusCountTimer) window.clearTimeout(this.statusCountTimer);
+    this.statusCountTimer = null;
+  }
+
+  queueStatusCountRefresh(file) {
+    if (file && file.extension !== "md") return;
+    this.clearStatusCountRefresh();
+    this.statusCountTimer = window.setTimeout(() => {
+      this.statusCountTimer = null;
+      this.refreshStatusCounts().catch((error) => console.warn(`${PLUGIN_NAME}: status count refresh failed`, error));
+    }, 800);
   }
 
   queueReminderScan(file) {
@@ -396,19 +421,67 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   updateStatus(text) {
     if (!this.statusBar) return;
     this.statusBar.setText(text);
+    const detail = this.statusCounts
+      ? `过期 ${this.statusCounts.pastCount || 0} / 今天 ${this.statusCounts.todayCount || 0} / 未来 ${this.statusCounts.futureCount || 0}`
+      : "Open Ntfy Notifications manager";
     this.statusBar.setAttr("aria-label", "Open Ntfy Notifications manager");
-    this.statusBar.setAttr("title", "Open Ntfy Notifications manager");
+    this.statusBar.setAttr("title", detail);
   }
 
   updateStatusCount(extraText) {
     const queueCount = (this.settings.queue || []).length;
-    const noticeCount = (this.settings.obsidianNotices || []).length;
-    const sentCount = Object.keys(this.settings.sent || {}).length;
-    const ignoredCount = Object.keys(this.settings.ignoredReminders || {}).length;
-    const totalCount = queueCount + noticeCount + sentCount + ignoredCount;
-    const localScheduledCount = queueCount;
-    const label = `ntfy ${localScheduledCount}/${totalCount}`;
+    const cached = this.statusCounts || {};
+    const redYellowCount = Number.isFinite(cached.redYellowCount) ? cached.redYellowCount : queueCount;
+    const totalCount = Number.isFinite(cached.totalCount) ? cached.totalCount : redYellowCount;
+    const label = `ntfy ${redYellowCount}/${totalCount}`;
     this.updateStatus(extraText ? `${label} ${extraText}` : label);
+    this.queueStatusCountRefresh();
+  }
+
+  setStatusCountsFromNotificationTasks(notificationTasks, extraText) {
+    const counts = this.countNotificationTasksForStatus(notificationTasks);
+    this.statusCounts = counts;
+    const label = `ntfy ${counts.redYellowCount}/${counts.totalCount}`;
+    this.updateStatus(extraText ? `${label} ${extraText}` : label);
+  }
+
+  countNotificationTasksForStatus(notificationTasks) {
+    const tasks = Array.isArray(notificationTasks) ? notificationTasks : [];
+    const totalCount = tasks.length;
+    let pastCount = 0;
+    let todayCount = 0;
+    let futureCount = 0;
+    for (const reminder of tasks) {
+      const bucket = this.notificationTimeBucket(reminder.due);
+      if (bucket === "past") pastCount++;
+      else if (bucket === "today") todayCount++;
+      else if (bucket === "future") futureCount++;
+    }
+    const redYellowCount = pastCount + todayCount;
+    return { redYellowCount, totalCount, pastCount, todayCount, futureCount };
+  }
+
+  notificationTimeBucket(dueDate) {
+    if (!dueDate) return "future";
+    const due = dueDate instanceof Date ? dueDate : new Date(dueDate);
+    const dueMs = due.getTime();
+    if (Number.isNaN(dueMs)) return "future";
+    const now = new Date();
+    if (
+      due.getFullYear() === now.getFullYear() &&
+      due.getMonth() === now.getMonth() &&
+      due.getDate() === now.getDate()
+    ) return "today";
+    if (dueMs < now.getTime()) return "past";
+    return "future";
+  }
+
+  async refreshStatusCounts(extraText) {
+    const refreshId = (this.statusCountRefreshId || 0) + 1;
+    this.statusCountRefreshId = refreshId;
+    const reminders = await this.collectNotificationTasks();
+    if (refreshId !== this.statusCountRefreshId) return;
+    this.setStatusCountsFromNotificationTasks(reminders, extraText);
   }
 
   normalizedServerUrl() {
@@ -641,6 +714,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
     const cacheCount = Object.keys(this.settings.sent || {}).length;
     this.updateStatusCount(failed ? `(${failed} fail)` : "");
+    this.queueStatusCountRefresh();
 
     if (showNotice) {
       new Notice(`${PLUGIN_NAME}: ${scheduled} sent/scheduled, ${queued} queued, ${skipped} skipped, ${failed} failed`);
@@ -1609,6 +1683,7 @@ class NtfyManagerView extends ItemView {
       }
     }
 
+    this.plugin.setStatusCountsFromNotificationTasks(this.notificationTasks);
     this.renderHeader(contentEl);
     const body = contentEl.createDiv({ cls: "obsidian-ntfy-window-body" });
     if (this.activeTab === "pending") this.renderNotificationTasks(body);
@@ -1744,7 +1819,7 @@ class NtfyManagerView extends ItemView {
       this.vaultTasks = await this.plugin.collectVaultTasks();
       this.scanError = "";
       this.updateNavCounts();
-      this.plugin.updateStatusCount();
+      this.plugin.setStatusCountsFromNotificationTasks(this.notificationTasks);
     } catch (error) {
       this.scanError = error.message || String(error);
       console.error(error);
