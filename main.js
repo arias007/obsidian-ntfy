@@ -470,6 +470,35 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     });
   }
 
+  async cancelSentEntry(id) {
+    const entry = this.settings.sent && this.settings.sent[id];
+    if (!entry || !entry.ntfyScheduled || entry.ntfyDeleted) return false;
+    try {
+      await this.cancelRemoteScheduled(entry);
+      this.settings.sent[id] = Object.assign({}, entry, {
+        ntfyDeleted: true,
+        ntfyDeletedAt: new Date().toISOString(),
+      });
+      return true;
+    } catch (error) {
+      console.warn(`${PLUGIN_NAME}: failed to cancel ntfy scheduled message`, error);
+      return false;
+    }
+  }
+
+  async cancelMatchingSentEntries(reminder) {
+    if (!reminder || !this.settings.sent) return 0;
+    const file = reminder.filePath;
+    const line = reminder.lineNumber;
+    let cancelled = 0;
+    for (const [id, entry] of Object.entries(this.settings.sent || {})) {
+      const sameReminder = id === reminder.key || (entry.file === file && Number(entry.line || 0) === Number(line || 0));
+      if (!sameReminder) continue;
+      if (await this.cancelSentEntry(id)) cancelled++;
+    }
+    return cancelled;
+  }
+
   async openNtfyManager() {
     const preload = await this.collectManagerViewData();
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_NTFY_MANAGER);
@@ -542,7 +571,6 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const now = nowDate.getTime();
     const sent = this.settings.sent || {};
     const maxFutureMs = Math.max(1, Number(this.settings.maxFutureDays || 3)) * 24 * 60 * 60 * 1000;
-    const handoffMs = Math.min(maxFutureMs, Math.max(1, Number(this.settings.ntfyHandoffLeadMinutes || 60)) * 60 * 1000);
     const queueLookaheadMs = Math.max(1, Number(this.settings.queueLookaheadDays || 30)) * 24 * 60 * 60 * 1000;
     const flushDailyBatch = this.shouldFlushDailyBatch(nowDate, forceDailyBatch);
     let scheduled = 0;
@@ -550,7 +578,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     let skipped = 0;
     let failed = 0;
 
-    const queueResult = await this.flushDueQueue(now, handoffMs, flushDailyBatch);
+    const queueResult = await this.flushDueQueue(now, maxFutureMs, flushDailyBatch);
     scheduled += queueResult.sent;
     failed += queueResult.failed;
 
@@ -567,10 +595,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       }
 
       const scheduleMs = scheduleDue.getTime();
-      const isDateOnly = this.isDateOnlyReminder(reminder);
-      const isBatchOnly = isDateOnly || (!reminder.isDelay && reminder.due.getTime() < now);
-      const shouldSendNow = scheduleMs <= now + 1000 && (!isBatchOnly || flushDailyBatch);
-      if (!shouldSendNow) {
+      const isBatchOnly = this.isDateOnlyReminder(reminder) || (!reminder.isDelay && reminder.due.getTime() < now);
+      if (isBatchOnly && scheduleMs <= now + 1000 && !flushDailyBatch) {
+        this.upsertQueueReminder(reminder, { due: scheduleDue, batchOnly: true });
+        queued++;
+        continue;
+      }
+
+      if (scheduleMs - now > maxFutureMs) {
         if (scheduleMs - now <= queueLookaheadMs) {
           this.upsertQueueReminder(reminder, { due: scheduleDue, batchOnly: isBatchOnly });
           queued++;
@@ -580,8 +612,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
       try {
         const scheduledReminder = Object.assign({}, reminder, { due: scheduleDue });
-        const results = await this.publishReminder(scheduledReminder, false);
-        sent[reminder.key] = this.sentEntry(scheduledReminder, results, false);
+        await this.cancelMatchingSentEntries(scheduledReminder);
+        const scheduleFuture = scheduleMs > now + 1000;
+        const results = await this.publishReminder(scheduledReminder, scheduleFuture);
+        sent[reminder.key] = this.sentEntry(scheduledReminder, results, scheduleFuture);
         scheduled++;
       } catch (error) {
         console.error(`${PLUGIN_NAME} publish failed`, error);
@@ -781,10 +815,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.upsertQueueReminder(reminder);
     await this.saveSettings();
     this.updateStatusCount();
+    this.scanAndSchedule({ showNotice: false }).catch((error) => console.warn(`${PLUGIN_NAME}: enable notification scan failed`, error));
   }
 
   async disableNotificationForReminder(reminder) {
     this.settings.queue = (this.settings.queue || []).filter((item) => item.id !== reminder.key);
+    await this.cancelMatchingSentEntries(reminder);
     this.settings.ignoredReminders = this.settings.ignoredReminders && typeof this.settings.ignoredReminders === "object" ? this.settings.ignoredReminders : {};
     this.settings.ignoredReminders[reminder.key] = {
       at: new Date().toISOString(),
@@ -822,7 +858,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       const repeatSeconds = Math.max(0, Number(item.repeatSeconds || 0));
       if (this.settings.sent[item.id] && repeatSeconds <= 0) continue;
       const dueMs = due.getTime();
-      if (item.batchOnly && (!flushDailyBatch || dueMs > now + 1000)) {
+      if (item.batchOnly && dueMs <= now + 1000 && !flushDailyBatch) {
         remaining.push(item);
         continue;
       }
@@ -841,6 +877,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
           source: item.source || "ntfy:queue",
         };
         const scheduleFuture = dueMs > now + 1000;
+        await this.cancelMatchingSentEntries(reminder);
         const results = await this.publishReminder(reminder, scheduleFuture);
         this.settings.sent[item.id] = this.sentEntry(reminder, results, scheduleFuture);
         if (repeatSeconds > 0) {
@@ -2866,7 +2903,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Maximum future days")
-      .setDesc("How far into the future this plugin may hand off reminders to ntfy. ntfy.sh defaults to a 3-day maximum.")
+      .setDesc("How far into the future this plugin may hand off reminders to ntfy immediately. ntfy.sh defaults to a 3-day maximum.")
       .addText((text) =>
         text
           .setPlaceholder("3")
@@ -2878,21 +2915,8 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("ntfy handoff lead minutes")
-      .setDesc("Queue items are handed off to ntfy only when they are this close to due time, so they stay editable in Obsidian longer.")
-      .addText((text) =>
-        text
-          .setPlaceholder("60")
-          .setValue(String(this.plugin.settings.ntfyHandoffLeadMinutes))
-          .onChange(async (value) => {
-            this.plugin.settings.ntfyHandoffLeadMinutes = Math.max(1, Number(value || 60));
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
       .setName("Local queue lookahead days")
-      .setDesc("Future reminders farther than the ntfy handoff window but within this range are kept in Obsidian's local editable queue.")
+      .setDesc("Future reminders farther than the ntfy scheduling window but within this range are kept in Obsidian's local editable queue.")
       .addText((text) =>
         text
           .setPlaceholder("30")

@@ -68,13 +68,13 @@ The status bar shows `ntfy local/total`, where `local` is the number of schedule
 
 In the editor, type `ntfy `, `提醒 `, `notify `, `remind `, or `⏲ ` to open minute-level reminder suggestions such as `30m`, `1h`, today 09:00, and tomorrow 09:00.
 
-New dated tasks are added to the local queue by the automatic scanner. Tasks with an explicit hour/minute are pushed at that time. Date-only tasks, daily-note tasks without a time, and overdue unsent tasks are pushed in the daily batch at `08:00` by default. Already sent tasks stay in the sent cache and are not pushed again.
+New dated tasks are added by the automatic scanner. Tasks inside the configured ntfy scheduling window, default `3` days, are handed off to ntfy immediately as scheduled messages. Tasks with an explicit hour/minute are scheduled for that time. Date-only tasks, daily-note tasks without a time, and overdue unsent tasks are scheduled for the daily batch at `08:00` by default. Already sent tasks stay in the sent cache and are not pushed again.
 
 Repeating notifications are handled by Ntfy Notifications' local queue. ntfy scheduled delivery is one-shot; after a repeating item is sent successfully, the plugin calculates and queues the next due time.
 
 Auto scan is enabled by default. While Obsidian is running, the plugin scans notes on the configured interval, keeps future reminders in the editable local queue, and hands queue items to ntfy only when they are close to due time. In daily-note folders such as `日记`, tasks without an explicit time use the date in the daily note filename plus the default time.
 
-The manager can refresh scheduled messages already handed off to ntfy and can cancel those scheduled ntfy messages when the server supports the ntfy delete API. Scheduled messages are published with a stable `X-Message-ID` so they can be matched later.
+The manager can refresh scheduled messages already handed off to ntfy and can cancel those scheduled ntfy messages when the server supports the ntfy delete API. Scheduled messages are published with a stable `X-Message-ID` so they can be matched later. Turning off a reminder with the bell button or editing the same task line cancels the old scheduled ntfy message before the new state is saved.
 
 Obsidian/plugin notices are captured by wrapping Obsidian's `Notice` API after this plugin loads. This covers most later notices, but a plugin that cached its own `Notice` reference before Ntfy Notifications loaded may not be captured.
 
@@ -132,8 +132,7 @@ According to the official ntfy publish docs:
 Ntfy Notifications uses two windows:
 
 - `Maximum future days`: how far ahead the plugin may hand off messages to ntfy. Keep this at `3` for public `ntfy.sh`.
-- `ntfy handoff lead minutes`: how close to due time a local queue item must be before it is handed off to ntfy. The default is `60`, so items stay editable inside Obsidian longer.
-- `Local queue lookahead days`: how far ahead the plugin keeps future reminders in Obsidian's editable local queue.
+- `Local queue lookahead days`: how far ahead the plugin keeps future reminders that are outside ntfy's scheduling window in Obsidian's editable local queue.
 
 For long-term reminders, keep them in the local queue and let later scans hand them off when they enter the ntfy scheduled-delivery window.
 
@@ -152,7 +151,6 @@ For long-term reminders, keep them in the local queue and let later scans hand t
    - auto scan, enabled by default
    - scan interval
    - maximum future days, usually `3` for public `ntfy.sh`
-   - ntfy handoff lead minutes
    - local queue lookahead days
 4. Run command `Ntfy Notifications: Send test notification`.
 
@@ -189,8 +187,9 @@ Set `AI webhook token` if the receiving service expects a Bearer token.
 - Supports editable local queue items with days/hours/minutes/seconds inputs in the manager.
 - Shows explicit day/hour/minute/second labels next to duration inputs.
 - Auto scan is enabled by default.
-- Date-only and overdue unsent tasks are grouped into the daily batch time, default `08:00`.
+- Date-only and overdue unsent tasks are grouped into the daily batch time, default `08:00`, then handed off to ntfy when inside the scheduling window.
 - Sent scheduled ntfy messages can be refreshed and cancelled from the manager when the ntfy server supports scheduled message listing and delete.
+- Turning off a reminder or editing the same task line cancels the previous scheduled ntfy message when possible.
 - Settings include two optional local support QR image fields; they stay in local plugin settings and are not bundled in the release.
 - Supports local repeating notifications.
 - Uses clear manager states: pending, queued, plugin notices, and delivered.
