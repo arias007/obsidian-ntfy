@@ -1,9 +1,9 @@
 {
   "id": "android-ntfy-notifier",
-  "name": "Obsidian Ntfy",
+  "name": "Ntfy Notifications",
   "version": "0.5.24",
   "minAppVersion": "1.5.0",
-  "description": "Send Obsidian reminders and captured plugin notices to ntfy with auto scan, editable queues, delayed notifications, repeats, and optional AI webhooks.",
+  "description": "Send vault reminders and captured app notices to ntfy with auto scan, editable queues, delayed notifications, repeats, and optional AI webhooks.",
   "author": "Codex",
   "authorUrl": "https://ntfy.sh",
   "isDesktopOnly": false

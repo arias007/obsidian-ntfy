@@ -15,7 +15,7 @@ const {
   setIcon,
 } = obsidian;
 
-const PLUGIN_NAME = "Obsidian Ntfy";
+const PLUGIN_NAME = "Ntfy Notifications";
 const VIEW_TYPE_NTFY_MANAGER = "obsidian-ntfy-manager-view";
 
 const DEFAULT_SETTINGS = {
@@ -280,8 +280,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   updateStatus(text) {
     if (!this.statusBar) return;
     this.statusBar.setText(text);
-    this.statusBar.setAttr("aria-label", "Open Obsidian Ntfy notification manager");
-    this.statusBar.setAttr("title", "Open Obsidian Ntfy notification manager");
+    this.statusBar.setAttr("aria-label", "Open Ntfy Notifications manager");
+    this.statusBar.setAttr("title", "Open Ntfy Notifications manager");
   }
 
   updateStatusCount(extraText) {
@@ -1105,7 +1105,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   async publishNtfy(reminder, scheduleFuture) {
     const headers = {
       "Content-Type": "text/plain; charset=utf-8",
-      "Title": this.safeHeader(`Obsidian Ntfy: ${reminder.text}`.slice(0, 120)),
+      "Title": this.safeHeader(`${PLUGIN_NAME}: ${reminder.text}`.slice(0, 120)),
     };
 
     const tags = String(this.settings.tags || "").trim();
@@ -1206,7 +1206,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const reminder = {
       key: "test",
       due: new Date(Date.now() + 5 * 1000),
-      text: "Obsidian Ntfy test notification",
+      text: "Ntfy Notifications test notification",
       filePath: "test.md",
       lineNumber: 1,
     };
@@ -1318,7 +1318,7 @@ class NtfyManagerView extends ItemView {
   }
 
   getDisplayText() {
-    return "Obsidian Ntfy";
+    return PLUGIN_NAME;
   }
 
   getIcon() {
