@@ -1,9 +1,9 @@
 {
   "id": "android-ntfy-notifier",
   "name": "Ntfy Notifications",
-  "version": "0.5.28",
+  "version": "0.6.0",
   "minAppVersion": "1.5.0",
-  "description": "Send vault reminders and captured app notices to ntfy with auto scan, editable queues, delayed notifications, repeats, and optional AI webhooks.",
+  "description": "Lightweight mobile notification and social channel hub for ntfy, agents, Telegram, Feishu, WeCom, Discord, Slack, Matrix, and email gateways.",
   "author": "Codex",
   "authorUrl": "https://ntfy.sh",
   "isDesktopOnly": false

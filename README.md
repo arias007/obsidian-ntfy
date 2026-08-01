@@ -208,3 +208,51 @@ Set `AI webhook token` if the receiving service expects a Bearer token.
 - Captured Obsidian/plugin notices depend on plugins using Obsidian's current `Notice` API after Ntfy Notifications has loaded.
 - ntfy scheduled delivery currently requires at least 10 seconds of delay. Shorter delays are raised to 10 seconds before publishing.
 - Data sent to ntfy or AI webhooks may pass through the configured server. Use a private topic, token, or self-hosted server for sensitive content.
+
+## Notification Hub And Social Connections
+
+Version `0.6.0` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, and scheduled-message cancellation, while adding a small dependency-free channel hub.
+
+The hub uses one **default channel**. Cancip, other Obsidian plugins, and external agents only use the default route unless they explicitly pass channel IDs or request a broadcast. Enabling several connections therefore does not unexpectedly send every message to every service.
+
+Built-in send channels are:
+
+- ntfy
+- Telegram Bot
+- Feishu bot webhook
+- WeCom group bot webhook
+- Discord webhook
+- Slack webhook
+- Matrix Client-Server API
+- Email through a user-provided HTTP gateway
+- Generic Webhook for Codex, Claude Code, custom agents, and automation
+
+Personal WeChat is not hard-coded. Enterprise WeChat uses its official group-bot webhook. A future WeChat or other service adapter can register through the public API without changing the core plugin.
+
+### Receiving Messages
+
+The plugin exposes one normalized inbound message format through `plugin.api.receive(input)`. It stores a bounded inbox, checks the contact/group allowlist and attachment size, deduplicates messages, records redacted connection logs, and can route messages as display-only, to a registered consumer, to a specified model, or to an auto-reply consumer.
+
+ntfy messages are polled incrementally while Obsidian is in the foreground. The last message ID is persisted and the plugin ignores its own `obntfy-*` messages. Telegram and Matrix also support lightweight foreground polling. Feishu, WeCom, Discord, Slack, and email inbound events should be forwarded to `receive()` by a provider webhook, Agent, or another connector; the mobile plugin does not start a public server or a Node process.
+
+Inbox deletion and delivery deduplication are intentionally separate. Removing an item from the visible inbox does not allow a provider retry with the same channel/message ID to run again. Poll-delivered messages start consumer work in the background, so a long Cancip or model task does not block later ntfy, Telegram, or Matrix polling. One malformed or oversized attachment is rejected without stopping the rest of the provider batch.
+
+Cancip can register its own handler without Ntfy Notifications importing Cancip:
+
+```js
+const hub = app.plugins.plugins["android-ntfy-notifier"]?.api;
+const unregister = hub?.registerIncomingHandler("cancip", async (message, context) => {
+  // Cancip decides whether to create a session, select a model, or reply.
+  return { accepted: true };
+});
+```
+
+If Cancip loads before Ntfy Notifications, it can listen for the workspace event `notification-hub:ready` and register when the API becomes available. Every accepted message also emits `notification-hub:incoming` for lightweight observers; the configured incoming consumer remains the authoritative model/session handler.
+
+The public API includes `getStatus`, `getIncomingStatus`, `listChannels`, `send`, `simulate`, `receive`, `pollIncoming`, `retryIncoming`, `removeIncoming`, `clearIncoming`, `registerChannel`, and `registerIncomingHandler`. External desktop agents can use the local `obsidian://notification-hub` URI templates shown by **Copy setup** in the settings. The URI is protected by a local token and a small request rate limit; the in-plugin API does not need that token.
+
+### Delivery Controls
+
+The settings include a total social-connection switch, add-connection selector, default channel, send-before-review dialog, contact/group allowlist, attachment size limit, quiet hours with a bounded local queue, simulated-event testing, and connection/error status. **Send test** creates a simulated event but sends it through the real default channel, so it must arrive on the selected platform. `simulate()` remains available to agents for a no-network, redacted request preview.
+
+Email deliberately uses an HTTP gateway rather than embedding SMTP. This keeps the plugin small and compatible with Obsidian mobile; the gateway can be a provider API or a user's own relay.

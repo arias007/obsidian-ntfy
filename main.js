@@ -31,11 +31,62 @@ const {
 
 const PLUGIN_NAME = "Ntfy Notifications";
 const VIEW_TYPE_NTFY_MANAGER = "obsidian-ntfy-manager-view";
+const NOTIFICATION_HUB_API_VERSION = "1";
+const BUILTIN_CHANNEL_IDS = ["ntfy", "telegram", "feishu", "wecom", "discord", "slack", "matrix", "email", "webhook"];
 
 const DEFAULT_SETTINGS = {
   serverUrl: "https://ntfy.sh",
   topic: "",
   authToken: "",
+  socialHubEnabled: true,
+  defaultChannelId: "ntfy",
+  ntfyChannelEnabled: true,
+  ntfyReceiveEnabled: true,
+  ntfyReceiveIntervalSeconds: 60,
+  ntfyReceiveSince: "",
+  ntfyReceiveTopic: "",
+  ntfyReceivedIds: [],
+  wecomChannelEnabled: false,
+  wecomWebhookUrl: "",
+  telegramChannelEnabled: false,
+  telegramReceiveEnabled: true,
+  telegramReceiveOffset: 0,
+  telegramBotToken: "",
+  telegramChatId: "",
+  feishuChannelEnabled: false,
+  feishuWebhookUrl: "",
+  discordChannelEnabled: false,
+  discordWebhookUrl: "",
+  slackChannelEnabled: false,
+  slackWebhookUrl: "",
+  matrixChannelEnabled: false,
+  matrixReceiveEnabled: true,
+  matrixNextBatch: "",
+  matrixServerUrl: "",
+  matrixAccessToken: "",
+  matrixRoomId: "",
+  emailChannelEnabled: false,
+  emailGatewayUrl: "",
+  emailGatewayToken: "",
+  emailFrom: "",
+  emailTo: "",
+  agentWebhookEnabled: false,
+  agentProtocolEnabled: true,
+  agentProtocolToken: "",
+  incomingAction: "display",
+  incomingConsumerId: "cancip",
+  incomingModel: "",
+  autoReplyRules: "",
+  reviewBeforeSend: false,
+  contactAllowlist: "",
+  attachmentLimitMb: 8,
+  quietHoursEnabled: false,
+  quietHoursStart: "22:00",
+  quietHoursEnd: "07:00",
+  incomingMessages: [],
+  incomingSeenKeys: [],
+  outboundQueue: [],
+  connectionLogs: [],
   aiWebhookUrl: "",
   aiWebhookToken: "",
   autoScanEnabled: true,
@@ -83,6 +134,15 @@ const TASKS_DATE_LABELS = {
 module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   async onload() {
     this.settings = this.normalizeSettings(await this.loadData());
+    if (!this.settings.agentProtocolToken) {
+      this.settings.agentProtocolToken = this.generateLocalToken();
+      await this.saveSettings();
+    }
+    this.externalChannelAdapters = new Map();
+    this.incomingMessageHandlers = new Map();
+    this.agentProtocolRequestTimes = [];
+    this.isPollingIncoming = false;
+    this.api = this.createNotificationHubApi();
     this.isScanning = false;
     this.doneDateWriteGuards = new Set();
     this.doneDateTimers = new Map();
@@ -119,6 +179,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "simulate-test-notification",
+      name: "Simulate test notification",
+      callback: async () => this.simulateTestNotification(),
+    });
+
+    this.addCommand({
       id: "schedule-delayed-notification",
       name: "Schedule delayed notification",
       callback: async () => this.scheduleDelayedNotificationPrompt(),
@@ -148,6 +214,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       },
     });
 
+    if (typeof this.registerObsidianProtocolHandler === "function") {
+      this.registerObsidianProtocolHandler("notification-hub", async (params) => {
+        await this.handleAgentProtocolRequest(params || {});
+      });
+    }
+
     this.scanTimer = window.setInterval(
       () => this.runAutoScan(),
       Math.max(1, Number(this.settings.scanIntervalMinutes || 15)) * 60 * 1000
@@ -158,6 +230,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       Math.max(1, Number(this.settings.scanIntervalMinutes || 15)) * 60 * 1000
     );
     this.registerInterval(this.statusCountScanTimer);
+    this.restartIncomingPollTimer();
+    if (typeof document !== "undefined") {
+      this.registerDomEvent(document, "visibilitychange", () => {
+        if (!document.hidden) this.runIncomingPoll();
+      });
+    }
     this.scheduleDailyBatchScan();
     this.register(() => {
       this.clearDailyBatchScan();
@@ -173,10 +251,17 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.app.workspace.onLayoutReady(() => {
       this.queueStatusCountRefresh();
       this.runAutoScan();
+      this.runIncomingPoll();
+      if (typeof this.app.workspace.trigger === "function") {
+        this.app.workspace.trigger("notification-hub:ready", this.api);
+      }
     });
   }
 
   onunload() {
+    if (this.app && this.app.workspace && typeof this.app.workspace.trigger === "function") {
+      this.app.workspace.trigger("notification-hub:unavailable");
+    }
     this.restoreNoticeCapture();
   }
 
@@ -250,9 +335,1145 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     settings.ignoredReminders = settings.ignoredReminders && typeof settings.ignoredReminders === "object" ? settings.ignoredReminders : {};
     settings.queue = Array.isArray(settings.queue) ? settings.queue : [];
     settings.obsidianNotices = Array.isArray(settings.obsidianNotices) ? settings.obsidianNotices : [];
+    settings.incomingMessages = Array.isArray(settings.incomingMessages) ? settings.incomingMessages.slice(0, 200) : [];
+    settings.incomingSeenKeys = data && Array.isArray(data.incomingSeenKeys)
+      ? data.incomingSeenKeys.map(String).filter(Boolean).slice(-1000)
+      : settings.incomingMessages.map((message) => `${String(message.channelId || "unknown")}:${String(message.id || "")}`).filter((key) => !key.endsWith(":"));
+    settings.outboundQueue = Array.isArray(settings.outboundQueue) ? settings.outboundQueue.slice(0, 200) : [];
+    settings.connectionLogs = Array.isArray(settings.connectionLogs) ? settings.connectionLogs.slice(0, 200) : [];
+    settings.ntfyReceivedIds = Array.isArray(settings.ntfyReceivedIds) ? settings.ntfyReceivedIds.slice(-500) : [];
     settings.autoScanEnabled = settings.autoScanEnabled !== false;
     settings.captureObsidianNotices = settings.captureObsidianNotices !== false;
+    settings.socialHubEnabled = settings.socialHubEnabled !== false;
+    settings.ntfyChannelEnabled = settings.ntfyChannelEnabled !== false;
+    settings.ntfyReceiveEnabled = settings.ntfyReceiveEnabled !== false;
+    settings.ntfyReceiveIntervalSeconds = Math.max(15, this.safePositiveNumber(settings.ntfyReceiveIntervalSeconds, DEFAULT_SETTINGS.ntfyReceiveIntervalSeconds));
+    settings.agentWebhookEnabled = data && typeof data.agentWebhookEnabled === "boolean"
+      ? data.agentWebhookEnabled
+      : Boolean(String(settings.aiWebhookUrl || "").trim());
+    settings.agentProtocolEnabled = settings.agentProtocolEnabled !== false;
+    settings.incomingAction = ["display", "consumer", "model", "auto-reply"].includes(settings.incomingAction) ? settings.incomingAction : "display";
+    settings.attachmentLimitMb = Math.max(1, this.safePositiveNumber(settings.attachmentLimitMb, DEFAULT_SETTINGS.attachmentLimitMb));
+    settings.quietHoursStart = this.normalizeClockTime(settings.quietHoursStart, DEFAULT_SETTINGS.quietHoursStart);
+    settings.quietHoursEnd = this.normalizeClockTime(settings.quietHoursEnd, DEFAULT_SETTINGS.quietHoursEnd);
+    const savedDefaultChannel = data && typeof data.defaultChannelId === "string" ? data.defaultChannelId : "";
+    settings.defaultChannelId = BUILTIN_CHANNEL_IDS.includes(savedDefaultChannel)
+      ? savedDefaultChannel
+      : !String(settings.topic || "").trim() && String(settings.aiWebhookUrl || "").trim()
+      ? "webhook"
+      : "ntfy";
     return settings;
+  }
+
+  createNotificationHubApi() {
+    return Object.freeze({
+      apiVersion: NOTIFICATION_HUB_API_VERSION,
+      getStatus: () => this.getNotificationHubStatus(),
+      getCapabilities: () => this.getNotificationHubCapabilities(),
+      listChannels: () => this.listNotificationChannels(),
+      send: (input) => this.sendNotification(input || {}),
+      simulate: (input) => this.simulateNotification(input || {}),
+      receive: (input) => this.ingestIncomingMessage(input || {}),
+      listIncomingMessages: () => [...(this.settings.incomingMessages || [])],
+      getIncomingStatus: () => this.getIncomingStatus(),
+      pollIncoming: (options) => this.runIncomingPoll(options || {}),
+      retryIncoming: (messageId, channelId) => this.retryIncomingMessage(messageId, channelId),
+      removeIncoming: (messageId, channelId) => this.removeIncomingMessage(messageId, channelId),
+      clearIncoming: () => this.clearIncomingMessages(),
+      getConnectionLogs: () => [...(this.settings.connectionLogs || [])],
+      registerChannel: (adapter) => this.registerNotificationChannel(adapter),
+      unregisterChannel: (channelId) => this.unregisterNotificationChannel(channelId),
+      registerIncomingHandler: (consumerId, handler) => this.registerIncomingMessageHandler(consumerId, handler),
+      unregisterIncomingHandler: (consumerId) => this.unregisterIncomingMessageHandler(consumerId),
+      getAgentConnectionInfo: () => this.getAgentConnectionInfo(),
+      openSettings: () => this.openPluginSettings(),
+    });
+  }
+
+  generateLocalToken() {
+    const bytes = new Uint8Array(24);
+    if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+      crypto.getRandomValues(bytes);
+      return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+    }
+    return this.hash(`${Date.now()}:${Math.random()}:${PLUGIN_NAME}`) + this.hash(`${Math.random()}:${Date.now()}`);
+  }
+
+  getNotificationHubCapabilities() {
+    return {
+      apiVersion: NOTIFICATION_HUB_API_VERSION,
+      defaultRouting: true,
+      explicitChannelRouting: true,
+      broadcastRouting: true,
+      simulation: true,
+      delayedDelivery: true,
+      dynamicChannelRegistration: true,
+      incomingMessages: true,
+      incomingConsumerRegistration: true,
+      incomingStatus: true,
+      incomingPolling: true,
+      incomingRetry: true,
+      incomingWorkspaceEvents: true,
+      ntfyReceive: true,
+      obsidianProtocol: true,
+      mobileCompatible: true,
+    };
+  }
+
+  getNotificationHubStatus() {
+    const channels = this.listNotificationChannels();
+    const defaultChannel = channels.find((channel) => channel.id === this.settings.defaultChannelId) || null;
+    return {
+      apiVersion: NOTIFICATION_HUB_API_VERSION,
+      ready: Boolean(defaultChannel && defaultChannel.enabled && defaultChannel.configured),
+      defaultChannelId: this.settings.defaultChannelId,
+      enabledChannelIds: channels.filter((channel) => channel.enabled && channel.configured).map((channel) => channel.id),
+      channelCount: channels.length,
+      incoming: this.getIncomingStatus(),
+    };
+  }
+
+  getIncomingStatus() {
+    const consumerId = String(this.settings.incomingConsumerId || "cancip").trim().toLowerCase();
+    return {
+      enabled: this.settings.socialHubEnabled !== false,
+      polling: Boolean(this.isPollingIncoming),
+      action: String(this.settings.incomingAction || "display"),
+      consumerId,
+      consumerRegistered: Boolean(this.incomingMessageHandlers && this.incomingMessageHandlers.has(consumerId)),
+      inboxCount: (this.settings.incomingMessages || []).length,
+      pollIntervalSeconds: Math.max(15, Number(this.settings.ntfyReceiveIntervalSeconds || 60)),
+      ntfyReceiveEnabled: Boolean(this.settings.ntfyReceiveEnabled && this.settings.ntfyChannelEnabled && this.topicUrl()),
+      telegramReceiveEnabled: Boolean(this.settings.telegramReceiveEnabled && this.settings.telegramChannelEnabled && this.settings.telegramBotToken),
+      matrixReceiveEnabled: Boolean(this.settings.matrixReceiveEnabled && this.settings.matrixChannelEnabled && this.settings.matrixAccessToken && this.settings.matrixServerUrl),
+    };
+  }
+
+  builtinChannelDefinitions() {
+    return [
+      {
+        id: "ntfy",
+        name: "ntfy",
+        enabled: this.settings.ntfyChannelEnabled !== false,
+        configured: Boolean(this.topicUrl()),
+        supportsRemoteSchedule: true,
+        canReceive: true,
+        receiveMode: "poll",
+      },
+      {
+        id: "wecom",
+        name: "企业微信机器人",
+        enabled: this.settings.wecomChannelEnabled === true,
+        configured: Boolean(String(this.settings.wecomWebhookUrl || "").trim()),
+        supportsRemoteSchedule: false,
+        canReceive: true,
+        receiveMode: "forward",
+      },
+      {
+        id: "telegram",
+        name: "Telegram Bot",
+        enabled: this.settings.telegramChannelEnabled === true,
+        configured: Boolean(String(this.settings.telegramBotToken || "").trim() && String(this.settings.telegramChatId || "").trim()),
+        supportsRemoteSchedule: false,
+        canReceive: true,
+        receiveMode: "poll",
+      },
+      {
+        id: "feishu",
+        name: "飞书机器人",
+        enabled: this.settings.feishuChannelEnabled === true,
+        configured: Boolean(String(this.settings.feishuWebhookUrl || "").trim()),
+        supportsRemoteSchedule: false,
+        canReceive: true,
+        receiveMode: "forward",
+      },
+      {
+        id: "discord",
+        name: "Discord Webhook",
+        enabled: this.settings.discordChannelEnabled === true,
+        configured: Boolean(String(this.settings.discordWebhookUrl || "").trim()),
+        supportsRemoteSchedule: false,
+        canReceive: true,
+        receiveMode: "forward",
+      },
+      {
+        id: "slack",
+        name: "Slack Webhook",
+        enabled: this.settings.slackChannelEnabled === true,
+        configured: Boolean(String(this.settings.slackWebhookUrl || "").trim()),
+        supportsRemoteSchedule: false,
+        canReceive: true,
+        receiveMode: "forward",
+      },
+      {
+        id: "matrix",
+        name: "Matrix",
+        enabled: this.settings.matrixChannelEnabled === true,
+        configured: Boolean(String(this.settings.matrixServerUrl || "").trim() && String(this.settings.matrixAccessToken || "").trim() && String(this.settings.matrixRoomId || "").trim()),
+        supportsRemoteSchedule: false,
+        canReceive: true,
+        receiveMode: "poll",
+      },
+      {
+        id: "email",
+        name: "Email (HTTP gateway)",
+        enabled: this.settings.emailChannelEnabled === true,
+        configured: Boolean(String(this.settings.emailGatewayUrl || "").trim() && String(this.settings.emailTo || "").trim()),
+        supportsRemoteSchedule: false,
+        canReceive: true,
+        receiveMode: "forward",
+      },
+      {
+        id: "webhook",
+        name: "通用 Webhook",
+        enabled: this.settings.agentWebhookEnabled === true,
+        configured: Boolean(String(this.settings.aiWebhookUrl || "").trim()),
+        supportsRemoteSchedule: true,
+        canReceive: true,
+        receiveMode: "forward",
+      },
+    ].map((channel) => Object.assign({ builtin: true }, channel, {
+      enabled: this.settings.socialHubEnabled !== false && channel.enabled,
+    }));
+  }
+
+  listNotificationChannels() {
+    const channels = this.builtinChannelDefinitions();
+    for (const [id, adapter] of this.externalChannelAdapters || []) {
+      let available = true;
+      try {
+        available = typeof adapter.isAvailable === "function" ? adapter.isAvailable() !== false : true;
+      } catch (_) {
+        available = false;
+      }
+      channels.push({
+        id,
+        name: String(adapter.name || id),
+        enabled: this.settings.socialHubEnabled !== false && adapter.enabled !== false,
+        configured: available,
+        supportsRemoteSchedule: adapter.supportsRemoteSchedule === true,
+        canReceive: typeof adapter.receive === "function" || typeof adapter.reply === "function",
+        receiveMode: adapter.receiveMode || "adapter",
+        builtin: false,
+      });
+    }
+    return channels;
+  }
+
+  registerNotificationChannel(adapter) {
+    if (!adapter || typeof adapter !== "object") throw new Error("Channel adapter must be an object.");
+    const id = String(adapter.id || "").trim().toLowerCase();
+    if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(id)) throw new Error("Channel id must contain 2-64 lowercase letters, numbers, dots, underscores, or dashes.");
+    if (BUILTIN_CHANNEL_IDS.includes(id)) throw new Error(`Built-in channel '${id}' cannot be replaced.`);
+    if (typeof adapter.send !== "function") throw new Error("Channel adapter must provide send(notification, context).");
+    this.externalChannelAdapters.set(id, Object.assign({}, adapter, { id }));
+    return () => this.unregisterNotificationChannel(id);
+  }
+
+  unregisterNotificationChannel(channelId) {
+    return Boolean(this.externalChannelAdapters && this.externalChannelAdapters.delete(String(channelId || "").trim().toLowerCase()));
+  }
+
+  registerIncomingMessageHandler(consumerId, handler) {
+    const id = String(consumerId || "").trim().toLowerCase();
+    if (!/^[a-z0-9][a-z0-9._-]{1,63}$/.test(id)) throw new Error("Consumer id must contain 2-64 lowercase letters, numbers, dots, underscores, or dashes.");
+    const callback = typeof handler === "function" ? handler : handler && typeof handler.handle === "function" ? handler.handle.bind(handler) : null;
+    if (!callback) throw new Error("Incoming message handler must be a function or provide handle(message, context).");
+    this.incomingMessageHandlers.set(id, { callback, raw: handler });
+    return () => this.unregisterIncomingMessageHandler(id);
+  }
+
+  unregisterIncomingMessageHandler(consumerId) {
+    return Boolean(this.incomingMessageHandlers && this.incomingMessageHandlers.delete(String(consumerId || "").trim().toLowerCase()));
+  }
+
+  normalizeIncomingMessage(input = {}) {
+    const channelId = String(input.channelId || input.channel || "ntfy").trim().toLowerCase().slice(0, 64) || "unknown";
+    const sender = String(input.sender || input.from || "unknown").trim().slice(0, 256) || "unknown";
+    const conversationId = String(input.conversationId || input.chatId || input.roomId || "").trim().slice(0, 512);
+    const text = String(input.text || input.message || "").trim().slice(0, 100000);
+    const attachments = Array.isArray(input.attachments) ? input.attachments.slice(0, 32).map((attachment) => ({
+      name: String(attachment && attachment.name || "attachment").slice(0, 512),
+      type: String(attachment && attachment.type || "").slice(0, 128),
+      size: Math.max(0, Number(attachment && attachment.size || 0)),
+      url: String(attachment && attachment.url || "").slice(0, 4096),
+    })) : [];
+    const receivedAt = new Date(input.receivedAt || Date.now());
+    return {
+      id: String(input.id || this.hash(`${channelId}:${sender}:${conversationId}:${text}:${Date.now()}`)).slice(0, 256),
+      channelId,
+      sender,
+      conversationId,
+      title: String(input.title || sender || channelId).slice(0, 512),
+      text,
+      attachments,
+      receivedAt: Number.isNaN(receivedAt.getTime()) ? new Date().toISOString() : receivedAt.toISOString(),
+      metadata: this.normalizeIncomingMetadata(input.metadata),
+    };
+  }
+
+  normalizeIncomingMetadata(value) {
+    if (!value || typeof value !== "object") return {};
+    try {
+      const serialized = JSON.stringify(value);
+      if (serialized.length <= 32768) return JSON.parse(serialized);
+      return { truncated: true, preview: serialized.slice(0, 32768) };
+    } catch (_) {
+      return {};
+    }
+  }
+
+  incomingMessageKey(message) {
+    return `${String(message && message.channelId || "unknown")}:${String(message && message.id || "")}`;
+  }
+
+  hasSeenIncomingMessage(message) {
+    return (this.settings.incomingSeenKeys || []).includes(this.incomingMessageKey(message));
+  }
+
+  rememberIncomingMessage(message) {
+    const key = this.incomingMessageKey(message);
+    this.settings.incomingSeenKeys = [...(this.settings.incomingSeenKeys || []).filter((item) => item !== key), key].slice(-1000);
+  }
+
+  contactIsAllowed(message) {
+    const entries = String(this.settings.contactAllowlist || "")
+      .split(/[,;\n]/)
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean);
+    if (!entries.length) return true;
+    const candidates = [message.sender, message.conversationId, `${message.channelId}:${message.sender}`, `${message.channelId}:${message.conversationId}`]
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean);
+    return candidates.some((value) => entries.includes(value));
+  }
+
+  validateIncomingAttachments(message) {
+    const maxBytes = Math.max(1, Number(this.settings.attachmentLimitMb || 8)) * 1024 * 1024;
+    const oversized = (message.attachments || []).find((attachment) => Number(attachment.size || 0) > maxBytes);
+    if (oversized) throw new Error(`Attachment '${oversized.name}' exceeds ${this.settings.attachmentLimitMb} MB.`);
+  }
+
+  isQuietHours(date = new Date()) {
+    if (!this.settings.quietHoursEnabled) return false;
+    const toMinutes = (value) => {
+      const [hour, minute] = this.normalizeClockTime(value, "00:00").split(":").map(Number);
+      return hour * 60 + minute;
+    };
+    const current = date.getHours() * 60 + date.getMinutes();
+    const start = toMinutes(this.settings.quietHoursStart);
+    const end = toMinutes(this.settings.quietHoursEnd);
+    if (start === end) return true;
+    return start < end ? current >= start && current < end : current >= start || current < end;
+  }
+
+  async requestOutboundApproval(notification, channelIds) {
+    return await new Promise((resolve) => {
+      new NotificationSendReviewModal(this.app, notification, channelIds, resolve).open();
+    });
+  }
+
+  async flushOutboundQueue() {
+    if (this.isQuietHours() || !(this.settings.outboundQueue || []).length) return false;
+    const pending = [...this.settings.outboundQueue];
+    const remaining = [];
+    let changed = false;
+    for (const item of pending) {
+      try {
+        const result = await this.dispatchNotification(item.notification, { channelIds: item.channelIds, simulate: false });
+        for (const delivery of result.results) {
+          this.recordConnectionLog(delivery.ok ? "info" : "error", delivery.channelId, `Queued notification ${delivery.status}`, { notificationId: item.id, error: delivery.error || "" });
+        }
+        changed = true;
+      } catch (error) {
+        remaining.push(item);
+        this.recordConnectionLog("error", "hub", "Queued notification failed", { notificationId: item.id, error: error.message || String(error) });
+      }
+    }
+    this.settings.outboundQueue = remaining;
+    if (changed || remaining.length !== pending.length) await this.saveSettings();
+    return changed;
+  }
+
+  recordConnectionLog(level, channelId, message, details = {}) {
+    let safeDetails = {};
+    try {
+      safeDetails = JSON.parse(this.redactSensitiveText(JSON.stringify(details && typeof details === "object" ? details : {}), true));
+    } catch (_) {
+      safeDetails = {};
+    }
+    const entry = {
+      at: new Date().toISOString(),
+      level: String(level || "info"),
+      channelId: String(channelId || "hub"),
+      message: String(message || ""),
+      details: safeDetails,
+    };
+    this.settings.connectionLogs = [entry, ...(this.settings.connectionLogs || [])].slice(0, 200);
+    return entry;
+  }
+
+  async ingestIncomingMessage(input = {}, options = {}) {
+    if (!this.settings.socialHubEnabled) return { ok: false, status: "hub-disabled" };
+    const message = this.normalizeIncomingMessage(input);
+    if (this.hasSeenIncomingMessage(message)) {
+      return { ok: true, status: "duplicate", messageId: message.id };
+    }
+    try {
+      this.validateIncomingAttachments(message);
+    } catch (error) {
+      this.rememberIncomingMessage(message);
+      this.recordConnectionLog("warning", message.channelId, "Incoming attachment blocked", { messageId: message.id, error: error.message || String(error) });
+      if (options.persist !== false) await this.saveSettings();
+      return { ok: false, status: "attachment-blocked", messageId: message.id };
+    }
+    if (!this.contactIsAllowed(message)) {
+      this.rememberIncomingMessage(message);
+      this.recordConnectionLog("warning", message.channelId, "Incoming message blocked by allowlist", { sender: message.sender, conversationId: message.conversationId });
+      if (options.persist !== false) await this.saveSettings();
+      return { ok: false, status: "blocked", messageId: message.id };
+    }
+
+    this.rememberIncomingMessage(message);
+    this.settings.incomingMessages = [message, ...(this.settings.incomingMessages || [])].slice(0, 200);
+    this.recordConnectionLog("info", message.channelId, "Incoming message received", { sender: message.sender, conversationId: message.conversationId });
+    const quiet = this.isQuietHours();
+    if (!quiet) new Notice(`[${message.channelId}] ${message.sender}: ${message.text || message.title}`);
+
+    if (this.app && this.app.workspace && typeof this.app.workspace.trigger === "function") {
+      try {
+        this.app.workspace.trigger("notification-hub:incoming", message, { hubApi: this.api, quiet });
+      } catch (error) {
+        this.recordConnectionLog("error", message.channelId, "Incoming workspace event failed", { error: error.message || String(error) });
+      }
+    }
+
+    if (options.persist !== false) await this.saveSettings();
+    if (options.awaitHandler === false) {
+      Promise.resolve()
+        .then(() => this.processIncomingMessage(message, quiet))
+        .then(() => this.saveSettings())
+        .catch(async (error) => {
+          this.recordConnectionLog("error", message.channelId, "Incoming background processing failed", { error: error.message || String(error) });
+          await this.saveSettings();
+        });
+      return { ok: true, status: "received", messageId: message.id, processing: "background" };
+    }
+
+    const handlerResult = await this.processIncomingMessage(message, quiet);
+    if (options.persist !== false) await this.saveSettings();
+    return { ok: true, status: "received", messageId: message.id, handlerResult };
+  }
+
+  async processIncomingMessage(message, quiet = this.isQuietHours()) {
+    const action = this.settings.incomingAction || "display";
+    let handlerResult = null;
+    if (action !== "display") {
+      const consumerId = String(this.settings.incomingConsumerId || "cancip").trim().toLowerCase();
+      const handler = this.incomingMessageHandlers.get(consumerId);
+      if (!handler) {
+        this.recordConnectionLog("warning", message.channelId, "Incoming consumer is unavailable", { consumerId, action });
+      } else {
+        try {
+          handlerResult = await handler.callback(message, {
+            action,
+            model: String(this.settings.incomingModel || ""),
+            autoReplyRules: String(this.settings.autoReplyRules || ""),
+            quiet,
+            hubApi: this.api,
+          });
+          this.recordConnectionLog("info", message.channelId, "Incoming consumer completed", { consumerId, action });
+        } catch (error) {
+          this.recordConnectionLog("error", message.channelId, "Incoming consumer failed", { consumerId, error: error.message || String(error) });
+        }
+      }
+    }
+
+    if (action === "auto-reply" && handlerResult && String(handlerResult.reply || "").trim()) {
+      try {
+        await this.replyToIncomingMessage(message, String(handlerResult.reply));
+      } catch (error) {
+        this.recordConnectionLog("error", message.channelId, "Incoming auto-reply failed", { error: error.message || String(error) });
+      }
+    }
+    return handlerResult;
+  }
+
+  async retryIncomingMessage(messageId, channelId = "") {
+    const id = String(messageId || "");
+    const channel = String(channelId || "").trim().toLowerCase();
+    const message = (this.settings.incomingMessages || []).find((item) => String(item.id) === id && (!channel || item.channelId === channel));
+    if (!message) return { ok: false, status: "not-found", messageId: id };
+    const handlerResult = await this.processIncomingMessage(message, this.isQuietHours());
+    await this.saveSettings();
+    return { ok: true, status: "retried", messageId: id, handlerResult };
+  }
+
+  async removeIncomingMessage(messageId, channelId = "") {
+    const id = String(messageId || "");
+    const channel = String(channelId || "").trim().toLowerCase();
+    const before = (this.settings.incomingMessages || []).length;
+    this.settings.incomingMessages = (this.settings.incomingMessages || []).filter((item) => !(String(item.id) === id && (!channel || item.channelId === channel)));
+    const removed = this.settings.incomingMessages.length !== before;
+    if (removed) await this.saveSettings();
+    return { ok: removed, status: removed ? "removed" : "not-found", messageId: id };
+  }
+
+  async clearIncomingMessages() {
+    const removed = (this.settings.incomingMessages || []).length;
+    this.settings.incomingMessages = [];
+    await this.saveSettings();
+    return { ok: true, status: "cleared", removed };
+  }
+
+  async replyToIncomingMessage(message, replyText) {
+    const adapter = this.externalChannelAdapters.get(message.channelId);
+    if (adapter && typeof adapter.reply === "function") {
+      return await adapter.reply(message, replyText, { app: this.app, plugin: this });
+    }
+    return await this.sendNotification({
+      source: "notification-hub-auto-reply",
+      event: "reply",
+      title: `Reply to ${message.sender}`,
+      message: replyText,
+      channelIds: [message.channelId],
+      metadata: {
+        replyTo: message.id,
+        conversationId: message.conversationId,
+        chatId: message.metadata && message.metadata.chatId ? message.metadata.chatId : message.conversationId,
+        roomId: message.metadata && message.metadata.roomId ? message.metadata.roomId : message.conversationId,
+      },
+    });
+  }
+
+  async runIncomingPoll(options = {}) {
+    if (this.isPollingIncoming) return { ok: false, status: "busy", changed: false, pollers: [] };
+    if (!this.settings.socialHubEnabled) return { ok: false, status: "hub-disabled", changed: false, pollers: [] };
+    if (typeof document !== "undefined" && document.hidden && options.force !== true) {
+      return { ok: false, status: "background", changed: false, pollers: [] };
+    }
+    this.isPollingIncoming = true;
+    let changed = false;
+    const pollResults = [];
+    try {
+      changed = (await this.flushOutboundQueue()) || changed;
+      const pollers = [
+        {
+          id: "ntfy",
+          enabled: this.settings.ntfyReceiveEnabled && this.settings.ntfyChannelEnabled && this.topicUrl(),
+          run: () => this.pollNtfyIncoming(),
+        },
+        {
+          id: "telegram",
+          enabled: this.settings.telegramReceiveEnabled && this.settings.telegramChannelEnabled && this.settings.telegramBotToken,
+          run: () => this.pollTelegramIncoming(),
+        },
+        {
+          id: "matrix",
+          enabled: this.settings.matrixReceiveEnabled && this.settings.matrixChannelEnabled && this.settings.matrixAccessToken && this.settings.matrixServerUrl,
+          run: () => this.pollMatrixIncoming(),
+        },
+      ];
+      for (const poller of pollers) {
+        if (!poller.enabled) continue;
+        try {
+          const pollerChanged = await poller.run();
+          changed = pollerChanged || changed;
+          pollResults.push({ id: poller.id, ok: true, changed: Boolean(pollerChanged) });
+        } catch (error) {
+          changed = true;
+          pollResults.push({ id: poller.id, ok: false, changed: false, error: this.redactSensitiveText(error.message || String(error), true) });
+          this.recordConnectionLog("error", poller.id, "Incoming poll failed", { error: error.message || String(error) });
+        }
+      }
+      if (changed) await this.saveSettings();
+      return {
+        ok: pollResults.every((result) => result.ok),
+        status: pollResults.some((result) => !result.ok) ? "partial" : "completed",
+        changed,
+        pollers: pollResults,
+      };
+    } catch (error) {
+      this.recordConnectionLog("error", "receive", "Incoming poll failed", { error: error.message || String(error) });
+      await this.saveSettings();
+      return { ok: false, status: "failed", changed: true, pollers: pollResults, error: this.redactSensitiveText(error.message || String(error), true) };
+    } finally {
+      this.isPollingIncoming = false;
+    }
+  }
+
+  restartIncomingPollTimer() {
+    if (this.incomingPollTimer) window.clearInterval(this.incomingPollTimer);
+    this.incomingPollTimer = window.setInterval(
+      () => this.runIncomingPoll(),
+      Math.max(15, Number(this.settings.ntfyReceiveIntervalSeconds || 60)) * 1000
+    );
+    this.registerInterval(this.incomingPollTimer);
+  }
+
+  async pollNtfyIncoming() {
+    const topic = String(this.settings.topic || "").trim();
+    if (this.settings.ntfyReceiveTopic !== topic) {
+      this.settings.ntfyReceiveTopic = topic;
+      this.settings.ntfyReceiveSince = "";
+      this.settings.ntfyReceivedIds = [];
+    }
+    const since = String(this.settings.ntfyReceiveSince || "10m");
+    const response = await this.httpRequest({
+      url: `${this.topicUrl()}/json?poll=1&since=${encodeURIComponent(since)}`,
+      method: "GET",
+      headers: this.ntfyRequestHeaders(),
+      throw: true,
+    });
+    const text = await this.responseText(response);
+    const known = new Set(this.settings.ntfyReceivedIds || []);
+    let changed = false;
+    for (const line of text.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+      let item;
+      try { item = JSON.parse(line); } catch (_) { continue; }
+      if (!item || item.event !== "message" || !item.id) continue;
+      this.settings.ntfyReceiveSince = item.id;
+      if (known.has(item.id)) continue;
+      known.add(item.id);
+      changed = true;
+      if (String(item.id).startsWith("obntfy-")) continue;
+      await this.ingestIncomingMessage({
+        id: item.id,
+        channelId: "ntfy",
+        sender: item.topic || "ntfy",
+        conversationId: item.topic || String(this.settings.topic || ""),
+        title: item.title || item.topic || "ntfy",
+        text: item.message || "",
+        attachments: item.attachment ? [{
+          name: item.attachment.name || "attachment",
+          type: item.attachment.type || "",
+          size: Number(item.attachment.size || 0),
+          url: item.attachment.url || "",
+        }] : [],
+        receivedAt: item.time ? new Date(Number(item.time) * 1000).toISOString() : new Date().toISOString(),
+        metadata: { priority: item.priority, tags: item.tags || [], clickUrl: item.click || "" },
+      }, { persist: false, awaitHandler: false });
+    }
+    this.settings.ntfyReceivedIds = [...known].slice(-500);
+    return changed;
+  }
+
+  async pollTelegramIncoming() {
+    const token = String(this.settings.telegramBotToken || "").trim();
+    if (!/^\d+:[A-Za-z0-9_-]+$/.test(token)) throw new Error("Telegram bot token format is invalid.");
+    const offset = Math.max(0, Number(this.settings.telegramReceiveOffset || 0));
+    const response = await this.httpRequest({
+      url: `https://api.telegram.org/bot${token}/getUpdates?timeout=0&limit=50&offset=${offset}`,
+      method: "GET",
+      throw: true,
+    });
+    const json = await this.responseJson(response);
+    if (!json || json.ok === false) throw new Error(json && json.description ? json.description : "Telegram getUpdates failed.");
+    let changed = false;
+    for (const update of Array.isArray(json.result) ? json.result : []) {
+      this.settings.telegramReceiveOffset = Math.max(Number(this.settings.telegramReceiveOffset || 0), Number(update.update_id || 0) + 1);
+      const source = update.message || update.channel_post || update.edited_message;
+      if (!source || !source.chat) continue;
+      changed = true;
+      const sender = source.from || {};
+      const attachments = [];
+      if (source.document) attachments.push({ name: source.document.file_name || "document", type: source.document.mime_type || "", size: source.document.file_size || 0 });
+      if (source.video) attachments.push({ name: source.video.file_name || "video", type: source.video.mime_type || "video", size: source.video.file_size || 0 });
+      if (source.audio) attachments.push({ name: source.audio.file_name || "audio", type: source.audio.mime_type || "audio", size: source.audio.file_size || 0 });
+      if (source.voice) attachments.push({ name: "voice", type: source.voice.mime_type || "audio", size: source.voice.file_size || 0 });
+      if (Array.isArray(source.photo) && source.photo.length) {
+        const photo = source.photo[source.photo.length - 1];
+        attachments.push({ name: "photo", type: "image", size: photo.file_size || 0 });
+      }
+      await this.ingestIncomingMessage({
+        id: `telegram-${update.update_id}`,
+        channelId: "telegram",
+        sender: sender.username || [sender.first_name, sender.last_name].filter(Boolean).join(" ") || String(sender.id || source.chat.id),
+        conversationId: String(source.chat.id),
+        text: source.text || source.caption || "",
+        attachments,
+        receivedAt: source.date ? new Date(Number(source.date) * 1000).toISOString() : new Date().toISOString(),
+        metadata: { chatId: String(source.chat.id), messageId: source.message_id },
+      }, { persist: false, awaitHandler: false });
+    }
+    return changed;
+  }
+
+  async pollMatrixIncoming() {
+    const base = this.requireHttpUrl(this.settings.matrixServerUrl, "Matrix server").replace(/\/+$/, "");
+    const token = String(this.settings.matrixAccessToken || "").trim();
+    const filter = JSON.stringify({ room: { timeline: { limit: 20 }, state: { types: [] }, ephemeral: { types: [] } }, presence: { types: [] } });
+    const since = this.settings.matrixNextBatch ? `&since=${encodeURIComponent(this.settings.matrixNextBatch)}` : "";
+    const response = await this.httpRequest({
+      url: `${base}/_matrix/client/v3/sync?timeout=0&filter=${encodeURIComponent(filter)}&access_token=${encodeURIComponent(token)}${since}`,
+      method: "GET",
+      throw: true,
+    });
+    const json = await this.responseJson(response);
+    if (!json || !json.next_batch) throw new Error("Matrix sync returned no next_batch token.");
+    this.settings.matrixNextBatch = json.next_batch;
+    let changed = false;
+    const joinedRooms = json.rooms && json.rooms.join ? json.rooms.join : {};
+    for (const [roomId, room] of Object.entries(joinedRooms)) {
+      if (this.settings.matrixRoomId && roomId !== this.settings.matrixRoomId) continue;
+      const events = room && room.timeline && Array.isArray(room.timeline.events) ? room.timeline.events : [];
+      for (const event of events) {
+        if (!event || event.type !== "m.room.message" || !event.event_id) continue;
+        const content = event.content || {};
+        if (!String(content.msgtype || "").startsWith("m.")) continue;
+        changed = true;
+        await this.ingestIncomingMessage({
+          id: event.event_id,
+          channelId: "matrix",
+          sender: event.sender || "matrix",
+          conversationId: roomId,
+          text: content.body || "",
+          attachments: content.url ? [{
+            name: content.body || "attachment",
+            type: content.info && content.info.mimetype || content.msgtype || "",
+            size: content.info && content.info.size || 0,
+            url: content.url,
+          }] : [],
+          receivedAt: event.origin_server_ts ? new Date(Number(event.origin_server_ts)).toISOString() : new Date().toISOString(),
+          metadata: { roomId, msgtype: content.msgtype },
+        }, { persist: false, awaitHandler: false });
+      }
+    }
+    return changed;
+  }
+
+  resolveChannelIds(input = {}) {
+    const requested = Array.isArray(input.channelIds)
+      ? input.channelIds
+      : typeof input.channelIds === "string"
+      ? input.channelIds.split(",")
+      : [];
+    const uniqueRequested = [...new Set(requested.map((id) => String(id || "").trim().toLowerCase()).filter(Boolean))];
+    if (uniqueRequested.length) return uniqueRequested;
+    if (input.broadcast === true) {
+      return this.listNotificationChannels()
+        .filter((channel) => channel.enabled && channel.configured)
+        .map((channel) => channel.id);
+    }
+    return [String(this.settings.defaultChannelId || "ntfy")];
+  }
+
+  normalizeHubNotification(input = {}) {
+    const message = String(input.message || input.text || "").trim();
+    const title = String(input.title || PLUGIN_NAME).trim().slice(0, 160) || PLUGIN_NAME;
+    const scheduledAtValue = input.scheduledAt || input.due || "";
+    const scheduledAtDate = scheduledAtValue ? new Date(scheduledAtValue) : null;
+    const scheduledAt = scheduledAtDate && !Number.isNaN(scheduledAtDate.getTime()) ? scheduledAtDate.toISOString() : "";
+    return {
+      id: String(input.id || this.hash(`${Date.now()}:${title}:${message}`)),
+      source: String(input.source || "notification-hub"),
+      event: String(input.event || input.type || "notification"),
+      title,
+      message: message || title,
+      priority: String(input.priority || this.settings.priority || "default"),
+      tags: Array.isArray(input.tags) ? input.tags.map(String) : String(input.tags || this.settings.tags || "").split(",").map((tag) => tag.trim()).filter(Boolean),
+      clickUrl: String(input.clickUrl || input.url || "").trim(),
+      scheduledAt,
+      attachments: Array.isArray(input.attachments) ? input.attachments.map((attachment) => ({
+        name: String(attachment && attachment.name || "attachment"),
+        type: String(attachment && attachment.type || ""),
+        size: Math.max(0, Number(attachment && attachment.size || 0)),
+        url: String(attachment && attachment.url || ""),
+      })) : [],
+      metadata: input.metadata && typeof input.metadata === "object" ? input.metadata : {},
+    };
+  }
+
+  async sendNotification(input = {}) {
+    if (!this.settings.socialHubEnabled) throw new Error("Social connections are disabled.");
+    const notification = this.normalizeHubNotification(input);
+    this.validateIncomingAttachments(notification);
+    const channelIds = this.resolveChannelIds(input);
+    if (this.settings.reviewBeforeSend && input.bypassReview !== true) {
+      const approved = await this.requestOutboundApproval(notification, channelIds);
+      if (!approved) return { ok: false, status: "rejected", notificationId: notification.id, results: [] };
+    }
+    if (this.isQuietHours() && input.bypassQuiet !== true && notification.priority !== "5") {
+      this.settings.outboundQueue = [...(this.settings.outboundQueue || []), {
+        id: notification.id,
+        notification,
+        channelIds,
+        createdAt: new Date().toISOString(),
+      }].slice(-200);
+      this.recordConnectionLog("info", "hub", "Outgoing notification queued for quiet hours", { notificationId: notification.id, channelIds });
+      await this.saveSettings();
+      return { ok: true, status: "queued-quiet-hours", notificationId: notification.id, results: [] };
+    }
+    const result = await this.dispatchNotification(notification, {
+      channelIds,
+      simulate: false,
+    });
+    for (const item of result.results) {
+      this.recordConnectionLog(item.ok ? "info" : "error", item.channelId, `Outgoing notification ${item.status}`, { notificationId: notification.id, error: item.error || "" });
+    }
+    await this.saveSettings();
+    return result;
+  }
+
+  async simulateNotification(input = {}) {
+    const notification = this.normalizeHubNotification(input);
+    return await this.dispatchNotification(notification, {
+      channelIds: this.resolveChannelIds(input),
+      simulate: true,
+      allowUnconfigured: true,
+    });
+  }
+
+  async dispatchNotification(notification, options = {}) {
+    const channelIds = [...new Set((options.channelIds || []).map((id) => String(id || "").trim().toLowerCase()).filter(Boolean))];
+    if (!channelIds.length) throw new Error("No notification channel was selected.");
+    const descriptors = new Map(this.listNotificationChannels().map((channel) => [channel.id, channel]));
+    const scheduledAtMs = notification.scheduledAt ? new Date(notification.scheduledAt).getTime() : 0;
+    const isFuture = scheduledAtMs > Date.now() + 1000;
+    const results = [];
+
+    for (const channelId of channelIds) {
+      const descriptor = descriptors.get(channelId);
+      if (!descriptor) {
+        results.push({ channelId, ok: false, status: "unsupported", error: "Unknown notification channel." });
+        continue;
+      }
+      if ((!descriptor.enabled || !descriptor.configured) && !options.allowUnconfigured) {
+        results.push({ channelId, ok: false, status: "not-configured", error: "Channel is disabled or not configured." });
+        continue;
+      }
+      if (isFuture && !descriptor.supportsRemoteSchedule && !options.simulate) {
+        results.push({ channelId, ok: true, status: "deferred", due: notification.scheduledAt });
+        continue;
+      }
+
+      try {
+        if (descriptor.builtin) {
+          const request = this.buildBuiltinChannelRequest(channelId, notification, { simulate: options.simulate });
+          if (options.simulate) {
+            results.push({ channelId, ok: true, status: "simulated", request: this.redactChannelRequest(request) });
+          } else {
+            results.push(await this.executeBuiltinChannelRequest(channelId, request));
+          }
+          continue;
+        }
+
+        const adapter = this.externalChannelAdapters.get(channelId);
+        if (!adapter) throw new Error("Channel adapter is no longer registered.");
+        if (options.simulate) {
+          const preview = typeof adapter.simulate === "function"
+            ? await adapter.simulate(notification, { app: this.app, plugin: this })
+            : { channelId, title: notification.title, message: notification.message };
+          results.push({ channelId, ok: true, status: "simulated", request: preview });
+        } else {
+          const result = await adapter.send(notification, { app: this.app, plugin: this });
+          results.push({ channelId, ok: true, status: "sent", result: result === undefined ? null : result });
+        }
+      } catch (error) {
+        results.push({ channelId, ok: false, status: "failed", error: this.redactSensitiveText(error.message || String(error), true) });
+      }
+    }
+
+    const ok = results.some((result) => result.ok);
+    if (!ok && !options.simulate) {
+      const error = new Error(results.map((result) => `${result.channelId}: ${result.error || result.status}`).join("; "));
+      error.results = results;
+      throw error;
+    }
+    return { ok, simulated: options.simulate === true, notificationId: notification.id, results };
+  }
+
+  requireHttpUrl(value, label) {
+    const raw = String(value || "").trim();
+    if (!raw) throw new Error(`${label} is not configured.`);
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch (_) {
+      throw new Error(`${label} is not a valid URL.`);
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error(`${label} must use HTTP or HTTPS.`);
+    return parsed.toString();
+  }
+
+  buildBuiltinChannelRequest(channelId, notification, options = {}) {
+    let text = notification.title === notification.message
+      ? notification.message
+      : `${notification.title}\n${notification.message}`;
+    const attachmentLines = (notification.attachments || []).map((attachment) => attachment.url ? `${attachment.name}: ${attachment.url}` : attachment.name).filter(Boolean);
+    if (attachmentLines.length) text = `${text}\n${attachmentLines.join("\n")}`;
+    const placeholder = options.simulate === true;
+
+    if (channelId === "ntfy") {
+      const url = this.topicUrl() || (placeholder ? "https://ntfy.sh/example-topic" : "");
+      const headers = {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Title": this.safeHeader(notification.title),
+        "X-Message-ID": this.ntfyMessageId(notification.id),
+      };
+      if (notification.tags.length) headers.Tags = this.safeHeader(notification.tags.join(","));
+      if (notification.priority && notification.priority !== "default") headers.Priority = this.safeHeader(notification.priority);
+      if (notification.clickUrl) headers.Click = this.safeHeader(notification.clickUrl);
+      const firstAttachment = (notification.attachments || []).find((attachment) => attachment.url);
+      if (firstAttachment) {
+        headers.Attach = this.safeHeader(firstAttachment.url);
+        headers.Filename = this.safeHeader(firstAttachment.name || "attachment");
+      }
+      if (this.settings.authToken) headers.Authorization = `Bearer ${String(this.settings.authToken).trim()}`;
+      if (notification.scheduledAt) headers.At = Math.floor(this.normalizeScheduledAt(new Date(notification.scheduledAt)).getTime() / 1000).toString();
+      return {
+        url: this.requireHttpUrl(url, "ntfy topic"),
+        method: "POST",
+        headers,
+        body: notification.message,
+        throw: true,
+        channelMeta: { messageId: headers["X-Message-ID"] },
+      };
+    }
+
+    if (channelId === "wecom") {
+      const url = String(this.settings.wecomWebhookUrl || "").trim() || (placeholder ? "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=example" : "");
+      return {
+        url: this.requireHttpUrl(url, "WeCom webhook"),
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ msgtype: "text", text: { content: text.slice(0, 2048) } }),
+        throw: true,
+      };
+    }
+
+    if (channelId === "telegram") {
+      const token = String(this.settings.telegramBotToken || "").trim() || (placeholder ? "000000:example-token" : "");
+      const chatId = String(notification.metadata && notification.metadata.chatId || this.settings.telegramChatId || "").trim() || (placeholder ? "example-chat" : "");
+      if (!token || !chatId) throw new Error("Telegram bot token and chat id are required.");
+      if (!/^\d+:[A-Za-z0-9_-]+$/.test(token)) throw new Error("Telegram bot token format is invalid.");
+      return {
+        url: this.requireHttpUrl(`https://api.telegram.org/bot${token}/sendMessage`, "Telegram API"),
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ chat_id: chatId, text: text.slice(0, 4096), disable_web_page_preview: false }),
+        throw: true,
+      };
+    }
+
+    if (channelId === "feishu") {
+      const url = String(this.settings.feishuWebhookUrl || "").trim() || (placeholder ? "https://open.feishu.cn/open-apis/bot/v2/hook/example" : "");
+      return {
+        url: this.requireHttpUrl(url, "Feishu webhook"),
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ msg_type: "text", content: { text: text.slice(0, 20000) } }),
+        throw: true,
+      };
+    }
+
+    if (channelId === "discord") {
+      const url = String(this.settings.discordWebhookUrl || "").trim() || (placeholder ? "https://discord.com/api/webhooks/example/token" : "");
+      return {
+        url: this.requireHttpUrl(url, "Discord webhook"),
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ content: text.slice(0, 2000) }),
+        throw: true,
+      };
+    }
+
+    if (channelId === "slack") {
+      const url = String(this.settings.slackWebhookUrl || "").trim() || (placeholder ? "https://hooks.slack.com/services/example/example/example" : "");
+      return {
+        url: this.requireHttpUrl(url, "Slack webhook"),
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ text: text.slice(0, 40000) }),
+        throw: true,
+      };
+    }
+
+    if (channelId === "matrix") {
+      const serverUrl = String(this.settings.matrixServerUrl || "").trim() || (placeholder ? "https://matrix.example" : "");
+      const token = String(this.settings.matrixAccessToken || "").trim() || (placeholder ? "example-token" : "");
+      const roomId = String(notification.metadata && notification.metadata.roomId || this.settings.matrixRoomId || "").trim() || (placeholder ? "!example:matrix.example" : "");
+      if (!token || !roomId) throw new Error("Matrix access token and room id are required.");
+      const base = this.requireHttpUrl(serverUrl, "Matrix server").replace(/\/+$/, "");
+      return {
+        url: `${base}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${encodeURIComponent(notification.id)}?access_token=${encodeURIComponent(token)}`,
+        method: "PUT",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ msgtype: "m.text", body: text.slice(0, 60000) }),
+        throw: true,
+      };
+    }
+
+    if (channelId === "email") {
+      const url = String(this.settings.emailGatewayUrl || "").trim() || (placeholder ? "https://mail-gateway.example/send" : "");
+      const headers = { "Content-Type": "application/json; charset=utf-8" };
+      if (this.settings.emailGatewayToken) headers.Authorization = `Bearer ${String(this.settings.emailGatewayToken).trim()}`;
+      return {
+        url: this.requireHttpUrl(url, "Email HTTP gateway"),
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          from: String(this.settings.emailFrom || "").trim(),
+          to: String(this.settings.emailTo || "").split(/[,;\n]/).map((item) => item.trim()).filter(Boolean),
+          subject: notification.title,
+          text: notification.message,
+          attachments: notification.attachments,
+          metadata: notification.metadata,
+        }),
+        throw: true,
+      };
+    }
+
+    if (channelId === "webhook") {
+      const url = String(this.settings.aiWebhookUrl || "").trim() || (placeholder ? "https://agent.example/notification" : "");
+      const headers = { "Content-Type": "application/json; charset=utf-8" };
+      if (this.settings.aiWebhookToken) headers.Authorization = `Bearer ${String(this.settings.aiWebhookToken).trim()}`;
+      return {
+        url: this.requireHttpUrl(url, "Agent webhook"),
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          apiVersion: NOTIFICATION_HUB_API_VERSION,
+          source: notification.source,
+          event: notification.event,
+          notification,
+        }),
+        throw: true,
+      };
+    }
+
+    throw new Error(`Unsupported built-in channel '${channelId}'.`);
+  }
+
+  async executeBuiltinChannelRequest(channelId, request) {
+    const channelMeta = request.channelMeta || {};
+    const httpOptions = Object.assign({}, request);
+    delete httpOptions.channelMeta;
+    const response = await this.httpRequest(httpOptions);
+    const json = await this.responseJson(response);
+    if (channelId === "wecom" && json && Number(json.errcode || 0) !== 0) throw new Error(json.errmsg || `WeCom error ${json.errcode}`);
+    if (channelId === "telegram" && json && json.ok === false) throw new Error(json.description || "Telegram rejected the message.");
+    if (channelId === "feishu" && json) {
+      const code = json.code === undefined ? json.StatusCode : json.code;
+      if (code !== undefined && Number(code) !== 0) throw new Error(json.msg || json.StatusMessage || `Feishu error ${code}`);
+    }
+    return {
+      channelId,
+      ok: true,
+      status: request.headers && request.headers.At ? "scheduled" : "sent",
+      messageId: channelMeta.messageId || "",
+    };
+  }
+
+  async responseJson(response) {
+    if (!response) return null;
+    if (response.json && typeof response.json === "object") return response.json;
+    const text = await this.responseText(response);
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  redactChannelRequest(request) {
+    let serialized = this.redactSensitiveText(JSON.stringify(request), false);
+    serialized = serialized.replace(/([?&]key=)[^&\"]+/gi, "$1***");
+    serialized = serialized.replace(/([?&]access_token=)[^&\"]+/gi, "$1***");
+    serialized = serialized.replace(/(\/bot)[^/\"]+(\/sendMessage)/gi, "$1***$2");
+    serialized = serialized.replace(/(\/webhooks\/)[^/\"]+\/[^?\"]+/gi, "$1***/***");
+    try {
+      return JSON.parse(serialized);
+    } catch (_) {
+      return { method: request.method || "POST", url: "[redacted]" };
+    }
+  }
+
+  redactSensitiveText(value, includeUrls = false) {
+    const secrets = [
+      this.settings.authToken,
+      this.settings.telegramBotToken,
+      this.settings.telegramChatId,
+      this.settings.matrixAccessToken,
+      this.settings.emailGatewayToken,
+      this.settings.aiWebhookToken,
+      this.settings.agentProtocolToken,
+      ...(includeUrls ? [this.settings.wecomWebhookUrl, this.settings.feishuWebhookUrl, this.settings.discordWebhookUrl, this.settings.slackWebhookUrl, this.settings.aiWebhookUrl] : []),
+    ].map((item) => String(item || "").trim()).filter(Boolean);
+    let text = String(value || "");
+    for (const secret of secrets) text = text.split(secret).join("***");
+    return text
+      .replace(/([?&]key=)[^&\"\s]+/gi, "$1***")
+      .replace(/([?&]access_token=)[^&\"\s]+/gi, "$1***")
+      .replace(/(\/bot)[^/\"\s]+/gi, "$1***");
+  }
+
+  getAgentConnectionInfo() {
+    const token = String(this.settings.agentProtocolToken || "");
+    return {
+      pluginId: "android-ntfy-notifier",
+      apiVersion: NOTIFICATION_HUB_API_VERSION,
+      inObsidian: 'app.plugins.plugins["android-ntfy-notifier"].api',
+      sendProtocolTemplate: `obsidian://notification-hub?action=send&token=${encodeURIComponent(token)}&title=TITLE&message=MESSAGE&channel=CHANNEL_ID`,
+      receiveProtocolTemplate: `obsidian://notification-hub?action=receive&token=${encodeURIComponent(token)}&sender=SENDER&message=MESSAGE&channel=CHANNEL_ID`,
+      apiMethods: ["getStatus", "getIncomingStatus", "listChannels", "send", "simulate", "receive", "pollIncoming", "retryIncoming", "removeIncoming", "clearIncoming", "registerChannel", "registerIncomingHandler"],
+      defaultChannelId: this.settings.defaultChannelId,
+      channels: this.listNotificationChannels().map((channel) => ({ id: channel.id, name: channel.name, receiveMode: channel.receiveMode })),
+    };
+  }
+
+  async handleAgentProtocolRequest(params) {
+    if (!this.settings.agentProtocolEnabled) {
+      new Notice(`${PLUGIN_NAME}: Agent protocol is disabled`);
+      return;
+    }
+    if (!this.settings.agentProtocolToken || String(params.token || "") !== String(this.settings.agentProtocolToken)) {
+      new Notice(`${PLUGIN_NAME}: unauthorized Agent request`);
+      return;
+    }
+    const now = Date.now();
+    this.agentProtocolRequestTimes = (this.agentProtocolRequestTimes || []).filter((time) => now - time < 60 * 1000);
+    if (this.agentProtocolRequestTimes.length >= 20) {
+      new Notice(`${PLUGIN_NAME}: Agent request rate limit reached`);
+      return;
+    }
+    this.agentProtocolRequestTimes.push(now);
+    const input = {
+      title: params.title || PLUGIN_NAME,
+      message: params.message || params.text || "Agent notification",
+      source: params.source || "external-agent",
+      event: params.event || "agent-notification",
+      channelIds: params.channel || params.channels || "",
+      broadcast: String(params.broadcast || "").toLowerCase() === "true",
+      clickUrl: params.click || params.url || "",
+    };
+    try {
+      const action = String(params.action || "send").toLowerCase();
+      if (action === "receive") {
+        const result = await this.ingestIncomingMessage({
+          id: params.id || "",
+          channelId: params.channel || "webhook",
+          sender: params.sender || params.from || "external-agent",
+          conversationId: params.conversation || params.chat || "",
+          title: params.title || "Incoming message",
+          text: params.message || params.text || "",
+        });
+        new Notice(`${PLUGIN_NAME}: incoming message ${result.status}`);
+        return;
+      }
+      const simulate = action === "simulate" || String(params.simulate || "").toLowerCase() === "true";
+      const result = simulate ? await this.simulateNotification(input) : await this.sendNotification(input);
+      new Notice(`${PLUGIN_NAME}: ${simulate ? "simulation" : "notification"} ${result.ok ? "completed" : "failed"}`);
+    } catch (error) {
+      new Notice(`${PLUGIN_NAME}: ${this.redactSensitiveText(error.message || String(error), true)}`);
+    }
+  }
+
+  openPluginSettings() {
+    if (!this.app.setting) return;
+    this.app.setting.open();
+    if (typeof this.app.setting.openTabById === "function") this.app.setting.openTabById("android-ntfy-notifier");
   }
 
   safePositiveNumber(value, fallback) {
@@ -399,7 +1620,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const notice = (this.settings.obsidianNotices || []).find((entry) => entry.id === id);
     if (!notice) return;
     if (!this.hasDestination()) {
-      new Notice(`${PLUGIN_NAME}: set an ntfy topic or AI webhook first`);
+      new Notice(`${PLUGIN_NAME}: configure the default channel first`);
       return;
     }
     const due = new Date();
@@ -433,7 +1654,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const cached = this.statusCounts || {};
     const redYellowCount = Number.isFinite(cached.redYellowCount) ? cached.redYellowCount : queueCount;
     const totalCount = Number.isFinite(cached.totalCount) ? cached.totalCount : redYellowCount;
-    const label = `ntfy ${redYellowCount}/${totalCount}`;
+    const label = `notify ${redYellowCount}/${totalCount}`;
     this.updateStatus(extraText ? `${label} ${extraText}` : label);
     this.queueStatusCountRefresh();
   }
@@ -441,7 +1662,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   setStatusCountsFromNotificationTasks(notificationTasks, extraText) {
     const counts = this.countNotificationTasksForStatus(notificationTasks);
     this.statusCounts = counts;
-    const label = `ntfy ${counts.redYellowCount}/${counts.totalCount}`;
+    const label = `notify ${counts.redYellowCount}/${counts.totalCount}`;
     this.updateStatus(extraText ? `${label} ${extraText}` : label);
   }
 
@@ -505,8 +1726,20 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   }
 
   sentEntry(reminder, publishResults, scheduleFuture) {
-    const ntfyResult = (publishResults || []).find((result) => result && result.ntfy);
-    const remoteScheduled = Boolean(scheduleFuture && this.settings.scheduleFutureWithNtfy && this.topicUrl());
+    const previousEntry = arguments.length > 3 && arguments[3] ? arguments[3] : null;
+    const results = Array.isArray(publishResults) ? publishResults : publishResults && Array.isArray(publishResults.results) ? publishResults.results : [];
+    const ntfyResult = results.find((result) => result && result.channelId === "ntfy" && result.ok);
+    const remoteScheduled = Boolean(ntfyResult && ntfyResult.status === "scheduled");
+    const channels = Object.assign({}, previousEntry && previousEntry.channels ? previousEntry.channels : {});
+    for (const result of results) {
+      if (!result || !result.channelId) continue;
+      channels[result.channelId] = {
+        status: result.status || (result.ok ? "sent" : "failed"),
+        at: new Date().toISOString(),
+        due: result.due || "",
+        error: result.error || "",
+      };
+    }
     return {
       at: new Date().toISOString(),
       due: reminder.due.toISOString(),
@@ -514,10 +1747,27 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       line: reminder.lineNumber,
       text: reminder.text,
       source: reminder.source || "obsidian-ntfy",
-      ntfyId: ntfyResult ? ntfyResult.messageId : "",
+      channels,
+      ntfyId: ntfyResult && ntfyResult.messageId ? ntfyResult.messageId : previousEntry && previousEntry.ntfyId ? previousEntry.ntfyId : "",
       ntfyScheduled: remoteScheduled,
       ntfyDeleted: false,
     };
+  }
+
+  pendingDeliveryChannelIds(entry, nowMs = Date.now()) {
+    if (!entry || !entry.channels || typeof entry.channels !== "object") return [];
+    return Object.entries(entry.channels)
+      .filter(([, state]) => {
+        if (!state || state.status === "failed" || state.status === "not-configured") return true;
+        if (state.status !== "deferred") return false;
+        const dueMs = new Date(state.due || entry.due || 0).getTime();
+        return Number.isNaN(dueMs) || dueMs <= nowMs + 1000;
+      })
+      .map(([channelId]) => channelId);
+  }
+
+  hasPendingNotificationDelivery(entry, nowMs = Date.now()) {
+    return this.pendingDeliveryChannelIds(entry, nowMs).length > 0;
   }
 
   ntfyRequestHeaders() {
@@ -625,7 +1875,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   }
 
   hasDestination() {
-    return Boolean(this.topicUrl() || String(this.settings.aiWebhookUrl || "").trim());
+    const channelId = String(this.settings.defaultChannelId || "ntfy");
+    const channel = this.listNotificationChannels().find((item) => item.id === channelId);
+    return Boolean(channel && channel.enabled && channel.configured);
   }
 
   async scanAndSchedule({ showNotice, forceDailyBatch = false } = {}) {
@@ -635,8 +1887,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     }
 
     if (!this.hasDestination()) {
-      this.updateStatus("ntfy: no destination");
-      if (showNotice) new Notice(`${PLUGIN_NAME}: set an ntfy topic or AI webhook first`);
+      this.updateStatus("notify: no destination");
+      if (showNotice) new Notice(`${PLUGIN_NAME}: configure the default channel first`);
       return;
     }
 
@@ -668,7 +1920,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     failed += queueResult.failed;
 
     for (const reminder of reminders) {
-      if (sent[reminder.key] || this.settings.ignoredReminders[reminder.key]) {
+      const previousEntry = sent[reminder.key] || null;
+      if ((previousEntry && !this.hasPendingNotificationDelivery(previousEntry, now)) || this.settings.ignoredReminders[reminder.key]) {
         skipped++;
         continue;
       }
@@ -699,8 +1952,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         const scheduledReminder = Object.assign({}, reminder, { due: scheduleDue });
         await this.cancelMatchingSentEntries(scheduledReminder);
         const scheduleFuture = scheduleMs > now + 1000;
-        const results = await this.publishReminder(scheduledReminder, scheduleFuture);
-        sent[reminder.key] = this.sentEntry(scheduledReminder, results, scheduleFuture);
+        const results = await this.publishReminder(scheduledReminder, scheduleFuture, previousEntry);
+        sent[reminder.key] = this.sentEntry(scheduledReminder, results, scheduleFuture, previousEntry);
         scheduled++;
       } catch (error) {
         console.error(`${PLUGIN_NAME} publish failed`, error);
@@ -743,7 +1996,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
           : queueIds.has(reminder.key)
           ? "queued"
           : sent[reminder.key]
-          ? "delivered"
+          ? Object.values(sent[reminder.key].channels || {}).some((state) => state && (state.status === "deferred" || state.status === "failed"))
+            ? "queued"
+            : "delivered"
           : "pending",
       }))
       .sort((a, b) => a.due.getTime() - b.due.getTime());
@@ -921,7 +2176,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   async sendReminderNow(reminder) {
     if (!this.hasDestination()) {
-      new Notice(`${PLUGIN_NAME}: set an ntfy topic or AI webhook first`);
+      new Notice(`${PLUGIN_NAME}: configure the default channel first`);
       return;
     }
     const results = await this.publishReminder(reminder, false);
@@ -942,7 +2197,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       const due = new Date(item.due);
       if (Number.isNaN(due.getTime())) continue;
       const repeatSeconds = Math.max(0, Number(item.repeatSeconds || 0));
-      if (this.settings.sent[item.id] && repeatSeconds <= 0) continue;
+      const previousEntry = this.settings.sent[item.id] || null;
+      if (previousEntry && repeatSeconds <= 0 && !this.hasPendingNotificationDelivery(previousEntry, now)) continue;
       const dueMs = due.getTime();
       if (item.batchOnly && dueMs <= now + 1000 && !flushDailyBatch) {
         remaining.push(item);
@@ -964,8 +2220,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         };
         const scheduleFuture = dueMs > now + 1000;
         await this.cancelMatchingSentEntries(reminder);
-        const results = await this.publishReminder(reminder, scheduleFuture);
-        this.settings.sent[item.id] = this.sentEntry(reminder, results, scheduleFuture);
+        const results = await this.publishReminder(reminder, scheduleFuture, previousEntry);
+        this.settings.sent[item.id] = this.sentEntry(reminder, results, scheduleFuture, previousEntry);
         if (repeatSeconds > 0) {
           const nextDue = this.nextRepeatDue(due, repeatSeconds, now);
           remaining.push(Object.assign({}, item, {
@@ -1053,7 +2309,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const item = (this.settings.queue || []).find((entry) => entry.id === id);
     if (!item) return;
     if (!this.hasDestination()) {
-      new Notice(`${PLUGIN_NAME}: set an ntfy topic or AI webhook first`);
+      new Notice(`${PLUGIN_NAME}: configure the default channel first`);
       return;
     }
 
@@ -1376,27 +2632,29 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return due;
   }
 
-  async publishReminder(reminder, scheduleFuture) {
-    const results = [];
-    let aiWebhookError = null;
-    if (this.topicUrl()) {
-      results.push(await this.publishNtfy(reminder, scheduleFuture));
-    }
-
-    if (String(this.settings.aiWebhookUrl || "").trim()) {
-      try {
-        results.push(await this.publishAiWebhook(reminder, scheduleFuture));
-      } catch (error) {
-        aiWebhookError = error;
-        console.warn(`${PLUGIN_NAME} AI webhook failed`, error);
-      }
-    }
-
-    if (!this.topicUrl() && aiWebhookError) {
-      throw aiWebhookError;
-    }
-
-    return results;
+  async publishReminder(reminder, scheduleFuture, previousEntry = null) {
+    const pendingChannelIds = previousEntry ? this.pendingDeliveryChannelIds(previousEntry) : [];
+    const channelIds = pendingChannelIds.length ? pendingChannelIds : this.resolveChannelIds({});
+    const notification = this.normalizeHubNotification({
+      id: reminder.key,
+      source: reminder.source || "obsidian-ntfy",
+      event: "reminder",
+      title: `${PLUGIN_NAME}: ${reminder.text}`.slice(0, 120),
+      message: this.buildNotificationBody(reminder),
+      scheduledAt: scheduleFuture ? reminder.due.toISOString() : "",
+      metadata: {
+        reminder: {
+          text: reminder.text,
+          due: reminder.due.toISOString(),
+          dueLocal: this.formatLocalDateTime(reminder.due),
+          file: this.settings.includeFullPath ? reminder.filePath : reminder.filePath.split("/").pop(),
+          line: reminder.lineNumber,
+          source: reminder.source || "obsidian-ntfy",
+        },
+      },
+    });
+    const result = await this.dispatchNotification(notification, { channelIds, simulate: false });
+    return result.results;
   }
 
   async publishNtfy(reminder, scheduleFuture) {
@@ -1507,29 +2765,37 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return lines.join("\n");
   }
 
-  async sendTestNotification() {
+  async sendTestNotification(options = {}) {
     if (!this.hasDestination()) {
-      new Notice(`${PLUGIN_NAME}: set an ntfy topic or AI webhook first`);
+      new Notice(`${PLUGIN_NAME}: configure the default channel first`);
       return;
     }
 
-    const reminder = {
-      key: "test",
-      due: new Date(Date.now() + 5 * 1000),
-      text: "Ntfy Notifications test notification",
-      filePath: "test.md",
-      lineNumber: 1,
-    };
-
     try {
-      await this.publishReminder(reminder, false);
-      new Notice(`${PLUGIN_NAME}: test notification sent`);
-      this.updateStatus("ntfy: test sent");
+      const channelId = String(this.settings.defaultChannelId || "ntfy");
+      const result = await this.sendNotification({
+        id: `test-${Date.now()}`,
+        source: "notification-hub-test",
+        event: options.simulatedEvent ? "simulated-event" : "test",
+        title: options.simulatedEvent ? "模拟通知测试" : "通知中枢测试",
+        message: `来自 Obsidian 的真实测试消息\n${this.formatLocalDateTime(new Date())}`,
+        channelIds: [channelId],
+        bypassReview: true,
+        bypassQuiet: true,
+      });
+      const delivered = result.results.filter((item) => item.ok).map((item) => item.channelId).join(", ");
+      new Notice(`${PLUGIN_NAME}: test sent through ${delivered || channelId}`);
+      this.updateStatus(`notify: ${channelId} test sent`);
     } catch (error) {
-      console.error(error);
-      new Notice(`${PLUGIN_NAME} failed: ${error.message || error}`);
-      this.updateStatus("ntfy: failed");
+      const safeError = this.redactSensitiveText(error.message || String(error), true);
+      console.error(`${PLUGIN_NAME}: test failed`, safeError);
+      new Notice(`${PLUGIN_NAME} failed: ${safeError}`);
+      this.updateStatus("notify: test failed");
     }
+  }
+
+  async simulateTestNotification() {
+    await this.sendTestNotification({ simulatedEvent: true });
   }
 
   async scheduleDelayedNotificationPrompt() {
@@ -1614,6 +2880,96 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   }
 };
 
+class NotificationSendReviewModal extends Modal {
+  constructor(app, notification, channelIds, resolve) {
+    super(app);
+    this.notification = notification;
+    this.channelIds = channelIds;
+    this.resolveResult = resolve;
+    this.finished = false;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("obsidian-ntfy-send-review");
+    contentEl.createEl("h2", { text: "发送前审核" });
+    contentEl.createEl("p", { cls: "setting-item-description", text: `Channel: ${this.channelIds.join(", ")}` });
+    contentEl.createEl("h3", { text: this.notification.title });
+    contentEl.createEl("pre", { cls: "obsidian-ntfy-review-message", text: this.notification.message });
+    new Setting(contentEl)
+      .addButton((button) => {
+        button.setButtonText("拒绝");
+        if (typeof button.setIcon === "function") button.setIcon("x");
+        button.onClick(() => this.finish(false));
+      })
+      .addButton((button) => {
+        button.setCta().setButtonText("发送");
+        if (typeof button.setIcon === "function") button.setIcon("send");
+        button.onClick(() => this.finish(true));
+      });
+  }
+
+  finish(value) {
+    if (this.finished) return;
+    this.finished = true;
+    this.resolveResult(value);
+    this.close();
+  }
+
+  onClose() {
+    this.contentEl.empty();
+    if (!this.finished) {
+      this.finished = true;
+      this.resolveResult(false);
+    }
+  }
+}
+
+class IncomingMessageReplyModal extends Modal {
+  constructor(app, plugin, message) {
+    super(app);
+    this.plugin = plugin;
+    this.message = message;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("obsidian-ntfy-reply-modal");
+    contentEl.createEl("h2", { text: `回复 ${this.message.sender || this.message.channelId}` });
+    contentEl.createEl("p", { cls: "setting-item-description", text: `[${this.message.channelId}] ${this.message.text || this.message.title || ""}` });
+    const input = contentEl.createEl("textarea", {
+      cls: "obsidian-ntfy-reply-input",
+      attr: { rows: "6", placeholder: "输入回复内容" },
+    });
+    new Setting(contentEl)
+      .addButton((button) => {
+        button.setButtonText("取消");
+        if (typeof button.setIcon === "function") button.setIcon("x");
+        button.onClick(() => this.close());
+      })
+      .addButton((button) => {
+        button.setCta().setButtonText("发送");
+        if (typeof button.setIcon === "function") button.setIcon("send");
+        button.onClick(async () => {
+          const text = input.value.trim();
+          if (!text) return;
+          try {
+            await this.plugin.replyToIncomingMessage(this.message, text);
+            new Notice(`${PLUGIN_NAME}: reply sent`);
+            this.close();
+          } catch (error) {
+            new Notice(`${PLUGIN_NAME}: ${this.plugin.redactSensitiveText(error.message || String(error), true)}`);
+          }
+        });
+      });
+    window.setTimeout(() => input.focus(), 0);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 class NtfyManagerView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -1690,6 +3046,8 @@ class NtfyManagerView extends ItemView {
     if (this.activeTab === "queue") this.renderQueueWorkspace(body);
     if (this.activeTab === "completed") this.renderCompletedTasks(body);
     if (this.activeTab === "tasks") this.renderVaultTasks(body);
+    if (this.activeTab === "inbox") this.renderIncomingMessages(body);
+    if (this.activeTab === "connections") this.renderConnectionStatus(body);
   }
 
   async loadRemoteScheduledQuietly() {
@@ -1707,6 +3065,83 @@ class NtfyManagerView extends ItemView {
     this.renderNavItem(nav, "pending", "alarm-clock", "待处理", this.notificationTasks.length);
     this.renderNavItem(nav, "completed", "check-check", "已完成", taskGroups.done.length);
     this.renderNavItem(nav, "tasks", "library", "整库待办", taskGroups.openUntimed.length);
+    this.renderNavItem(nav, "inbox", "inbox", "收件", (this.plugin.settings.incomingMessages || []).length);
+    this.renderNavItem(nav, "connections", "radio-tower", "连接", this.plugin.listNotificationChannels().filter((channel) => channel.enabled && channel.configured).length);
+  }
+
+  renderIncomingMessages(containerEl) {
+    const messages = this.plugin.settings.incomingMessages || [];
+    const group = containerEl.createDiv({ cls: "obsidian-ntfy-section" });
+    this.renderSectionHeader(group, "收到的消息", messages.length, "来自 ntfy、Telegram、Matrix 或统一 receive API 的入站消息。");
+    const controls = group.createDiv({ cls: "obsidian-ntfy-controls" });
+    this.iconButton(controls, "refresh-cw", "立即接收", "secondary", async () => {
+      await this.plugin.runIncomingPoll();
+      await this.render();
+    });
+    this.iconButton(controls, "trash-2", "清空收件", "danger", async () => {
+      await this.plugin.clearIncomingMessages();
+      await this.render();
+    });
+    if (!messages.length) {
+      group.createEl("p", { cls: "obsidian-ntfy-muted", text: "暂无收到的消息。" });
+      return;
+    }
+    for (const message of messages) {
+      const row = group.createDiv({ cls: "obsidian-ntfy-item obsidian-ntfy-incoming-item" });
+      const content = row.createDiv({ cls: "obsidian-ntfy-task-content" });
+      const meta = content.createDiv({ cls: "obsidian-ntfy-item-meta" });
+      meta.createSpan({ cls: "obsidian-ntfy-tag", text: message.channelId || "channel" });
+      meta.createSpan({ cls: "obsidian-ntfy-muted", text: message.sender || "unknown" });
+      if (message.conversationId) meta.createSpan({ cls: "obsidian-ntfy-muted", text: message.conversationId });
+      content.createDiv({ cls: "obsidian-ntfy-task-text", text: message.text || message.title || "(empty)" });
+      if ((message.attachments || []).length) {
+        content.createDiv({
+          cls: "obsidian-ntfy-muted",
+          text: message.attachments.map((attachment) => `${attachment.name} (${Math.ceil(Number(attachment.size || 0) / 1024)} KB)`).join(" · "),
+        });
+      }
+      content.createDiv({ cls: "obsidian-ntfy-muted", text: this.plugin.formatLocalDateTime(new Date(message.receivedAt)) });
+      const actions = row.createDiv({ cls: "obsidian-ntfy-controls" });
+      if (this.plugin.settings.incomingAction !== "display") {
+        this.iconButton(actions, "rotate-ccw", "重新交给消费者", "secondary", async () => {
+          await this.plugin.retryIncomingMessage(message.id, message.channelId);
+          await this.render();
+        });
+      }
+      this.iconButton(actions, "reply", "回复", "secondary", async () => {
+        new IncomingMessageReplyModal(this.app, this.plugin, message).open();
+      });
+      this.iconButton(actions, "trash-2", "删除", "danger", async () => {
+        await this.plugin.removeIncomingMessage(message.id, message.channelId);
+        await this.render();
+      });
+    }
+  }
+
+  renderConnectionStatus(containerEl) {
+    const group = containerEl.createDiv({ cls: "obsidian-ntfy-section" });
+    const channels = this.plugin.listNotificationChannels();
+    this.renderSectionHeader(group, "社交连接", channels.length, `默认 Channel: ${this.plugin.settings.defaultChannelId}`);
+    for (const channel of channels) {
+      const row = group.createDiv({ cls: "obsidian-ntfy-item obsidian-ntfy-item-compact" });
+      const content = row.createDiv({ cls: "obsidian-ntfy-task-content" });
+      content.createDiv({ cls: "obsidian-ntfy-task-text", text: channel.name });
+      content.createDiv({
+        cls: "obsidian-ntfy-muted",
+        text: `${channel.enabled ? "已启用" : "已关闭"} · ${channel.configured ? "已配置" : "未配置"} · 接收: ${channel.receiveMode || "不支持"}`,
+      });
+    }
+    const errors = (this.plugin.settings.connectionLogs || []).filter((entry) => entry.level === "error").slice(0, 20);
+    const logGroup = containerEl.createDiv({ cls: "obsidian-ntfy-section" });
+    this.renderSectionHeader(logGroup, "最近错误", errors.length, "日志已脱敏，最多显示最近 20 条错误。");
+    if (!errors.length) {
+      logGroup.createEl("p", { cls: "obsidian-ntfy-muted", text: "暂无错误。" });
+      return;
+    }
+    for (const entry of errors) {
+      const row = logGroup.createDiv({ cls: "obsidian-ntfy-item obsidian-ntfy-item-compact" });
+      row.createDiv({ cls: "obsidian-ntfy-task-content", text: `${entry.at} [${entry.channelId}] ${entry.message}` });
+    }
   }
 
   renderNavItem(containerEl, id, icon, label, value, subValue) {
@@ -2749,12 +4184,127 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: PLUGIN_NAME });
     containerEl.createEl("p", {
       text: this.uiText(
-        "把 Obsidian 待办和提醒发送到 ntfy，可选同步到 AI webhook。安卓通知由订阅同一 topic 的 ntfy app 显示。",
-        "Send reminder lines to ntfy and optional AI webhooks. Android notifications are shown by the ntfy app subscribed to the same topic."
+        "轻量通知中枢：Obsidian、Cancip 和 Agent 默认通过一个 Channel 发送，也可显式指定或广播到多个 Channel。",
+        "A lightweight notification hub for Obsidian, Cancip, and agents. Requests use one default channel unless they explicitly select or broadcast to multiple channels."
       ),
     });
 
-    new Setting(containerEl)
+    const hubGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-hub" });
+    hubGroup.createEl("h3", { text: this.uiText("通知中枢", "Notification hub") });
+    const hubStatus = this.plugin.getNotificationHubStatus();
+    const channelMap = new Map(this.plugin.listNotificationChannels().map((channel) => [channel.id, channel]));
+    const defaultChannel = channelMap.get(hubStatus.defaultChannelId);
+
+    new Setting(hubGroup)
+      .setName(this.uiText("社交连接总开关", "Social connections"))
+      .setDesc(this.uiText("关闭后停止所有收发和轮询，但保留连接配置。", "Stops all sending, receiving, and polling while keeping connection settings."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.socialHubEnabled)).onChange(async (value) => {
+        this.plugin.settings.socialHubEnabled = value;
+        await this.plugin.saveSettings();
+        this.display();
+      }));
+
+    new Setting(hubGroup)
+      .setName(this.uiText("当前状态", "Current status"))
+      .setDesc(
+        hubStatus.ready
+          ? this.uiText(`默认走 ${defaultChannel ? defaultChannel.name : hubStatus.defaultChannelId}，已可发送。`, `Ready. Default route: ${defaultChannel ? defaultChannel.name : hubStatus.defaultChannelId}.`)
+          : this.uiText(`默认 Channel ${defaultChannel ? defaultChannel.name : hubStatus.defaultChannelId} 尚未启用或配置。`, `The default channel ${defaultChannel ? defaultChannel.name : hubStatus.defaultChannelId} is disabled or not configured.`)
+      );
+
+    new Setting(hubGroup)
+      .setName(this.uiText("默认 Channel", "Default channel"))
+      .setDesc(this.uiText("Cancip、提醒和 Agent 未指定目标时只走这里，不会自动群发。", "Cancip, reminders, and agents use only this route unless they explicitly select channels."))
+      .addDropdown((dropdown) => {
+        for (const channel of this.plugin.listNotificationChannels()) dropdown.addOption(channel.id, channel.name);
+        dropdown.setValue(this.plugin.settings.defaultChannelId).onChange(async (value) => {
+          this.plugin.settings.defaultChannelId = value;
+          await this.plugin.saveSettings();
+          this.display();
+        });
+      });
+
+    const enableSettingKeys = {
+      ntfy: "ntfyChannelEnabled",
+      telegram: "telegramChannelEnabled",
+      feishu: "feishuChannelEnabled",
+      wecom: "wecomChannelEnabled",
+      discord: "discordChannelEnabled",
+      slack: "slackChannelEnabled",
+      matrix: "matrixChannelEnabled",
+      email: "emailChannelEnabled",
+      webhook: "agentWebhookEnabled",
+    };
+    new Setting(hubGroup)
+      .setName(this.uiText("添加连接", "Add connection"))
+      .setDesc(this.uiText("选择后启用对应配置区域；可在区域内关闭连接。", "Enables the selected connection settings; it can be disabled again inside its section."))
+      .addDropdown((dropdown) => {
+        dropdown.addOption("", this.uiText("选择连接类型", "Select a connection"));
+        for (const channel of this.plugin.listNotificationChannels().filter((item) => item.builtin)) dropdown.addOption(channel.id, channel.name);
+        dropdown.setValue("").onChange(async (value) => {
+          const key = enableSettingKeys[value];
+          if (!key) return;
+          this.plugin.settings[key] = true;
+          await this.plugin.saveSettings();
+          this.display();
+        });
+      });
+
+    new Setting(hubGroup)
+      .setName(this.uiText("模拟通知测试", "Simulated event test"))
+      .setDesc(this.uiText("生成一条模拟事件并通过默认 Channel 真实发送；应能在对应社交平台收到。", "Creates a simulated event and really sends it through the default channel so it can be verified on the target platform."))
+      .addButton((button) => {
+        button.setButtonText(this.uiText("发送测试", "Send test"));
+        if (typeof button.setIcon === "function") button.setIcon("send");
+        if (typeof button.setDisabled === "function") button.setDisabled(!hubStatus.ready);
+        button.onClick(async () => await this.plugin.simulateTestNotification());
+      });
+
+    new Setting(hubGroup)
+      .setName(this.uiText("Agent 链接", "Agent connection"))
+      .setDesc(this.uiText("插件内通过公开 API 调用；外部 Codex、Claude Code 等可使用 obsidian://notification-hub 链接。", "Obsidian plugins use the public API; external tools such as Codex and Claude Code can use obsidian://notification-hub links."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.agentProtocolEnabled)).onChange(async (value) => {
+        this.plugin.settings.agentProtocolEnabled = value;
+        await this.plugin.saveSettings();
+      }))
+      .addButton((button) => {
+        button.setButtonText(this.uiText("复制说明", "Copy setup"));
+        if (typeof button.setIcon === "function") button.setIcon("copy");
+        button.onClick(async () => {
+          const text = JSON.stringify(this.plugin.getAgentConnectionInfo(), null, 2);
+          if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+            new Notice(this.uiText("当前设备没有可用的剪贴板接口。", "Clipboard API is unavailable on this device."));
+            return;
+          }
+          await navigator.clipboard.writeText(text);
+          new Notice(this.uiText("Agent 连接说明已复制。", "Agent connection setup copied."));
+        });
+      });
+
+    const ntfyGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
+    ntfyGroup.createEl("h3", { text: "ntfy" });
+    new Setting(ntfyGroup)
+      .setName(this.uiText("启用 Channel", "Enable channel"))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.ntfyChannelEnabled)).onChange(async (value) => {
+        this.plugin.settings.ntfyChannelEnabled = value;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(ntfyGroup)
+      .setName(this.uiText("接收 ntfy 消息", "Receive ntfy messages"))
+      .setDesc(this.uiText("前台低频增量拉取 topic 消息，去重后交给统一入站处理器。", "Polls the topic incrementally while Obsidian is in the foreground and routes deduplicated messages to the common inbound handler."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.ntfyReceiveEnabled)).onChange(async (value) => {
+        this.plugin.settings.ntfyReceiveEnabled = value;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(ntfyGroup)
+      .setName(this.uiText("接收轮询间隔（秒）", "Receive poll interval (seconds)"))
+      .addText((text) => text.setPlaceholder("60").setValue(String(this.plugin.settings.ntfyReceiveIntervalSeconds)).onChange(async (value) => {
+        this.plugin.settings.ntfyReceiveIntervalSeconds = Math.max(15, this.plugin.safePositiveNumber(value, DEFAULT_SETTINGS.ntfyReceiveIntervalSeconds));
+        await this.plugin.saveSettings();
+        this.plugin.restartIncomingPollTimer();
+      }));
+
+    new Setting(ntfyGroup)
       .setName(this.uiText("ntfy 服务器", "ntfy server"))
       .setDesc(this.uiText("使用 https://ntfy.sh 或你自己部署的 ntfy 服务器。", "Use https://ntfy.sh or your self-hosted ntfy server."))
       .addText((text) =>
@@ -2767,7 +4317,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(ntfyGroup)
       .setName(this.uiText("Topic 主题", "Topic"))
       .setDesc(this.uiText("建议使用足够长的随机 topic。公开 topic 被猜到后别人也可以订阅。", "Use a long random topic. Anyone who guesses a public topic can subscribe to it."))
       .addText((text) =>
@@ -2780,44 +4330,297 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(ntfyGroup)
       .setName(this.uiText("认证 token", "Auth token"))
       .setDesc(this.uiText("受保护的 ntfy 服务器或 topic 可填写 Bearer token。", "Optional Bearer token for a protected ntfy server/topic."))
-      .addText((text) =>
-        text
-          .setPlaceholder("tk_...")
-          .setValue(this.plugin.settings.authToken)
-          .onChange(async (value) => {
-            this.plugin.settings.authToken = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text.setPlaceholder("tk_...").setValue(this.plugin.settings.authToken).onChange(async (value) => {
+          this.plugin.settings.authToken = value.trim();
+          await this.plugin.saveSettings();
+        });
+      });
 
-    new Setting(containerEl)
-      .setName("AI webhook URL")
-      .setDesc(this.uiText("可选 JSON 接口，用于 AI agent 或自动化；留空则关闭。", "Optional JSON endpoint for AI agents or automation. Leave empty to disable."))
-      .addText((text) =>
-        text
-          .setPlaceholder("https://example.com/obsidian-ntfy")
-          .setValue(this.plugin.settings.aiWebhookUrl)
-          .onChange(async (value) => {
-            this.plugin.settings.aiWebhookUrl = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
+    const wecomGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
+    if (!this.plugin.settings.wecomChannelEnabled) wecomGroup.addClass("is-disabled");
+    wecomGroup.createEl("h3", { text: this.uiText("企业微信机器人", "WeCom bot") });
+    new Setting(wecomGroup)
+      .setName(this.uiText("启用 Channel", "Enable channel"))
+      .setDesc(this.uiText("使用企业微信群机器人的官方 webhook；不接入个人微信。", "Uses an official WeCom group bot webhook. Personal WeChat is not hard-coded."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.wecomChannelEnabled)).onChange(async (value) => {
+        this.plugin.settings.wecomChannelEnabled = value;
+        await this.plugin.saveSettings();
+        if (!value) this.display();
+      }));
+    new Setting(wecomGroup)
+      .setName("Webhook URL")
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text.setPlaceholder("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...").setValue(this.plugin.settings.wecomWebhookUrl).onChange(async (value) => {
+          this.plugin.settings.wecomWebhookUrl = value.trim();
+          await this.plugin.saveSettings();
+        });
+      });
 
-    new Setting(containerEl)
-      .setName(this.uiText("AI webhook token", "AI webhook token"))
-      .setDesc(this.uiText("AI webhook 的可选 Bearer token。", "Optional Bearer token for the AI webhook."))
-      .addText((text) =>
-        text
-          .setPlaceholder("optional")
-          .setValue(this.plugin.settings.aiWebhookToken)
-          .onChange(async (value) => {
-            this.plugin.settings.aiWebhookToken = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
+    const telegramGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
+    if (!this.plugin.settings.telegramChannelEnabled) telegramGroup.addClass("is-disabled");
+    telegramGroup.createEl("h3", { text: "Telegram" });
+    new Setting(telegramGroup)
+      .setName(this.uiText("启用 Channel", "Enable channel"))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.telegramChannelEnabled)).onChange(async (value) => {
+        this.plugin.settings.telegramChannelEnabled = value;
+        await this.plugin.saveSettings();
+        if (!value) this.display();
+      }));
+    new Setting(telegramGroup).setName("Bot token").addText((text) => {
+      text.inputEl.type = "password";
+      text.setPlaceholder("123456:ABC...").setValue(this.plugin.settings.telegramBotToken).onChange(async (value) => {
+        this.plugin.settings.telegramBotToken = value.trim();
+        await this.plugin.saveSettings();
+      });
+    });
+    new Setting(telegramGroup).setName("Chat ID").addText((text) => text.setPlaceholder("-100...").setValue(this.plugin.settings.telegramChatId).onChange(async (value) => {
+      this.plugin.settings.telegramChatId = value.trim();
+      await this.plugin.saveSettings();
+    }));
+    new Setting(telegramGroup)
+      .setName(this.uiText("接收 Telegram 消息", "Receive Telegram messages"))
+      .setDesc(this.uiText("前台增量读取 Bot getUpdates；附件只保存元数据，不自动下载。", "Incrementally polls Bot getUpdates in the foreground; attachment binaries are not downloaded."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.telegramReceiveEnabled)).onChange(async (value) => {
+        this.plugin.settings.telegramReceiveEnabled = value;
+        await this.plugin.saveSettings();
+        if (value) await this.plugin.runIncomingPoll({ force: true });
+      }));
+
+    const feishuGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
+    if (!this.plugin.settings.feishuChannelEnabled) feishuGroup.addClass("is-disabled");
+    feishuGroup.createEl("h3", { text: this.uiText("飞书机器人", "Feishu bot") });
+    new Setting(feishuGroup)
+      .setName(this.uiText("启用 Channel", "Enable channel"))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.feishuChannelEnabled)).onChange(async (value) => {
+        this.plugin.settings.feishuChannelEnabled = value;
+        await this.plugin.saveSettings();
+        if (!value) this.display();
+      }));
+    new Setting(feishuGroup).setName("Webhook URL").addText((text) => {
+      text.inputEl.type = "password";
+      text.setPlaceholder("https://open.feishu.cn/open-apis/bot/v2/hook/...").setValue(this.plugin.settings.feishuWebhookUrl).onChange(async (value) => {
+        this.plugin.settings.feishuWebhookUrl = value.trim();
+        await this.plugin.saveSettings();
+      });
+    });
+
+    const discordGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
+    if (!this.plugin.settings.discordChannelEnabled) discordGroup.addClass("is-disabled");
+    discordGroup.createEl("h3", { text: "Discord" });
+    new Setting(discordGroup)
+      .setName(this.uiText("启用 Channel", "Enable channel"))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.discordChannelEnabled)).onChange(async (value) => {
+        this.plugin.settings.discordChannelEnabled = value;
+        await this.plugin.saveSettings();
+        if (!value) this.display();
+      }));
+    new Setting(discordGroup).setName("Webhook URL").addText((text) => {
+      text.inputEl.type = "password";
+      text.setPlaceholder("https://discord.com/api/webhooks/...").setValue(this.plugin.settings.discordWebhookUrl).onChange(async (value) => {
+        this.plugin.settings.discordWebhookUrl = value.trim();
+        await this.plugin.saveSettings();
+      });
+    });
+
+    const slackGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
+    if (!this.plugin.settings.slackChannelEnabled) slackGroup.addClass("is-disabled");
+    slackGroup.createEl("h3", { text: "Slack" });
+    new Setting(slackGroup)
+      .setName(this.uiText("启用 Channel", "Enable channel"))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.slackChannelEnabled)).onChange(async (value) => {
+        this.plugin.settings.slackChannelEnabled = value;
+        await this.plugin.saveSettings();
+        if (!value) this.display();
+      }));
+    new Setting(slackGroup).setName("Webhook URL").addText((text) => {
+      text.inputEl.type = "password";
+      text.setPlaceholder("https://hooks.slack.com/services/...").setValue(this.plugin.settings.slackWebhookUrl).onChange(async (value) => {
+        this.plugin.settings.slackWebhookUrl = value.trim();
+        await this.plugin.saveSettings();
+      });
+    });
+
+    const matrixGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
+    if (!this.plugin.settings.matrixChannelEnabled) matrixGroup.addClass("is-disabled");
+    matrixGroup.createEl("h3", { text: "Matrix" });
+    new Setting(matrixGroup)
+      .setName(this.uiText("启用 Channel", "Enable channel"))
+      .setDesc(this.uiText("移动端可用 Matrix Client-Server API 轮询收发。", "Uses the Matrix Client-Server API for mobile-compatible polling."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.matrixChannelEnabled)).onChange(async (value) => {
+        this.plugin.settings.matrixChannelEnabled = value;
+        await this.plugin.saveSettings();
+        if (!value) this.display();
+      }));
+    new Setting(matrixGroup).setName(this.uiText("服务器", "Server")).addText((text) => text.setPlaceholder("https://matrix.example").setValue(this.plugin.settings.matrixServerUrl).onChange(async (value) => {
+      this.plugin.settings.matrixServerUrl = value.trim();
+      await this.plugin.saveSettings();
+    }));
+    new Setting(matrixGroup).setName("Access token").addText((text) => {
+      text.inputEl.type = "password";
+      text.setPlaceholder("syt_...").setValue(this.plugin.settings.matrixAccessToken).onChange(async (value) => {
+        this.plugin.settings.matrixAccessToken = value.trim();
+        await this.plugin.saveSettings();
+      });
+    });
+    new Setting(matrixGroup).setName("Room ID").addText((text) => text.setPlaceholder("!room:matrix.example").setValue(this.plugin.settings.matrixRoomId).onChange(async (value) => {
+      this.plugin.settings.matrixRoomId = value.trim();
+      await this.plugin.saveSettings();
+    }));
+    new Setting(matrixGroup)
+      .setName(this.uiText("接收 Matrix 消息", "Receive Matrix messages"))
+      .setDesc(this.uiText("前台增量调用 /sync，可限制为上面的 Room ID。", "Incrementally calls /sync in the foreground and can be limited to the Room ID above."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.matrixReceiveEnabled)).onChange(async (value) => {
+        this.plugin.settings.matrixReceiveEnabled = value;
+        await this.plugin.saveSettings();
+        if (value) await this.plugin.runIncomingPoll({ force: true });
+      }));
+
+    const emailGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
+    if (!this.plugin.settings.emailChannelEnabled) emailGroup.addClass("is-disabled");
+    emailGroup.createEl("h3", { text: this.uiText("Email", "Email") });
+    new Setting(emailGroup)
+      .setName(this.uiText("启用 Channel", "Enable channel"))
+      .setDesc(this.uiText("使用移动端兼容的 HTTP 邮件网关，不在插件内实现 SMTP。", "Uses a mobile-compatible HTTP email gateway instead of embedding SMTP in the plugin."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.emailChannelEnabled)).onChange(async (value) => {
+        this.plugin.settings.emailChannelEnabled = value;
+        await this.plugin.saveSettings();
+        if (!value) this.display();
+      }));
+    new Setting(emailGroup).setName(this.uiText("邮件网关 URL", "Gateway URL")).addText((text) => text.setPlaceholder("https://api.example/send").setValue(this.plugin.settings.emailGatewayUrl).onChange(async (value) => {
+      this.plugin.settings.emailGatewayUrl = value.trim();
+      await this.plugin.saveSettings();
+    }));
+    new Setting(emailGroup).setName("Gateway token").addText((text) => {
+      text.inputEl.type = "password";
+      text.setPlaceholder("optional").setValue(this.plugin.settings.emailGatewayToken).onChange(async (value) => {
+        this.plugin.settings.emailGatewayToken = value.trim();
+        await this.plugin.saveSettings();
+      });
+    });
+    new Setting(emailGroup).setName("From").addText((text) => text.setPlaceholder("obsidian@example.com").setValue(this.plugin.settings.emailFrom).onChange(async (value) => {
+      this.plugin.settings.emailFrom = value.trim();
+      await this.plugin.saveSettings();
+    }));
+    new Setting(emailGroup).setName("To").addText((text) => text.setPlaceholder("you@example.com").setValue(this.plugin.settings.emailTo).onChange(async (value) => {
+      this.plugin.settings.emailTo = value.trim();
+      await this.plugin.saveSettings();
+    }));
+
+    const agentGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
+    if (!this.plugin.settings.agentWebhookEnabled) agentGroup.addClass("is-disabled");
+    agentGroup.createEl("h3", { text: this.uiText("通用 Webhook", "Generic webhook") });
+    new Setting(agentGroup)
+      .setName(this.uiText("启用 Channel", "Enable channel"))
+      .setDesc(this.uiText("向 Codex、Claude Code、自建 Agent、自动化或其他 HTTP 接口发送统一 JSON；入站消息可调用 receive API。", "Sends normalized JSON to Codex, Claude Code, custom agents, automation, or other HTTP endpoints; inbound messages can call the receive API."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.agentWebhookEnabled)).onChange(async (value) => {
+        this.plugin.settings.agentWebhookEnabled = value;
+        await this.plugin.saveSettings();
+        if (!value) this.display();
+      }));
+    new Setting(agentGroup).setName("Webhook URL").addText((text) => text.setPlaceholder("https://agent.example/notification").setValue(this.plugin.settings.aiWebhookUrl).onChange(async (value) => {
+      this.plugin.settings.aiWebhookUrl = value.trim();
+      await this.plugin.saveSettings();
+    }));
+    new Setting(agentGroup)
+      .setName(this.uiText("Bearer token", "Bearer token"))
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text.setPlaceholder("optional").setValue(this.plugin.settings.aiWebhookToken).onChange(async (value) => {
+          this.plugin.settings.aiWebhookToken = value.trim();
+          await this.plugin.saveSettings();
+        });
+      });
+
+    const inboundGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-inbound-group" });
+    inboundGroup.createEl("h3", { text: this.uiText("收到消息后", "When a message arrives") });
+    new Setting(inboundGroup)
+      .setName(this.uiText("处理方式", "Action"))
+      .setDesc(this.uiText("Ntfy 只负责统一接收和分发；Cancip 处理器可选择建立会话、选模型和回复。", "Ntfy receives and routes messages; a Cancip consumer can create sessions, choose a model, and reply."))
+      .addDropdown((dropdown) => dropdown
+        .addOption("display", this.uiText("仅显示", "Display only"))
+        .addOption("consumer", this.uiText("交给指定消费者", "Send to consumer"))
+        .addOption("model", this.uiText("交给指定模型", "Route to model"))
+        .addOption("auto-reply", this.uiText("满足规则后自动回复", "Auto-reply by rules"))
+        .setValue(this.plugin.settings.incomingAction)
+        .onChange(async (value) => {
+          this.plugin.settings.incomingAction = value;
+          await this.plugin.saveSettings();
+        }))
+      .addText((text) => text.setPlaceholder("cancip").setValue(this.plugin.settings.incomingConsumerId).onChange(async (value) => {
+        this.plugin.settings.incomingConsumerId = value.trim() || "cancip";
+        await this.plugin.saveSettings();
+      }));
+    new Setting(inboundGroup)
+      .setName(this.uiText("指定模型", "Target model"))
+      .addText((text) => text.setPlaceholder("留空由消费者决定").setValue(this.plugin.settings.incomingModel).onChange(async (value) => {
+        this.plugin.settings.incomingModel = value.trim();
+        await this.plugin.saveSettings();
+      }));
+    new Setting(inboundGroup)
+      .setName(this.uiText("自动回复规则", "Auto-reply rules"))
+      .addText((text) => text.setPlaceholder("可选：仅匹配指定联系人或关键词").setValue(this.plugin.settings.autoReplyRules).onChange(async (value) => {
+        this.plugin.settings.autoReplyRules = value.trim();
+        await this.plugin.saveSettings();
+      }));
+    new Setting(inboundGroup)
+      .setName(this.uiText("发送前审核", "Review before sending"))
+      .setDesc(this.uiText("普通发送和自动回复先弹出审核；真实模拟通知测试会直接发送。", "Shows a review dialog before normal sends and auto-replies; real simulated tests bypass it."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.reviewBeforeSend)).onChange(async (value) => {
+        this.plugin.settings.reviewBeforeSend = value;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(inboundGroup)
+      .setName(this.uiText("联系人和群聊白名单", "Contact and group allowlist"))
+      .setDesc(this.uiText("逗号、分号或换行分隔；留空表示不限制。可填发送者、群聊 ID 或 channel:sender。", "Separate by commas, semicolons, or new lines; empty means unrestricted. Use sender, group ID, or channel:sender."))
+      .addText((text) => text.setPlaceholder("telegram:user, matrix:@user:server").setValue(this.plugin.settings.contactAllowlist).onChange(async (value) => {
+        this.plugin.settings.contactAllowlist = value;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(inboundGroup)
+      .setName(this.uiText("附件大小限制（MB）", "Attachment limit (MB)"))
+      .addText((text) => text.setPlaceholder("8").setValue(String(this.plugin.settings.attachmentLimitMb)).onChange(async (value) => {
+        this.plugin.settings.attachmentLimitMb = Math.max(1, this.plugin.safePositiveNumber(value, DEFAULT_SETTINGS.attachmentLimitMb));
+        await this.plugin.saveSettings();
+      }));
+
+    const quietGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-quiet-group" });
+    quietGroup.createEl("h3", { text: this.uiText("静默时间", "Quiet hours") });
+    new Setting(quietGroup)
+      .setName(this.uiText("启用静默", "Enable quiet hours"))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.quietHoursEnabled)).onChange(async (value) => {
+        this.plugin.settings.quietHoursEnabled = value;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(quietGroup).setName(this.uiText("开始", "Start")).addText((text) => text.setPlaceholder("22:00").setValue(this.plugin.settings.quietHoursStart).onChange(async (value) => {
+      this.plugin.settings.quietHoursStart = this.plugin.normalizeClockTime(value, "22:00");
+      await this.plugin.saveSettings();
+    }));
+    new Setting(quietGroup).setName(this.uiText("结束", "End")).addText((text) => text.setPlaceholder("07:00").setValue(this.plugin.settings.quietHoursEnd).onChange(async (value) => {
+      this.plugin.settings.quietHoursEnd = this.plugin.normalizeClockTime(value, "07:00");
+      await this.plugin.saveSettings();
+    }));
+
+    const logGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-log-group" });
+    logGroup.createEl("h3", { text: this.uiText("连接状态与错误日志", "Connection status and error log") });
+    const statuses = this.plugin.listNotificationChannels().map((channel) => `${channel.name}: ${channel.enabled ? (channel.configured ? "ready" : "not configured") : "off"}`);
+    logGroup.createEl("p", { cls: "setting-item-description", text: statuses.join(" · ") });
+    const errorLogs = (this.plugin.settings.connectionLogs || []).filter((entry) => entry.level === "error").slice(0, 5);
+    logGroup.createEl("p", { cls: "setting-item-description", text: errorLogs.length ? errorLogs.map((entry) => `${entry.at} ${entry.channelId}: ${entry.message}`).join("\n") : this.uiText("暂无错误。", "No errors recorded.") });
+    new Setting(logGroup).addButton((button) => {
+      button.setButtonText(this.uiText("清空日志", "Clear log"));
+      if (typeof button.setIcon === "function") button.setIcon("trash-2");
+      button.onClick(async () => {
+        this.plugin.settings.connectionLogs = [];
+        await this.plugin.saveSettings();
+        this.display();
+      });
+    });
 
     new Setting(containerEl)
       .setName(this.uiText("自动扫描", "Auto scan"))

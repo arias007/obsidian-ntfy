@@ -221,6 +221,44 @@
   margin: 0 0 8px;
 }
 
+.obsidian-ntfy-channel-group.is-disabled {
+  display: none;
+}
+
+.obsidian-ntfy-channel-hub .setting-item-control,
+.obsidian-ntfy-inbound-group .setting-item-control,
+.obsidian-ntfy-quiet-group .setting-item-control {
+  flex-wrap: wrap;
+}
+
+.obsidian-ntfy-channel-group input,
+.obsidian-ntfy-channel-hub input,
+.obsidian-ntfy-inbound-group input {
+  max-width: min(100%, 420px);
+}
+
+.obsidian-ntfy-log-group .setting-item-description {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.obsidian-ntfy-send-review .obsidian-ntfy-review-message {
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  max-height: 45vh;
+  overflow: auto;
+  padding: 10px;
+  white-space: pre-wrap;
+}
+
+.obsidian-ntfy-reply-input {
+  box-sizing: border-box;
+  min-height: 120px;
+  resize: vertical;
+  width: 100%;
+}
+
 .obsidian-ntfy-qr-grid {
   display: grid;
   gap: 12px;
@@ -664,6 +702,33 @@
 
   .obsidian-ntfy-controls {
     justify-content: flex-end;
+  }
+
+  .obsidian-ntfy-channel-hub .setting-item,
+  .obsidian-ntfy-channel-group .setting-item,
+  .obsidian-ntfy-inbound-group .setting-item,
+  .obsidian-ntfy-quiet-group .setting-item {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .obsidian-ntfy-channel-hub .setting-item-control,
+  .obsidian-ntfy-channel-group .setting-item-control,
+  .obsidian-ntfy-inbound-group .setting-item-control,
+  .obsidian-ntfy-quiet-group .setting-item-control {
+    justify-content: flex-start;
+    width: 100%;
+  }
+
+  .obsidian-ntfy-channel-hub input,
+  .obsidian-ntfy-channel-group input,
+  .obsidian-ntfy-inbound-group input,
+  .obsidian-ntfy-quiet-group input,
+  .obsidian-ntfy-channel-hub select,
+  .obsidian-ntfy-inbound-group select {
+    max-width: 100%;
+    width: 100%;
   }
 }
 
