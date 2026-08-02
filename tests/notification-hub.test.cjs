@@ -1,5 +1,7 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
 const Module = require("node:module");
+const path = require("node:path");
 
 const notices = [];
 global.window = global.window || {
@@ -83,6 +85,16 @@ class FakeWebSocket {
 }
 
 async function run() {
+  const source = fs.readFileSync(path.join(__dirname, "..", "main.js"), "utf8");
+  const styles = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
+  const managerHeaderStart = source.indexOf("  renderHeader(containerEl) {");
+  const managerHeaderEnd = source.indexOf("  renderIncomingMessages(containerEl)", managerHeaderStart);
+  assert.ok(managerHeaderStart >= 0 && managerHeaderEnd > managerHeaderStart, "manager header should remain discoverable");
+  const managerHeader = source.slice(managerHeaderStart, managerHeaderEnd);
+  assert.equal((managerHeader.match(/this\.renderNavItem\(/g) || []).length, 4);
+  assert.doesNotMatch(managerHeader, /["']connections["']/);
+  assert.match(styles, /grid-template-columns:\s*repeat\(4,\s*minmax\(0,\s*1fr\)\)/);
+
   const plugin = createPlugin({
     topic: "test-topic",
     authToken: "secret-ntfy-token",
@@ -122,7 +134,25 @@ async function run() {
   });
   assert.equal(restoredQqPlugin.getChannelAccount("qqbot").config.appId, "qq-app");
   assert.equal(restoredQqPlugin.settings.retiredChannelAccounts.some((account) => account.type === "qqbot"), false);
-  assert.equal(restoredQqPlugin.listNotificationChannels().find((channel) => channel.id === "qqbot").receiveMode, "socket");
+  const restoredQqChannel = restoredQqPlugin.listNotificationChannels().find((channel) => channel.id === "qqbot");
+  assert.equal(restoredQqChannel.receiveMode, "socket");
+  assert.equal(restoredQqChannel.configured, true);
+  assert.equal(restoredQqChannel.sendConfigured, true);
+
+  const receiveOnlyQqPlugin = createPlugin({ topic: "qq-receive-only" });
+  await receiveOnlyQqPlugin.addChannelToSettings("qqbot", { accountId: "receive", name: "QQ Receive" });
+  await receiveOnlyQqPlugin.updateChannelAccount("qqbot:receive", { config: { appId: "qq-app", clientSecret: "qq-secret", target: "" } });
+  const receiveOnlyQqChannel = receiveOnlyQqPlugin.listNotificationChannels().find((channel) => channel.id === "qqbot:receive");
+  assert.equal(receiveOnlyQqChannel.configured, true);
+  assert.equal(receiveOnlyQqChannel.sendConfigured, false);
+  assert.equal(receiveOnlyQqChannel.receiveMode, "socket");
+
+  const rejectedQqPlugin = createPlugin({ topic: "qq-auth-error" });
+  rejectedQqPlugin.httpRequest = async () => ({ json: { message: "invalid appid or secret" } });
+  await assert.rejects(
+    rejectedQqPlugin.getQqBotAccessToken({ appId: "bad-app", clientSecret: "bad-secret" }),
+    /invalid Bot ID\/AppID or ClientSecret/
+  );
 
   const channelSettingsPlugin = createPlugin({
     topic: "settings-topic",

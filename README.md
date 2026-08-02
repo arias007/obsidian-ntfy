@@ -211,7 +211,7 @@ Set `AI webhook token` if the receiving service expects a Bearer token.
 
 ## Notification Hub And Social Connections
 
-Version `0.6.4` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, review flow, inbox, deduplication, and quiet queue. Every built-in provider can have multiple named accounts with independent credentials, send/receive state, configuration, cursors, and a per-account test action.
+Version `0.6.5` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, review flow, inbox, deduplication, and quiet queue. Every built-in provider can have multiple named accounts with independent credentials, send/receive state, configuration, cursors, and a per-account test action.
 
 The hub uses one **default channel**. Cancip, other Obsidian plugins, and external agents only use the default route unless they explicitly pass channel IDs or request a broadcast. Enabling several connections therefore does not unexpectedly send every message to every service.
 

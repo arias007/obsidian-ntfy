@@ -616,9 +616,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const defaultChannel = channels.find((channel) => channel.id === this.settings.defaultChannelId) || null;
     return {
       apiVersion: NOTIFICATION_HUB_API_VERSION,
-      ready: Boolean(defaultChannel && defaultChannel.enabled && defaultChannel.configured),
+      ready: Boolean(defaultChannel && defaultChannel.enabled && defaultChannel.sendConfigured),
       defaultChannelId: this.settings.defaultChannelId,
-      enabledChannelIds: channels.filter((channel) => channel.enabled && channel.configured).map((channel) => channel.id),
+      enabledChannelIds: channels.filter((channel) => channel.enabled && channel.sendConfigured).map((channel) => channel.id),
       channelCount: channels.length,
       incoming: this.getIncomingStatus(),
     };
@@ -801,10 +801,16 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       ? Boolean(String(config.botToken || "").trim() && String(config.channelId || "").trim())
       : Boolean(String(config.webhookUrl || "").trim());
     if (account.type === "matrix") return Boolean(String(config.serverUrl || "").trim() && String(config.accessToken || "").trim() && String(config.roomId || "").trim());
-    if (account.type === "qqbot") return Boolean(String(config.appId || "").trim() && String(config.clientSecret || "").trim() && String(config.target || "").trim());
+    if (account.type === "qqbot") return Boolean(String(config.appId || "").trim() && String(config.clientSecret || "").trim());
     if (account.type === "email") return Boolean(String(config.gatewayUrl || "").trim() && String(config.to || "").trim());
     if (account.type === "webhook") return Boolean(String(config.url || "").trim());
     return false;
+  }
+
+  channelAccountSendConfigured(account) {
+    if (!this.channelAccountConfigured(account)) return false;
+    if (account.type === "qqbot") return Boolean(String(account.config && account.config.target || "").trim());
+    return true;
   }
 
   channelAccountReceiveConfigured(account) {
@@ -852,6 +858,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return (this.settings.channelAccounts || []).map((account) => {
       const provider = this.channelProvider(account.type) || { name: account.type };
       const receiveMode = this.channelReceiveMode(account);
+      const socketState = receiveMode === "socket" && this.incomingSocketStates ? this.incomingSocketStates.get(account.id) : null;
+      const latestError = (this.settings.connectionLogs || []).find((entry) => entry.channelId === account.id && entry.level === "error");
       return {
         id: account.id,
         type: account.type,
@@ -861,11 +869,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         enabled: this.settings.socialHubEnabled !== false && this.isChannelAdded(account.id) && account.enabled !== false,
         storedEnabled: account.enabled !== false,
         configured: this.channelAccountConfigured(account),
+        sendConfigured: this.channelAccountSendConfigured(account),
         receiveConfigured: this.channelAccountReceiveConfigured(account),
         config: account.config || {},
         supportsRemoteSchedule: account.type === "ntfy",
         canReceive: ["poll", "socket", "relay"].includes(receiveMode),
         receiveMode,
+        connectionStatus: receiveMode === "socket" ? socketState && socketState.status || "disconnected" : receiveMode,
+        connectionError: latestError && latestError.details ? String(latestError.details.error || "") : "",
         builtin: true,
       };
     });
@@ -885,6 +896,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         name: String(adapter.name || id),
         enabled: this.settings.socialHubEnabled !== false && adapter.enabled !== false,
         configured: available,
+        sendConfigured: available,
         supportsRemoteSchedule: adapter.supportsRemoteSchedule === true,
         canReceive: typeof adapter.receive === "function" || typeof adapter.reply === "function",
         receiveMode: adapter.receiveMode || "adapter",
@@ -1350,6 +1362,19 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (this.incomingReconnectAttempts) this.incomingReconnectAttempts.clear();
   }
 
+  async refreshRealtimeChannel(channelId) {
+    const id = String(channelId || "").trim().toLowerCase();
+    const account = this.getChannelAccount(id);
+    if (!account) return false;
+    const state = this.incomingSocketStates && this.incomingSocketStates.get(id);
+    if (state) this.closeIncomingSocketState(state);
+    if (this.incomingSocketStates) this.incomingSocketStates.delete(id);
+    if (this.incomingReconnectAttempts) this.incomingReconnectAttempts.delete(id);
+    if (account.type === "qqbot" && this.qqBotAccessTokens) this.qqBotAccessTokens.clear();
+    await this.ensureRealtimeIncomingConnections();
+    return true;
+  }
+
   scheduleIncomingSocketReconnect(channelId) {
     const existing = this.incomingSocketStates.get(channelId) || { channelId };
     if (existing.reconnectTimer || !this.shouldRunIncomingSocket(channelId)) return;
@@ -1493,12 +1518,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   async connectQqBotGateway(account) {
     const config = account.config || {};
-    const accessToken = await this.getQqBotAccessToken(config);
-    const apiRoot = this.requireHttpUrl(config.apiRoot || "https://api.sgroup.qq.com", "QQ Bot API root").replace(/\/+$/, "");
-    const response = await this.httpRequest({ url: `${apiRoot}/gateway/bot`, method: "GET", headers: { Authorization: `QQBot ${accessToken}` }, throw: true });
-    const json = await this.responseJson(response);
-    if (!json || !json.url) throw new Error(json && (json.message || json.msg) || "QQ Bot Gateway URL is unavailable.");
-    const socket = new WebSocket(json.url);
+    const gateway = await this.getQqBotGateway(config);
+    const accessToken = gateway.accessToken;
+    const socket = new WebSocket(gateway.url);
     return this.attachIncomingSocket(account, socket, async (raw, current, currentSocket) => {
       const payload = JSON.parse(String(raw || "{}"));
       if (payload.s !== undefined && payload.s !== null) current.sequence = payload.s;
@@ -1543,6 +1565,15 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         metadata: { qqTargetType: targetType, qqTarget: String(target || ""), channelId: String(message.channel_id || ""), messageId: message.id },
       }, { awaitHandler: false });
     });
+  }
+
+  async getQqBotGateway(config) {
+    const accessToken = await this.getQqBotAccessToken(config);
+    const apiRoot = this.requireHttpUrl(config.apiRoot || "https://api.sgroup.qq.com", "QQ Bot API root").replace(/\/+$/, "");
+    const response = await this.httpRequest({ url: `${apiRoot}/gateway/bot`, method: "GET", headers: { Authorization: `QQBot ${accessToken}` }, throw: true });
+    const json = await this.responseJson(response);
+    if (!json || !json.url) throw new Error(json && (json.message || json.msg) || "QQ Bot Gateway URL is unavailable.");
+    return { accessToken, url: String(json.url), shards: Math.max(1, Number(json.shards || 1)) };
   }
 
   async pollNtfyIncoming(account = this.getChannelAccount("ntfy")) {
@@ -1703,7 +1734,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (uniqueRequested.length) return uniqueRequested;
     if (input.broadcast === true) {
       return this.listNotificationChannels()
-        .filter((channel) => channel.enabled && channel.configured)
+        .filter((channel) => channel.enabled && channel.sendConfigured)
         .map((channel) => channel.id);
     }
     return [String(this.settings.defaultChannelId || "ntfy")];
@@ -1789,7 +1820,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         results.push({ channelId, ok: false, status: "unsupported", error: "Unknown notification channel." });
         continue;
       }
-      if ((!descriptor.enabled || !descriptor.configured) && !options.allowUnconfigured) {
+      if ((!descriptor.enabled || !descriptor.sendConfigured) && !options.allowUnconfigured) {
         results.push({ channelId, ok: false, status: "not-configured", error: "Channel is disabled or not configured." });
         continue;
       }
@@ -2119,7 +2150,13 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     });
     const json = await this.responseJson(response);
     const token = String(json && json.access_token || "").trim();
-    if (!token) throw new Error(json && (json.message || json.msg) || "QQ Bot authentication failed.");
+    if (!token) {
+      const message = String(json && (json.message || json.msg) || "QQ Bot authentication failed.").trim();
+      if (/invalid\s+appid\s+or\s+secret/i.test(message)) {
+        throw new Error("QQ Bot authentication failed: invalid Bot ID/AppID or ClientSecret. Re-copy both values from the same QQ Open Platform bot.");
+      }
+      throw new Error(message);
+    }
     const parsedExpiresIn = Number(json.expires_in);
     const expiresIn = Number.isFinite(parsedExpiresIn) && parsedExpiresIn > 0 ? Math.max(60, parsedExpiresIn) : 7200;
     this.qqBotAccessTokens.set(cacheKey, { token, expiresAt: Date.now() + expiresIn * 1000 });
@@ -2763,7 +2800,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   hasDestination() {
     const channelId = String(this.settings.defaultChannelId || "ntfy");
     const channel = this.listNotificationChannels().find((item) => item.id === channelId);
-    return Boolean(channel && channel.enabled && channel.configured);
+    return Boolean(channel && channel.enabled && channel.sendConfigured);
   }
 
   async scanAndSchedule({ showNotice, forceDailyBatch = false } = {}) {
@@ -3659,6 +3696,20 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       return;
     }
 
+    if (channel.type === "qqbot" && !channel.sendConfigured) {
+      try {
+        await this.getQqBotGateway(channel.config || {});
+        this.recordConnectionLog("info", channel.id, "QQ Bot authentication and Gateway check passed");
+        await this.refreshRealtimeChannel(channel.id);
+        new Notice(`${PLUGIN_NAME}: QQ Bot connected; send target remains optional`);
+      } catch (error) {
+        const safeError = this.redactSensitiveText(error.message || String(error), true);
+        this.recordConnectionLog("error", channel.id, "QQ Bot connection test failed", { error: safeError });
+        new Notice(`${PLUGIN_NAME}: ${safeError}`);
+      }
+      return;
+    }
+
     try {
       const result = await this.sendNotification({
         id: `test-${Date.now()}`,
@@ -3953,7 +4004,6 @@ class NtfyManagerView extends ItemView {
     this.renderNavItem(nav, "completed", "check-check", "已完成", taskGroups.done.length);
     this.renderNavItem(nav, "tasks", "library", "整库待办", taskGroups.openUntimed.length);
     this.renderNavItem(nav, "inbox", "inbox", "收件", (this.plugin.settings.incomingMessages || []).length);
-    this.renderNavItem(nav, "connections", "radio-tower", "连接", this.plugin.listNotificationChannels().filter((channel) => channel.enabled && channel.configured).length);
   }
 
   renderIncomingMessages(containerEl) {
@@ -4016,7 +4066,7 @@ class NtfyManagerView extends ItemView {
       const receiveLabels = { poll: "轮询收件", socket: "实时收件", relay: "HTTPS 中继收件", disabled: "收件已关闭", unconfigured: "等待接收配置", adapter: "适配器收件" };
       content.createDiv({
         cls: "obsidian-ntfy-muted",
-        text: `${channel.enabled ? "已启用" : "已关闭"} · ${channel.configured ? "发送已配置" : "等待发送配置"} · ${receiveLabels[channel.receiveMode] || "等待接收配置"}`,
+        text: `${channel.enabled ? "已启用" : "已关闭"} · ${channel.configured ? "基础配置完成" : "等待基础配置"} · ${channel.sendConfigured ? "主动发送已配置" : "主动发送未配置"} · ${receiveLabels[channel.receiveMode] || "等待接收配置"}`,
       });
     }
     const errors = (this.plugin.settings.connectionLogs || []).filter((entry) => entry.level === "error").slice(0, 20);
@@ -4028,7 +4078,8 @@ class NtfyManagerView extends ItemView {
     }
     for (const entry of errors) {
       const row = logGroup.createDiv({ cls: "obsidian-ntfy-item obsidian-ntfy-item-compact" });
-      row.createDiv({ cls: "obsidian-ntfy-task-content", text: `${entry.at} [${entry.channelId}] ${entry.message}` });
+      const detail = entry.details && entry.details.error ? `: ${entry.details.error}` : "";
+      row.createDiv({ cls: "obsidian-ntfy-task-content", text: `${entry.at} [${entry.channelId}] ${entry.message}${detail}` });
     }
   }
 
@@ -5110,22 +5161,34 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
     const enabled = channel.storedEnabled !== false;
     const status = [
       enabled ? this.uiText("已启用", "Enabled") : this.uiText("已停用", "Disabled"),
-      channel.configured ? this.uiText("配置完整", "Configured") : this.uiText("等待配置", "Needs setup"),
+      channel.configured ? this.uiText("基础配置完成", "Basic setup complete") : this.uiText("等待基础配置", "Basic setup required"),
     ];
+    if (channel.type === "qqbot" && channel.configured && !channel.sendConfigured) {
+      status.push(this.uiText("主动发送目标未设置", "Proactive send target not set"));
+    }
     const receiveLabels = {
       poll: this.uiText("轮询收件", "Polling receive"),
-      socket: this.uiText("实时收件", "Realtime receive"),
       relay: this.uiText("HTTPS 中继收件", "HTTPS relay receive"),
       disabled: this.uiText("收件已关闭", "Receive disabled"),
       unconfigured: this.uiText("等待接收配置", "Receive needs setup"),
       adapter: this.uiText("适配器收件", "Adapter receive"),
     };
-    status.push(receiveLabels[channel.receiveMode] || this.uiText("等待接收配置", "Receive needs setup"));
+    const socketLabels = {
+      connected: this.uiText("实时连接已建立", "Realtime connected"),
+      authorizing: this.uiText("正在鉴权", "Authorizing"),
+      connecting: this.uiText("正在连接", "Connecting"),
+      reconnecting: this.uiText("连接失败，正在重试", "Connection failed; retrying"),
+      closed: this.uiText("实时连接已断开", "Realtime disconnected"),
+      disconnected: this.uiText("等待实时连接", "Waiting for realtime connection"),
+    };
+    status.push(channel.receiveMode === "socket"
+      ? socketLabels[channel.connectionStatus] || this.uiText("实时收件", "Realtime receive")
+      : receiveLabels[channel.receiveMode] || this.uiText("等待接收配置", "Receive needs setup"));
     if (this.plugin.settings.defaultChannelId === channel.id) status.unshift(this.uiText("默认发送", "Default route"));
     return status.join(" · ");
   }
 
-  addChannelTextSetting(containerEl, channel, key, name, placeholder = "", password = false, description = "") {
+  addChannelTextSetting(containerEl, channel, key, name, placeholder = "", password = false, description = "", options = {}) {
     const setting = new Setting(containerEl).setName(name);
     if (description) setting.setDesc(description);
     setting.addText((text) => {
@@ -5133,6 +5196,13 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         await this.plugin.updateChannelAccount(channel.id, { config: { [key]: value.trim() } });
       });
       if (password) text.inputEl.type = "password";
+      if (options.reconnectOnBlur) {
+        text.inputEl.addEventListener("blur", () => {
+          this.plugin.refreshRealtimeChannel(channel.id).catch((error) => {
+            this.plugin.recordConnectionLog("error", channel.id, "Realtime connection refresh failed", { error: error.message || String(error) });
+          });
+        });
+      }
     });
     return setting;
   }
@@ -5219,25 +5289,70 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       this.addChannelTextSetting(containerEl, channel, "roomId", "Room ID", "!room:matrix.example");
     }
     if (channel.type === "qqbot") {
-      this.addChannelTextSetting(containerEl, channel, "appId", "App ID", "102...");
-      this.addChannelTextSetting(containerEl, channel, "clientSecret", "Client secret", "...", true);
-      this.addChannelTextSetting(containerEl, channel, "apiRoot", "API root", "https://api.sgroup.qq.com");
-      new Setting(containerEl).setName(this.uiText("发送目标类型", "Target type")).addDropdown((dropdown) => dropdown
+      containerEl.createEl("h5", { cls: "obsidian-ntfy-channel-subheading", text: this.uiText("基础配置", "Basic setup") });
+      this.addChannelTextSetting(
+        containerEl,
+        channel,
+        "appId",
+        this.uiText("机器人 ID（AppID）", "Bot ID (AppID)"),
+        "102...",
+        false,
+        this.uiText("必填。使用 QQ 开放平台机器人详情中的机器人 ID。填写完成后自动尝试连接。", "Required. Use the Bot ID from the QQ Open Platform bot details. Connection starts automatically after editing."),
+        { reconnectOnBlur: true }
+      );
+      this.addChannelTextSetting(
+        containerEl,
+        channel,
+        "clientSecret",
+        this.uiText("机器人密钥（ClientSecret）", "Bot secret (ClientSecret)"),
+        "...",
+        true,
+        this.uiText("必填。必须与上面的机器人 ID 来自同一个机器人；不是 QQ 号或旧 Token。", "Required. It must belong to the same bot as the ID above; it is not a QQ number or legacy token."),
+        { reconnectOnBlur: true }
+      );
+
+      const sendOptions = containerEl.createEl("details", { cls: "obsidian-ntfy-channel-options" });
+      sendOptions.createEl("summary", { text: this.uiText("主动发送（可选）", "Proactive sending (optional)") });
+      const sendOptionsBody = sendOptions.createDiv({ cls: "obsidian-ntfy-channel-options-body" });
+      new Setting(sendOptionsBody).setName(this.uiText("发送目标类型", "Target type")).addDropdown((dropdown) => dropdown
         .addOption("c2c", "C2C")
         .addOption("group", this.uiText("群聊", "Group"))
         .addOption("channel", this.uiText("频道", "Channel"))
         .addOption("dms", this.uiText("频道私信", "Guild DM"))
         .setValue(String(config.targetType || "c2c"))
         .onChange(async (value) => await this.plugin.updateChannelAccount(channel.id, { config: { targetType: value } })));
-      this.addChannelTextSetting(containerEl, channel, "target", this.uiText("发送目标", "Send target"), "openid / group_openid / channel_id");
       this.addChannelTextSetting(
-        containerEl,
+        sendOptionsBody,
+        channel,
+        "target",
+        this.uiText("发送目标", "Send target"),
+        "openid / group_openid / channel_id",
+        false,
+        this.uiText("仅主动推送时需要；回复收到的 QQ 消息不需要预填。", "Only required for proactive sends; replies to received QQ messages use the original conversation automatically.")
+      );
+
+      const advancedOptions = containerEl.createEl("details", { cls: "obsidian-ntfy-channel-options" });
+      advancedOptions.createEl("summary", { text: this.uiText("高级配置（可选）", "Advanced settings (optional)") });
+      const advancedOptionsBody = advancedOptions.createDiv({ cls: "obsidian-ntfy-channel-options-body" });
+      this.addChannelTextSetting(
+        advancedOptionsBody,
+        channel,
+        "apiRoot",
+        "API root",
+        "https://api.sgroup.qq.com",
+        false,
+        this.uiText("默认使用 QQ 官方生产环境地址；通常无需修改。", "Uses the official QQ production API by default; normally no change is needed."),
+        { reconnectOnBlur: true }
+      );
+      this.addChannelTextSetting(
+        advancedOptionsBody,
         channel,
         "gatewayIntents",
         "Gateway intents",
         String(QQ_BOT_GATEWAY_INTENTS),
         false,
-        this.uiText("默认订阅私信、群聊/C2C 和公域频道消息；私域机器人可按 QQ 官方权限加入其他 intents。", "Defaults to direct, group/C2C, and public guild messages. Private bots may add intents allowed by QQ.")
+        this.uiText("默认订阅私信、群聊/C2C 和公域频道消息；私域机器人可按 QQ 官方权限加入其他 intents。", "Defaults to direct, group/C2C, and public guild messages. Private bots may add intents allowed by QQ."),
+        { reconnectOnBlur: true }
       );
     }
     if (channel.type === "email") {
@@ -5328,7 +5443,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         await this.plugin.removeChannelFromSettings(channel.id);
         this.display();
       });
-      addAction("send", this.uiText("测试当前账号", "Test this account"), async () => {
+      addAction("send", channel.type === "qqbot" && !channel.sendConfigured ? this.uiText("测试 QQ 连接", "Test QQ connection") : this.uiText("测试当前账号", "Test this account"), async () => {
         await this.plugin.sendTestNotification({ channelId: channel.id, simulatedEvent: true });
       }, channel.storedEnabled === false || !channel.configured);
     }
@@ -5821,10 +5936,18 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       this.uiText("脱敏连接状态和最近错误。", "Redacted connection status and recent errors.")
     );
     logGroup.addClass("obsidian-ntfy-log-group");
-    const statuses = this.plugin.listNotificationChannels().map((channel) => `${channel.name}: ${channel.enabled ? (channel.configured ? "ready" : "not configured") : "off"}`);
+    const statuses = this.plugin.listNotificationChannels().map((channel) => {
+      if (!channel.enabled) return `${channel.name}: off`;
+      if (!channel.configured) return `${channel.name}: basic setup required`;
+      const send = channel.sendConfigured ? "send ready" : "send target optional";
+      return `${channel.name}: ${send} · ${channel.connectionStatus || channel.receiveMode}`;
+    });
     logGroup.createEl("p", { cls: "setting-item-description", text: statuses.join(" · ") });
     const errorLogs = (this.plugin.settings.connectionLogs || []).filter((entry) => entry.level === "error").slice(0, 5);
-    logGroup.createEl("p", { cls: "setting-item-description", text: errorLogs.length ? errorLogs.map((entry) => `${entry.at} ${entry.channelId}: ${entry.message}`).join("\n") : this.uiText("暂无错误。", "No errors recorded.") });
+    logGroup.createEl("p", { cls: "setting-item-description", text: errorLogs.length ? errorLogs.map((entry) => {
+      const detail = entry.details && entry.details.error ? `: ${entry.details.error}` : "";
+      return `${entry.at} ${entry.channelId}: ${entry.message}${detail}`;
+    }).join("\n") : this.uiText("暂无错误。", "No errors recorded.") });
     new Setting(logGroup).addButton((button) => {
       button.setButtonText(this.uiText("清空日志", "Clear log"));
       if (typeof button.setIcon === "function") button.setIcon("trash-2");

@@ -41,10 +41,10 @@
   align-items: stretch;
   border-bottom: 1px solid var(--background-modifier-border);
   display: grid;
-  gap: 8px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   margin: 0 -16px;
-  padding: 8px 12px;
+  padding: 6px 12px;
   position: sticky;
   top: 0;
   z-index: 1;
@@ -58,12 +58,12 @@
   border-radius: 8px;
   color: var(--text-muted);
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  flex-direction: row;
+  gap: 5px;
   justify-content: center;
-  min-height: 58px;
+  min-height: 40px;
   min-width: 0;
-  padding: 8px 6px 6px;
+  padding: 5px 22px 5px 6px;
   position: relative;
 }
 
@@ -82,19 +82,20 @@
   align-items: center;
   display: inline-flex;
   flex: 0 0 auto;
-  height: 22px;
+  height: 18px;
   justify-content: center;
-  width: 22px;
+  width: 18px;
 }
 
 .obsidian-ntfy-nav-icon svg {
-  height: 20px;
-  width: 20px;
+  height: 16px;
+  width: 16px;
 }
 
 .obsidian-ntfy-nav-label {
   display: block;
   font-size: 11px;
+  font-weight: 500;
   line-height: 1.25;
   min-width: 0;
   overflow: hidden;
@@ -416,6 +417,22 @@
   margin: 0;
   padding: 10px 12px 6px;
   text-transform: none;
+}
+
+.obsidian-ntfy-channel-options {
+  border-top: 1px solid var(--background-modifier-border-hover);
+}
+
+.obsidian-ntfy-channel-options > summary {
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-semibold);
+  padding: 10px 12px;
+}
+
+.obsidian-ntfy-channel-options-body {
+  padding-left: 8px;
 }
 
 .obsidian-ntfy-channel-row {
@@ -937,14 +954,15 @@
   }
 
   .obsidian-ntfy-nav {
+    gap: 4px;
     margin: 0 -12px;
-    padding: 6px 8px;
+    padding: 5px 6px;
   }
 
   .obsidian-ntfy-nav-item {
-    gap: 4px;
-    min-height: 56px;
-    padding: 8px 4px 5px;
+    gap: 3px;
+    min-height: 38px;
+    padding: 4px 18px 4px 3px;
   }
 
   .obsidian-ntfy-nav-label {
