@@ -324,6 +324,100 @@
   overflow: hidden;
 }
 
+.obsidian-ntfy-channel-account + .obsidian-ntfy-channel-account,
+.obsidian-ntfy-channel-account + .obsidian-ntfy-channel-row,
+.obsidian-ntfy-channel-row + .obsidian-ntfy-channel-account {
+  border-top: 1px solid var(--background-modifier-border-hover);
+}
+
+.obsidian-ntfy-channel-account-summary {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  list-style: none;
+  min-height: 50px;
+  padding: 9px 12px;
+}
+
+.obsidian-ntfy-channel-account-summary::-webkit-details-marker {
+  display: none;
+}
+
+.obsidian-ntfy-channel-account-summary::before {
+  border-bottom: 2px solid var(--text-muted);
+  border-right: 2px solid var(--text-muted);
+  content: "";
+  flex: 0 0 auto;
+  height: 6px;
+  transform: rotate(-45deg);
+  transition: transform 120ms ease;
+  width: 6px;
+}
+
+.obsidian-ntfy-channel-account[open] > .obsidian-ntfy-channel-account-summary::before {
+  transform: rotate(45deg);
+}
+
+.obsidian-ntfy-channel-account-identity {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.obsidian-ntfy-channel-account-name {
+  color: var(--text-normal);
+  font-weight: var(--font-semibold);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.obsidian-ntfy-channel-account-id,
+.obsidian-ntfy-channel-account-state {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  overflow-wrap: anywhere;
+}
+
+.obsidian-ntfy-channel-summary-actions {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 2px;
+}
+
+.obsidian-ntfy-channel-summary-actions .clickable-icon {
+  height: 28px;
+  padding: 5px;
+  width: 28px;
+}
+
+.obsidian-ntfy-channel-summary-actions .clickable-icon.is-active {
+  color: var(--interactive-accent);
+}
+
+.obsidian-ntfy-channel-account-state.is-configured {
+  color: var(--text-success);
+}
+
+.obsidian-ntfy-channel-account-body,
+.obsidian-ntfy-channel-add-form {
+  background: var(--background-secondary);
+  border-top: 1px solid var(--background-modifier-border-hover);
+  padding: 2px 12px 8px 28px;
+}
+
+.obsidian-ntfy-channel-subheading {
+  border-bottom: 1px solid var(--background-modifier-border-hover);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin: 0;
+  padding: 10px 12px 6px;
+  text-transform: none;
+}
+
 .obsidian-ntfy-channel-row {
   align-items: center;
   flex-wrap: wrap;
@@ -898,6 +992,25 @@
     flex-direction: row;
     flex-wrap: wrap;
     justify-content: flex-end;
+  }
+
+  .obsidian-ntfy-channel-account-summary {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .obsidian-ntfy-channel-account-state {
+    flex-basis: calc(100% - 18px);
+    margin-left: 18px;
+  }
+
+  .obsidian-ntfy-channel-summary-actions {
+    margin-left: auto;
+  }
+
+  .obsidian-ntfy-channel-account-body,
+  .obsidian-ntfy-channel-add-form {
+    padding-left: 12px;
   }
 
   .obsidian-ntfy-channel-hub input,

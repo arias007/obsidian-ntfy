@@ -32,7 +32,21 @@ const {
 const PLUGIN_NAME = "Ntfy Notifications";
 const VIEW_TYPE_NTFY_MANAGER = "obsidian-ntfy-manager-view";
 const NOTIFICATION_HUB_API_VERSION = "1";
-const BUILTIN_CHANNEL_IDS = ["ntfy", "telegram", "feishu", "wecom", "discord", "slack", "matrix", "email", "webhook"];
+const CHANNEL_PROVIDER_DEFINITIONS = Object.freeze([
+  { id: "ntfy", name: "ntfy", description: "ntfy topic" },
+  { id: "telegram", name: "Telegram Bot", description: "Bot API" },
+  { id: "feishu", name: "飞书 / Lark", description: "应用或群机器人 Webhook" },
+  { id: "wecom", name: "企业微信", description: "应用或群机器人 Webhook" },
+  { id: "discord", name: "Discord", description: "Bot 或 Webhook" },
+  { id: "slack", name: "Slack", description: "Bot 或 Webhook" },
+  { id: "matrix", name: "Matrix", description: "Client-Server API" },
+  { id: "email", name: "Email", description: "移动端兼容的 HTTP 邮件网关" },
+  { id: "openclaw", name: "OpenClaw Gateway", description: "通过 OpenClaw 的真实消息工具转发到已连接 Channel" },
+  { id: "qqbot", name: "QQ Bot", description: "OpenClaw Gateway 或 QQ 官方 Bot API" },
+  { id: "wechat", name: "微信 / OpenClaw Weixin", description: "通过 OpenClaw 微信插件扫码连接" },
+  { id: "webhook", name: "通用 Webhook", description: "任意兼容 HTTP 接口" },
+]);
+const BUILTIN_CHANNEL_IDS = CHANNEL_PROVIDER_DEFINITIONS.map((provider) => provider.id);
 const CHANNEL_ENABLE_SETTING_KEYS = Object.freeze({
   ntfy: "ntfyChannelEnabled",
   telegram: "telegramChannelEnabled",
@@ -52,6 +66,7 @@ const DEFAULT_SETTINGS = {
   socialHubEnabled: true,
   defaultChannelId: "ntfy",
   addedChannelIds: ["ntfy"],
+  channelAccounts: [],
   ntfyChannelEnabled: true,
   ntfyReceiveEnabled: true,
   ntfyReceiveIntervalSeconds: 60,
@@ -368,20 +383,129 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     settings.attachmentLimitMb = Math.max(1, this.safePositiveNumber(settings.attachmentLimitMb, DEFAULT_SETTINGS.attachmentLimitMb));
     settings.quietHoursStart = this.normalizeClockTime(settings.quietHoursStart, DEFAULT_SETTINGS.quietHoursStart);
     settings.quietHoursEnd = this.normalizeClockTime(settings.quietHoursEnd, DEFAULT_SETTINGS.quietHoursEnd);
-    const savedDefaultChannel = data && typeof data.defaultChannelId === "string" ? data.defaultChannelId : "";
-    settings.defaultChannelId = BUILTIN_CHANNEL_IDS.includes(savedDefaultChannel)
-      ? savedDefaultChannel
-      : !String(settings.topic || "").trim() && String(settings.aiWebhookUrl || "").trim()
-      ? "webhook"
-      : "ntfy";
     const migratedAddedChannels = BUILTIN_CHANNEL_IDS.filter((channelId) => {
       const settingKey = CHANNEL_ENABLE_SETTING_KEYS[channelId];
       return settingKey && settings[settingKey] === true;
     });
+    settings.channelAccounts = this.normalizeChannelAccounts(data && data.channelAccounts, settings);
+    const knownAccountIds = new Set(settings.channelAccounts.map((account) => account.id));
     settings.addedChannelIds = data && Array.isArray(data.addedChannelIds)
-      ? [...new Set(data.addedChannelIds.map((id) => String(id || "").trim().toLowerCase()).filter((id) => BUILTIN_CHANNEL_IDS.includes(id)))]
-      : migratedAddedChannels;
+      ? [...new Set(data.addedChannelIds.map((id) => String(id || "").trim().toLowerCase()).filter((id) => knownAccountIds.has(id)))]
+      : migratedAddedChannels.filter((id) => knownAccountIds.has(id));
+    const savedDefaultChannel = data && typeof data.defaultChannelId === "string" ? data.defaultChannelId.trim().toLowerCase() : "";
+    settings.defaultChannelId = knownAccountIds.has(savedDefaultChannel)
+      ? savedDefaultChannel
+      : settings.addedChannelIds[0] || (!String(settings.topic || "").trim() && String(settings.aiWebhookUrl || "").trim() ? "webhook" : "ntfy");
     return settings;
+  }
+
+  normalizeChannelAccountId(value, fallback = "default") {
+    const normalized = String(value || fallback).trim().toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, "-")
+      .replace(/^[._-]+|[._-]+$/g, "")
+      .slice(0, 48);
+    return normalized || fallback;
+  }
+
+  channelInstanceId(type, accountId = "default") {
+    const provider = String(type || "").trim().toLowerCase();
+    const account = this.normalizeChannelAccountId(accountId);
+    return account === "default" ? provider : `${provider}:${account}`;
+  }
+
+  channelProvider(type) {
+    const id = String(type || "").trim().toLowerCase();
+    return CHANNEL_PROVIDER_DEFINITIONS.find((provider) => provider.id === id) || null;
+  }
+
+  channelConfigDefaults(type) {
+    const defaults = {
+      ntfy: { serverUrl: "https://ntfy.sh", topic: "", authToken: "", receiveEnabled: true, pollIntervalSeconds: 60 },
+      telegram: { apiRoot: "https://api.telegram.org", botToken: "", chatId: "", receiveEnabled: true },
+      feishu: { mode: "app", domain: "feishu", appId: "", appSecret: "", receiveIdType: "chat_id", receiveId: "", webhookUrl: "" },
+      wecom: { mode: "webhook", webhookUrl: "", corpId: "", agentId: "", secret: "", targetType: "touser", target: "" },
+      discord: { mode: "webhook", webhookUrl: "", apiRoot: "https://discord.com/api/v10", botToken: "", channelId: "" },
+      slack: { mode: "webhook", webhookUrl: "", apiRoot: "https://slack.com/api", botToken: "", channelId: "" },
+      matrix: { serverUrl: "", accessToken: "", roomId: "", receiveEnabled: true },
+      email: { gatewayUrl: "", gatewayToken: "", from: "", to: "" },
+      openclaw: { mode: "gateway", gatewayUrl: "", gatewayToken: "", sessionKey: "main", targetChannel: "", targetAccountId: "default", target: "", bridgeUrl: "", token: "" },
+      qqbot: { mode: "openclaw", gatewayUrl: "", gatewayToken: "", openclawAccountId: "default", appId: "", clientSecret: "", apiRoot: "https://api.sgroup.qq.com", targetType: "c2c", target: "", bridgeUrl: "", token: "", accountId: "default" },
+      wechat: { mode: "openclaw", gatewayUrl: "", gatewayToken: "", channelId: "openclaw-weixin", openclawAccountId: "default", target: "", bridgeUrl: "", token: "", accountId: "default" },
+      webhook: { url: "", token: "", customHeaders: "" },
+    };
+    return Object.assign({}, defaults[String(type || "").trim().toLowerCase()] || {});
+  }
+
+  normalizeChannelConfig(type, value, legacy = {}) {
+    const provider = String(type || "").trim().toLowerCase();
+    const raw = value && typeof value === "object" ? value : {};
+    const config = Object.assign(this.channelConfigDefaults(provider), legacy, raw);
+    if (["openclaw", "qqbot", "wechat"].includes(provider) && !Object.prototype.hasOwnProperty.call(raw, "mode")) {
+      config.mode = String(raw.bridgeUrl || "").trim()
+        ? "legacy"
+        : provider === "openclaw" ? "gateway" : "openclaw";
+    }
+    return config;
+  }
+
+  legacyChannelConfig(type, settings = this.settings || {}) {
+    const legacy = {
+      ntfy: { serverUrl: settings.serverUrl, topic: settings.topic, authToken: settings.authToken, receiveEnabled: settings.ntfyReceiveEnabled, pollIntervalSeconds: settings.ntfyReceiveIntervalSeconds },
+      telegram: { apiRoot: "https://api.telegram.org", botToken: settings.telegramBotToken, chatId: settings.telegramChatId, receiveEnabled: settings.telegramReceiveEnabled },
+      feishu: { mode: "webhook", webhookUrl: settings.feishuWebhookUrl },
+      wecom: { mode: "webhook", webhookUrl: settings.wecomWebhookUrl },
+      discord: { mode: "webhook", webhookUrl: settings.discordWebhookUrl },
+      slack: { mode: "webhook", webhookUrl: settings.slackWebhookUrl },
+      matrix: { serverUrl: settings.matrixServerUrl, accessToken: settings.matrixAccessToken, roomId: settings.matrixRoomId, receiveEnabled: settings.matrixReceiveEnabled },
+      email: { gatewayUrl: settings.emailGatewayUrl, gatewayToken: settings.emailGatewayToken, from: settings.emailFrom, to: settings.emailTo },
+      webhook: { url: settings.aiWebhookUrl, token: settings.aiWebhookToken },
+    };
+    return Object.fromEntries(Object.entries(legacy[type] || {}).filter(([, value]) => value !== undefined && value !== null && value !== ""));
+  }
+
+  normalizeChannelAccounts(value, settings) {
+    const accounts = [];
+    const usedIds = new Set();
+    for (const raw of Array.isArray(value) ? value : []) {
+      if (!raw || typeof raw !== "object") continue;
+      const rawId = String(raw.id || "").trim().toLowerCase();
+      const inferredType = String(raw.type || rawId.split(":")[0] || "").trim().toLowerCase();
+      if (!this.channelProvider(inferredType)) continue;
+      const accountId = this.normalizeChannelAccountId(raw.accountId || rawId.split(":").slice(1).join(":") || "default");
+      const id = this.channelInstanceId(inferredType, accountId);
+      if (usedIds.has(id)) continue;
+      usedIds.add(id);
+      const provider = this.channelProvider(inferredType);
+      const legacy = accountId === "default" ? this.legacyChannelConfig(inferredType, settings) : {};
+      const legacyProviderNames = {
+        openclaw: ["OpenClaw bridge"],
+        qqbot: ["QQ Bot bridge"],
+        wechat: ["微信 / ClawBot bridge"],
+      }[inferredType] || [];
+      const savedName = String(raw.name || provider.name || id).trim().slice(0, 80) || id;
+      accounts.push({
+        id,
+        type: inferredType,
+        accountId,
+        name: accountId === "default" && legacyProviderNames.includes(savedName) ? provider.name : savedName,
+        enabled: raw.enabled !== false,
+        config: this.normalizeChannelConfig(inferredType, raw.config, legacy),
+      });
+    }
+    for (const provider of CHANNEL_PROVIDER_DEFINITIONS) {
+      const id = this.channelInstanceId(provider.id, "default");
+      if (usedIds.has(id)) continue;
+      const settingKey = CHANNEL_ENABLE_SETTING_KEYS[provider.id];
+      accounts.push({
+        id,
+        type: provider.id,
+        accountId: "default",
+        name: provider.name,
+        enabled: settingKey ? settings[settingKey] === true : false,
+        config: this.normalizeChannelConfig(provider.id, {}, this.legacyChannelConfig(provider.id, settings)),
+      });
+    }
+    return accounts;
   }
 
   createNotificationHubApi() {
@@ -472,9 +596,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return (this.settings.addedChannelIds || []).includes(String(channelId || "").trim().toLowerCase());
   }
 
+  getChannelAccount(channelId) {
+    const id = String(channelId || "").trim().toLowerCase();
+    return (this.settings.channelAccounts || []).find((account) => account.id === id) || null;
+  }
+
   isChannelSettingEnabled(channelId) {
-    const settingKey = CHANNEL_ENABLE_SETTING_KEYS[String(channelId || "").trim().toLowerCase()];
-    return Boolean(settingKey && this.settings[settingKey] === true);
+    const account = this.getChannelAccount(channelId);
+    return Boolean(account && account.enabled !== false);
   }
 
   firstEnabledAddedChannel(excludedId = "") {
@@ -482,12 +611,61 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return (this.settings.addedChannelIds || []).find((channelId) => channelId !== excluded && this.isChannelSettingEnabled(channelId)) || "";
   }
 
-  async addChannelToSettings(channelId) {
-    const id = String(channelId || "").trim().toLowerCase();
-    const settingKey = CHANNEL_ENABLE_SETTING_KEYS[id];
-    if (!settingKey) return false;
+  nextChannelAccountId(type) {
+    const provider = String(type || "").trim().toLowerCase();
+    const defaultId = this.channelInstanceId(provider, "default");
+    if (!this.isChannelAdded(defaultId)) return "default";
+    let suffix = 2;
+    while (this.getChannelAccount(this.channelInstanceId(provider, String(suffix)))) suffix += 1;
+    return String(suffix);
+  }
+
+  syncLegacyChannelAccount(account) {
+    if (!account || account.accountId !== "default") return;
+    const config = account.config || {};
+    const settingKey = CHANNEL_ENABLE_SETTING_KEYS[account.type];
+    if (settingKey) this.settings[settingKey] = account.enabled !== false;
+    const values = {
+      ntfy: { serverUrl: config.serverUrl, topic: config.topic, authToken: config.authToken, ntfyReceiveEnabled: config.receiveEnabled, ntfyReceiveIntervalSeconds: config.pollIntervalSeconds },
+      telegram: { telegramBotToken: config.botToken, telegramChatId: config.chatId, telegramReceiveEnabled: config.receiveEnabled },
+      feishu: { feishuWebhookUrl: config.webhookUrl },
+      wecom: { wecomWebhookUrl: config.webhookUrl },
+      discord: { discordWebhookUrl: config.webhookUrl },
+      slack: { slackWebhookUrl: config.webhookUrl },
+      matrix: { matrixServerUrl: config.serverUrl, matrixAccessToken: config.accessToken, matrixRoomId: config.roomId, matrixReceiveEnabled: config.receiveEnabled },
+      email: { emailGatewayUrl: config.gatewayUrl, emailGatewayToken: config.gatewayToken, emailFrom: config.from, emailTo: config.to },
+      webhook: { aiWebhookUrl: config.url, aiWebhookToken: config.token },
+    }[account.type] || {};
+    for (const [key, value] of Object.entries(values)) {
+      if (value !== undefined) this.settings[key] = value;
+    }
+  }
+
+  async addChannelToSettings(channelId, options = {}) {
+    const requested = String(channelId || options.type || "").trim().toLowerCase();
+    const type = String(options.type || requested.split(":")[0]).trim().toLowerCase();
+    const provider = this.channelProvider(type);
+    if (!provider) return false;
+    const inferredAccount = requested.includes(":") ? requested.split(":").slice(1).join(":") : "";
+    const accountId = this.normalizeChannelAccountId(options.accountId || inferredAccount || "default");
+    const id = this.channelInstanceId(type, accountId);
+    let account = this.getChannelAccount(id);
+    if (!account) {
+      account = {
+        id,
+        type,
+        accountId,
+        name: String(options.name || provider.name).trim().slice(0, 80) || provider.name,
+        enabled: true,
+        config: this.channelConfigDefaults(type),
+      };
+      this.settings.channelAccounts.push(account);
+    } else {
+      account.enabled = true;
+      if (options.name) account.name = String(options.name).trim().slice(0, 80) || account.name;
+    }
     this.settings.addedChannelIds = [...new Set([...(this.settings.addedChannelIds || []), id])];
-    this.settings[settingKey] = true;
+    this.syncLegacyChannelAccount(account);
     if (!this.isChannelSettingEnabled(this.settings.defaultChannelId) || !this.isChannelAdded(this.settings.defaultChannelId)) {
       this.settings.defaultChannelId = id;
     }
@@ -497,10 +675,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   async removeChannelFromSettings(channelId) {
     const id = String(channelId || "").trim().toLowerCase();
-    const settingKey = CHANNEL_ENABLE_SETTING_KEYS[id];
-    if (!settingKey) return false;
+    const account = this.getChannelAccount(id);
+    if (!account) return false;
     this.settings.addedChannelIds = (this.settings.addedChannelIds || []).filter((item) => item !== id);
-    this.settings[settingKey] = false;
+    account.enabled = false;
+    this.syncLegacyChannelAccount(account);
     if (this.settings.defaultChannelId === id) {
       this.settings.defaultChannelId = this.firstEnabledAddedChannel(id) || "ntfy";
     }
@@ -510,9 +689,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   async setChannelSettingEnabled(channelId, enabled) {
     const id = String(channelId || "").trim().toLowerCase();
-    const settingKey = CHANNEL_ENABLE_SETTING_KEYS[id];
-    if (!settingKey) return false;
-    this.settings[settingKey] = Boolean(enabled);
+    const account = this.getChannelAccount(id);
+    if (!account) return false;
+    account.enabled = Boolean(enabled);
+    this.syncLegacyChannelAccount(account);
     if (enabled) {
       this.settings.addedChannelIds = [...new Set([...(this.settings.addedChannelIds || []), id])];
       if (!this.isChannelSettingEnabled(this.settings.defaultChannelId) || !this.isChannelAdded(this.settings.defaultChannelId)) {
@@ -525,6 +705,17 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return true;
   }
 
+  async updateChannelAccount(channelId, patch = {}) {
+    const account = this.getChannelAccount(channelId);
+    if (!account) return false;
+    if (patch.name !== undefined) account.name = String(patch.name || "").trim().slice(0, 80) || this.channelProvider(account.type).name;
+    if (patch.enabled !== undefined) account.enabled = Boolean(patch.enabled);
+    if (patch.config && typeof patch.config === "object") account.config = Object.assign({}, account.config || {}, patch.config);
+    this.syncLegacyChannelAccount(account);
+    await this.saveSettings();
+    return true;
+  }
+
   async setDefaultNotificationChannel(channelId) {
     const id = String(channelId || "").trim().toLowerCase();
     if (!this.isChannelAdded(id) || !this.isChannelSettingEnabled(id)) return false;
@@ -533,92 +724,58 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return true;
   }
 
+  channelAccountConfigured(account) {
+    const config = account && account.config || {};
+    const mode = String(config.mode || "").trim().toLowerCase();
+    if (!account) return false;
+    if (account.type === "ntfy") return Boolean(String(config.serverUrl || "").trim() && String(config.topic || "").trim());
+    if (account.type === "telegram") return Boolean(String(config.botToken || "").trim() && String(config.chatId || "").trim());
+    if (account.type === "feishu") return mode === "webhook"
+      ? Boolean(String(config.webhookUrl || "").trim())
+      : Boolean(String(config.appId || "").trim() && String(config.appSecret || "").trim() && String(config.receiveId || "").trim());
+    if (account.type === "wecom") return mode === "app"
+      ? Boolean(String(config.corpId || "").trim() && String(config.agentId || "").trim() && String(config.secret || "").trim() && String(config.target || "").trim())
+      : Boolean(String(config.webhookUrl || "").trim());
+    if (account.type === "discord" || account.type === "slack") return mode === "bot"
+      ? Boolean(String(config.botToken || "").trim() && String(config.channelId || "").trim())
+      : Boolean(String(config.webhookUrl || "").trim());
+    if (account.type === "matrix") return Boolean(String(config.serverUrl || "").trim() && String(config.accessToken || "").trim() && String(config.roomId || "").trim());
+    if (account.type === "email") return Boolean(String(config.gatewayUrl || "").trim() && String(config.to || "").trim());
+    if (account.type === "openclaw") return mode === "legacy"
+      ? Boolean(String(config.bridgeUrl || "").trim() && String(config.targetChannel || "").trim())
+      : Boolean(String(config.gatewayUrl || "").trim() && String(config.targetChannel || "").trim() && String(config.target || "").trim());
+    if (account.type === "qqbot") {
+      if (mode === "legacy") return Boolean(String(config.bridgeUrl || "").trim() && String(config.target || "").trim());
+      if (mode === "official") return Boolean(String(config.appId || "").trim() && String(config.clientSecret || "").trim() && String(config.target || "").trim());
+      return Boolean(String(config.gatewayUrl || "").trim() && String(config.target || "").trim());
+    }
+    if (account.type === "wechat") return mode === "legacy"
+      ? Boolean(String(config.bridgeUrl || "").trim() && String(config.target || "").trim())
+      : Boolean(String(config.gatewayUrl || "").trim() && String(config.target || "").trim());
+    if (account.type === "webhook") return Boolean(String(config.url || "").trim());
+    return false;
+  }
+
   builtinChannelDefinitions() {
-    return [
-      {
-        id: "ntfy",
-        name: "ntfy",
-        enabled: this.settings.ntfyChannelEnabled !== false,
-        configured: Boolean(this.topicUrl()),
-        supportsRemoteSchedule: true,
+    return (this.settings.channelAccounts || []).map((account) => {
+      const provider = this.channelProvider(account.type) || { name: account.type };
+      const isNativePollAccount = account.accountId === "default" && ["ntfy", "telegram", "matrix"].includes(account.type) && account.config && account.config.receiveEnabled !== false;
+      return {
+        id: account.id,
+        type: account.type,
+        accountId: account.accountId,
+        name: account.name || provider.name,
+        providerName: provider.name,
+        enabled: this.settings.socialHubEnabled !== false && this.isChannelAdded(account.id) && account.enabled !== false,
+        storedEnabled: account.enabled !== false,
+        configured: this.channelAccountConfigured(account),
+        config: account.config || {},
+        supportsRemoteSchedule: account.type === "ntfy" || account.type === "webhook" || account.type === "openclaw",
         canReceive: true,
-        receiveMode: "poll",
-      },
-      {
-        id: "wecom",
-        name: "企业微信机器人",
-        enabled: this.settings.wecomChannelEnabled === true,
-        configured: Boolean(String(this.settings.wecomWebhookUrl || "").trim()),
-        supportsRemoteSchedule: false,
-        canReceive: true,
-        receiveMode: "forward",
-      },
-      {
-        id: "telegram",
-        name: "Telegram Bot",
-        enabled: this.settings.telegramChannelEnabled === true,
-        configured: Boolean(String(this.settings.telegramBotToken || "").trim() && String(this.settings.telegramChatId || "").trim()),
-        supportsRemoteSchedule: false,
-        canReceive: true,
-        receiveMode: "poll",
-      },
-      {
-        id: "feishu",
-        name: "飞书机器人",
-        enabled: this.settings.feishuChannelEnabled === true,
-        configured: Boolean(String(this.settings.feishuWebhookUrl || "").trim()),
-        supportsRemoteSchedule: false,
-        canReceive: true,
-        receiveMode: "forward",
-      },
-      {
-        id: "discord",
-        name: "Discord Webhook",
-        enabled: this.settings.discordChannelEnabled === true,
-        configured: Boolean(String(this.settings.discordWebhookUrl || "").trim()),
-        supportsRemoteSchedule: false,
-        canReceive: true,
-        receiveMode: "forward",
-      },
-      {
-        id: "slack",
-        name: "Slack Webhook",
-        enabled: this.settings.slackChannelEnabled === true,
-        configured: Boolean(String(this.settings.slackWebhookUrl || "").trim()),
-        supportsRemoteSchedule: false,
-        canReceive: true,
-        receiveMode: "forward",
-      },
-      {
-        id: "matrix",
-        name: "Matrix",
-        enabled: this.settings.matrixChannelEnabled === true,
-        configured: Boolean(String(this.settings.matrixServerUrl || "").trim() && String(this.settings.matrixAccessToken || "").trim() && String(this.settings.matrixRoomId || "").trim()),
-        supportsRemoteSchedule: false,
-        canReceive: true,
-        receiveMode: "poll",
-      },
-      {
-        id: "email",
-        name: "Email (HTTP gateway)",
-        enabled: this.settings.emailChannelEnabled === true,
-        configured: Boolean(String(this.settings.emailGatewayUrl || "").trim() && String(this.settings.emailTo || "").trim()),
-        supportsRemoteSchedule: false,
-        canReceive: true,
-        receiveMode: "forward",
-      },
-      {
-        id: "webhook",
-        name: "通用 Webhook",
-        enabled: this.settings.agentWebhookEnabled === true,
-        configured: Boolean(String(this.settings.aiWebhookUrl || "").trim()),
-        supportsRemoteSchedule: true,
-        canReceive: true,
-        receiveMode: "forward",
-      },
-    ].map((channel) => Object.assign({ builtin: true }, channel, {
-      enabled: this.settings.socialHubEnabled !== false && channel.enabled,
-    }));
+        receiveMode: isNativePollAccount ? "poll" : "forward",
+        builtin: true,
+      };
+    });
   }
 
   listNotificationChannels() {
@@ -1233,11 +1390,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
       try {
         if (descriptor.builtin) {
-          const request = this.buildBuiltinChannelRequest(channelId, notification, { simulate: options.simulate });
+          const request = this.buildBuiltinChannelRequest(descriptor, notification, { simulate: options.simulate });
           if (options.simulate) {
             results.push({ channelId, ok: true, status: "simulated", request: this.redactChannelRequest(request) });
           } else {
-            results.push(await this.executeBuiltinChannelRequest(channelId, request));
+            results.push(await this.executeBuiltinChannelRequest(descriptor, request));
           }
           continue;
         }
@@ -1280,7 +1437,102 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return parsed.toString();
   }
 
-  buildBuiltinChannelRequest(channelId, notification, options = {}) {
+  parseCustomHeaders(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return {};
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (_) {
+      throw new Error("Custom headers must be a JSON object.");
+    }
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error("Custom headers must be a JSON object.");
+    return Object.fromEntries(Object.entries(parsed).map(([key, item]) => [String(key), String(item)]));
+  }
+
+  openClawToolsInvokeUrl(value, placeholder = false) {
+    const gatewayUrl = String(value || "").trim() || (placeholder ? "https://gateway.example" : "");
+    const normalized = this.requireHttpUrl(gatewayUrl, "OpenClaw Gateway").replace(/\/+$/, "");
+    return /\/tools\/invoke$/i.test(normalized) ? normalized : `${normalized}/tools/invoke`;
+  }
+
+  buildOpenClawToolsInvokeRequest(config, notification, text, route = {}, placeholder = false) {
+    const targetChannel = String(route.targetChannel || config.targetChannel || "").trim() || (placeholder ? "qqbot" : "");
+    const targetAccountId = String(route.targetAccountId || config.targetAccountId || config.openclawAccountId || "default").trim() || "default";
+    const target = String(route.target || config.target || "").trim() || (placeholder ? "example-target" : "");
+    if (!targetChannel) throw new Error("OpenClaw target channel is required.");
+    if (!target) throw new Error("OpenClaw target peer is required.");
+    const headers = {
+      "Content-Type": "application/json; charset=utf-8",
+      "x-openclaw-message-channel": targetChannel,
+      "x-openclaw-account-id": targetAccountId,
+      "x-openclaw-message-to": target,
+    };
+    const gatewayToken = String(config.gatewayToken || config.token || "").trim();
+    if (gatewayToken) headers.Authorization = `Bearer ${gatewayToken}`;
+    return {
+      channelAction: "openclaw-tools-invoke",
+      url: this.openClawToolsInvokeUrl(config.gatewayUrl || config.bridgeUrl, placeholder),
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        tool: "message",
+        args: {
+          action: "send",
+          channel: targetChannel,
+          accountId: targetAccountId,
+          to: target,
+          message: text,
+        },
+        sessionKey: String(config.sessionKey || "main").trim() || "main",
+        idempotencyKey: notification.id,
+      }),
+      throw: true,
+    };
+  }
+
+  resolveQqBotTarget(config, placeholder = false) {
+    let target = String(config.target || "").trim() || (placeholder ? "example-openid" : "");
+    target = target.replace(/^qqbot:/i, "");
+    let targetType = String(config.targetType || "c2c").trim().toLowerCase();
+    const typed = /^(c2c|group|channel):(.*)$/i.exec(target);
+    if (typed) {
+      targetType = typed[1].toLowerCase();
+      target = typed[2].trim();
+    }
+    if (!["c2c", "group", "channel"].includes(targetType)) throw new Error("QQ Bot target type is invalid.");
+    if (!target) throw new Error("QQ Bot target is required.");
+    return { targetType, target };
+  }
+
+  buildLegacyBridgeRequest(channelType, channelId, descriptor, config, notification, placeholder = false) {
+    const url = String(config.bridgeUrl || "").trim() || (placeholder ? "https://bridge.example/notification" : "");
+    const headers = { "Content-Type": "application/json; charset=utf-8" };
+    if (config.token) headers.Authorization = `Bearer ${String(config.token).trim()}`;
+    return {
+      url: this.requireHttpUrl(url, `${channelType} bridge`),
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        apiVersion: NOTIFICATION_HUB_API_VERSION,
+        channel: channelType,
+        channelId,
+        accountId: descriptor.accountId || "default",
+        targetChannel: config.targetChannel || channelType,
+        targetAccountId: config.targetAccountId || config.accountId || "default",
+        target: config.target || "",
+        source: notification.source,
+        event: notification.event,
+        notification,
+      }),
+      throw: true,
+    };
+  }
+
+  buildBuiltinChannelRequest(descriptor, notification, options = {}) {
+    const channelId = descriptor && descriptor.id || String(descriptor || "");
+    const channelType = descriptor && descriptor.type || channelId.split(":")[0];
+    const config = descriptor && descriptor.config || this.getChannelAccount(channelId) && this.getChannelAccount(channelId).config || {};
     let text = notification.title === notification.message
       ? notification.message
       : `${notification.title}\n${notification.message}`;
@@ -1288,8 +1540,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (attachmentLines.length) text = `${text}\n${attachmentLines.join("\n")}`;
     const placeholder = options.simulate === true;
 
-    if (channelId === "ntfy") {
-      const url = this.topicUrl() || (placeholder ? "https://ntfy.sh/example-topic" : "");
+    if (channelType === "ntfy") {
+      const serverUrl = String(config.serverUrl || "").trim() || (placeholder ? "https://ntfy.sh" : "");
+      const topic = String(config.topic || "").trim() || (placeholder ? "example-topic" : "");
+      const url = serverUrl && topic ? `${this.requireHttpUrl(serverUrl, "ntfy server").replace(/\/+$/, "")}/${encodeURIComponent(topic)}` : "";
       const headers = {
         "Content-Type": "text/plain; charset=utf-8",
         "Title": this.safeHeader(notification.title),
@@ -1303,7 +1557,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         headers.Attach = this.safeHeader(firstAttachment.url);
         headers.Filename = this.safeHeader(firstAttachment.name || "attachment");
       }
-      if (this.settings.authToken) headers.Authorization = `Bearer ${String(this.settings.authToken).trim()}`;
+      if (config.authToken) headers.Authorization = `Bearer ${String(config.authToken).trim()}`;
       if (notification.scheduledAt) headers.At = Math.floor(this.normalizeScheduledAt(new Date(notification.scheduledAt)).getTime() / 1000).toString();
       return {
         url: this.requireHttpUrl(url, "ntfy topic"),
@@ -1315,8 +1569,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       };
     }
 
-    if (channelId === "wecom") {
-      const url = String(this.settings.wecomWebhookUrl || "").trim() || (placeholder ? "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=example" : "");
+    if (channelType === "wecom") {
+      if (String(config.mode || "webhook") === "app") {
+        return { channelAction: "wecom-app", config, text: text.slice(0, 2048), notification };
+      }
+      const url = String(config.webhookUrl || "").trim() || (placeholder ? "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=example" : "");
       return {
         url: this.requireHttpUrl(url, "WeCom webhook"),
         method: "POST",
@@ -1326,13 +1583,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       };
     }
 
-    if (channelId === "telegram") {
-      const token = String(this.settings.telegramBotToken || "").trim() || (placeholder ? "000000:example-token" : "");
-      const chatId = String(notification.metadata && notification.metadata.chatId || this.settings.telegramChatId || "").trim() || (placeholder ? "example-chat" : "");
+    if (channelType === "telegram") {
+      const token = String(config.botToken || "").trim() || (placeholder ? "000000:example-token" : "");
+      const chatId = String(notification.metadata && notification.metadata.chatId || config.chatId || "").trim() || (placeholder ? "example-chat" : "");
       if (!token || !chatId) throw new Error("Telegram bot token and chat id are required.");
       if (!/^\d+:[A-Za-z0-9_-]+$/.test(token)) throw new Error("Telegram bot token format is invalid.");
+      const apiRoot = this.requireHttpUrl(config.apiRoot || "https://api.telegram.org", "Telegram API root").replace(/\/+$/, "");
       return {
-        url: this.requireHttpUrl(`https://api.telegram.org/bot${token}/sendMessage`, "Telegram API"),
+        url: this.requireHttpUrl(`${apiRoot}/bot${token}/sendMessage`, "Telegram API"),
         method: "POST",
         headers: { "Content-Type": "application/json; charset=utf-8" },
         body: JSON.stringify({ chat_id: chatId, text: text.slice(0, 4096), disable_web_page_preview: false }),
@@ -1340,8 +1598,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       };
     }
 
-    if (channelId === "feishu") {
-      const url = String(this.settings.feishuWebhookUrl || "").trim() || (placeholder ? "https://open.feishu.cn/open-apis/bot/v2/hook/example" : "");
+    if (channelType === "feishu") {
+      if (String(config.mode || "app") === "app") {
+        return { channelAction: "feishu-app", config, text: text.slice(0, 20000), notification };
+      }
+      const url = String(config.webhookUrl || "").trim() || (placeholder ? "https://open.feishu.cn/open-apis/bot/v2/hook/example" : "");
       return {
         url: this.requireHttpUrl(url, "Feishu webhook"),
         method: "POST",
@@ -1351,8 +1612,21 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       };
     }
 
-    if (channelId === "discord") {
-      const url = String(this.settings.discordWebhookUrl || "").trim() || (placeholder ? "https://discord.com/api/webhooks/example/token" : "");
+    if (channelType === "discord") {
+      if (String(config.mode || "webhook") === "bot") {
+        const apiRoot = this.requireHttpUrl(config.apiRoot || "https://discord.com/api/v10", "Discord API root").replace(/\/+$/, "");
+        const token = String(config.botToken || "").trim() || (placeholder ? "example-token" : "");
+        const destination = String(config.channelId || "").trim() || (placeholder ? "example-channel" : "");
+        if (!token || !destination) throw new Error("Discord bot token and channel id are required.");
+        return {
+          url: `${apiRoot}/channels/${encodeURIComponent(destination)}/messages`,
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bot ${token}` },
+          body: JSON.stringify({ content: text.slice(0, 2000) }),
+          throw: true,
+        };
+      }
+      const url = String(config.webhookUrl || "").trim() || (placeholder ? "https://discord.com/api/webhooks/example/token" : "");
       return {
         url: this.requireHttpUrl(url, "Discord webhook"),
         method: "POST",
@@ -1362,8 +1636,21 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       };
     }
 
-    if (channelId === "slack") {
-      const url = String(this.settings.slackWebhookUrl || "").trim() || (placeholder ? "https://hooks.slack.com/services/example/example/example" : "");
+    if (channelType === "slack") {
+      if (String(config.mode || "webhook") === "bot") {
+        const apiRoot = this.requireHttpUrl(config.apiRoot || "https://slack.com/api", "Slack API root").replace(/\/+$/, "");
+        const token = String(config.botToken || "").trim() || (placeholder ? "xoxb-example" : "");
+        const destination = String(config.channelId || "").trim() || (placeholder ? "example-channel" : "");
+        if (!token || !destination) throw new Error("Slack bot token and channel id are required.");
+        return {
+          url: `${apiRoot}/chat.postMessage`,
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ channel: destination, text: text.slice(0, 40000) }),
+          throw: true,
+        };
+      }
+      const url = String(config.webhookUrl || "").trim() || (placeholder ? "https://hooks.slack.com/services/example/example/example" : "");
       return {
         url: this.requireHttpUrl(url, "Slack webhook"),
         method: "POST",
@@ -1373,10 +1660,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       };
     }
 
-    if (channelId === "matrix") {
-      const serverUrl = String(this.settings.matrixServerUrl || "").trim() || (placeholder ? "https://matrix.example" : "");
-      const token = String(this.settings.matrixAccessToken || "").trim() || (placeholder ? "example-token" : "");
-      const roomId = String(notification.metadata && notification.metadata.roomId || this.settings.matrixRoomId || "").trim() || (placeholder ? "!example:matrix.example" : "");
+    if (channelType === "matrix") {
+      const serverUrl = String(config.serverUrl || "").trim() || (placeholder ? "https://matrix.example" : "");
+      const token = String(config.accessToken || "").trim() || (placeholder ? "example-token" : "");
+      const roomId = String(notification.metadata && notification.metadata.roomId || config.roomId || "").trim() || (placeholder ? "!example:matrix.example" : "");
       if (!token || !roomId) throw new Error("Matrix access token and room id are required.");
       const base = this.requireHttpUrl(serverUrl, "Matrix server").replace(/\/+$/, "");
       return {
@@ -1388,17 +1675,17 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       };
     }
 
-    if (channelId === "email") {
-      const url = String(this.settings.emailGatewayUrl || "").trim() || (placeholder ? "https://mail-gateway.example/send" : "");
+    if (channelType === "email") {
+      const url = String(config.gatewayUrl || "").trim() || (placeholder ? "https://mail-gateway.example/send" : "");
       const headers = { "Content-Type": "application/json; charset=utf-8" };
-      if (this.settings.emailGatewayToken) headers.Authorization = `Bearer ${String(this.settings.emailGatewayToken).trim()}`;
+      if (config.gatewayToken) headers.Authorization = `Bearer ${String(config.gatewayToken).trim()}`;
       return {
         url: this.requireHttpUrl(url, "Email HTTP gateway"),
         method: "POST",
         headers,
         body: JSON.stringify({
-          from: String(this.settings.emailFrom || "").trim(),
-          to: String(this.settings.emailTo || "").split(/[,;\n]/).map((item) => item.trim()).filter(Boolean),
+          from: String(config.from || "").trim(),
+          to: String(config.to || "").split(/[,;\n]/).map((item) => item.trim()).filter(Boolean),
           subject: notification.title,
           text: notification.message,
           attachments: notification.attachments,
@@ -1408,16 +1695,22 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       };
     }
 
-    if (channelId === "webhook") {
-      const url = String(this.settings.aiWebhookUrl || "").trim() || (placeholder ? "https://agent.example/notification" : "");
-      const headers = { "Content-Type": "application/json; charset=utf-8" };
-      if (this.settings.aiWebhookToken) headers.Authorization = `Bearer ${String(this.settings.aiWebhookToken).trim()}`;
+    if (channelType === "webhook") {
+      const url = String(config.url || "").trim() || (placeholder ? "https://bridge.example/notification" : "");
+      const headers = Object.assign({ "Content-Type": "application/json; charset=utf-8" }, this.parseCustomHeaders(config.customHeaders));
+      if (config.token) headers.Authorization = `Bearer ${String(config.token).trim()}`;
       return {
-        url: this.requireHttpUrl(url, "Agent webhook"),
+        url: this.requireHttpUrl(url, "Webhook"),
         method: "POST",
         headers,
         body: JSON.stringify({
           apiVersion: NOTIFICATION_HUB_API_VERSION,
+          channel: channelType,
+          channelId,
+          accountId: descriptor.accountId || "default",
+          targetChannel: config.targetChannel || "webhook",
+          targetAccountId: config.targetAccountId || config.accountId || "default",
+          target: config.target || "",
           source: notification.source,
           event: notification.event,
           notification,
@@ -1426,18 +1719,155 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       };
     }
 
-    throw new Error(`Unsupported built-in channel '${channelId}'.`);
+    if (["openclaw", "qqbot", "wechat"].includes(channelType) && String(config.mode || "").toLowerCase() === "legacy") {
+      return this.buildLegacyBridgeRequest(channelType, channelId, descriptor, config, notification, placeholder);
+    }
+
+    if (channelType === "openclaw") {
+      return this.buildOpenClawToolsInvokeRequest(config, notification, text, {}, placeholder);
+    }
+
+    if (channelType === "qqbot") {
+      if (String(config.mode || "openclaw").toLowerCase() === "official") {
+        const target = this.resolveQqBotTarget(config, placeholder);
+        return { channelAction: "qqbot-official", config, text: text.slice(0, 2000), target };
+      }
+      const target = this.resolveQqBotTarget(config, placeholder);
+      return this.buildOpenClawToolsInvokeRequest(config, notification, text, {
+        targetChannel: "qqbot",
+        targetAccountId: config.openclawAccountId || config.accountId || "default",
+        target: `qqbot:${target.targetType}:${target.target}`,
+      }, placeholder);
+    }
+
+    if (channelType === "wechat") {
+      return this.buildOpenClawToolsInvokeRequest(config, notification, text, {
+        targetChannel: config.channelId || "openclaw-weixin",
+        targetAccountId: config.openclawAccountId || config.accountId || "default",
+      }, placeholder);
+    }
+
+    throw new Error(`Unsupported built-in channel '${channelType}'.`);
   }
 
-  async executeBuiltinChannelRequest(channelId, request) {
+  async getQqBotAccessToken(config) {
+    const appId = String(config.appId || "").trim();
+    const clientSecret = String(config.clientSecret || "").trim();
+    if (!appId || !clientSecret) throw new Error("QQ Bot App ID and App Secret are required.");
+    if (!this.qqBotAccessTokens) this.qqBotAccessTokens = new Map();
+    const cacheKey = `${appId}:${this.hash(clientSecret)}`;
+    const cached = this.qqBotAccessTokens.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now() + 60_000) return cached.token;
+    const response = await this.httpRequest({
+      url: "https://bots.qq.com/app/getAppAccessToken",
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ appId, clientSecret }),
+      throw: true,
+    });
+    const json = await this.responseJson(response);
+    const token = String(json && json.access_token || "").trim();
+    if (!token) throw new Error(json && (json.message || json.msg) || "QQ Bot authentication failed.");
+    const parsedExpiresIn = Number(json.expires_in);
+    const expiresIn = Number.isFinite(parsedExpiresIn) && parsedExpiresIn > 0 ? Math.max(60, parsedExpiresIn) : 7200;
+    this.qqBotAccessTokens.set(cacheKey, { token, expiresAt: Date.now() + expiresIn * 1000 });
+    return token;
+  }
+
+  async executeBuiltinChannelRequest(descriptor, request) {
+    const channelId = descriptor.id;
+    const channelType = descriptor.type;
+    if (request.channelAction === "openclaw-tools-invoke") {
+      const httpOptions = Object.assign({}, request);
+      delete httpOptions.channelAction;
+      const response = await this.httpRequest(httpOptions);
+      const json = await this.responseJson(response);
+      if (!json || json.ok !== true) {
+        throw new Error(json && json.error && (json.error.message || json.error.type) || "OpenClaw Gateway did not return a successful tool result.");
+      }
+      const result = json.result && typeof json.result === "object" ? json.result : {};
+      return { channelId, ok: true, status: "sent", messageId: result.messageId || result.id || "", result };
+    }
+    if (request.channelAction === "qqbot-official") {
+      const config = request.config || {};
+      const token = await this.getQqBotAccessToken(config);
+      const base = this.requireHttpUrl(config.apiRoot || "https://api.sgroup.qq.com", "QQ Bot API root").replace(/\/+$/, "");
+      const target = request.target || this.resolveQqBotTarget(config);
+      const path = target.targetType === "c2c"
+        ? `/v2/users/${encodeURIComponent(target.target)}/messages`
+        : target.targetType === "group"
+          ? `/v2/groups/${encodeURIComponent(target.target)}/messages`
+          : `/channels/${encodeURIComponent(target.target)}/messages`;
+      const body = target.targetType === "channel"
+        ? { content: request.text }
+        : { content: request.text, msg_type: 0 };
+      const response = await this.httpRequest({
+        url: `${base}${path}`,
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `QQBot ${token}` },
+        body: JSON.stringify(body),
+        throw: true,
+      });
+      const json = await this.responseJson(response);
+      const code = json && (json.code !== undefined ? json.code : json.err_code);
+      if (code !== undefined && Number(code) !== 0) throw new Error(json.message || json.msg || `QQ Bot error ${code}`);
+      return { channelId, ok: true, status: "sent", messageId: json && (json.id || json.message_id) || "" };
+    }
+    if (request.channelAction === "feishu-app") {
+      const config = request.config || {};
+      const domain = String(config.domain || "feishu").trim().toLowerCase();
+      const apiBase = domain === "lark" ? "https://open.larksuite.com" : domain.startsWith("http") ? this.requireHttpUrl(domain, "Feishu domain").replace(/\/+$/, "") : "https://open.feishu.cn";
+      const tokenResponse = await this.httpRequest({
+        url: `${apiBase}/open-apis/auth/v3/tenant_access_token/internal`,
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ app_id: config.appId, app_secret: config.appSecret }),
+        throw: true,
+      });
+      const tokenJson = await this.responseJson(tokenResponse);
+      const token = tokenJson && tokenJson.tenant_access_token;
+      if (!token || Number(tokenJson.code || 0) !== 0) throw new Error(tokenJson && tokenJson.msg || "Feishu app authentication failed.");
+      const response = await this.httpRequest({
+        url: `${apiBase}/open-apis/im/v1/messages?receive_id_type=${encodeURIComponent(config.receiveIdType || "chat_id")}`,
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ receive_id: config.receiveId, msg_type: "text", content: JSON.stringify({ text: request.text }) }),
+        throw: true,
+      });
+      const json = await this.responseJson(response);
+      if (json && Number(json.code || 0) !== 0) throw new Error(json.msg || `Feishu error ${json.code}`);
+      return { channelId, ok: true, status: "sent", messageId: json && json.data && json.data.message_id || "" };
+    }
+    if (request.channelAction === "wecom-app") {
+      const config = request.config || {};
+      const tokenResponse = await this.httpRequest({
+        url: `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${encodeURIComponent(config.corpId || "")}&corpsecret=${encodeURIComponent(config.secret || "")}`,
+        method: "GET",
+        throw: true,
+      });
+      const tokenJson = await this.responseJson(tokenResponse);
+      if (!tokenJson || Number(tokenJson.errcode || 0) !== 0 || !tokenJson.access_token) throw new Error(tokenJson && tokenJson.errmsg || "WeCom app authentication failed.");
+      const targetType = ["touser", "toparty", "totag"].includes(config.targetType) ? config.targetType : "touser";
+      const response = await this.httpRequest({
+        url: `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${encodeURIComponent(tokenJson.access_token)}`,
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ [targetType]: config.target, msgtype: "text", agentid: Number(config.agentId), text: { content: request.text }, safe: 0 }),
+        throw: true,
+      });
+      const json = await this.responseJson(response);
+      if (json && Number(json.errcode || 0) !== 0) throw new Error(json.errmsg || `WeCom error ${json.errcode}`);
+      return { channelId, ok: true, status: "sent", messageId: json && json.msgid || "" };
+    }
     const channelMeta = request.channelMeta || {};
     const httpOptions = Object.assign({}, request);
     delete httpOptions.channelMeta;
     const response = await this.httpRequest(httpOptions);
     const json = await this.responseJson(response);
-    if (channelId === "wecom" && json && Number(json.errcode || 0) !== 0) throw new Error(json.errmsg || `WeCom error ${json.errcode}`);
-    if (channelId === "telegram" && json && json.ok === false) throw new Error(json.description || "Telegram rejected the message.");
-    if (channelId === "feishu" && json) {
+    if (channelType === "wecom" && json && Number(json.errcode || 0) !== 0) throw new Error(json.errmsg || `WeCom error ${json.errcode}`);
+    if (channelType === "telegram" && json && json.ok === false) throw new Error(json.description || "Telegram rejected the message.");
+    if (channelType === "slack" && json && json.ok === false) throw new Error(json.error || "Slack rejected the message.");
+    if (channelType === "feishu" && json) {
       const code = json.code === undefined ? json.StatusCode : json.code;
       if (code !== undefined && Number(code) !== 0) throw new Error(json.msg || json.StatusMessage || `Feishu error ${code}`);
     }
@@ -1463,6 +1893,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   redactChannelRequest(request) {
     let serialized = this.redactSensitiveText(JSON.stringify(request), false);
+    serialized = serialized.replace(/("(?:authorization|x-api-key|api-key)"\s*:\s*")[^"]+/gi, "$1***");
     serialized = serialized.replace(/([?&]key=)[^&\"]+/gi, "$1***");
     serialized = serialized.replace(/([?&]access_token=)[^&\"]+/gi, "$1***");
     serialized = serialized.replace(/(\/bot)[^/\"]+(\/sendMessage)/gi, "$1***$2");
@@ -1475,6 +1906,20 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   }
 
   redactSensitiveText(value, includeUrls = false) {
+    const accountSecrets = [];
+    for (const account of this.settings.channelAccounts || []) {
+      for (const [key, item] of Object.entries(account.config || {})) {
+        if (item && (/(token|secret|password|webhookurl|bridgeurl|gatewayurl|accesstoken|bottoken)/i.test(key) || (account.type === "webhook" && key === "url"))) {
+          accountSecrets.push(item);
+        }
+        if (key === "customHeaders" && item) {
+          try {
+            const headers = JSON.parse(String(item));
+            if (headers && typeof headers === "object" && !Array.isArray(headers)) accountSecrets.push(...Object.values(headers));
+          } catch (_) {}
+        }
+      }
+    }
     const secrets = [
       this.settings.authToken,
       this.settings.telegramBotToken,
@@ -1483,6 +1928,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       this.settings.emailGatewayToken,
       this.settings.aiWebhookToken,
       this.settings.agentProtocolToken,
+      ...accountSecrets,
       ...(includeUrls ? [this.settings.wecomWebhookUrl, this.settings.feishuWebhookUrl, this.settings.discordWebhookUrl, this.settings.slackWebhookUrl, this.settings.aiWebhookUrl] : []),
     ].map((item) => String(item || "").trim()).filter(Boolean);
     let text = String(value || "");
@@ -1490,6 +1936,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return text
       .replace(/([?&]key=)[^&\"\s]+/gi, "$1***")
       .replace(/([?&]access_token=)[^&\"\s]+/gi, "$1***")
+      .replace(/([?&](?:token|auth|signature|sig|secret|api_?key)=)[^&\"\s]+/gi, "$1***")
       .replace(/(\/bot)[^/\"\s]+/gi, "$1***");
   }
 
@@ -2850,13 +3297,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   }
 
   async sendTestNotification(options = {}) {
-    if (!this.hasDestination()) {
-      new Notice(`${PLUGIN_NAME}: configure the default channel first`);
+    const channelId = String(options.channelId || this.settings.defaultChannelId || "ntfy").trim().toLowerCase();
+    const channel = this.listNotificationChannels().find((item) => item.id === channelId);
+    if (!channel || !channel.enabled || !channel.configured) {
+      new Notice(`${PLUGIN_NAME}: configure ${channelId} first`);
       return;
     }
 
     try {
-      const channelId = String(this.settings.defaultChannelId || "ntfy");
       const result = await this.sendNotification({
         id: `test-${Date.now()}`,
         source: "notification-hub-test",
@@ -4303,7 +4751,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
   }
 
   channelStatusText(channel) {
-    const enabled = this.plugin.isChannelSettingEnabled(channel.id);
+    const enabled = channel.storedEnabled !== false;
     const status = [
       enabled ? this.uiText("已启用", "Enabled") : this.uiText("已停用", "Disabled"),
       channel.configured ? this.uiText("配置完整", "Configured") : this.uiText("等待配置", "Needs setup"),
@@ -4320,11 +4768,270 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
     return status.join(" · ");
   }
 
+  addChannelTextSetting(containerEl, channel, key, name, placeholder = "", password = false, description = "") {
+    const setting = new Setting(containerEl).setName(name);
+    if (description) setting.setDesc(description);
+    setting.addText((text) => {
+      text.setPlaceholder(placeholder).setValue(String(channel.config && channel.config[key] || "")).onChange(async (value) => {
+        await this.plugin.updateChannelAccount(channel.id, { config: { [key]: value.trim() } });
+      });
+      if (password) text.inputEl.type = "password";
+    });
+    return setting;
+  }
+
+  addChannelModeSetting(containerEl, channel, values) {
+    new Setting(containerEl)
+      .setName(this.uiText("连接方式", "Connection mode"))
+      .addDropdown((dropdown) => {
+        for (const [value, label] of Object.entries(values)) dropdown.addOption(value, label);
+        dropdown.setValue(String(channel.config.mode || Object.keys(values)[0])).onChange(async (value) => {
+          await this.plugin.updateChannelAccount(channel.id, { config: { mode: value } });
+          if (!this.openChannelEditors) this.openChannelEditors = new Set();
+          this.openChannelEditors.add(channel.id);
+          this.display();
+        });
+      });
+  }
+
+  renderChannelAccountConfig(containerEl, channel, active) {
+    const config = channel.config || {};
+    if (channel.type === "ntfy") {
+      this.addChannelTextSetting(containerEl, channel, "serverUrl", this.uiText("服务器", "Server"), "https://ntfy.sh");
+      this.addChannelTextSetting(containerEl, channel, "topic", "Topic", "random-private-topic");
+      this.addChannelTextSetting(containerEl, channel, "authToken", this.uiText("认证 token", "Auth token"), "tk_...", true);
+    }
+    if (channel.type === "telegram") {
+      this.addChannelTextSetting(containerEl, channel, "apiRoot", "API root", "https://api.telegram.org");
+      this.addChannelTextSetting(containerEl, channel, "botToken", "Bot token", "123456:ABC...", true);
+      this.addChannelTextSetting(containerEl, channel, "chatId", "Chat ID", "-100...");
+    }
+    if (channel.type === "feishu") {
+      this.addChannelModeSetting(containerEl, channel, { app: this.uiText("应用", "App"), webhook: "Webhook" });
+      if (String(config.mode || "app") === "webhook") {
+        this.addChannelTextSetting(containerEl, channel, "webhookUrl", "Webhook URL", "https://open.feishu.cn/open-apis/bot/v2/hook/...", true);
+      } else {
+        new Setting(containerEl).setName(this.uiText("域", "Domain")).addDropdown((dropdown) => dropdown
+          .addOption("feishu", "Feishu")
+          .addOption("lark", "Lark")
+          .setValue(String(config.domain || "feishu"))
+          .onChange(async (value) => await this.plugin.updateChannelAccount(channel.id, { config: { domain: value } })));
+        this.addChannelTextSetting(containerEl, channel, "appId", "App ID", "cli_...");
+        this.addChannelTextSetting(containerEl, channel, "appSecret", "App secret", "...", true);
+        new Setting(containerEl).setName("Receive ID type").addDropdown((dropdown) => dropdown
+          .addOption("chat_id", "chat_id")
+          .addOption("open_id", "open_id")
+          .addOption("user_id", "user_id")
+          .addOption("email", "email")
+          .setValue(String(config.receiveIdType || "chat_id"))
+          .onChange(async (value) => await this.plugin.updateChannelAccount(channel.id, { config: { receiveIdType: value } })));
+        this.addChannelTextSetting(containerEl, channel, "receiveId", "Receive ID", "oc_... / ou_...");
+      }
+    }
+    if (channel.type === "wecom") {
+      this.addChannelModeSetting(containerEl, channel, { webhook: this.uiText("群机器人 Webhook", "Group webhook"), app: this.uiText("企业应用", "App") });
+      if (String(config.mode || "webhook") === "webhook") {
+        this.addChannelTextSetting(containerEl, channel, "webhookUrl", "Webhook URL", "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...", true);
+      } else {
+        this.addChannelTextSetting(containerEl, channel, "corpId", "Corp ID", "ww...");
+        this.addChannelTextSetting(containerEl, channel, "agentId", "Agent ID", "1000002");
+        this.addChannelTextSetting(containerEl, channel, "secret", "Secret", "...", true);
+        new Setting(containerEl).setName(this.uiText("接收对象类型", "Target type")).addDropdown((dropdown) => dropdown
+          .addOption("touser", "touser")
+          .addOption("toparty", "toparty")
+          .addOption("totag", "totag")
+          .setValue(String(config.targetType || "touser"))
+          .onChange(async (value) => await this.plugin.updateChannelAccount(channel.id, { config: { targetType: value } })));
+        this.addChannelTextSetting(containerEl, channel, "target", this.uiText("接收对象", "Target"), "@all / user id");
+      }
+    }
+    if (channel.type === "discord" || channel.type === "slack") {
+      this.addChannelModeSetting(containerEl, channel, { webhook: "Webhook", bot: "Bot" });
+      if (String(config.mode || "webhook") === "webhook") {
+        this.addChannelTextSetting(containerEl, channel, "webhookUrl", "Webhook URL", "https://...", true);
+      } else {
+        this.addChannelTextSetting(containerEl, channel, "apiRoot", "API root", channel.type === "discord" ? "https://discord.com/api/v10" : "https://slack.com/api");
+        this.addChannelTextSetting(containerEl, channel, "botToken", "Bot token", "...", true);
+        this.addChannelTextSetting(containerEl, channel, "channelId", "Channel ID", "...");
+      }
+    }
+    if (channel.type === "matrix") {
+      this.addChannelTextSetting(containerEl, channel, "serverUrl", this.uiText("服务器", "Server"), "https://matrix.example");
+      this.addChannelTextSetting(containerEl, channel, "accessToken", "Access token", "syt_...", true);
+      this.addChannelTextSetting(containerEl, channel, "roomId", "Room ID", "!room:matrix.example");
+    }
+    if (channel.type === "email") {
+      this.addChannelTextSetting(containerEl, channel, "gatewayUrl", this.uiText("HTTP 邮件网关", "HTTP email gateway"), "https://mail.example/send");
+      this.addChannelTextSetting(containerEl, channel, "gatewayToken", "Gateway token", "...", true);
+      this.addChannelTextSetting(containerEl, channel, "from", "From", "obsidian@example.com");
+      this.addChannelTextSetting(containerEl, channel, "to", "To", "you@example.com");
+    }
+    if (channel.type === "openclaw") {
+      this.addChannelModeSetting(containerEl, channel, {
+        gateway: this.uiText("OpenClaw Gateway（真实消息工具）", "OpenClaw Gateway (message tool)"),
+        legacy: this.uiText("兼容 HTTP 桥接", "Legacy HTTP bridge"),
+      });
+      if (String(config.mode || "gateway") === "legacy") {
+        this.addChannelTextSetting(containerEl, channel, "bridgeUrl", this.uiText("桥接 URL", "Bridge URL"), "https://bridge.example/send");
+        this.addChannelTextSetting(containerEl, channel, "token", "Token", "...", true);
+      } else {
+        this.addChannelTextSetting(containerEl, channel, "gatewayUrl", this.uiText("Gateway URL", "Gateway URL"), "http://127.0.0.1:18789");
+        this.addChannelTextSetting(containerEl, channel, "gatewayToken", this.uiText("Gateway token（可选）", "Gateway token (optional)"), "...", true);
+        this.addChannelTextSetting(containerEl, channel, "sessionKey", this.uiText("会话键", "Session key"), "main");
+      }
+      this.addChannelTextSetting(containerEl, channel, "targetChannel", this.uiText("目标 Channel", "Target channel"), "telegram / feishu / qqbot / openclaw-weixin");
+      this.addChannelTextSetting(containerEl, channel, "targetAccountId", this.uiText("目标账号 ID", "Target account ID"), "default");
+      this.addChannelTextSetting(containerEl, channel, "target", this.uiText("目标联系人或群", "Target peer"), "qqbot:c2c:openid / user id");
+      if (String(config.mode || "gateway") !== "legacy") new Setting(containerEl).setDesc(this.uiText(
+        "这里调用 OpenClaw 的 /tools/invoke → message(action=send)，QQ/微信的扫码、收件和平台令牌仍由 OpenClaw Channel 插件管理。",
+        "Uses OpenClaw /tools/invoke → message(action=send); QR login, inbound messages, and platform tokens remain managed by OpenClaw Channel plugins."
+      ));
+    }
+    if (channel.type === "qqbot") {
+      this.addChannelModeSetting(containerEl, channel, {
+        openclaw: this.uiText("OpenClaw QQ Bot（由 OpenClaw 管理收发）", "OpenClaw QQ Bot (managed by OpenClaw)"),
+        official: this.uiText("QQ 官方 Bot API（直接发送）", "Official QQ Bot API (direct send)"),
+        legacy: this.uiText("兼容 HTTP 桥接", "Legacy HTTP bridge"),
+      });
+      const mode = String(config.mode || "openclaw");
+      if (mode === "legacy") {
+        this.addChannelTextSetting(containerEl, channel, "bridgeUrl", this.uiText("桥接 URL", "Bridge URL"), "https://bridge.example/send");
+        this.addChannelTextSetting(containerEl, channel, "token", "Token", "...", true);
+        this.addChannelTextSetting(containerEl, channel, "accountId", this.uiText("桥接账号 ID", "Bridge account ID"), "default");
+      } else if (mode === "official") {
+        this.addChannelTextSetting(containerEl, channel, "appId", "App ID", "QQ 开放平台 AppID");
+        this.addChannelTextSetting(containerEl, channel, "clientSecret", "App Secret", "QQ 开放平台 AppSecret", true);
+        this.addChannelTextSetting(containerEl, channel, "apiRoot", this.uiText("官方 API 地址", "Official API root"), "https://api.sgroup.qq.com");
+      } else {
+        this.addChannelTextSetting(containerEl, channel, "gatewayUrl", this.uiText("OpenClaw Gateway URL", "OpenClaw Gateway URL"), "http://127.0.0.1:18789");
+        this.addChannelTextSetting(containerEl, channel, "gatewayToken", this.uiText("Gateway token（可选）", "Gateway token (optional)"), "...", true);
+        this.addChannelTextSetting(containerEl, channel, "openclawAccountId", this.uiText("OpenClaw QQ 账号 ID", "OpenClaw QQ account ID"), "default");
+      }
+      if (mode !== "legacy") new Setting(containerEl).setDesc(this.uiText(
+        mode === "official"
+          ? "字段与 OpenClaw QQ Bot 插件一致：App ID + App Secret；目标可填 c2c:OPENID、group:GROUP_OPENID 或 channel:CHANNEL_ID。"
+          : "OpenClaw 负责 QQ 官方 WebSocket 收件、allowlist 和账号生命周期；此处只调用它的 message 工具发送。",
+        mode === "official"
+          ? "Matches OpenClaw QQ Bot: App ID + App Secret; target may be c2c:OPENID, group:GROUP_OPENID, or channel:CHANNEL_ID."
+          : "OpenClaw owns QQ WebSocket receive, allowlists, and account lifecycle; this channel calls its message tool for delivery."
+      ));
+      if (mode !== "legacy") new Setting(containerEl).setName(this.uiText("目标类型", "Target type")).addDropdown((dropdown) => dropdown
+          .addOption("c2c", "C2C / 私聊")
+          .addOption("group", "Group / 群聊")
+          .addOption("channel", "Guild channel")
+          .setValue(String(config.targetType || "c2c"))
+          .onChange(async (value) => await this.plugin.updateChannelAccount(channel.id, { config: { targetType: value } })));
+      this.addChannelTextSetting(containerEl, channel, "target", this.uiText("目标 ID", "Target ID"), "c2c:OPENID / group:OPENID");
+    }
+    if (channel.type === "wechat") {
+      this.addChannelModeSetting(containerEl, channel, {
+        openclaw: this.uiText("OpenClaw Weixin（扫码登录）", "OpenClaw Weixin (QR login)"),
+        legacy: this.uiText("兼容 HTTP 桥接", "Legacy HTTP bridge"),
+      });
+      const mode = String(config.mode || "openclaw");
+      if (mode === "legacy") {
+        this.addChannelTextSetting(containerEl, channel, "bridgeUrl", this.uiText("桥接 URL", "Bridge URL"), "https://bridge.example/send");
+        this.addChannelTextSetting(containerEl, channel, "token", "Token", "...", true);
+        this.addChannelTextSetting(containerEl, channel, "accountId", this.uiText("桥接账号 ID", "Bridge account ID"), "default");
+      } else {
+        this.addChannelTextSetting(containerEl, channel, "gatewayUrl", this.uiText("OpenClaw Gateway URL", "OpenClaw Gateway URL"), "http://127.0.0.1:18789");
+        this.addChannelTextSetting(containerEl, channel, "gatewayToken", this.uiText("Gateway token（可选）", "Gateway token (optional)"), "...", true);
+        this.addChannelTextSetting(containerEl, channel, "channelId", this.uiText("OpenClaw Channel ID", "OpenClaw channel ID"), "openclaw-weixin");
+        this.addChannelTextSetting(containerEl, channel, "openclawAccountId", this.uiText("OpenClaw 微信账号 ID", "OpenClaw Weixin account ID"), "default");
+      }
+      this.addChannelTextSetting(containerEl, channel, "target", this.uiText("微信联系人 ID", "Weixin peer ID"), "微信用户 ID");
+      new Setting(containerEl).setDesc(this.uiText(
+        mode === "legacy"
+          ? "旧 HTTP 桥接仍保留；新连接建议在 OpenClaw 主机安装 @tencent-weixin/openclaw-weixin，运行 openclaw channels login --channel openclaw-weixin 扫码，再在这里填 Gateway。"
+          : "微信扫码、ilink token、getupdates 长轮询和上下文 token 由 OpenClaw 官方外部插件管理；这里使用真实 message(action=send) 路由。",
+        mode === "legacy"
+          ? "Legacy HTTP bridge is preserved; recommended setup: install @tencent-weixin/openclaw-weixin on the OpenClaw host, run openclaw channels login --channel openclaw-weixin, then enter the Gateway here."
+          : "QR login, ilink token, getupdates long polling, and context tokens are managed by OpenClaw's official external plugin; this uses the real message(action=send) route."
+      ));
+    }
+    if (channel.type === "webhook") {
+      this.addChannelTextSetting(containerEl, channel, "url", "Webhook URL", "https://agent.example/notification");
+      this.addChannelTextSetting(containerEl, channel, "token", "Bearer token", "...", true);
+      this.addChannelTextSetting(containerEl, channel, "customHeaders", this.uiText("自定义请求头 JSON", "Custom headers JSON"), '{"X-API-Key":"..."}', false);
+    }
+
+    if (["ntfy", "telegram", "matrix"].includes(channel.type)) {
+      if (channel.accountId === "default") {
+        new Setting(containerEl)
+          .setName(this.uiText("主动接收", "Native receive"))
+          .setDesc(this.uiText("默认账号可在 Obsidian 前台低频轮询；其他账号仍可通过统一 receive API 接收。", "The default account can poll in the foreground; other accounts can still receive through the shared API."))
+          .addToggle((toggle) => toggle.setValue(config.receiveEnabled !== false).onChange(async (value) => {
+            await this.plugin.updateChannelAccount(channel.id, { config: { receiveEnabled: value } });
+            if (channel.type === "ntfy") this.plugin.restartIncomingPollTimer();
+          }));
+      } else {
+        new Setting(containerEl).setName(this.uiText("接收方式", "Receive mode")).setDesc(this.uiText("通过统一 receive API 或外部适配器转入。", "Incoming messages use the shared receive API or an external adapter."));
+      }
+    }
+    if (channel.type === "ntfy" && channel.accountId === "default") {
+      this.addChannelTextSetting(containerEl, channel, "pollIntervalSeconds", this.uiText("轮询间隔（秒）", "Poll interval (seconds)"), "60");
+    }
+
+    if (!active) {
+      const actions = new Setting(containerEl).setName(this.uiText("账号操作", "Account actions"));
+      actions.addButton((button) => button.setButtonText(this.uiText("加入正在使用", "Add to in use")).setCta().onClick(async () => {
+        await this.plugin.addChannelToSettings(channel.id);
+        this.display();
+      }));
+    }
+  }
+
+  renderChannelAccountDetails(containerEl, channel, active) {
+    if (!this.openChannelEditors) this.openChannelEditors = new Set();
+    const details = containerEl.createEl("details", { cls: "obsidian-ntfy-channel-account" });
+    details.open = this.openChannelEditors.has(channel.id);
+    const summary = details.createEl("summary", { cls: "obsidian-ntfy-channel-account-summary" });
+    const identity = summary.createSpan({ cls: "obsidian-ntfy-channel-account-identity" });
+    identity.createSpan({ cls: "obsidian-ntfy-channel-account-name", text: channel.name, attr: { title: channel.id } });
+    if (active) {
+      const actions = summary.createSpan({ cls: "obsidian-ntfy-channel-summary-actions" });
+      const addAction = (icon, label, handler, disabled = false, activeState = false) => {
+        const button = actions.createEl("button", { cls: "clickable-icon", attr: { type: "button", "aria-label": label, title: label } });
+        setIcon(button, icon);
+        button.disabled = Boolean(disabled);
+        if (activeState) button.addClass("is-active");
+        button.addEventListener("click", async (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (!button.disabled) await handler();
+        });
+        return button;
+      };
+      addAction("power", channel.storedEnabled === false ? this.uiText("启用", "Enable") : this.uiText("停用", "Disable"), async () => {
+        await this.plugin.setChannelSettingEnabled(channel.id, channel.storedEnabled === false);
+        this.display();
+      }, false, channel.storedEnabled !== false);
+      addAction("star", this.plugin.settings.defaultChannelId === channel.id ? this.uiText("当前默认", "Current default") : this.uiText("设为默认", "Set default"), async () => {
+        await this.plugin.setDefaultNotificationChannel(channel.id);
+        this.display();
+      }, channel.storedEnabled === false, this.plugin.settings.defaultChannelId === channel.id);
+      addAction("minus", this.uiText("移出并保留配置", "Remove and keep configuration"), async () => {
+        await this.plugin.removeChannelFromSettings(channel.id);
+        this.display();
+      });
+      addAction("send", this.uiText("测试当前账号", "Test this account"), async () => {
+        await this.plugin.sendTestNotification({ channelId: channel.id, simulatedEvent: true });
+      }, channel.storedEnabled === false || !channel.configured);
+    }
+    summary.createSpan({ cls: `obsidian-ntfy-channel-account-state ${channel.configured ? "is-configured" : ""}`, text: this.channelStatusText(channel) });
+    details.addEventListener("toggle", () => {
+      if (details.open) this.openChannelEditors.add(channel.id);
+      else this.openChannelEditors.delete(channel.id);
+    });
+    const body = details.createDiv({ cls: "obsidian-ntfy-channel-account-body" });
+    this.renderChannelAccountConfig(body, channel, active);
+  }
+
   renderChannelOverview(containerEl) {
     const channels = this.plugin.listNotificationChannels().filter((channel) => channel.builtin);
     const channelMap = new Map(channels.map((channel) => [channel.id, channel]));
     const activeChannels = (this.plugin.settings.addedChannelIds || []).map((id) => channelMap.get(id)).filter(Boolean);
-    const availableChannels = channels.filter((channel) => !this.plugin.isChannelAdded(channel.id));
+    const savedInactiveChannels = channels.filter((channel) => !this.plugin.isChannelAdded(channel.id) && (channel.configured || channel.accountId !== "default"));
 
     const activeHeader = containerEl.createDiv({ cls: "obsidian-ntfy-channel-list-header" });
     activeHeader.createEl("h4", { text: this.uiText("正在使用", "In use") });
@@ -4336,64 +5043,73 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         text: this.uiText("还没有加入 Channel，请从下面的可用列表添加。", "No channels added. Add one from the available list below."),
       });
     }
-    for (const channel of activeChannels) {
-      const enabled = this.plugin.isChannelSettingEnabled(channel.id);
-      const isDefault = this.plugin.settings.defaultChannelId === channel.id;
-      const row = new Setting(activeList)
-        .setName(channel.name)
-        .setDesc(this.channelStatusText(channel));
-      row.settingEl.addClass("obsidian-ntfy-channel-row");
-      row.addExtraButton((button) => {
-        button.setIcon("star").setTooltip(isDefault ? this.uiText("当前默认发送 Channel", "Current default route") : this.uiText("设为默认发送 Channel", "Set as default route"));
-        if (button.extraSettingsEl && isDefault) button.extraSettingsEl.addClass("is-active");
-        if (typeof button.setDisabled === "function") button.setDisabled(!enabled);
-        else if (button.extraSettingsEl) button.extraSettingsEl.toggleAttribute("disabled", !enabled);
-        button.onClick(async () => {
-          await this.plugin.setDefaultNotificationChannel(channel.id);
-          this.display();
-        });
-      });
-      row.addExtraButton((button) => button
-        .setIcon("settings-2")
-        .setTooltip(this.uiText("编辑 Channel", "Edit channel"))
-        .onClick(() => this.openChannelEditor(channel.id)));
-      row.addToggle((toggle) => toggle.setValue(enabled).onChange(async (value) => {
-        await this.plugin.setChannelSettingEnabled(channel.id, value);
-        this.display();
-      }));
-      row.addExtraButton((button) => button
-        .setIcon("minus")
-        .setTooltip(this.uiText("移回可用列表", "Move back to available"))
-        .onClick(async () => {
-          if (this.editingChannelId === channel.id) this.editingChannelId = "";
-          await this.plugin.removeChannelFromSettings(channel.id);
-          this.display();
-        }));
-    }
+    for (const channel of activeChannels) this.renderChannelAccountDetails(activeList, channel, true);
 
     const availableDetails = containerEl.createEl("details", { cls: "obsidian-ntfy-available-channels" });
     availableDetails.open = Boolean(this.availableChannelsOpen);
     const availableSummary = availableDetails.createEl("summary");
     availableSummary.createSpan({ text: this.uiText("可用 Channel", "Available channels") });
-    availableSummary.createSpan({ cls: "obsidian-ntfy-muted", text: ` ${availableChannels.length}` });
+    availableSummary.createSpan({ cls: "obsidian-ntfy-muted", text: ` ${CHANNEL_PROVIDER_DEFINITIONS.length}` });
     availableDetails.addEventListener("toggle", () => { this.availableChannelsOpen = availableDetails.open; });
     const availableList = availableDetails.createDiv({ cls: "obsidian-ntfy-channel-list" });
-    for (const channel of availableChannels) {
-      const row = new Setting(availableList)
-        .setName(channel.name)
-        .setDesc(channel.configured ? this.uiText("已有配置，可直接加入。", "Configured and ready to add.") : this.uiText("加入前后都可以编辑连接信息。", "Connection details can be edited before or after adding."));
+    new Setting(availableList)
+      .setName(this.uiText("新增 Channel", "Add channel"))
+      .setDesc(this.uiText("同一种来源可以建立多个独立账号。", "Create multiple independent accounts for the same provider."))
+      .addButton((button) => button.setButtonText(this.uiText("新增", "Add")).setIcon("plus").setCta().onClick(() => {
+        this.addChannelFormOpen = !this.addChannelFormOpen;
+        this.pendingChannelType = this.pendingChannelType || "ntfy";
+        this.pendingChannelAccountId = this.plugin.nextChannelAccountId(this.pendingChannelType);
+        this.display();
+      }));
+    if (this.addChannelFormOpen) {
+      const form = availableList.createDiv({ cls: "obsidian-ntfy-channel-add-form" });
+      new Setting(form).setName(this.uiText("来源", "Provider")).addDropdown((dropdown) => {
+        for (const provider of CHANNEL_PROVIDER_DEFINITIONS) dropdown.addOption(provider.id, provider.name);
+        dropdown.setValue(this.pendingChannelType || "ntfy").onChange((value) => {
+          this.pendingChannelType = value;
+          this.pendingChannelAccountId = this.plugin.nextChannelAccountId(value);
+          this.pendingChannelName = "";
+          this.display();
+        });
+      });
+      new Setting(form).setName(this.uiText("账号 ID", "Account ID")).setDesc(this.uiText("稳定路由标识，只使用英文、数字、点、横线或下划线。", "Stable route identifier using letters, numbers, dots, dashes, or underscores.")).addText((text) => text
+        .setPlaceholder("default / work / personal")
+        .setValue(this.pendingChannelAccountId || "default")
+        .onChange((value) => { this.pendingChannelAccountId = value; }));
+      new Setting(form).setName(this.uiText("显示名称", "Display name")).addText((text) => text
+        .setPlaceholder(this.plugin.channelProvider(this.pendingChannelType).name)
+        .setValue(this.pendingChannelName || "")
+        .onChange((value) => { this.pendingChannelName = value; }));
+      new Setting(form).addButton((button) => button.setButtonText(this.uiText("创建并配置", "Create and configure")).setCta().onClick(async () => {
+        const type = this.pendingChannelType || "ntfy";
+        const accountId = this.plugin.normalizeChannelAccountId(this.pendingChannelAccountId || "default");
+        const id = this.plugin.channelInstanceId(type, accountId);
+        if (this.plugin.isChannelAdded(id)) {
+          new Notice(this.uiText("这个 Channel 账号已经在使用。", "This channel account is already in use."));
+          return;
+        }
+        await this.plugin.addChannelToSettings(type, { type, accountId, name: this.pendingChannelName });
+        if (!this.openChannelEditors) this.openChannelEditors = new Set();
+        this.openChannelEditors.add(id);
+        this.addChannelFormOpen = false;
+        this.display();
+      }));
+    }
+    if (savedInactiveChannels.length) {
+      availableList.createEl("h5", { cls: "obsidian-ntfy-channel-subheading", text: this.uiText("已保存", "Saved accounts") });
+      for (const channel of savedInactiveChannels) this.renderChannelAccountDetails(availableList, channel, false);
+    }
+    availableList.createEl("h5", { cls: "obsidian-ntfy-channel-subheading", text: this.uiText("可添加来源", "Providers") });
+    for (const provider of CHANNEL_PROVIDER_DEFINITIONS) {
+      const row = new Setting(availableList).setName(provider.name).setDesc(provider.description);
       row.settingEl.addClass("obsidian-ntfy-channel-row");
-      row.addExtraButton((button) => button
-        .setIcon("settings-2")
-        .setTooltip(this.uiText("编辑 Channel", "Edit channel"))
-        .onClick(() => this.openChannelEditor(channel.id)));
-      row.addExtraButton((button) => button
-        .setIcon("plus")
-        .setTooltip(this.uiText("加入正在使用", "Add to in use"))
-        .onClick(async () => {
-          await this.plugin.addChannelToSettings(channel.id);
-          this.openChannelEditor(channel.id);
-        }));
+      row.addExtraButton((button) => button.setIcon("plus").setTooltip(this.uiText("新增这个来源的账号", "Add an account for this provider")).onClick(() => {
+        this.pendingChannelType = provider.id;
+        this.pendingChannelAccountId = this.plugin.nextChannelAccountId(provider.id);
+        this.pendingChannelName = "";
+        this.addChannelFormOpen = true;
+        this.display();
+      }));
     }
     availableList.createEl("p", {
       cls: "obsidian-ntfy-channel-extension-note",
@@ -4436,6 +5152,8 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       }));
     this.renderChannelOverview(hubGroup);
 
+    // Kept as a migration fallback for legacy settings data; the account editor above is the active UI.
+    if (this.legacyChannelEditorVisible === true) {
     const ntfyGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
     this.renderChannelEditorHeader(ntfyGroup, "ntfy", "ntfy");
     new Setting(ntfyGroup)
@@ -4676,6 +5394,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         });
       });
 
+    }
     const hubStatus = this.plugin.getNotificationHubStatus();
     const deliveryGroup = this.createSettingsSection(
       containerEl,

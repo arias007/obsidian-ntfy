@@ -211,7 +211,7 @@ Set `AI webhook token` if the receiving service expects a Bearer token.
 
 ## Notification Hub And Social Connections
 
-Version `0.6.1` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, and dependency-free channel hub. Its settings separate channels that are in use from available providers and group the remaining options by responsibility.
+Version `0.6.2` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, inbox, deduplication, and quiet queue. It adds OpenClaw-style multi-account channels: every provider can have multiple named accounts with independent credentials, enabled state, and configuration.
 
 The hub uses one **default channel**. Cancip, other Obsidian plugins, and external agents only use the default route unless they explicitly pass channel IDs or request a broadcast. Enabling several connections therefore does not unexpectedly send every message to every service.
 
@@ -219,15 +219,37 @@ Built-in send channels are:
 
 - ntfy
 - Telegram Bot
-- Feishu bot webhook
-- WeCom group bot webhook
-- Discord webhook
-- Slack webhook
+- Feishu/Lark app or bot webhook
+- WeCom app or group bot webhook
+- Discord bot or webhook
+- Slack bot or webhook
 - Matrix Client-Server API
 - Email through a user-provided HTTP gateway
+- OpenClaw Gateway through its authenticated `/tools/invoke` and `message(action=send)` API
+- QQ Bot through OpenClaw or the official QQ Bot `AppID + AppSecret` REST API
+- WeChat through Tencent's `@tencent-weixin/openclaw-weixin` plugin loaded by OpenClaw
 - Generic Webhook for Codex, Claude Code, custom agents, and automation
 
-Personal WeChat is not hard-coded. Enterprise WeChat uses its official group-bot webhook. A future WeChat or other service adapter can register through the public API without changing the core plugin.
+The recommended QQ/WeChat route keeps platform login, inbound WebSocket or long-poll processing, allowlists, account state, and context tokens in OpenClaw. Ntfy Notifications calls the real OpenClaw message tool and keeps only the Gateway URL/token, OpenClaw account ID, and delivery target. QQ can also send directly with the official QQ Bot API; direct mode intentionally does not reimplement OpenClaw's WebSocket receive engine. Existing custom `bridgeUrl` accounts migrate to **Legacy HTTP bridge** without losing credentials.
+
+For WeChat, install and log in on the OpenClaw Gateway host first:
+
+```bash
+openclaw plugins install "@tencent-weixin/openclaw-weixin"
+openclaw config set plugins.entries.openclaw-weixin.enabled true
+openclaw channels login --channel openclaw-weixin
+openclaw gateway restart
+```
+
+For QQ managed by OpenClaw:
+
+```bash
+openclaw plugins install @openclaw/qqbot
+openclaw channels add --channel qqbot --token "AppID:AppSecret"
+openclaw gateway restart
+```
+
+The Gateway's `/tools/invoke` endpoint is an operator surface. Keep it on loopback, a private LAN/tailnet, or another authenticated private ingress; do not publish the Gateway token or endpoint directly to the public internet.
 
 ### Receiving Messages
 
@@ -253,6 +275,6 @@ The public API includes `getStatus`, `getIncomingStatus`, `listChannels`, `send`
 
 ### Delivery Controls
 
-The settings show channels currently in use with their configuration, receive mode, enable switch, edit action, and default-route marker. Additional providers stay in a collapsed available list until added; their connection details can be edited before or after adding. Delivery review, allowlists, attachment limits, quiet hours, reminder scanning, queue timing, content, APIs, and logs are organized into separate collapsible sections. **Send test** creates a simulated event but sends it through the real default channel, so it must arrive on the selected platform. `simulate()` remains available to agents for a no-network, redacted request preview.
+The settings show every active account as its own collapsible configuration block. **Available channels** stays collapsed by default and contains a real add flow for provider, stable account ID, and display name. The same provider can be added repeatedly, for example `feishu:work`, `feishu:personal`, `email:work`, and `email:personal`. In **In use**, enable/disable, make default, remove, and test are compact icon actions beside the account name. Removing an account keeps its credentials for later reuse. Each test icon sends through that exact account; `simulate()` remains available for a no-network, redacted request preview.
 
 Email deliberately uses an HTTP gateway rather than embedding SMTP. This keeps the plugin small and compatible with Obsidian mobile; the gateway can be a provider API or a user's own relay.
