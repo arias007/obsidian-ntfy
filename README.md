@@ -211,15 +211,17 @@ Set `AI webhook token` if the receiving service expects a Bearer token.
 
 ## Notification Hub And Social Connections
 
-Version `0.6.9` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, review flow, inbox, deduplication, and quiet queue. Every built-in provider can have multiple named accounts with independent credentials, send/receive state, configuration, cursors, and a per-account test action.
+Version `0.6.10` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, review flow, inbox, deduplication, and quiet queue. Every built-in provider can have multiple named accounts with independent credentials, send/receive state, configuration, cursors, and a per-account test action.
 
 Channel status now separates required-field completion, credential verification, runtime receive connection, and proactive-send readiness. It records redacted failures plus the latest inbound/outbound activity, refreshes the account summary as soon as edited values are saved, and suppresses repeated identical connection errors. Realtime connections and low-frequency polling stay active while Obsidian remains runnable in the background by default; mobile operating systems can still suspend or stop Obsidian, and returning to the foreground reconnects immediately.
 
 Replies from the inbox use the destination carried by the received message, so a receive-only account can answer its original conversation without duplicating that conversation ID in proactive-send settings. An open manager view also refreshes its inbox count and message list as messages arrive.
 
-Feishu inbox replies use the official reply endpoint for the original message and require a real returned message ID before reporting success. This keeps replies attached to the source message and prevents malformed or incomplete API responses from being treated as successful delivery. When no proactive destination is configured, the account test replies to the latest received conversation; if neither target exists, it reports the missing destination instead of claiming that a message was sent.
+Feishu inbox replies use the official reply endpoint for the original message and require a real returned message ID before reporting success. This keeps replies attached to the source message and prevents malformed or incomplete API responses from being treated as successful delivery. When no proactive destination is configured, normal tests, reminders, and API notifications send a new message to the latest received conversation; explicit inbox replies still use reply semantics. If neither target exists, the plugin reports the missing destination instead of claiming that a message was sent.
 
 The hub uses one **default channel**. Cancip, other Obsidian plugins, and external agents only use the default route unless they explicitly pass channel IDs or request a broadcast. Enabling several connections therefore does not unexpectedly send every message to every service.
+
+Telegram, Feishu, WeCom, Discord, Slack, Matrix, QQ Bot, and Email accounts can reuse the destination from their latest real inbound conversation when their credentials are complete but no static proactive target is configured. Channel status marks this route explicitly. Broadcasts report `partial` with `ok: false` if any selected channel fails, while preserving each per-channel result so callers never mistake partial delivery for full success.
 
 Built-in send channels are:
 
@@ -294,9 +296,13 @@ const unregister = hub?.registerIncomingHandler("cancip", async (message, contex
 
 If Cancip loads before Ntfy Notifications, it can listen for the workspace event `notification-hub:ready` and register when the API becomes available. Every accepted message also emits `notification-hub:incoming` for lightweight observers; the configured incoming consumer remains the authoritative model/session handler.
 
-The public API includes `getStatus`, `getIncomingStatus`, `listChannels`, `send`, `simulate`, `receive`, `pollIncoming`, `retryIncoming`, `removeIncoming`, `clearIncoming`, `registerChannel`, and `registerIncomingHandler`. External desktop agents can use the local `obsidian://notification-hub` URI templates shown by **Copy setup** in the settings. The URI is protected by a local token and a small request rate limit; the in-plugin API does not need that token.
+The public API includes `getStatus`, `getCapabilities`, `listChannels`, `send`, `schedule`, `simulate`, `test`, `receive`, `reply`, inbox polling/retry/removal methods, scheduled-delivery listing/cancellation, reminder listing/add/update/removal/send/scan methods, dynamic Channel and incoming-consumer registration, and manager/settings open methods. External desktop agents can use the local `obsidian://notification-hub` URI templates shown by **Copy setup** in the settings. The URI supports `send`, `schedule`, `simulate`, `test`, `receive`, `reply`, and `reminder`; it is protected by a local token and a small request rate limit. The in-plugin API does not need that token.
 
 ### Delivery Controls
+
+Future notifications for providers without a remote scheduling API are retained in the bounded local outbound queue and delivered when due. Overlapping queue entries for the same notification are merged, cancelling one Channel leaves the other destinations intact, and a partial queued broadcast retains only the channels that did not confirm delivery.
+
+Provider-backed sends require their normal receipt before success is reported: ntfy returns an ID; Telegram returns `message_id`; Feishu/Lark returns `data.message_id`; WeCom app returns `msgid`; Discord bot returns an ID; Slack bot returns `ts`; Matrix returns `event_id`; and QQ Bot returns a message ID. Generic webhooks, provider webhook modes, and Email gateways use successful HTTP completion because they do not share one portable receipt schema.
 
 The settings show every active account as its own collapsible configuration block. **Available channels** stays collapsed by default and contains a real add flow for provider, stable account ID, and display name. The same provider can be added repeatedly, for example `feishu:work`, `feishu:personal`, `email:work`, and `email:personal`. In **In use**, enable/disable, make default, remove, and test are compact icon actions beside the account name. Removing an account keeps its credentials for later reuse. Each test icon sends through that exact account; `simulate()` remains available for a no-network, redacted request preview.
 

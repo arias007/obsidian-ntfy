@@ -273,9 +273,90 @@ async function run() {
   };
   const feishuTestResult = await replyOnlyFeishuPlugin.sendTestNotification({ channelId: "feishu:reply", simulatedEvent: true });
   assert.equal(feishuTestResult.ok, true);
-  assert.equal(testRequests[1].url.endsWith("/open-apis/im/v1/messages/om_latest_inbound/reply"), true);
-  assert.match(JSON.parse(JSON.parse(testRequests[1].body).content).text, /^来自 Obsidian 的真实测试消息/);
+  assert.equal(new URL(testRequests[1].url).searchParams.get("receive_id_type"), "chat_id");
+  const testRequestBody = JSON.parse(testRequests[1].body);
+  assert.equal(testRequestBody.receive_id, "oc_runtime");
+  assert.match(JSON.parse(testRequestBody.content).text, /来自 Obsidian 的真实测试消息/);
   assert.ok(notices.some((message) => message.includes("test sent through feishu:reply")));
+  const replyRoute = replyOnlyFeishuPlugin.listNotificationChannels().find((channel) => channel.id === "feishu:reply");
+  assert.equal(replyRoute.runtimeTargetAvailable, true);
+  assert.equal(replyRoute.deliveryReady, true);
+  await replyOnlyFeishuPlugin.setDefaultNotificationChannel("feishu:reply");
+  assert.equal(replyOnlyFeishuPlugin.getNotificationHubStatus().ready, true);
+
+  const reminderRequests = [];
+  replyOnlyFeishuPlugin.httpRequest = async (request) => {
+    reminderRequests.push(request);
+    if (request.url.includes("tenant_access_token")) return { json: { code: 0, tenant_access_token: "tenant-token" } };
+    return { json: { code: 0, data: { message_id: "om_reminder" } } };
+  };
+  const reminderResults = await replyOnlyFeishuPlugin.publishReminder({
+    key: "feishu-reminder",
+    due: new Date(),
+    text: "Reminder through Feishu",
+    filePath: "Tasks.md",
+    lineNumber: 3,
+    source: "test",
+  }, false);
+  assert.equal(reminderResults[0].status, "sent");
+  assert.equal(JSON.parse(reminderRequests[1].body).receive_id, "oc_runtime");
+
+  const scheduledAt = new Date(Date.now() + 60_000).toISOString();
+  const scheduledResult = await replyOnlyFeishuPlugin.scheduleNotification({
+    id: "scheduled-feishu",
+    title: "Scheduled",
+    message: "Later",
+    scheduledAt,
+    channelIds: ["feishu:reply"],
+  });
+  assert.equal(scheduledResult.results[0].status, "deferred");
+  assert.equal(replyOnlyFeishuPlugin.listScheduledNotifications().length, 1);
+  replyOnlyFeishuPlugin.settings.outboundQueue[0].notification.scheduledAt = new Date(Date.now() - 2_000).toISOString();
+  await replyOnlyFeishuPlugin.flushOutboundQueue();
+  assert.equal(replyOnlyFeishuPlugin.listScheduledNotifications().length, 0);
+  const hubApi = replyOnlyFeishuPlugin.createNotificationHubApi();
+  assert.equal(typeof hubApi.test, "function");
+  assert.equal(typeof hubApi.reply, "function");
+  assert.equal(typeof hubApi.schedule, "function");
+  assert.equal(typeof hubApi.addReminder, "function");
+  replyOnlyFeishuPlugin.updateStatusCount = () => {};
+  const apiReminder = await hubApi.addReminder({ text: "API reminder", due: new Date(Date.now() + 120_000).toISOString() });
+  assert.equal(apiReminder.status, "queued");
+  assert.equal(hubApi.listReminders().some((item) => item.id === apiReminder.id), true);
+  const apiReminderSent = await hubApi.sendReminderNow(apiReminder.id);
+  assert.equal(apiReminderSent.ok, true);
+  assert.equal(apiReminderSent.results[0].messageId, "om_reminder");
+  assert.equal(hubApi.listReminders().some((item) => item.id === apiReminder.id), false);
+
+  const queuedDeliveryPlugin = createPlugin({ topic: "queued-delivery" });
+  queuedDeliveryPlugin.registerNotificationChannel({ id: "queue-pass", send: async () => ({ id: "pass-receipt" }) });
+  queuedDeliveryPlugin.registerNotificationChannel({ id: "queue-fail", send: async () => { throw new Error("temporary failure"); } });
+  const queuedNotification = queuedDeliveryPlugin.normalizeHubNotification({
+    id: "queued-broadcast",
+    title: "Queued broadcast",
+    message: "Deliver once",
+    scheduledAt: new Date(Date.now() - 2_000).toISOString(),
+  });
+  queuedDeliveryPlugin.queueOutboundDelivery(queuedNotification, ["queue-pass", "queue-fail"]);
+  queuedDeliveryPlugin.queueOutboundDelivery(queuedNotification, ["queue-pass"]);
+  assert.equal(queuedDeliveryPlugin.listScheduledNotifications().length, 1);
+  assert.deepEqual(queuedDeliveryPlugin.listScheduledNotifications()[0].channelIds, ["queue-fail", "queue-pass"]);
+  await queuedDeliveryPlugin.flushOutboundQueue();
+  assert.deepEqual(queuedDeliveryPlugin.listScheduledNotifications()[0].channelIds, ["queue-fail"]);
+
+  queuedDeliveryPlugin.settings.outboundQueue = [];
+  queuedDeliveryPlugin.queueOutboundDelivery(queuedNotification, ["queue-pass", "queue-fail"]);
+  const cancelOneChannel = await queuedDeliveryPlugin.cancelScheduledNotification("queued-broadcast", "queue-pass");
+  assert.equal(cancelOneChannel.removed, 1);
+  assert.deepEqual(queuedDeliveryPlugin.listScheduledNotifications()[0].channelIds, ["queue-fail"]);
+
+  const partialBroadcast = await queuedDeliveryPlugin.dispatchNotification(queuedNotification, {
+    channelIds: ["queue-pass", "queue-fail"],
+    simulate: false,
+  });
+  assert.equal(partialBroadcast.ok, false);
+  assert.equal(partialBroadcast.status, "partial");
+  assert.equal(partialBroadcast.results.filter((item) => item.ok).length, 1);
 
   const targetlessFeishuPlugin = createPlugin({ topic: "feishu-targetless" });
   await targetlessFeishuPlugin.addChannelToSettings("feishu", { accountId: "targetless", name: "Feishu Targetless" });
@@ -376,6 +457,13 @@ async function run() {
   const wecomAppResult = await appChannelPlugin.sendNotification({ title: "App", message: "WeCom", channelIds: ["wecom:app"] });
   assert.equal(wecomAppResult.results[0].status, "sent");
   assert.equal(JSON.parse(wecomRequests[1].body).touser, "murat");
+  appChannelPlugin.httpRequest = async (request) => request.url.includes("gettoken")
+    ? { json: { errcode: 0, access_token: "wecom-token" } }
+    : { json: { errcode: 0 } };
+  await assert.rejects(
+    appChannelPlugin.sendNotification({ title: "App", message: "WeCom missing receipt", channelIds: ["wecom:app"] }),
+    /WeCom message send returned no message ID/
+  );
 
   await appChannelPlugin.addChannelToSettings("discord", { accountId: "bot", name: "Discord Bot" });
   await appChannelPlugin.updateChannelAccount("discord:bot", { config: { mode: "bot", botToken: "discord-secret", channelId: "12345" } });
@@ -390,6 +478,23 @@ async function run() {
   assert.equal(JSON.parse(telegramPreview.results[0].request.body).chat_id, "-100123");
   assert.equal(appChannelPlugin.listNotificationChannels().find((channel) => channel.id === "telegram:work").receiveMode, "poll");
   assert.equal(JSON.stringify(telegramPreview).includes("telegram-secret"), false);
+  appChannelPlugin.httpRequest = async () => ({ json: { ok: true, result: { message_id: 321 } } });
+  const telegramResult = await appChannelPlugin.sendNotification({ title: "Bot", message: "Telegram", channelIds: ["telegram:work"] });
+  assert.equal(telegramResult.results[0].messageId, "321");
+  appChannelPlugin.httpRequest = async () => ({ json: { ok: true, result: {} } });
+  await assert.rejects(
+    appChannelPlugin.sendNotification({ title: "Bot", message: "Telegram missing receipt", channelIds: ["telegram:work"] }),
+    /Telegram message send returned no message ID/
+  );
+
+  appChannelPlugin.httpRequest = async () => ({ json: { id: "discord-message" } });
+  const discordResult = await appChannelPlugin.sendNotification({ title: "Bot", message: "Discord", channelIds: ["discord:bot"] });
+  assert.equal(discordResult.results[0].messageId, "discord-message");
+  appChannelPlugin.httpRequest = async () => ({ json: {} });
+  await assert.rejects(
+    appChannelPlugin.sendNotification({ title: "Bot", message: "Discord missing receipt", channelIds: ["discord:bot"] }),
+    /Discord message send returned no message ID/
+  );
 
   await appChannelPlugin.addChannelToSettings("slack", { accountId: "bot", name: "Slack Bot" });
   await appChannelPlugin.updateChannelAccount("slack:bot", { config: { mode: "bot", botToken: "xoxb-slack-secret", channelId: "C123" } });
@@ -399,6 +504,14 @@ async function run() {
   assert.equal(JSON.stringify(slackPreview).includes("slack-secret"), false);
   const slackReplyPreview = await appChannelPlugin.simulateNotification({ title: "Reply", message: "Slack", channelIds: ["slack:bot"], metadata: { channelId: "C-INCOMING", threadTs: "171.25" } });
   assert.deepEqual(JSON.parse(slackReplyPreview.results[0].request.body), { channel: "C-INCOMING", text: "Reply\nSlack", thread_ts: "171.25" });
+  appChannelPlugin.httpRequest = async () => ({ json: { ok: true, ts: "171.99" } });
+  const slackResult = await appChannelPlugin.sendNotification({ title: "Bot", message: "Slack", channelIds: ["slack:bot"] });
+  assert.equal(slackResult.results[0].messageId, "171.99");
+  appChannelPlugin.httpRequest = async () => ({ json: { ok: true } });
+  await assert.rejects(
+    appChannelPlugin.sendNotification({ title: "Bot", message: "Slack missing receipt", channelIds: ["slack:bot"] }),
+    /Slack message send returned no timestamp/
+  );
 
   const discordReplyPreview = await appChannelPlugin.simulateNotification({ title: "Reply", message: "Discord", channelIds: ["discord:bot"], metadata: { channelId: "98765" } });
   assert.equal(discordReplyPreview.results[0].request.url.endsWith("/channels/98765/messages"), true);
@@ -409,6 +522,14 @@ async function run() {
   assert.equal(matrixPreview.results[0].request.method, "PUT");
   assert.equal(matrixPreview.results[0].request.url.includes("/_matrix/client/v3/rooms/"), true);
   assert.equal(JSON.stringify(matrixPreview).includes("matrix-secret"), false);
+  appChannelPlugin.httpRequest = async () => ({ json: { event_id: "$matrix-event" } });
+  const matrixResult = await appChannelPlugin.sendNotification({ title: "Bot", message: "Matrix", channelIds: ["matrix:work"] });
+  assert.equal(matrixResult.results[0].messageId, "$matrix-event");
+  appChannelPlugin.httpRequest = async () => ({ json: {} });
+  await assert.rejects(
+    appChannelPlugin.sendNotification({ title: "Bot", message: "Matrix missing receipt", channelIds: ["matrix:work"] }),
+    /Matrix message send returned no event ID/
+  );
 
   await appChannelPlugin.addChannelToSettings("qqbot", { accountId: "official", name: "QQ Official" });
   await appChannelPlugin.updateChannelAccount("qqbot:official", { config: { appId: "qq-app", clientSecret: "qq-secret", targetType: "c2c", target: "default-openid" } });
@@ -425,6 +546,11 @@ async function run() {
   await appChannelPlugin.sendNotification({ title: "Reply", message: "QQ DM", channelIds: ["qqbot:official"], metadata: { qqTargetType: "dms", qqTarget: "guild-id", messageId: "dm-message" } });
   assert.equal(qqRequests[2].url.endsWith("/dms/guild-id/messages"), true);
   assert.deepEqual(JSON.parse(qqRequests[2].body), { content: "Reply\nQQ DM", msg_id: "dm-message" });
+  appChannelPlugin.httpRequest = async () => ({ json: {} });
+  await assert.rejects(
+    appChannelPlugin.sendNotification({ title: "Reply", message: "QQ missing receipt", channelIds: ["qqbot:official"] }),
+    /QQ Bot message send returned no message ID/
+  );
 
   await appChannelPlugin.addChannelToSettings("webhook", { accountId: "agent", name: "Agent Webhook" });
   await appChannelPlugin.updateChannelAccount("webhook:agent", { config: { url: "https://agent.example/receive", token: "webhook-secret", customHeaders: '{"X-API-Key":"header-secret"}', receiveUrl: "https://relay.example/inbox", receiveToken: "relay-secret" } });
@@ -746,6 +872,11 @@ async function run() {
   assert.equal(sentRequest.url, "https://ntfy.sh/test-topic");
   assert.equal(plugin.getChannelAccount("ntfy").config.receivedIds.includes("ntfy-server-id"), true);
   assert.ok(notices.some((message) => message.includes("test sent through ntfy")));
+  plugin.httpRequest = async () => ({ json: {} });
+  await assert.rejects(
+    plugin.sendNotification({ title: "Missing", message: "ntfy receipt", channelIds: ["ntfy"] }),
+    /ntfy message send returned no message ID/
+  );
 
   process.stdout.write("notification-hub tests passed\n");
 }

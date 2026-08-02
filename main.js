@@ -800,8 +800,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       getCapabilities: () => this.getNotificationHubCapabilities(),
       listChannels: () => this.listNotificationChannels(),
       send: (input) => this.sendNotification(input || {}),
+      schedule: (input) => this.scheduleNotification(input || {}),
       simulate: (input) => this.simulateNotification(input || {}),
+      test: (channelId) => this.sendTestNotification({ channelId: channelId || this.settings.defaultChannelId, simulatedEvent: true }),
       receive: (input) => this.ingestIncomingMessage(input || {}),
+      reply: (messageId, replyText, channelId) => this.replyToStoredIncomingMessage(messageId, replyText, channelId),
       listIncomingMessages: () => [...(this.settings.incomingMessages || [])],
       getIncomingStatus: () => this.getIncomingStatus(),
       pollIncoming: (options) => this.runIncomingPoll(options || {}),
@@ -809,12 +812,21 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       removeIncoming: (messageId, channelId) => this.removeIncomingMessage(messageId, channelId),
       clearIncoming: () => this.clearIncomingMessages(),
       getConnectionLogs: () => [...(this.settings.connectionLogs || [])],
+      listScheduled: () => this.listScheduledNotifications(),
+      cancelScheduled: (notificationId, channelId) => this.cancelScheduledNotification(notificationId, channelId),
+      listReminders: () => [...(this.settings.queue || [])],
+      addReminder: (input) => this.addApiReminder(input || {}),
+      updateReminder: (id, patch) => this.updateQueueItem(id, patch || {}),
+      removeReminder: (id) => this.deleteQueueItem(id),
+      sendReminderNow: (id) => this.sendQueueItemNow(id),
+      scanReminders: () => this.scanAndSchedule({ showNotice: false }),
       registerChannel: (adapter) => this.registerNotificationChannel(adapter),
       unregisterChannel: (channelId) => this.unregisterNotificationChannel(channelId),
       registerIncomingHandler: (consumerId, handler) => this.registerIncomingMessageHandler(consumerId, handler),
       unregisterIncomingHandler: (consumerId) => this.unregisterIncomingMessageHandler(consumerId),
       getAgentConnectionInfo: () => this.getAgentConnectionInfo(),
       openSettings: () => this.openPluginSettings(),
+      openManager: () => this.openNtfyManager(),
     });
   }
 
@@ -835,6 +847,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       broadcastRouting: true,
       simulation: true,
       delayedDelivery: true,
+      scheduledQueue: true,
+      reminderQueue: true,
+      channelTesting: true,
+      messageReplies: true,
+      recentConversationRouting: true,
+      verifiedDeliveryReceipts: true,
       dynamicChannelRegistration: true,
       incomingMessages: true,
       incomingConsumerRegistration: true,
@@ -853,10 +871,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const defaultChannel = channels.find((channel) => channel.id === this.settings.defaultChannelId) || null;
     return {
       apiVersion: NOTIFICATION_HUB_API_VERSION,
-      ready: Boolean(defaultChannel && defaultChannel.enabled && defaultChannel.sendConfigured),
+      ready: Boolean(defaultChannel && defaultChannel.deliveryReady),
       defaultChannelId: this.settings.defaultChannelId,
-      enabledChannelIds: channels.filter((channel) => channel.enabled && channel.sendConfigured).map((channel) => channel.id),
+      enabledChannelIds: channels.filter((channel) => channel.deliveryReady).map((channel) => channel.id),
       channelCount: channels.length,
+      scheduledCount: (this.settings.outboundQueue || []).length,
+      reminderCount: (this.settings.queue || []).length,
       incoming: this.getIncomingStatus(),
     };
   }
@@ -1127,7 +1147,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
           ? "paused-background"
           : socketState && socketState.status || (health.verificationState === "failed" ? "failed" : "disconnected")
         : receiveMode;
-      return {
+      const descriptor = {
         id: account.id,
         type: account.type,
         accountId: account.accountId,
@@ -1151,6 +1171,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         connectionError: health.lastError || (latestError && latestError.details ? String(latestError.details.error || "") : ""),
         builtin: true,
       };
+      descriptor.runtimeTargetAvailable = Boolean(this.recentChannelTargetMetadata(descriptor));
+      descriptor.deliveryReady = Boolean(descriptor.enabled && (descriptor.sendConfigured || descriptor.runtimeTargetAvailable));
+      return descriptor;
     });
   }
 
@@ -1163,7 +1186,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       } catch (_) {
         available = false;
       }
-      channels.push({
+      const descriptor = {
         id,
         name: String(adapter.name || id),
         enabled: this.settings.socialHubEnabled !== false && adapter.enabled !== false,
@@ -1173,7 +1196,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         canReceive: typeof adapter.receive === "function" || typeof adapter.reply === "function",
         receiveMode: adapter.receiveMode || "adapter",
         builtin: false,
-      });
+      };
+      descriptor.runtimeTargetAvailable = false;
+      descriptor.deliveryReady = Boolean(descriptor.enabled && descriptor.sendConfigured);
+      channels.push(descriptor);
     }
     return channels;
   }
@@ -1291,22 +1317,106 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     });
   }
 
+  queueOutboundDelivery(notification, channelIds, options = {}) {
+    const channels = [...new Set((channelIds || []).map((id) => String(id || "").trim().toLowerCase()).filter(Boolean))].sort();
+    if (!channels.length) return;
+    const reason = String(options.reason || "scheduled");
+    const allowRuntimeTarget = options.allowRuntimeTarget === true;
+    const allowRecentTarget = options.allowRecentTarget !== false;
+    const scheduledAt = String(notification && notification.scheduledAt || "");
+    const compatible = (existing) => Boolean(
+      existing
+      && existing.notification
+      && existing.notification.id === notification.id
+      && String(existing.notification.scheduledAt || "") === scheduledAt
+      && String(existing.reason || "scheduled") === reason
+      && existing.allowRuntimeTarget === allowRuntimeTarget
+      && (existing.allowRecentTarget !== false) === allowRecentTarget
+    );
+    const matching = (this.settings.outboundQueue || []).filter(compatible);
+    const mergedChannels = [...new Set([
+      ...channels,
+      ...matching.flatMap((existing) => existing.channelIds || []),
+    ])].sort();
+    const item = {
+      id: `${notification.id}:${reason}:${this.hash(scheduledAt || "ready")}:${mergedChannels.join(",")}`,
+      notification,
+      channelIds: mergedChannels,
+      allowRuntimeTarget,
+      allowRecentTarget,
+      reason,
+      createdAt: matching.map((existing) => existing.createdAt).filter(Boolean).sort()[0] || new Date().toISOString(),
+    };
+    const queue = (this.settings.outboundQueue || []).filter((existing) => !compatible(existing));
+    this.settings.outboundQueue = [...queue, item].slice(-200);
+  }
+
+  listScheduledNotifications() {
+    return (this.settings.outboundQueue || []).map((item) => ({
+      id: item.id,
+      notificationId: item.notification && item.notification.id || item.id,
+      title: item.notification && item.notification.title || "",
+      message: item.notification && item.notification.message || "",
+      scheduledAt: item.notification && item.notification.scheduledAt || "",
+      channelIds: [...(item.channelIds || [])],
+      reason: item.reason || "queued",
+      createdAt: item.createdAt || "",
+    }));
+  }
+
+  async cancelScheduledNotification(notificationId, channelId = "") {
+    const id = String(notificationId || "").trim();
+    const channel = String(channelId || "").trim().toLowerCase();
+    let removed = 0;
+    const remaining = [];
+    for (const item of this.settings.outboundQueue || []) {
+      const matchesId = item.id === id || item.notification && item.notification.id === id;
+      if (!matchesId) {
+        remaining.push(item);
+        continue;
+      }
+      if (!channel) {
+        removed += Math.max(1, (item.channelIds || []).length);
+        continue;
+      }
+      const channelIds = (item.channelIds || []).filter((itemChannelId) => itemChannelId !== channel);
+      if (channelIds.length === (item.channelIds || []).length) {
+        remaining.push(item);
+        continue;
+      }
+      removed += 1;
+      if (channelIds.length) remaining.push(Object.assign({}, item, { channelIds }));
+    }
+    this.settings.outboundQueue = remaining;
+    if (removed) await this.saveSettings();
+    return { ok: removed > 0, status: removed ? "cancelled" : "not-found", removed };
+  }
+
   async flushOutboundQueue() {
     if (this.isQuietHours() || !(this.settings.outboundQueue || []).length) return false;
     const pending = [...this.settings.outboundQueue];
     const remaining = [];
     let changed = false;
     for (const item of pending) {
+      const due = new Date(item.notification && item.notification.scheduledAt || 0).getTime();
+      if (Number.isFinite(due) && due > Date.now() + 1000) {
+        remaining.push(item);
+        continue;
+      }
       try {
         const result = await this.dispatchNotification(item.notification, {
           channelIds: item.channelIds,
           simulate: false,
           allowRuntimeTarget: item.allowRuntimeTarget === true,
+          allowRecentTarget: item.allowRecentTarget !== false,
         });
         for (const delivery of result.results) {
           this.recordConnectionLog(delivery.ok ? "info" : "error", delivery.channelId, `Queued notification ${delivery.status}`, { notificationId: item.id, error: delivery.error || "" });
         }
-        changed = true;
+        const deliveredChannels = new Set(result.results.filter((delivery) => delivery.ok).map((delivery) => delivery.channelId));
+        const failedChannels = (item.channelIds || []).filter((channelId) => !deliveredChannels.has(channelId));
+        if (failedChannels.length) remaining.push(Object.assign({}, item, { channelIds: failedChannels }));
+        if (deliveredChannels.size) changed = true;
       } catch (error) {
         remaining.push(item);
         this.recordConnectionLog("error", "hub", "Queued notification failed", { notificationId: item.id, error: error.message || String(error) });
@@ -1492,6 +1602,16 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     });
   }
 
+  async replyToStoredIncomingMessage(messageId, replyText, channelId = "") {
+    const id = String(messageId || "").trim();
+    const channel = String(channelId || "").trim().toLowerCase();
+    const message = (this.settings.incomingMessages || []).find((item) => String(item.id || "") === id && (!channel || item.channelId === channel));
+    if (!message) throw new Error("Incoming message was not found.");
+    const text = String(replyText || "").trim();
+    if (!text) throw new Error("Reply text is required.");
+    return await this.replyToIncomingMessage(message, text);
+  }
+
   latestReplyableIncomingMessage(channel) {
     if (!channel) return null;
     const adapter = this.externalChannelAdapters.get(channel.id);
@@ -1502,8 +1622,28 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     }) || null;
   }
 
+  recentChannelTargetMetadata(channel) {
+    const message = this.latestReplyableIncomingMessage(channel);
+    if (!message) return null;
+    const metadata = Object.assign({}, message.metadata || {});
+    delete metadata.messageId;
+    delete metadata.replyTo;
+    delete metadata.threadTs;
+    if (channel.type === "telegram") metadata.chatId = metadata.chatId || message.conversationId;
+    if (channel.type === "feishu") {
+      metadata.feishuReceiveIdType = metadata.feishuReceiveIdType || "chat_id";
+      metadata.feishuReceiveId = metadata.feishuReceiveId || message.conversationId;
+    }
+    if (channel.type === "wecom") metadata.wecomTarget = metadata.wecomTarget || message.conversationId;
+    if (channel.type === "discord" || channel.type === "slack") metadata.channelId = metadata.channelId || message.conversationId;
+    if (channel.type === "matrix") metadata.roomId = metadata.roomId || message.conversationId;
+    if (channel.type === "qqbot") metadata.qqTarget = metadata.qqTarget || message.conversationId;
+    if (channel.type === "email") metadata.emailReplyTo = metadata.emailReplyTo || metadata.emailFrom || message.sender;
+    return this.hasRuntimeChannelTarget(channel, { metadata }) ? metadata : null;
+  }
+
   channelHasTestTarget(channel) {
-    return Boolean(channel && (channel.sendConfigured || this.latestReplyableIncomingMessage(channel)));
+    return Boolean(channel && (channel.sendConfigured || channel.runtimeTargetAvailable || this.recentChannelTargetMetadata(channel)));
   }
 
   async runIncomingPoll(options = {}) {
@@ -2394,7 +2534,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (uniqueRequested.length) return uniqueRequested;
     if (input.broadcast === true) {
       return this.listNotificationChannels()
-        .filter((channel) => channel.enabled && channel.sendConfigured)
+        .filter((channel) => channel.deliveryReady)
         .map((channel) => channel.id);
     }
     return [String(this.settings.defaultChannelId || "ntfy")];
@@ -2436,13 +2576,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       if (!approved) return { ok: false, status: "rejected", notificationId: notification.id, results: [] };
     }
     if (this.isQuietHours() && input.bypassQuiet !== true && notification.priority !== "5") {
-      this.settings.outboundQueue = [...(this.settings.outboundQueue || []), {
-        id: notification.id,
-        notification,
-        channelIds,
+      this.queueOutboundDelivery(notification, channelIds, {
         allowRuntimeTarget: input.allowRuntimeTarget === true,
-        createdAt: new Date().toISOString(),
-      }].slice(-200);
+        allowRecentTarget: input.allowRecentTarget !== false,
+        reason: "quiet-hours",
+      });
       this.recordConnectionLog("info", "hub", "Outgoing notification queued for quiet hours", { notificationId: notification.id, channelIds });
       await this.saveSettings();
       return { ok: true, status: "queued-quiet-hours", notificationId: notification.id, results: [] };
@@ -2451,7 +2589,15 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       channelIds,
       simulate: false,
       allowRuntimeTarget: input.allowRuntimeTarget === true,
+      allowRecentTarget: input.allowRecentTarget !== false,
     });
+    for (const item of result.results.filter((delivery) => delivery.ok && delivery.status === "deferred")) {
+      this.queueOutboundDelivery(notification, [item.channelId], {
+        allowRuntimeTarget: input.allowRuntimeTarget === true,
+        allowRecentTarget: input.allowRecentTarget !== false,
+        reason: "scheduled",
+      });
+    }
     for (const item of result.results) {
       this.recordConnectionLog(item.ok ? "info" : "error", item.channelId, `Outgoing notification ${item.status}`, { notificationId: notification.id, error: item.error || "" });
       if (item.ok && ["sent", "scheduled"].includes(item.status)) {
@@ -2476,7 +2622,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       channelIds: this.resolveChannelIds(input),
       simulate: true,
       allowUnconfigured: true,
+      allowRecentTarget: input.allowRecentTarget !== false,
     });
+  }
+
+  async scheduleNotification(input = {}) {
+    const scheduledAt = new Date(input.scheduledAt || input.due || 0);
+    if (Number.isNaN(scheduledAt.getTime())) throw new Error("A valid scheduledAt or due time is required.");
+    return await this.sendNotification(Object.assign({}, input, { scheduledAt: scheduledAt.toISOString() }));
   }
 
   async dispatchNotification(notification, options = {}) {
@@ -2493,7 +2646,17 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         results.push({ channelId, ok: false, status: "unsupported", error: "Unknown notification channel." });
         continue;
       }
-      const hasRuntimeTarget = options.allowRuntimeTarget === true && this.hasRuntimeChannelTarget(descriptor, notification);
+      let deliveryNotification = notification;
+      if (descriptor.builtin && !descriptor.sendConfigured && options.allowRecentTarget !== false) {
+        const recentMetadata = this.recentChannelTargetMetadata(descriptor);
+        if (recentMetadata) {
+          deliveryNotification = Object.assign({}, notification, {
+            metadata: Object.assign({}, recentMetadata, notification.metadata || {}),
+          });
+        }
+      }
+      const hasRuntimeTarget = (options.allowRuntimeTarget === true || options.allowRecentTarget !== false)
+        && this.hasRuntimeChannelTarget(descriptor, deliveryNotification);
       if (!options.allowUnconfigured && (!descriptor.enabled || (!descriptor.sendConfigured && !hasRuntimeTarget))) {
         results.push({ channelId, ok: false, status: "not-configured", error: "Channel is disabled or not configured." });
         continue;
@@ -2505,7 +2668,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
       try {
         if (descriptor.builtin) {
-          const request = this.buildBuiltinChannelRequest(descriptor, notification, { simulate: options.simulate });
+          const request = this.buildBuiltinChannelRequest(descriptor, deliveryNotification, { simulate: options.simulate });
           if (options.simulate) {
             results.push({ channelId, ok: true, status: "simulated", request: this.redactChannelRequest(request) });
           } else {
@@ -2518,11 +2681,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         if (!adapter) throw new Error("Channel adapter is no longer registered.");
         if (options.simulate) {
           const preview = typeof adapter.simulate === "function"
-            ? await adapter.simulate(notification, { app: this.app, plugin: this })
-            : { channelId, title: notification.title, message: notification.message };
+            ? await adapter.simulate(deliveryNotification, { app: this.app, plugin: this })
+            : { channelId, title: deliveryNotification.title, message: deliveryNotification.message };
           results.push({ channelId, ok: true, status: "simulated", request: preview });
         } else {
-          const result = await adapter.send(notification, { app: this.app, plugin: this });
+          const result = await adapter.send(deliveryNotification, { app: this.app, plugin: this });
           results.push({ channelId, ok: true, status: "sent", result: result === undefined ? null : result });
         }
       } catch (error) {
@@ -2530,13 +2693,23 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       }
     }
 
-    const ok = results.some((result) => result.ok);
-    if (!ok && !options.simulate) {
+    const anyOk = results.some((result) => result.ok);
+    const ok = results.length > 0 && results.every((result) => result.ok);
+    if (!anyOk && !options.simulate) {
       const error = new Error(results.map((result) => `${result.channelId}: ${result.error || result.status}`).join("; "));
       error.results = results;
       throw error;
     }
-    return { ok, simulated: options.simulate === true, notificationId: notification.id, results };
+    const status = options.simulate === true
+      ? ok ? "simulated" : "partial"
+      : ok && results.every((result) => result.status === "deferred")
+      ? "deferred"
+      : ok
+      ? "completed"
+      : anyOk
+      ? "partial"
+      : "failed";
+    return { ok, status, simulated: options.simulate === true, notificationId: notification.id, results };
   }
 
   hasRuntimeChannelTarget(descriptor, notification) {
@@ -2886,8 +3059,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       });
       const json = await this.responseJson(response);
       const code = json && (json.code !== undefined ? json.code : json.err_code);
-      if (code !== undefined && Number(code) !== 0) throw new Error(json.message || json.msg || `QQ Bot error ${code}`);
-      return { channelId, ok: true, status: "sent", messageId: json && (json.id || json.message_id) || "" };
+      if (!json || code !== undefined && Number(code) !== 0) throw new Error(json && (json.message || json.msg) || `QQ Bot error ${code === undefined ? "invalid response" : code}`);
+      const messageId = String(json.id || json.message_id || "").trim();
+      if (!messageId) throw new Error("QQ Bot message send returned no message ID.");
+      return { channelId, ok: true, status: "sent", messageId };
     }
     if (request.channelAction === "feishu-app") {
       const config = request.config || {};
@@ -2940,31 +3115,58 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         throw: true,
       });
       const json = await this.responseJson(response);
-      if (json && Number(json.errcode || 0) !== 0) throw new Error(json.errmsg || `WeCom error ${json.errcode}`);
-      return { channelId, ok: true, status: "sent", messageId: json && json.msgid || "" };
+      if (!json || Number(json.errcode || 0) !== 0) throw new Error(json && json.errmsg || `WeCom error ${json && json.errcode !== undefined ? json.errcode : "invalid response"}`);
+      const messageId = String(json.msgid || "").trim();
+      if (!messageId) throw new Error("WeCom message send returned no message ID.");
+      return { channelId, ok: true, status: "sent", messageId };
     }
     const channelMeta = request.channelMeta || {};
     const httpOptions = Object.assign({}, request);
     delete httpOptions.channelMeta;
     const response = await this.httpRequest(httpOptions);
     const json = await this.responseJson(response);
-    if (channelType === "ntfy" && json && json.id) {
+    const mode = String(descriptor.config && descriptor.config.mode || "").trim().toLowerCase();
+    if (channelType === "ntfy") {
+      const messageId = String(json && json.id || "").trim();
+      if (!messageId) throw new Error("ntfy message send returned no message ID.");
       const account = this.getChannelAccount(channelId);
       if (account) {
         const known = new Set(account.config && account.config.receivedIds || []);
-        known.add(String(json.id));
+        known.add(messageId);
         account.config.receivedIds = [...known].slice(-500);
         this.syncLegacyChannelAccount(account);
         await this.saveSettings();
       }
-      channelMeta.messageId = String(json.id);
+      channelMeta.messageId = messageId;
     }
-    if (channelType === "wecom" && json && Number(json.errcode || 0) !== 0) throw new Error(json.errmsg || `WeCom error ${json.errcode}`);
-    if (channelType === "telegram" && json && json.ok === false) throw new Error(json.description || "Telegram rejected the message.");
-    if (channelType === "slack" && json && json.ok === false) throw new Error(json.error || "Slack rejected the message.");
-    if (channelType === "feishu" && json) {
-      const code = json.code === undefined ? json.StatusCode : json.code;
-      if (code !== undefined && Number(code) !== 0) throw new Error(json.msg || json.StatusMessage || `Feishu error ${code}`);
+    if (channelType === "telegram") {
+      if (!json || json.ok !== true) throw new Error(json && json.description || "Telegram rejected the message.");
+      const messageId = String(json.result && json.result.message_id || "").trim();
+      if (!messageId) throw new Error("Telegram message send returned no message ID.");
+      channelMeta.messageId = messageId;
+    }
+    if (channelType === "discord" && mode === "bot") {
+      const messageId = String(json && json.id || "").trim();
+      if (!messageId) throw new Error("Discord message send returned no message ID.");
+      channelMeta.messageId = messageId;
+    }
+    if (channelType === "slack" && mode === "bot") {
+      if (!json || json.ok !== true) throw new Error(json && json.error || "Slack rejected the message.");
+      const messageId = String(json.ts || "").trim();
+      if (!messageId) throw new Error("Slack message send returned no timestamp.");
+      channelMeta.messageId = messageId;
+    }
+    if (channelType === "matrix") {
+      const messageId = String(json && json.event_id || "").trim();
+      if (!messageId) throw new Error(json && (json.error || json.errcode) || "Matrix message send returned no event ID.");
+      channelMeta.messageId = messageId;
+    }
+    if (channelType === "wecom") {
+      if (!json || Number(json.errcode) !== 0) throw new Error(json && json.errmsg || `WeCom error ${json && json.errcode !== undefined ? json.errcode : "invalid response"}`);
+    }
+    if (channelType === "feishu") {
+      const code = json && (json.code === undefined ? json.StatusCode : json.code);
+      if (!json || code === undefined || Number(code) !== 0) throw new Error(json && (json.msg || json.StatusMessage) || `Feishu error ${code === undefined ? "invalid response" : code}`);
     }
     return {
       channelId,
@@ -3043,7 +3245,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       inObsidian: 'app.plugins.plugins["android-ntfy-notifier"].api',
       sendProtocolTemplate: `obsidian://notification-hub?action=send&token=${encodeURIComponent(token)}&title=TITLE&message=MESSAGE&channel=CHANNEL_ID`,
       receiveProtocolTemplate: `obsidian://notification-hub?action=receive&token=${encodeURIComponent(token)}&sender=SENDER&message=MESSAGE&channel=CHANNEL_ID`,
-      apiMethods: ["getStatus", "getIncomingStatus", "listChannels", "send", "simulate", "receive", "pollIncoming", "retryIncoming", "removeIncoming", "clearIncoming", "registerChannel", "registerIncomingHandler"],
+      apiMethods: ["getStatus", "getCapabilities", "listChannels", "send", "schedule", "simulate", "test", "receive", "reply", "getIncomingStatus", "listIncomingMessages", "pollIncoming", "retryIncoming", "removeIncoming", "clearIncoming", "listScheduled", "cancelScheduled", "listReminders", "addReminder", "updateReminder", "removeReminder", "sendReminderNow", "scanReminders", "registerChannel", "registerIncomingHandler", "openSettings", "openManager"],
       defaultChannelId: this.settings.defaultChannelId,
       channels: this.listNotificationChannels().map((channel) => ({ id: channel.id, name: channel.name, receiveMode: channel.receiveMode })),
     };
@@ -3073,9 +3275,15 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       channelIds: params.channel || params.channels || "",
       broadcast: String(params.broadcast || "").toLowerCase() === "true",
       clickUrl: params.click || params.url || "",
+      scheduledAt: params.scheduledAt || params.due || "",
     };
     try {
       const action = String(params.action || "send").toLowerCase();
+      if (action === "test") {
+        const result = await this.sendTestNotification({ channelId: params.channel || this.settings.defaultChannelId, simulatedEvent: true });
+        new Notice(`${PLUGIN_NAME}: test ${result && result.ok ? "sent" : result && result.status || "failed"}`);
+        return;
+      }
       if (action === "receive") {
         const result = await this.ingestIncomingMessage({
           id: params.id || "",
@@ -3088,8 +3296,24 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         new Notice(`${PLUGIN_NAME}: incoming message ${result.status}`);
         return;
       }
+      if (action === "reply") {
+        const result = await this.replyToStoredIncomingMessage(params.id || params.messageId, params.message || params.text, params.channel || "");
+        new Notice(`${PLUGIN_NAME}: reply ${result && result.ok ? "sent" : "failed"}`);
+        return;
+      }
+      if (action === "reminder") {
+        const result = await this.addApiReminder({
+          id: params.id || "",
+          text: params.message || params.text,
+          due: params.due || params.scheduledAt,
+          repeatSeconds: params.repeatSeconds || 0,
+          source: params.source || "external-agent",
+        });
+        new Notice(`${PLUGIN_NAME}: reminder ${result.status}`);
+        return;
+      }
       const simulate = action === "simulate" || String(params.simulate || "").toLowerCase() === "true";
-      const result = simulate ? await this.simulateNotification(input) : await this.sendNotification(input);
+      const result = simulate ? await this.simulateNotification(input) : action === "schedule" ? await this.scheduleNotification(input) : await this.sendNotification(input);
       new Notice(`${PLUGIN_NAME}: ${simulate ? "simulation" : "notification"} ${result.ok ? "completed" : "failed"}`);
     } catch (error) {
       new Notice(`${PLUGIN_NAME}: ${this.redactSensitiveText(error.message || String(error), true)}`);
@@ -3244,10 +3468,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   async sendObsidianNoticeNow(id) {
     const notice = (this.settings.obsidianNotices || []).find((entry) => entry.id === id);
-    if (!notice) return;
+    if (!notice) return { ok: false, status: "not-found", id };
     if (!this.hasDestination()) {
       new Notice(`${PLUGIN_NAME}: configure the default channel first`);
-      return;
+      return { ok: false, status: "not-configured", id };
     }
     const due = new Date();
     const reminder = {
@@ -3258,11 +3482,15 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       lineNumber: 0,
       source: "obsidian-notice",
     };
-    const results = await this.publishReminder(reminder, false);
-    this.settings.sent[notice.id] = this.sentEntry(reminder, results, false);
+    const previousEntry = this.settings.sent && this.settings.sent[notice.id] || null;
+    const results = await this.publishReminder(reminder, false, previousEntry);
+    this.settings.sent[notice.id] = this.sentEntry(reminder, results, false, previousEntry);
     this.settings.sent = this.pruneSentCache(this.settings.sent);
-    await this.deleteObsidianNotice(id);
+    const ok = results.length > 0 && results.every((result) => result.ok);
+    if (ok) await this.deleteObsidianNotice(id);
+    else await this.saveSettings();
     this.updateStatusCount();
+    return { ok, status: ok ? "sent" : "partial", id, results };
   }
 
   updateStatus(text) {
@@ -3503,7 +3731,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   hasDestination() {
     const channelId = String(this.settings.defaultChannelId || "ntfy");
     const channel = this.listNotificationChannels().find((item) => item.id === channelId);
-    return Boolean(channel && channel.enabled && channel.sendConfigured);
+    return Boolean(channel && channel.deliveryReady);
   }
 
   async scanAndSchedule({ showNotice, forceDailyBatch = false } = {}) {
@@ -3803,13 +4031,16 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   async sendReminderNow(reminder) {
     if (!this.hasDestination()) {
       new Notice(`${PLUGIN_NAME}: configure the default channel first`);
-      return;
+      return { ok: false, status: "not-configured", results: [] };
     }
-    const results = await this.publishReminder(reminder, false);
-    this.settings.sent[reminder.key] = this.sentEntry(reminder, results, false);
+    const previousEntry = this.settings.sent && this.settings.sent[reminder.key] || null;
+    const results = await this.publishReminder(reminder, false, previousEntry);
+    this.settings.sent[reminder.key] = this.sentEntry(reminder, results, false, previousEntry);
     this.settings.sent = this.pruneSentCache(this.settings.sent);
     await this.saveSettings();
     this.updateStatusCount();
+    const ok = results.length > 0 && results.every((result) => result.ok);
+    return { ok, status: ok ? "sent" : "partial", results };
   }
 
   async flushDueQueue(now, maxFutureMs, flushDailyBatch = false) {
@@ -3848,7 +4079,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         await this.cancelMatchingSentEntries(reminder);
         const results = await this.publishReminder(reminder, scheduleFuture, previousEntry);
         this.settings.sent[item.id] = this.sentEntry(reminder, results, scheduleFuture, previousEntry);
-        if (repeatSeconds > 0) {
+        const failedResults = results.filter((result) => !result.ok);
+        if (failedResults.length) {
+          remaining.push(Object.assign({}, item, {
+            lastError: failedResults.map((result) => `${result.channelId}: ${result.error || result.status}`).join("; "),
+            updatedAt: new Date().toISOString(),
+          }));
+          failed++;
+        } else if (repeatSeconds > 0) {
           const nextDue = this.nextRepeatDue(due, repeatSeconds, now);
           remaining.push(Object.assign({}, item, {
             due: nextDue.toISOString(),
@@ -3856,7 +4094,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
             updatedAt: new Date().toISOString(),
           }));
         }
-        sent++;
+        if (!failedResults.length) sent++;
       } catch (error) {
         item.lastError = error.message || String(error);
         remaining.push(item);
@@ -3915,6 +4153,21 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return id;
   }
 
+  async addApiReminder(input = {}) {
+    const text = String(input.text || input.message || "").trim();
+    if (!text) throw new Error("Reminder text is required.");
+    const due = new Date(input.due || input.scheduledAt || 0);
+    if (Number.isNaN(due.getTime())) throw new Error("A valid reminder due time is required.");
+    const id = await this.addQueueItem(text, due, {
+      id: String(input.id || "").trim() || undefined,
+      file: String(input.file || "api").trim() || "api",
+      line: Math.max(0, Number(input.line || 0)),
+      source: String(input.source || "notification-hub-api").trim() || "notification-hub-api",
+      repeatSeconds: Math.max(0, Number(input.repeatSeconds || 0)),
+    });
+    return { ok: true, status: "queued", id, due: due.toISOString() };
+  }
+
   async updateQueueItem(id, patch) {
     this.settings.queue = (this.settings.queue || []).map((item) => item.id === id ? Object.assign({}, item, patch, {
       updatedAt: new Date().toISOString(),
@@ -3933,22 +4186,32 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   async sendQueueItemNow(id) {
     const item = (this.settings.queue || []).find((entry) => entry.id === id);
-    if (!item) return;
+    if (!item) return { ok: false, status: "not-found", id };
     if (!this.hasDestination()) {
       new Notice(`${PLUGIN_NAME}: configure the default channel first`);
-      return;
+      return { ok: false, status: "not-configured", id };
     }
 
     const due = new Date(item.due);
     const now = Date.now();
-    await this.publishReminder({
+    const reminder = {
       key: item.id,
       due: Number.isNaN(due.getTime()) ? new Date(now) : due,
       text: item.text,
       filePath: item.file || "queue",
       lineNumber: item.line || 0,
       source: item.source || "ntfy:queue",
-    }, false);
+    };
+    const previousEntry = this.settings.sent && this.settings.sent[item.id] || null;
+    const results = await this.publishReminder(reminder, false, previousEntry);
+    this.settings.sent = this.settings.sent && typeof this.settings.sent === "object" ? this.settings.sent : {};
+    this.settings.sent[item.id] = this.sentEntry(reminder, results, false, previousEntry);
+    this.settings.sent = this.pruneSentCache(this.settings.sent);
+    const failed = results.filter((result) => !result.ok);
+    if (failed.length) {
+      await this.updateQueueItem(id, { lastError: failed.map((result) => `${result.channelId}: ${result.error || result.status}`).join("; ") });
+      return { ok: false, status: "partial", id, results };
+    }
 
     const repeatSeconds = Math.max(0, Number(item.repeatSeconds || 0));
     if (repeatSeconds > 0) {
@@ -3957,6 +4220,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     } else {
       await this.deleteQueueItem(id);
     }
+    return { ok: true, status: "sent", id, results };
   }
 
   nextRepeatDue(previousDue, repeatSeconds, nowMs) {
@@ -4279,7 +4543,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         },
       },
     });
-    const result = await this.dispatchNotification(notification, { channelIds, simulate: false });
+    const result = await this.dispatchNotification(notification, { channelIds, simulate: false, allowRecentTarget: true });
     return result.results;
   }
 
@@ -4404,25 +4668,23 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
     try {
       const testMessage = `来自 Obsidian 的真实测试消息\n${this.formatLocalDateTime(new Date())}`;
-      const runtimeTarget = channel.sendConfigured ? null : this.latestReplyableIncomingMessage(channel);
-      if (!channel.sendConfigured && !runtimeTarget) {
+      if (!this.channelHasTestTarget(channel)) {
         const error = `${channel.name} credentials are valid, but no proactive target or received conversation is available.`;
         new Notice(`${PLUGIN_NAME}: ${error}`);
         this.updateStatus(`notify: ${channelId} missing target`);
         return { ok: false, status: "missing-target", channelId, error };
       }
-      const result = runtimeTarget
-        ? await this.replyToIncomingMessage(runtimeTarget, testMessage)
-        : await this.sendNotification({
-          id: `test-${Date.now()}`,
-          source: "notification-hub-test",
-          event: options.simulatedEvent ? "simulated-event" : "test",
-          title: options.simulatedEvent ? "模拟通知测试" : "通知中枢测试",
-          message: testMessage,
-          channelIds: [channelId],
-          bypassReview: true,
-          bypassQuiet: true,
-        });
+      const result = await this.sendNotification({
+        id: `test-${Date.now()}`,
+        source: "notification-hub-test",
+        event: options.simulatedEvent ? "simulated-event" : "test",
+        title: options.simulatedEvent ? "模拟通知测试" : "通知中枢测试",
+        message: testMessage,
+        channelIds: [channelId],
+        allowRecentTarget: true,
+        bypassReview: true,
+        bypassQuiet: true,
+      });
       const delivered = Array.isArray(result && result.results)
         ? result.results.filter((item) => item.ok).map((item) => item.channelId).join(", ")
         : result && result.ok !== false ? channelId : "";
@@ -5898,7 +6160,9 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       status.push(verificationLabels[channel.verificationState] || verificationLabels.unchecked);
     }
     if (channel.configured && !channel.sendConfigured) {
-      status.push(this.uiText("主动发送目标未设置", "Proactive send target not set"));
+      status.push(channel.runtimeTargetAvailable
+        ? this.uiText("使用最近收件会话发送", "Sending through the latest received conversation")
+        : this.uiText("主动发送目标未设置", "Proactive send target not set"));
     }
     const receiveLabels = {
       poll: this.uiText("轮询收件", "Polling receive"),
