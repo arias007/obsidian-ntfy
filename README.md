@@ -211,7 +211,7 @@ Set `AI webhook token` if the receiving service expects a Bearer token.
 
 ## Notification Hub And Social Connections
 
-Version `0.6.0` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, and scheduled-message cancellation, while adding a small dependency-free channel hub.
+Version `0.6.1` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, and dependency-free channel hub. Its settings separate channels that are in use from available providers and group the remaining options by responsibility.
 
 The hub uses one **default channel**. Cancip, other Obsidian plugins, and external agents only use the default route unless they explicitly pass channel IDs or request a broadcast. Enabling several connections therefore does not unexpectedly send every message to every service.
 
@@ -231,7 +231,7 @@ Personal WeChat is not hard-coded. Enterprise WeChat uses its official group-bot
 
 ### Receiving Messages
 
-The plugin exposes one normalized inbound message format through `plugin.api.receive(input)`. It stores a bounded inbox, checks the contact/group allowlist and attachment size, deduplicates messages, records redacted connection logs, and can route messages as display-only, to a registered consumer, to a specified model, or to an auto-reply consumer.
+The plugin exposes one normalized inbound message format through `plugin.api.receive(input)`. It stores a bounded inbox, checks the contact/group allowlist and attachment size, deduplicates messages, records redacted connection logs, emits an incoming event, and exposes registered-handler APIs. Model selection, session creation, and reply policy belong to the plugin that consumes this interface rather than the Ntfy Notifications settings.
 
 ntfy messages are polled incrementally while Obsidian is in the foreground. The last message ID is persisted and the plugin ignores its own `obntfy-*` messages. Telegram and Matrix also support lightweight foreground polling. Feishu, WeCom, Discord, Slack, and email inbound events should be forwarded to `receive()` by a provider webhook, Agent, or another connector; the mobile plugin does not start a public server or a Node process.
 
@@ -253,6 +253,6 @@ The public API includes `getStatus`, `getIncomingStatus`, `listChannels`, `send`
 
 ### Delivery Controls
 
-The settings include a total social-connection switch, add-connection selector, default channel, send-before-review dialog, contact/group allowlist, attachment size limit, quiet hours with a bounded local queue, simulated-event testing, and connection/error status. **Send test** creates a simulated event but sends it through the real default channel, so it must arrive on the selected platform. `simulate()` remains available to agents for a no-network, redacted request preview.
+The settings show channels currently in use with their configuration, receive mode, enable switch, edit action, and default-route marker. Additional providers stay in a collapsed available list until added; their connection details can be edited before or after adding. Delivery review, allowlists, attachment limits, quiet hours, reminder scanning, queue timing, content, APIs, and logs are organized into separate collapsible sections. **Send test** creates a simulated event but sends it through the real default channel, so it must arrive on the selected platform. `simulate()` remains available to agents for a no-network, redacted request preview.
 
 Email deliberately uses an HTTP gateway rather than embedding SMTP. This keeps the plugin small and compatible with Obsidian mobile; the gateway can be a provider API or a user's own relay.

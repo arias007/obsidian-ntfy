@@ -54,6 +54,35 @@ async function run() {
   const status = plugin.getNotificationHubStatus();
   assert.equal(status.ready, true);
   assert.equal(status.defaultChannelId, "ntfy");
+  assert.deepEqual(plugin.settings.addedChannelIds, ["ntfy"]);
+
+  const migratedPlugin = createPlugin({
+    topic: "legacy-topic",
+    telegramChannelEnabled: true,
+    telegramBotToken: "123456:legacy-token",
+    telegramChatId: "legacy-chat",
+  });
+  assert.deepEqual(migratedPlugin.settings.addedChannelIds, ["ntfy", "telegram"]);
+
+  const channelSettingsPlugin = createPlugin({
+    topic: "settings-topic",
+    addedChannelIds: ["ntfy"],
+    telegramBotToken: "123456:settings-token",
+    telegramChatId: "settings-chat",
+  });
+  assert.equal(await channelSettingsPlugin.addChannelToSettings("telegram"), true);
+  assert.equal(channelSettingsPlugin.isChannelAdded("telegram"), true);
+  assert.equal(channelSettingsPlugin.isChannelSettingEnabled("telegram"), true);
+  assert.equal(await channelSettingsPlugin.setDefaultNotificationChannel("telegram"), true);
+  assert.equal(channelSettingsPlugin.settings.defaultChannelId, "telegram");
+  await channelSettingsPlugin.setChannelSettingEnabled("telegram", false);
+  assert.equal(channelSettingsPlugin.settings.defaultChannelId, "ntfy");
+  await channelSettingsPlugin.setChannelSettingEnabled("telegram", true);
+  await channelSettingsPlugin.removeChannelFromSettings("telegram");
+  assert.equal(channelSettingsPlugin.isChannelAdded("telegram"), false);
+  assert.equal(channelSettingsPlugin.isChannelSettingEnabled("telegram"), false);
+  assert.equal(channelSettingsPlugin.settings.telegramBotToken, "123456:settings-token");
+  assert.equal(channelSettingsPlugin.settings.telegramChatId, "settings-chat");
 
   const preview = await plugin.simulateNotification({
     title: "Preview",

@@ -221,8 +221,166 @@
   margin: 0 0 8px;
 }
 
-.obsidian-ntfy-channel-group.is-disabled {
+.obsidian-ntfy-settings-root {
+  box-sizing: border-box;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: hidden;
+}
+
+.obsidian-ntfy-settings-root .setting-item {
+  flex-wrap: wrap;
+}
+
+.obsidian-ntfy-settings-root .setting-item-info {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.obsidian-ntfy-settings-root .setting-item-control {
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+
+.obsidian-ntfy-channel-group {
   display: none;
+}
+
+.obsidian-ntfy-channel-group.is-editing {
+  display: block;
+}
+
+.obsidian-ntfy-settings-section {
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.obsidian-ntfy-settings-summary,
+.obsidian-ntfy-available-channels > summary {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  list-style: none;
+  min-height: 44px;
+  padding: 10px 2px;
+}
+
+.obsidian-ntfy-settings-summary::-webkit-details-marker,
+.obsidian-ntfy-available-channels > summary::-webkit-details-marker {
+  display: none;
+}
+
+.obsidian-ntfy-settings-summary::before,
+.obsidian-ntfy-available-channels > summary::before {
+  border-bottom: 2px solid var(--text-muted);
+  border-right: 2px solid var(--text-muted);
+  content: "";
+  flex: 0 0 auto;
+  height: 6px;
+  transform: rotate(-45deg);
+  transition: transform 120ms ease;
+  width: 6px;
+}
+
+.obsidian-ntfy-settings-section[open] > .obsidian-ntfy-settings-summary::before,
+.obsidian-ntfy-available-channels[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.obsidian-ntfy-settings-summary-title {
+  color: var(--text-normal);
+  font-size: var(--font-ui-medium);
+  font-weight: var(--font-semibold);
+}
+
+.obsidian-ntfy-settings-summary-desc {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-left: auto;
+  text-align: right;
+}
+
+.obsidian-ntfy-settings-section-body {
+  padding: 0 0 12px 18px;
+}
+
+.obsidian-ntfy-channel-list-header,
+.obsidian-ntfy-channel-editor-header {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.obsidian-ntfy-channel-list-header h4,
+.obsidian-ntfy-channel-editor-header h3 {
+  margin: 10px 0 6px;
+}
+
+.obsidian-ntfy-channel-list {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.obsidian-ntfy-channel-row {
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 0;
+  padding: 10px 12px;
+}
+
+.obsidian-ntfy-channel-row + .obsidian-ntfy-channel-row {
+  border-top: 1px solid var(--background-modifier-border-hover);
+}
+
+.obsidian-ntfy-channel-row .setting-item-info {
+  min-width: 0;
+}
+
+.obsidian-ntfy-channel-row .setting-item-description {
+  overflow-wrap: anywhere;
+}
+
+.obsidian-ntfy-channel-row .setting-item-control {
+  flex: 0 0 auto;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.obsidian-ntfy-channel-row .clickable-icon.is-active {
+  color: var(--interactive-accent);
+}
+
+.obsidian-ntfy-available-channels {
+  margin-top: 10px;
+}
+
+.obsidian-ntfy-available-channels > summary {
+  color: var(--text-normal);
+  font-weight: var(--font-semibold);
+}
+
+.obsidian-ntfy-empty-state,
+.obsidian-ntfy-channel-extension-note {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin: 0;
+  padding: 12px;
+}
+
+.obsidian-ntfy-channel-extension-note {
+  border-top: 1px solid var(--background-modifier-border-hover);
+}
+
+.obsidian-ntfy-channel-editor-header {
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: 2px;
+}
+
+.obsidian-ntfy-channel-editor-close {
+  flex: 0 0 auto;
 }
 
 .obsidian-ntfy-channel-hub .setting-item-control,
@@ -660,6 +818,21 @@
 }
 
 @media (max-width: 600px) {
+  .obsidian-ntfy-settings-summary {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .obsidian-ntfy-settings-summary-desc {
+    flex-basis: calc(100% - 18px);
+    margin-left: 18px;
+    text-align: left;
+  }
+
+  .obsidian-ntfy-settings-section-body {
+    padding-left: 0;
+  }
+
   .obsidian-ntfy-manager {
     padding: 12px;
   }
@@ -719,6 +892,12 @@
   .obsidian-ntfy-quiet-group .setting-item-control {
     justify-content: flex-start;
     width: 100%;
+  }
+
+  .obsidian-ntfy-channel-row .setting-item-control {
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
 
   .obsidian-ntfy-channel-hub input,

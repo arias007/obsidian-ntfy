@@ -33,6 +33,17 @@ const PLUGIN_NAME = "Ntfy Notifications";
 const VIEW_TYPE_NTFY_MANAGER = "obsidian-ntfy-manager-view";
 const NOTIFICATION_HUB_API_VERSION = "1";
 const BUILTIN_CHANNEL_IDS = ["ntfy", "telegram", "feishu", "wecom", "discord", "slack", "matrix", "email", "webhook"];
+const CHANNEL_ENABLE_SETTING_KEYS = Object.freeze({
+  ntfy: "ntfyChannelEnabled",
+  telegram: "telegramChannelEnabled",
+  feishu: "feishuChannelEnabled",
+  wecom: "wecomChannelEnabled",
+  discord: "discordChannelEnabled",
+  slack: "slackChannelEnabled",
+  matrix: "matrixChannelEnabled",
+  email: "emailChannelEnabled",
+  webhook: "agentWebhookEnabled",
+});
 
 const DEFAULT_SETTINGS = {
   serverUrl: "https://ntfy.sh",
@@ -40,6 +51,7 @@ const DEFAULT_SETTINGS = {
   authToken: "",
   socialHubEnabled: true,
   defaultChannelId: "ntfy",
+  addedChannelIds: ["ntfy"],
   ntfyChannelEnabled: true,
   ntfyReceiveEnabled: true,
   ntfyReceiveIntervalSeconds: 60,
@@ -362,6 +374,13 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       : !String(settings.topic || "").trim() && String(settings.aiWebhookUrl || "").trim()
       ? "webhook"
       : "ntfy";
+    const migratedAddedChannels = BUILTIN_CHANNEL_IDS.filter((channelId) => {
+      const settingKey = CHANNEL_ENABLE_SETTING_KEYS[channelId];
+      return settingKey && settings[settingKey] === true;
+    });
+    settings.addedChannelIds = data && Array.isArray(data.addedChannelIds)
+      ? [...new Set(data.addedChannelIds.map((id) => String(id || "").trim().toLowerCase()).filter((id) => BUILTIN_CHANNEL_IDS.includes(id)))]
+      : migratedAddedChannels;
     return settings;
   }
 
@@ -447,6 +466,71 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       telegramReceiveEnabled: Boolean(this.settings.telegramReceiveEnabled && this.settings.telegramChannelEnabled && this.settings.telegramBotToken),
       matrixReceiveEnabled: Boolean(this.settings.matrixReceiveEnabled && this.settings.matrixChannelEnabled && this.settings.matrixAccessToken && this.settings.matrixServerUrl),
     };
+  }
+
+  isChannelAdded(channelId) {
+    return (this.settings.addedChannelIds || []).includes(String(channelId || "").trim().toLowerCase());
+  }
+
+  isChannelSettingEnabled(channelId) {
+    const settingKey = CHANNEL_ENABLE_SETTING_KEYS[String(channelId || "").trim().toLowerCase()];
+    return Boolean(settingKey && this.settings[settingKey] === true);
+  }
+
+  firstEnabledAddedChannel(excludedId = "") {
+    const excluded = String(excludedId || "").trim().toLowerCase();
+    return (this.settings.addedChannelIds || []).find((channelId) => channelId !== excluded && this.isChannelSettingEnabled(channelId)) || "";
+  }
+
+  async addChannelToSettings(channelId) {
+    const id = String(channelId || "").trim().toLowerCase();
+    const settingKey = CHANNEL_ENABLE_SETTING_KEYS[id];
+    if (!settingKey) return false;
+    this.settings.addedChannelIds = [...new Set([...(this.settings.addedChannelIds || []), id])];
+    this.settings[settingKey] = true;
+    if (!this.isChannelSettingEnabled(this.settings.defaultChannelId) || !this.isChannelAdded(this.settings.defaultChannelId)) {
+      this.settings.defaultChannelId = id;
+    }
+    await this.saveSettings();
+    return true;
+  }
+
+  async removeChannelFromSettings(channelId) {
+    const id = String(channelId || "").trim().toLowerCase();
+    const settingKey = CHANNEL_ENABLE_SETTING_KEYS[id];
+    if (!settingKey) return false;
+    this.settings.addedChannelIds = (this.settings.addedChannelIds || []).filter((item) => item !== id);
+    this.settings[settingKey] = false;
+    if (this.settings.defaultChannelId === id) {
+      this.settings.defaultChannelId = this.firstEnabledAddedChannel(id) || "ntfy";
+    }
+    await this.saveSettings();
+    return true;
+  }
+
+  async setChannelSettingEnabled(channelId, enabled) {
+    const id = String(channelId || "").trim().toLowerCase();
+    const settingKey = CHANNEL_ENABLE_SETTING_KEYS[id];
+    if (!settingKey) return false;
+    this.settings[settingKey] = Boolean(enabled);
+    if (enabled) {
+      this.settings.addedChannelIds = [...new Set([...(this.settings.addedChannelIds || []), id])];
+      if (!this.isChannelSettingEnabled(this.settings.defaultChannelId) || !this.isChannelAdded(this.settings.defaultChannelId)) {
+        this.settings.defaultChannelId = id;
+      }
+    } else if (this.settings.defaultChannelId === id) {
+      this.settings.defaultChannelId = this.firstEnabledAddedChannel(id) || id;
+    }
+    await this.saveSettings();
+    return true;
+  }
+
+  async setDefaultNotificationChannel(channelId) {
+    const id = String(channelId || "").trim().toLowerCase();
+    if (!this.isChannelAdded(id) || !this.isChannelSettingEnabled(id)) return false;
+    this.settings.defaultChannelId = id;
+    await this.saveSettings();
+    return true;
   }
 
   builtinChannelDefinitions() {
@@ -4177,117 +4261,188 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
     }
   }
 
+  createSettingsSection(containerEl, id, title, description = "", openByDefault = false) {
+    if (!this.openSettingSections) this.openSettingSections = new Set(openByDefault ? [id] : []);
+    const details = containerEl.createEl("details", { cls: "obsidian-ntfy-settings-section" });
+    details.open = this.openSettingSections.has(id) || (!this.openSettingSectionsInitialized && openByDefault);
+    const summary = details.createEl("summary", { cls: "obsidian-ntfy-settings-summary" });
+    summary.createSpan({ cls: "obsidian-ntfy-settings-summary-title", text: title });
+    if (description) summary.createSpan({ cls: "obsidian-ntfy-settings-summary-desc", text: description });
+    const body = details.createDiv({ cls: "obsidian-ntfy-settings-section-body" });
+    details.addEventListener("toggle", () => {
+      if (details.open) this.openSettingSections.add(id);
+      else this.openSettingSections.delete(id);
+    });
+    this.openSettingSectionsInitialized = true;
+    return body;
+  }
+
+  openChannelEditor(channelId) {
+    this.editingChannelId = String(channelId || "").trim().toLowerCase();
+    this.display();
+    window.setTimeout(() => {
+      const editor = this.settingsContainerEl && this.settingsContainerEl.querySelector(`[data-channel-editor="${this.editingChannelId}"]`);
+      if (editor && typeof editor.scrollIntoView === "function") editor.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }, 0);
+  }
+
+  renderChannelEditorHeader(containerEl, channelId, title) {
+    containerEl.dataset.channelEditor = channelId;
+    if (this.editingChannelId === channelId) containerEl.addClass("is-editing");
+    const header = containerEl.createDiv({ cls: "obsidian-ntfy-channel-editor-header" });
+    header.createEl("h3", { text: title });
+    const closeButton = header.createEl("button", {
+      cls: "clickable-icon obsidian-ntfy-channel-editor-close",
+      attr: { type: "button", "aria-label": this.uiText("关闭 Channel 编辑", "Close channel editor") },
+    });
+    setIcon(closeButton, "x");
+    closeButton.addEventListener("click", () => {
+      this.editingChannelId = "";
+      this.display();
+    });
+  }
+
+  channelStatusText(channel) {
+    const enabled = this.plugin.isChannelSettingEnabled(channel.id);
+    const status = [
+      enabled ? this.uiText("已启用", "Enabled") : this.uiText("已停用", "Disabled"),
+      channel.configured ? this.uiText("配置完整", "Configured") : this.uiText("等待配置", "Needs setup"),
+    ];
+    if (channel.canReceive) {
+      const receiveLabels = {
+        poll: this.uiText("主动接收", "Polling receive"),
+        forward: this.uiText("接口接收", "API receive"),
+        adapter: this.uiText("适配器接收", "Adapter receive"),
+      };
+      status.push(receiveLabels[channel.receiveMode] || this.uiText("可接收", "Can receive"));
+    }
+    if (this.plugin.settings.defaultChannelId === channel.id) status.unshift(this.uiText("默认发送", "Default route"));
+    return status.join(" · ");
+  }
+
+  renderChannelOverview(containerEl) {
+    const channels = this.plugin.listNotificationChannels().filter((channel) => channel.builtin);
+    const channelMap = new Map(channels.map((channel) => [channel.id, channel]));
+    const activeChannels = (this.plugin.settings.addedChannelIds || []).map((id) => channelMap.get(id)).filter(Boolean);
+    const availableChannels = channels.filter((channel) => !this.plugin.isChannelAdded(channel.id));
+
+    const activeHeader = containerEl.createDiv({ cls: "obsidian-ntfy-channel-list-header" });
+    activeHeader.createEl("h4", { text: this.uiText("正在使用", "In use") });
+    activeHeader.createSpan({ cls: "obsidian-ntfy-muted", text: String(activeChannels.length) });
+    const activeList = containerEl.createDiv({ cls: "obsidian-ntfy-channel-list obsidian-ntfy-active-channels" });
+    if (!activeChannels.length) {
+      activeList.createEl("p", {
+        cls: "obsidian-ntfy-empty-state",
+        text: this.uiText("还没有加入 Channel，请从下面的可用列表添加。", "No channels added. Add one from the available list below."),
+      });
+    }
+    for (const channel of activeChannels) {
+      const enabled = this.plugin.isChannelSettingEnabled(channel.id);
+      const isDefault = this.plugin.settings.defaultChannelId === channel.id;
+      const row = new Setting(activeList)
+        .setName(channel.name)
+        .setDesc(this.channelStatusText(channel));
+      row.settingEl.addClass("obsidian-ntfy-channel-row");
+      row.addExtraButton((button) => {
+        button.setIcon("star").setTooltip(isDefault ? this.uiText("当前默认发送 Channel", "Current default route") : this.uiText("设为默认发送 Channel", "Set as default route"));
+        if (button.extraSettingsEl && isDefault) button.extraSettingsEl.addClass("is-active");
+        if (typeof button.setDisabled === "function") button.setDisabled(!enabled);
+        else if (button.extraSettingsEl) button.extraSettingsEl.toggleAttribute("disabled", !enabled);
+        button.onClick(async () => {
+          await this.plugin.setDefaultNotificationChannel(channel.id);
+          this.display();
+        });
+      });
+      row.addExtraButton((button) => button
+        .setIcon("settings-2")
+        .setTooltip(this.uiText("编辑 Channel", "Edit channel"))
+        .onClick(() => this.openChannelEditor(channel.id)));
+      row.addToggle((toggle) => toggle.setValue(enabled).onChange(async (value) => {
+        await this.plugin.setChannelSettingEnabled(channel.id, value);
+        this.display();
+      }));
+      row.addExtraButton((button) => button
+        .setIcon("minus")
+        .setTooltip(this.uiText("移回可用列表", "Move back to available"))
+        .onClick(async () => {
+          if (this.editingChannelId === channel.id) this.editingChannelId = "";
+          await this.plugin.removeChannelFromSettings(channel.id);
+          this.display();
+        }));
+    }
+
+    const availableDetails = containerEl.createEl("details", { cls: "obsidian-ntfy-available-channels" });
+    availableDetails.open = Boolean(this.availableChannelsOpen);
+    const availableSummary = availableDetails.createEl("summary");
+    availableSummary.createSpan({ text: this.uiText("可用 Channel", "Available channels") });
+    availableSummary.createSpan({ cls: "obsidian-ntfy-muted", text: ` ${availableChannels.length}` });
+    availableDetails.addEventListener("toggle", () => { this.availableChannelsOpen = availableDetails.open; });
+    const availableList = availableDetails.createDiv({ cls: "obsidian-ntfy-channel-list" });
+    for (const channel of availableChannels) {
+      const row = new Setting(availableList)
+        .setName(channel.name)
+        .setDesc(channel.configured ? this.uiText("已有配置，可直接加入。", "Configured and ready to add.") : this.uiText("加入前后都可以编辑连接信息。", "Connection details can be edited before or after adding."));
+      row.settingEl.addClass("obsidian-ntfy-channel-row");
+      row.addExtraButton((button) => button
+        .setIcon("settings-2")
+        .setTooltip(this.uiText("编辑 Channel", "Edit channel"))
+        .onClick(() => this.openChannelEditor(channel.id)));
+      row.addExtraButton((button) => button
+        .setIcon("plus")
+        .setTooltip(this.uiText("加入正在使用", "Add to in use"))
+        .onClick(async () => {
+          await this.plugin.addChannelToSettings(channel.id);
+          this.openChannelEditor(channel.id);
+        }));
+    }
+    availableList.createEl("p", {
+      cls: "obsidian-ntfy-channel-extension-note",
+      text: this.uiText(
+        "更多来源可使用“通用 Webhook”，或由其他插件通过 registerChannel API 动态接入。",
+        "Add more providers through Generic Webhook or the registerChannel API exposed to other plugins."
+      ),
+    });
+  }
+
   display() {
     const { containerEl } = this;
+    this.settingsContainerEl = containerEl;
     containerEl.empty();
+    containerEl.addClass("obsidian-ntfy-settings-root");
 
     containerEl.createEl("h2", { text: PLUGIN_NAME });
     containerEl.createEl("p", {
       text: this.uiText(
-        "轻量通知中枢：Obsidian、Cancip 和 Agent 默认通过一个 Channel 发送，也可显式指定或广播到多个 Channel。",
-        "A lightweight notification hub for Obsidian, Cancip, and agents. Requests use one default channel unless they explicitly select or broadcast to multiple channels."
+        "轻量通知中枢：Obsidian、插件和外部工具可通过统一 Channel 接口收发消息。",
+        "A lightweight notification hub for Obsidian, plugins, and external tools through a shared channel interface."
       ),
     });
 
-    const hubGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-hub" });
-    hubGroup.createEl("h3", { text: this.uiText("通知中枢", "Notification hub") });
-    const hubStatus = this.plugin.getNotificationHubStatus();
-    const channelMap = new Map(this.plugin.listNotificationChannels().map((channel) => [channel.id, channel]));
-    const defaultChannel = channelMap.get(hubStatus.defaultChannelId);
-
+    const hubGroup = this.createSettingsSection(
+      containerEl,
+      "channels",
+      this.uiText("Channel", "Channels"),
+      this.uiText("查看正在使用的连接、状态和可用来源。", "Manage active connections, status, and available providers."),
+      true
+    );
+    hubGroup.addClass("obsidian-ntfy-channel-hub");
     new Setting(hubGroup)
-      .setName(this.uiText("社交连接总开关", "Social connections"))
-      .setDesc(this.uiText("关闭后停止所有收发和轮询，但保留连接配置。", "Stops all sending, receiving, and polling while keeping connection settings."))
+      .setName(this.uiText("通知中枢总开关", "Notification hub"))
+      .setDesc(this.uiText("关闭后停止所有收发和轮询，但保留 Channel 和连接配置。", "Stops all sending, receiving, and polling while preserving channel configuration."))
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.socialHubEnabled)).onChange(async (value) => {
         this.plugin.settings.socialHubEnabled = value;
         await this.plugin.saveSettings();
         this.display();
       }));
-
-    new Setting(hubGroup)
-      .setName(this.uiText("当前状态", "Current status"))
-      .setDesc(
-        hubStatus.ready
-          ? this.uiText(`默认走 ${defaultChannel ? defaultChannel.name : hubStatus.defaultChannelId}，已可发送。`, `Ready. Default route: ${defaultChannel ? defaultChannel.name : hubStatus.defaultChannelId}.`)
-          : this.uiText(`默认 Channel ${defaultChannel ? defaultChannel.name : hubStatus.defaultChannelId} 尚未启用或配置。`, `The default channel ${defaultChannel ? defaultChannel.name : hubStatus.defaultChannelId} is disabled or not configured.`)
-      );
-
-    new Setting(hubGroup)
-      .setName(this.uiText("默认 Channel", "Default channel"))
-      .setDesc(this.uiText("Cancip、提醒和 Agent 未指定目标时只走这里，不会自动群发。", "Cancip, reminders, and agents use only this route unless they explicitly select channels."))
-      .addDropdown((dropdown) => {
-        for (const channel of this.plugin.listNotificationChannels()) dropdown.addOption(channel.id, channel.name);
-        dropdown.setValue(this.plugin.settings.defaultChannelId).onChange(async (value) => {
-          this.plugin.settings.defaultChannelId = value;
-          await this.plugin.saveSettings();
-          this.display();
-        });
-      });
-
-    const enableSettingKeys = {
-      ntfy: "ntfyChannelEnabled",
-      telegram: "telegramChannelEnabled",
-      feishu: "feishuChannelEnabled",
-      wecom: "wecomChannelEnabled",
-      discord: "discordChannelEnabled",
-      slack: "slackChannelEnabled",
-      matrix: "matrixChannelEnabled",
-      email: "emailChannelEnabled",
-      webhook: "agentWebhookEnabled",
-    };
-    new Setting(hubGroup)
-      .setName(this.uiText("添加连接", "Add connection"))
-      .setDesc(this.uiText("选择后启用对应配置区域；可在区域内关闭连接。", "Enables the selected connection settings; it can be disabled again inside its section."))
-      .addDropdown((dropdown) => {
-        dropdown.addOption("", this.uiText("选择连接类型", "Select a connection"));
-        for (const channel of this.plugin.listNotificationChannels().filter((item) => item.builtin)) dropdown.addOption(channel.id, channel.name);
-        dropdown.setValue("").onChange(async (value) => {
-          const key = enableSettingKeys[value];
-          if (!key) return;
-          this.plugin.settings[key] = true;
-          await this.plugin.saveSettings();
-          this.display();
-        });
-      });
-
-    new Setting(hubGroup)
-      .setName(this.uiText("模拟通知测试", "Simulated event test"))
-      .setDesc(this.uiText("生成一条模拟事件并通过默认 Channel 真实发送；应能在对应社交平台收到。", "Creates a simulated event and really sends it through the default channel so it can be verified on the target platform."))
-      .addButton((button) => {
-        button.setButtonText(this.uiText("发送测试", "Send test"));
-        if (typeof button.setIcon === "function") button.setIcon("send");
-        if (typeof button.setDisabled === "function") button.setDisabled(!hubStatus.ready);
-        button.onClick(async () => await this.plugin.simulateTestNotification());
-      });
-
-    new Setting(hubGroup)
-      .setName(this.uiText("Agent 链接", "Agent connection"))
-      .setDesc(this.uiText("插件内通过公开 API 调用；外部 Codex、Claude Code 等可使用 obsidian://notification-hub 链接。", "Obsidian plugins use the public API; external tools such as Codex and Claude Code can use obsidian://notification-hub links."))
-      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.agentProtocolEnabled)).onChange(async (value) => {
-        this.plugin.settings.agentProtocolEnabled = value;
-        await this.plugin.saveSettings();
-      }))
-      .addButton((button) => {
-        button.setButtonText(this.uiText("复制说明", "Copy setup"));
-        if (typeof button.setIcon === "function") button.setIcon("copy");
-        button.onClick(async () => {
-          const text = JSON.stringify(this.plugin.getAgentConnectionInfo(), null, 2);
-          if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
-            new Notice(this.uiText("当前设备没有可用的剪贴板接口。", "Clipboard API is unavailable on this device."));
-            return;
-          }
-          await navigator.clipboard.writeText(text);
-          new Notice(this.uiText("Agent 连接说明已复制。", "Agent connection setup copied."));
-        });
-      });
+    this.renderChannelOverview(hubGroup);
 
     const ntfyGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
-    ntfyGroup.createEl("h3", { text: "ntfy" });
+    this.renderChannelEditorHeader(ntfyGroup, "ntfy", "ntfy");
     new Setting(ntfyGroup)
       .setName(this.uiText("启用 Channel", "Enable channel"))
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.ntfyChannelEnabled)).onChange(async (value) => {
-        this.plugin.settings.ntfyChannelEnabled = value;
-        await this.plugin.saveSettings();
+        await this.plugin.setChannelSettingEnabled("ntfy", value);
+        this.display();
       }));
     new Setting(ntfyGroup)
       .setName(this.uiText("接收 ntfy 消息", "Receive ntfy messages"))
@@ -4342,15 +4497,13 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       });
 
     const wecomGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
-    if (!this.plugin.settings.wecomChannelEnabled) wecomGroup.addClass("is-disabled");
-    wecomGroup.createEl("h3", { text: this.uiText("企业微信机器人", "WeCom bot") });
+    this.renderChannelEditorHeader(wecomGroup, "wecom", this.uiText("企业微信机器人", "WeCom bot"));
     new Setting(wecomGroup)
       .setName(this.uiText("启用 Channel", "Enable channel"))
       .setDesc(this.uiText("使用企业微信群机器人的官方 webhook；不接入个人微信。", "Uses an official WeCom group bot webhook. Personal WeChat is not hard-coded."))
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.wecomChannelEnabled)).onChange(async (value) => {
-        this.plugin.settings.wecomChannelEnabled = value;
-        await this.plugin.saveSettings();
-        if (!value) this.display();
+        await this.plugin.setChannelSettingEnabled("wecom", value);
+        this.display();
       }));
     new Setting(wecomGroup)
       .setName("Webhook URL")
@@ -4363,14 +4516,12 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       });
 
     const telegramGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
-    if (!this.plugin.settings.telegramChannelEnabled) telegramGroup.addClass("is-disabled");
-    telegramGroup.createEl("h3", { text: "Telegram" });
+    this.renderChannelEditorHeader(telegramGroup, "telegram", "Telegram");
     new Setting(telegramGroup)
       .setName(this.uiText("启用 Channel", "Enable channel"))
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.telegramChannelEnabled)).onChange(async (value) => {
-        this.plugin.settings.telegramChannelEnabled = value;
-        await this.plugin.saveSettings();
-        if (!value) this.display();
+        await this.plugin.setChannelSettingEnabled("telegram", value);
+        this.display();
       }));
     new Setting(telegramGroup).setName("Bot token").addText((text) => {
       text.inputEl.type = "password";
@@ -4393,14 +4544,12 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       }));
 
     const feishuGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
-    if (!this.plugin.settings.feishuChannelEnabled) feishuGroup.addClass("is-disabled");
-    feishuGroup.createEl("h3", { text: this.uiText("飞书机器人", "Feishu bot") });
+    this.renderChannelEditorHeader(feishuGroup, "feishu", this.uiText("飞书机器人", "Feishu bot"));
     new Setting(feishuGroup)
       .setName(this.uiText("启用 Channel", "Enable channel"))
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.feishuChannelEnabled)).onChange(async (value) => {
-        this.plugin.settings.feishuChannelEnabled = value;
-        await this.plugin.saveSettings();
-        if (!value) this.display();
+        await this.plugin.setChannelSettingEnabled("feishu", value);
+        this.display();
       }));
     new Setting(feishuGroup).setName("Webhook URL").addText((text) => {
       text.inputEl.type = "password";
@@ -4411,14 +4560,12 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
     });
 
     const discordGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
-    if (!this.plugin.settings.discordChannelEnabled) discordGroup.addClass("is-disabled");
-    discordGroup.createEl("h3", { text: "Discord" });
+    this.renderChannelEditorHeader(discordGroup, "discord", "Discord");
     new Setting(discordGroup)
       .setName(this.uiText("启用 Channel", "Enable channel"))
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.discordChannelEnabled)).onChange(async (value) => {
-        this.plugin.settings.discordChannelEnabled = value;
-        await this.plugin.saveSettings();
-        if (!value) this.display();
+        await this.plugin.setChannelSettingEnabled("discord", value);
+        this.display();
       }));
     new Setting(discordGroup).setName("Webhook URL").addText((text) => {
       text.inputEl.type = "password";
@@ -4429,14 +4576,12 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
     });
 
     const slackGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
-    if (!this.plugin.settings.slackChannelEnabled) slackGroup.addClass("is-disabled");
-    slackGroup.createEl("h3", { text: "Slack" });
+    this.renderChannelEditorHeader(slackGroup, "slack", "Slack");
     new Setting(slackGroup)
       .setName(this.uiText("启用 Channel", "Enable channel"))
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.slackChannelEnabled)).onChange(async (value) => {
-        this.plugin.settings.slackChannelEnabled = value;
-        await this.plugin.saveSettings();
-        if (!value) this.display();
+        await this.plugin.setChannelSettingEnabled("slack", value);
+        this.display();
       }));
     new Setting(slackGroup).setName("Webhook URL").addText((text) => {
       text.inputEl.type = "password";
@@ -4447,15 +4592,13 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
     });
 
     const matrixGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
-    if (!this.plugin.settings.matrixChannelEnabled) matrixGroup.addClass("is-disabled");
-    matrixGroup.createEl("h3", { text: "Matrix" });
+    this.renderChannelEditorHeader(matrixGroup, "matrix", "Matrix");
     new Setting(matrixGroup)
       .setName(this.uiText("启用 Channel", "Enable channel"))
       .setDesc(this.uiText("移动端可用 Matrix Client-Server API 轮询收发。", "Uses the Matrix Client-Server API for mobile-compatible polling."))
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.matrixChannelEnabled)).onChange(async (value) => {
-        this.plugin.settings.matrixChannelEnabled = value;
-        await this.plugin.saveSettings();
-        if (!value) this.display();
+        await this.plugin.setChannelSettingEnabled("matrix", value);
+        this.display();
       }));
     new Setting(matrixGroup).setName(this.uiText("服务器", "Server")).addText((text) => text.setPlaceholder("https://matrix.example").setValue(this.plugin.settings.matrixServerUrl).onChange(async (value) => {
       this.plugin.settings.matrixServerUrl = value.trim();
@@ -4482,15 +4625,13 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       }));
 
     const emailGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
-    if (!this.plugin.settings.emailChannelEnabled) emailGroup.addClass("is-disabled");
-    emailGroup.createEl("h3", { text: this.uiText("Email", "Email") });
+    this.renderChannelEditorHeader(emailGroup, "email", this.uiText("Email", "Email"));
     new Setting(emailGroup)
       .setName(this.uiText("启用 Channel", "Enable channel"))
       .setDesc(this.uiText("使用移动端兼容的 HTTP 邮件网关，不在插件内实现 SMTP。", "Uses a mobile-compatible HTTP email gateway instead of embedding SMTP in the plugin."))
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.emailChannelEnabled)).onChange(async (value) => {
-        this.plugin.settings.emailChannelEnabled = value;
-        await this.plugin.saveSettings();
-        if (!value) this.display();
+        await this.plugin.setChannelSettingEnabled("email", value);
+        this.display();
       }));
     new Setting(emailGroup).setName(this.uiText("邮件网关 URL", "Gateway URL")).addText((text) => text.setPlaceholder("https://api.example/send").setValue(this.plugin.settings.emailGatewayUrl).onChange(async (value) => {
       this.plugin.settings.emailGatewayUrl = value.trim();
@@ -4513,15 +4654,13 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
     }));
 
     const agentGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-channel-group" });
-    if (!this.plugin.settings.agentWebhookEnabled) agentGroup.addClass("is-disabled");
-    agentGroup.createEl("h3", { text: this.uiText("通用 Webhook", "Generic webhook") });
+    this.renderChannelEditorHeader(agentGroup, "webhook", this.uiText("通用 Webhook", "Generic webhook"));
     new Setting(agentGroup)
       .setName(this.uiText("启用 Channel", "Enable channel"))
       .setDesc(this.uiText("向 Codex、Claude Code、自建 Agent、自动化或其他 HTTP 接口发送统一 JSON；入站消息可调用 receive API。", "Sends normalized JSON to Codex, Claude Code, custom agents, automation, or other HTTP endpoints; inbound messages can call the receive API."))
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.agentWebhookEnabled)).onChange(async (value) => {
-        this.plugin.settings.agentWebhookEnabled = value;
-        await this.plugin.saveSettings();
-        if (!value) this.display();
+        await this.plugin.setChannelSettingEnabled("webhook", value);
+        this.display();
       }));
     new Setting(agentGroup).setName("Webhook URL").addText((text) => text.setPlaceholder("https://agent.example/notification").setValue(this.plugin.settings.aiWebhookUrl).onChange(async (value) => {
       this.plugin.settings.aiWebhookUrl = value.trim();
@@ -4537,77 +4676,118 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         });
       });
 
-    const inboundGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-inbound-group" });
-    inboundGroup.createEl("h3", { text: this.uiText("收到消息后", "When a message arrives") });
-    new Setting(inboundGroup)
-      .setName(this.uiText("处理方式", "Action"))
-      .setDesc(this.uiText("Ntfy 只负责统一接收和分发；Cancip 处理器可选择建立会话、选模型和回复。", "Ntfy receives and routes messages; a Cancip consumer can create sessions, choose a model, and reply."))
-      .addDropdown((dropdown) => dropdown
-        .addOption("display", this.uiText("仅显示", "Display only"))
-        .addOption("consumer", this.uiText("交给指定消费者", "Send to consumer"))
-        .addOption("model", this.uiText("交给指定模型", "Route to model"))
-        .addOption("auto-reply", this.uiText("满足规则后自动回复", "Auto-reply by rules"))
-        .setValue(this.plugin.settings.incomingAction)
-        .onChange(async (value) => {
-          this.plugin.settings.incomingAction = value;
-          await this.plugin.saveSettings();
-        }))
-      .addText((text) => text.setPlaceholder("cancip").setValue(this.plugin.settings.incomingConsumerId).onChange(async (value) => {
-        this.plugin.settings.incomingConsumerId = value.trim() || "cancip";
-        await this.plugin.saveSettings();
-      }));
-    new Setting(inboundGroup)
-      .setName(this.uiText("指定模型", "Target model"))
-      .addText((text) => text.setPlaceholder("留空由消费者决定").setValue(this.plugin.settings.incomingModel).onChange(async (value) => {
-        this.plugin.settings.incomingModel = value.trim();
-        await this.plugin.saveSettings();
-      }));
-    new Setting(inboundGroup)
-      .setName(this.uiText("自动回复规则", "Auto-reply rules"))
-      .addText((text) => text.setPlaceholder("可选：仅匹配指定联系人或关键词").setValue(this.plugin.settings.autoReplyRules).onChange(async (value) => {
-        this.plugin.settings.autoReplyRules = value.trim();
-        await this.plugin.saveSettings();
-      }));
-    new Setting(inboundGroup)
+    const hubStatus = this.plugin.getNotificationHubStatus();
+    const deliveryGroup = this.createSettingsSection(
+      containerEl,
+      "delivery",
+      this.uiText("发送与静默", "Delivery and quiet hours"),
+      this.uiText("测试、发送审核和静默队列。", "Testing, send review, and quiet-hour queueing.")
+    );
+    new Setting(deliveryGroup)
+      .setName(this.uiText("真实发送测试", "Real delivery test"))
+      .setDesc(this.uiText("通过当前默认发送 Channel 投递真实消息，不会广播。", "Sends a real message through the current default route without broadcasting."))
+      .addButton((button) => {
+        button.setButtonText(this.uiText("发送测试", "Send test"));
+        if (typeof button.setIcon === "function") button.setIcon("send");
+        if (typeof button.setDisabled === "function") button.setDisabled(!hubStatus.ready);
+        button.onClick(async () => await this.plugin.simulateTestNotification());
+      });
+    new Setting(deliveryGroup)
       .setName(this.uiText("发送前审核", "Review before sending"))
-      .setDesc(this.uiText("普通发送和自动回复先弹出审核；真实模拟通知测试会直接发送。", "Shows a review dialog before normal sends and auto-replies; real simulated tests bypass it."))
+      .setDesc(this.uiText("普通发送先弹出审核；真实发送测试直接发送。", "Shows a review dialog before normal sends; real delivery tests bypass it."))
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.reviewBeforeSend)).onChange(async (value) => {
         this.plugin.settings.reviewBeforeSend = value;
         await this.plugin.saveSettings();
       }));
-    new Setting(inboundGroup)
+    new Setting(deliveryGroup)
+      .setName(this.uiText("启用静默时间", "Enable quiet hours"))
+      .setDesc(this.uiText("普通消息暂存到本地队列，静默结束后再发送；紧急优先级可绕过。", "Queues normal messages locally until quiet hours end; urgent priority can bypass the queue."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.quietHoursEnabled)).onChange(async (value) => {
+        this.plugin.settings.quietHoursEnabled = value;
+        await this.plugin.saveSettings();
+      }));
+    new Setting(deliveryGroup).setName(this.uiText("静默开始", "Quiet start")).addText((text) => text.setPlaceholder("22:00").setValue(this.plugin.settings.quietHoursStart).onChange(async (value) => {
+      this.plugin.settings.quietHoursStart = this.plugin.normalizeClockTime(value, "22:00");
+      await this.plugin.saveSettings();
+    }));
+    new Setting(deliveryGroup).setName(this.uiText("静默结束", "Quiet end")).addText((text) => text.setPlaceholder("07:00").setValue(this.plugin.settings.quietHoursEnd).onChange(async (value) => {
+      this.plugin.settings.quietHoursEnd = this.plugin.normalizeClockTime(value, "07:00");
+      await this.plugin.saveSettings();
+    }));
+
+    const receivingGroup = this.createSettingsSection(
+      containerEl,
+      "receiving",
+      this.uiText("接收与安全", "Receiving and safety"),
+      this.uiText("收件状态、白名单和附件限制。", "Inbox status, allowlist, and attachment limits.")
+    );
+    receivingGroup.addClass("obsidian-ntfy-inbound-group");
+    const incomingStatus = this.plugin.getIncomingStatus();
+    new Setting(receivingGroup)
+      .setName(this.uiText("收件接口", "Inbound interface"))
+      .setDesc(this.uiText(
+        `收件箱 ${incomingStatus.inboxCount} 条；Ntfy 只负责接收、去重、保存并提供通用 API，后续处理由注册的插件决定。`,
+        `${incomingStatus.inboxCount} inbox items. Ntfy receives, deduplicates, stores, and exposes a generic API; registered plugins decide subsequent handling.`
+      ))
+      .addButton((button) => {
+        button.setButtonText(this.uiText("立即接收", "Poll now"));
+        if (typeof button.setIcon === "function") button.setIcon("refresh-cw");
+        button.onClick(async () => {
+          await this.plugin.runIncomingPoll({ force: true });
+          this.display();
+        });
+      });
+    new Setting(receivingGroup)
       .setName(this.uiText("联系人和群聊白名单", "Contact and group allowlist"))
       .setDesc(this.uiText("逗号、分号或换行分隔；留空表示不限制。可填发送者、群聊 ID 或 channel:sender。", "Separate by commas, semicolons, or new lines; empty means unrestricted. Use sender, group ID, or channel:sender."))
       .addText((text) => text.setPlaceholder("telegram:user, matrix:@user:server").setValue(this.plugin.settings.contactAllowlist).onChange(async (value) => {
         this.plugin.settings.contactAllowlist = value;
         await this.plugin.saveSettings();
       }));
-    new Setting(inboundGroup)
+    new Setting(receivingGroup)
       .setName(this.uiText("附件大小限制（MB）", "Attachment limit (MB)"))
       .addText((text) => text.setPlaceholder("8").setValue(String(this.plugin.settings.attachmentLimitMb)).onChange(async (value) => {
         this.plugin.settings.attachmentLimitMb = Math.max(1, this.plugin.safePositiveNumber(value, DEFAULT_SETTINGS.attachmentLimitMb));
         await this.plugin.saveSettings();
       }));
 
-    const quietGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-quiet-group" });
-    quietGroup.createEl("h3", { text: this.uiText("静默时间", "Quiet hours") });
-    new Setting(quietGroup)
-      .setName(this.uiText("启用静默", "Enable quiet hours"))
-      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.quietHoursEnabled)).onChange(async (value) => {
-        this.plugin.settings.quietHoursEnabled = value;
+    const apiGroup = this.createSettingsSection(
+      containerEl,
+      "api",
+      this.uiText("Agent 与插件接口", "Agent and plugin API"),
+      this.uiText("外部 URI、插件 API 和动态 Channel 接口。", "External URI, plugin API, and dynamic channel registration.")
+    );
+    new Setting(apiGroup)
+      .setName(this.uiText("Agent URI 接口", "Agent URI interface"))
+      .setDesc(this.uiText("插件内直接读取公开 API；外部 Agent 可使用受令牌保护的 obsidian://notification-hub 链接。", "Plugins use the public API directly; external agents can use token-protected obsidian://notification-hub links."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.agentProtocolEnabled)).onChange(async (value) => {
+        this.plugin.settings.agentProtocolEnabled = value;
         await this.plugin.saveSettings();
-      }));
-    new Setting(quietGroup).setName(this.uiText("开始", "Start")).addText((text) => text.setPlaceholder("22:00").setValue(this.plugin.settings.quietHoursStart).onChange(async (value) => {
-      this.plugin.settings.quietHoursStart = this.plugin.normalizeClockTime(value, "22:00");
-      await this.plugin.saveSettings();
-    }));
-    new Setting(quietGroup).setName(this.uiText("结束", "End")).addText((text) => text.setPlaceholder("07:00").setValue(this.plugin.settings.quietHoursEnd).onChange(async (value) => {
-      this.plugin.settings.quietHoursEnd = this.plugin.normalizeClockTime(value, "07:00");
-      await this.plugin.saveSettings();
-    }));
+      }))
+      .addButton((button) => {
+        button.setButtonText(this.uiText("复制连接说明", "Copy setup"));
+        if (typeof button.setIcon === "function") button.setIcon("copy");
+        button.onClick(async () => {
+          const text = JSON.stringify(this.plugin.getAgentConnectionInfo(), null, 2);
+          if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+            new Notice(this.uiText("当前设备没有可用的剪贴板接口。", "Clipboard API is unavailable on this device."));
+            return;
+          }
+          await navigator.clipboard.writeText(text);
+          new Notice(this.uiText("连接说明已复制。", "Connection setup copied."));
+        });
+      });
+    new Setting(apiGroup)
+      .setName(this.uiText("公开能力", "Public capabilities"))
+      .setDesc(this.uiText("支持 send、receive、pollIncoming、registerIncomingHandler 和 registerChannel；不在 Ntfy 内管理模型或会话。", "Supports send, receive, pollIncoming, registerIncomingHandler, and registerChannel without managing models or sessions inside Ntfy."));
 
-    const logGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group obsidian-ntfy-log-group" });
-    logGroup.createEl("h3", { text: this.uiText("连接状态与错误日志", "Connection status and error log") });
+    const logGroup = this.createSettingsSection(
+      containerEl,
+      "logs",
+      this.uiText("状态与错误日志", "Status and error log"),
+      this.uiText("脱敏连接状态和最近错误。", "Redacted connection status and recent errors.")
+    );
+    logGroup.addClass("obsidian-ntfy-log-group");
     const statuses = this.plugin.listNotificationChannels().map((channel) => `${channel.name}: ${channel.enabled ? (channel.configured ? "ready" : "not configured") : "off"}`);
     logGroup.createEl("p", { cls: "setting-item-description", text: statuses.join(" · ") });
     const errorLogs = (this.plugin.settings.connectionLogs || []).filter((entry) => entry.level === "error").slice(0, 5);
@@ -4622,7 +4802,13 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       });
     });
 
-    new Setting(containerEl)
+    const scanGroup = this.createSettingsSection(
+      containerEl,
+      "scan",
+      this.uiText("提醒扫描与捕获", "Reminder scanning and capture"),
+      this.uiText("扫描笔记提醒并管理 Obsidian 通知。", "Scan note reminders and manage Obsidian notices.")
+    );
+    new Setting(scanGroup)
       .setName(this.uiText("自动扫描", "Auto scan"))
       .setDesc(this.uiText("Obsidian 运行时自动扫描笔记并刷新本地队列。", "Automatically scan notes and refresh the local queue while Obsidian is running."))
       .addToggle((toggle) =>
@@ -4635,7 +4821,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(scanGroup)
       .setName(this.uiText("扫描间隔", "Scan interval"))
       .setDesc(this.uiText("Obsidian 运行时两次扫描之间的分钟数。", "Minutes between scans while Obsidian is running."))
       .addText((text) =>
@@ -4648,7 +4834,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(scanGroup)
       .setName(this.uiText("捕获 Obsidian 通知", "Capture Obsidian notices"))
       .setDesc(this.uiText("尽量把 Obsidian 或插件弹出的 Notice 纳入管理。早于本插件加载并缓存 Notice 的插件可能无法捕获。", "Try to capture later Obsidian/plugin Notice popups into the manager. Plugins that cached Notice before this plugin loaded may not be captured."))
       .addToggle((toggle) =>
@@ -4662,7 +4848,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(scanGroup)
       .setName(this.uiText("Obsidian 通知缓存上限", "Obsidian notice cache limit"))
       .setDesc(this.uiText("通知管理中最多保留多少条已捕获的 OB 或插件通知。", "Maximum captured OB/plugin notices to keep in the manager."))
       .addText((text) =>
@@ -4676,8 +4862,12 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    const timeGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group" });
-    timeGroup.createEl("h3", { text: this.uiText("时间默认值", "Time Defaults") });
+    const timeGroup = this.createSettingsSection(
+      containerEl,
+      "time-queue",
+      this.uiText("时间与队列", "Time and queue"),
+      this.uiText("提醒时间、未来投递和本地缓存边界。", "Reminder timing, future delivery, and local cache limits.")
+    );
 
     new Setting(timeGroup)
       .setName(this.uiText("默认时间", "Default time"))
@@ -4771,7 +4961,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(timeGroup)
       .setName(this.uiText("用 ntfy 定时未来提醒", "Schedule future reminders through ntfy"))
       .setDesc(this.uiText("使用 ntfy 的定时投递，Obsidian 不必在提醒时刻保持打开。", "Uses ntfy scheduled delivery so Obsidian does not need to be open at the exact reminder time."))
       .addToggle((toggle) =>
@@ -4783,7 +4973,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(timeGroup)
       .setName(this.uiText("最大未来天数", "Maximum future days"))
       .setDesc(this.uiText("插件可提前交给 ntfy 的未来天数。ntfy.sh 默认最多 3 天。", "How far into the future this plugin may hand off reminders to ntfy immediately. ntfy.sh defaults to a 3-day maximum."))
       .addText((text) =>
@@ -4796,7 +4986,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(timeGroup)
       .setName(this.uiText("本地队列前瞻天数", "Local queue lookahead days"))
       .setDesc(this.uiText("超过 ntfy 定时窗口、但在此范围内的未来提醒，会保留在 Obsidian 本地可编辑队列。", "Future reminders farther than the ntfy scheduling window but within this range are kept in Obsidian's local editable queue."))
       .addText((text) =>
@@ -4809,7 +4999,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(timeGroup)
       .setName(this.uiText("已发送缓存上限", "Sent cache limit"))
       .setDesc(this.uiText("限制已发送/已交给 ntfy 的记录数量，避免移动端长期运行后缓存过大。", "Keeps the sent/scheduled cache bounded for long-running mobile use."))
       .addText((text) =>
@@ -4822,7 +5012,13 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    const contentGroup = this.createSettingsSection(
+      containerEl,
+      "content",
+      this.uiText("通知内容", "Notification content"),
+      this.uiText("控制提醒正文、来源信息、优先级和标签。", "Control reminder text, source details, priority, and tags.")
+    );
+    new Setting(contentGroup)
       .setName(this.uiText("包含待办内容", "Include task text"))
       .addToggle((toggle) =>
         toggle.setValue(Boolean(this.plugin.settings.includeTaskText)).onChange(async (value) => {
@@ -4831,7 +5027,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         })
       );
 
-    new Setting(containerEl)
+    new Setting(contentGroup)
       .setName(this.uiText("读取 Tasks 插件日期", "Read Tasks plugin dates"))
       .setDesc(this.uiText("读取 Tasks Emoji Format 日期：优先 scheduled，其次 due，再其次 start。", "Use Tasks Emoji Format dates: scheduled first, then due, then start."))
       .addToggle((toggle) =>
@@ -4841,7 +5037,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         })
       );
 
-    new Setting(containerEl)
+    new Setting(contentGroup)
       .setName(this.uiText("包含文件名", "Include file name"))
       .addToggle((toggle) =>
         toggle.setValue(Boolean(this.plugin.settings.includeFileName)).onChange(async (value) => {
@@ -4850,7 +5046,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         })
       );
 
-    new Setting(containerEl)
+    new Setting(contentGroup)
       .setName(this.uiText("包含完整路径", "Include full path"))
       .setDesc(this.uiText("更便于定位，但会把更多库目录结构发送给 ntfy。", "More useful, but leaks more vault structure to ntfy."))
       .addToggle((toggle) =>
@@ -4860,7 +5056,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         })
       );
 
-    new Setting(containerEl)
+    new Setting(contentGroup)
       .setName(this.uiText("优先级", "Priority"))
       .addDropdown((dropdown) =>
         dropdown
@@ -4877,7 +5073,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    new Setting(containerEl)
+    new Setting(contentGroup)
       .setName(this.uiText("标签", "Tags"))
       .setDesc(this.uiText("用英文逗号分隔 ntfy 标签，例如 bell,warning。", "Comma-separated ntfy tags, for example bell,warning."))
       .addText((text) =>
@@ -4890,8 +5086,12 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           })
       );
 
-    const supportGroup = containerEl.createDiv({ cls: "obsidian-ntfy-settings-group" });
-    supportGroup.createEl("h3", { text: this.uiText("支持 / 收款码", "Support QR") });
+    const supportGroup = this.createSettingsSection(
+      containerEl,
+      "support",
+      this.uiText("支持", "Support"),
+      this.uiText("项目支持与收款码。", "Project support and QR codes.")
+    );
     supportGroup.createEl("p", {
       cls: "setting-item-description",
       text: this.uiText(
