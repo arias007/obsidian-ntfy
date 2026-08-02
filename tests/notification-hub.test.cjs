@@ -64,13 +64,18 @@ async function run() {
   });
   assert.deepEqual(migratedPlugin.settings.addedChannelIds, ["ntfy", "telegram"]);
 
-  const legacyBridgePlugin = createPlugin({
-    channelAccounts: [{ id: "wechat", type: "wechat", accountId: "default", name: "微信 / ClawBot bridge", config: { bridgeUrl: "https://legacy.example/send", token: "legacy-token", target: "peer" } }],
+  const retiredChannelPlugin = createPlugin({
+    channelAccounts: [{ id: "wechat", type: "wechat", accountId: "default", name: "旧微信连接", config: { bridgeUrl: "https://legacy.example/send", token: "legacy-token", target: "peer" } }],
     addedChannelIds: ["wechat"],
+    defaultChannelId: "wechat",
   });
-  assert.equal(legacyBridgePlugin.getChannelAccount("wechat").config.mode, "legacy");
-  assert.equal(legacyBridgePlugin.getChannelAccount("wechat").config.bridgeUrl, "https://legacy.example/send");
-  assert.equal(legacyBridgePlugin.getChannelAccount("wechat").name, "微信 / OpenClaw Weixin");
+  assert.equal(retiredChannelPlugin.getChannelAccount("wechat"), null);
+  assert.equal(retiredChannelPlugin.settings.addedChannelIds.includes("wechat"), false);
+  assert.equal(retiredChannelPlugin.settings.defaultChannelId, "ntfy");
+  assert.equal(retiredChannelPlugin.settings.retiredChannelAccounts[0].config.token, "legacy-token");
+  assert.equal(await retiredChannelPlugin.addChannelToSettings("wechat"), false);
+  const reloadedRetiredPlugin = createPlugin(retiredChannelPlugin.settings);
+  assert.equal(reloadedRetiredPlugin.settings.retiredChannelAccounts[0].config.bridgeUrl, "https://legacy.example/send");
 
   const channelSettingsPlugin = createPlugin({
     topic: "settings-topic",
@@ -163,58 +168,35 @@ async function run() {
   assert.equal(discordBotPreview.results[0].request.url.endsWith("/channels/12345/messages"), true);
   assert.equal(JSON.stringify(discordBotPreview).includes("discord-secret"), false);
 
-  await appChannelPlugin.addChannelToSettings("openclaw", { accountId: "home", name: "OpenClaw Home" });
-  await appChannelPlugin.updateChannelAccount("openclaw:home", { config: { mode: "gateway", gatewayUrl: "https://gateway.example", gatewayToken: "bridge-secret", sessionKey: "main", targetChannel: "qqbot", targetAccountId: "family", target: "qqbot:group:group-1" } });
-  const bridgePreview = await appChannelPlugin.simulateNotification({ title: "Bridge", message: "OpenClaw", channelIds: ["openclaw:home"] });
-  const bridgeBody = JSON.parse(bridgePreview.results[0].request.body);
-  assert.equal(bridgeBody.tool, "message");
-  assert.equal(bridgeBody.args.action, "send");
-  assert.equal(bridgeBody.args.channel, "qqbot");
-  assert.equal(bridgeBody.args.accountId, "family");
-  assert.equal(bridgeBody.args.to, "qqbot:group:group-1");
-  assert.equal(bridgePreview.results[0].request.url.endsWith("/tools/invoke"), true);
-  assert.equal(JSON.stringify(bridgePreview).includes("bridge-secret"), false);
-  const openClawRequests = [];
-  appChannelPlugin.httpRequest = async (request) => {
-    openClawRequests.push(request);
-    return { json: { ok: true, result: { messageId: "openclaw-message" } } };
-  };
-  const openClawResult = await appChannelPlugin.sendNotification({ title: "Bridge", message: "Deliver", channelIds: ["openclaw:home"] });
-  assert.equal(openClawResult.results[0].messageId, "openclaw-message");
-  assert.equal(openClawRequests[0].url.endsWith("/tools/invoke"), true);
-  assert.equal(JSON.parse(openClawRequests[0].body).tool, "message");
+  await appChannelPlugin.addChannelToSettings("telegram", { accountId: "work", name: "工作 Telegram" });
+  await appChannelPlugin.updateChannelAccount("telegram:work", { config: { botToken: "123456:telegram-secret", chatId: "-100123" } });
+  const telegramPreview = await appChannelPlugin.simulateNotification({ title: "Bot", message: "Telegram", channelIds: ["telegram:work"] });
+  assert.equal(telegramPreview.results[0].request.url.endsWith("/bot***/sendMessage"), true);
+  assert.equal(JSON.parse(telegramPreview.results[0].request.body).chat_id, "-100123");
+  assert.equal(appChannelPlugin.listNotificationChannels().find((channel) => channel.id === "telegram:work").receiveMode, "send-only");
+  assert.equal(JSON.stringify(telegramPreview).includes("telegram-secret"), false);
 
-  await appChannelPlugin.addChannelToSettings("qqbot", { accountId: "official", name: "QQ 官方" });
-  await appChannelPlugin.updateChannelAccount("qqbot:official", { config: { mode: "official", appId: "qq-app", clientSecret: "qq-secret", targetType: "group", target: "group-openid" } });
-  const qqRequests = [];
-  appChannelPlugin.httpRequest = async (request) => {
-    qqRequests.push(request);
-    if (request.url.includes("getAppAccessToken")) return { json: { access_token: "qq-access-token", expires_in: 7200 } };
-    return { json: { id: "qq-message" } };
-  };
-  const qqResult = await appChannelPlugin.sendNotification({ title: "QQ", message: "Official", channelIds: ["qqbot:official"] });
-  assert.equal(qqResult.results[0].messageId, "qq-message");
-  assert.equal(qqRequests.length, 2);
-  assert.equal(qqRequests[1].url.endsWith("/v2/groups/group-openid/messages"), true);
-  assert.equal(qqRequests[1].headers.Authorization, "QQBot qq-access-token");
-  await appChannelPlugin.sendNotification({ title: "QQ", message: "Cached", channelIds: ["qqbot:official"] });
-  assert.equal(qqRequests.filter((request) => request.url.includes("getAppAccessToken")).length, 1);
+  await appChannelPlugin.addChannelToSettings("slack", { accountId: "bot", name: "Slack Bot" });
+  await appChannelPlugin.updateChannelAccount("slack:bot", { config: { mode: "bot", botToken: "xoxb-slack-secret", channelId: "C123" } });
+  const slackPreview = await appChannelPlugin.simulateNotification({ title: "Bot", message: "Slack", channelIds: ["slack:bot"] });
+  assert.equal(slackPreview.results[0].request.url.endsWith("/chat.postMessage"), true);
+  assert.equal(JSON.parse(slackPreview.results[0].request.body).channel, "C123");
+  assert.equal(JSON.stringify(slackPreview).includes("slack-secret"), false);
 
-  await appChannelPlugin.addChannelToSettings("qqbot", { accountId: "gateway", name: "QQ OpenClaw" });
-  await appChannelPlugin.updateChannelAccount("qqbot:gateway", { config: { mode: "openclaw", gatewayUrl: "https://gateway.example", gatewayToken: "gateway-secret", openclawAccountId: "family", targetType: "c2c", target: "user-openid" } });
-  const qqGatewayPreview = await appChannelPlugin.simulateNotification({ title: "QQ", message: "Gateway", channelIds: ["qqbot:gateway"] });
-  const qqGatewayBody = JSON.parse(qqGatewayPreview.results[0].request.body);
-  assert.equal(qqGatewayBody.args.channel, "qqbot");
-  assert.equal(qqGatewayBody.args.accountId, "family");
-  assert.equal(qqGatewayBody.args.to, "qqbot:c2c:user-openid");
+  await appChannelPlugin.addChannelToSettings("matrix", { accountId: "work", name: "工作 Matrix" });
+  await appChannelPlugin.updateChannelAccount("matrix:work", { config: { serverUrl: "https://matrix.example", accessToken: "matrix-secret", roomId: "!room:matrix.example" } });
+  const matrixPreview = await appChannelPlugin.simulateNotification({ title: "Bot", message: "Matrix", channelIds: ["matrix:work"] });
+  assert.equal(matrixPreview.results[0].request.method, "PUT");
+  assert.equal(matrixPreview.results[0].request.url.includes("/_matrix/client/v3/rooms/"), true);
+  assert.equal(JSON.stringify(matrixPreview).includes("matrix-secret"), false);
 
-  await appChannelPlugin.addChannelToSettings("wechat", { accountId: "home", name: "微信 OpenClaw" });
-  await appChannelPlugin.updateChannelAccount("wechat:home", { config: { mode: "openclaw", gatewayUrl: "https://gateway.example", gatewayToken: "gateway-secret", channelId: "openclaw-weixin", openclawAccountId: "wx-home", target: "weixin-user" } });
-  const wechatPreview = await appChannelPlugin.simulateNotification({ title: "微信", message: "Gateway", channelIds: ["wechat:home"] });
-  const wechatBody = JSON.parse(wechatPreview.results[0].request.body);
-  assert.equal(wechatBody.args.channel, "openclaw-weixin");
-  assert.equal(wechatBody.args.accountId, "wx-home");
-  assert.equal(wechatBody.args.to, "weixin-user");
+  await appChannelPlugin.addChannelToSettings("webhook", { accountId: "agent", name: "Agent Webhook" });
+  await appChannelPlugin.updateChannelAccount("webhook:agent", { config: { url: "https://agent.example/receive", token: "webhook-secret", customHeaders: '{"X-API-Key":"header-secret"}' } });
+  const webhookPreview = await appChannelPlugin.simulateNotification({ title: "Bot", message: "Webhook", channelIds: ["webhook:agent"] });
+  assert.equal(webhookPreview.results[0].request.url, "***");
+  assert.equal(webhookPreview.results[0].request.headers.Authorization, "***");
+  assert.equal(webhookPreview.results[0].request.headers["X-API-Key"], "***");
+  assert.equal(appChannelPlugin.listNotificationChannels().find((channel) => channel.id === "webhook:agent").receiveMode, "forward");
 
   const preview = await plugin.simulateNotification({
     title: "Preview",
@@ -238,7 +220,19 @@ async function run() {
   assert.equal(JSON.parse(wecomPreview.results[0].request.body).msgtype, "text");
 
   const channelIds = plugin.listNotificationChannels().map((channel) => channel.id);
-  assert.deepEqual(channelIds, ["ntfy", "telegram", "feishu", "wecom", "discord", "slack", "matrix", "email", "openclaw", "qqbot", "wechat", "webhook"]);
+  assert.deepEqual(channelIds, ["ntfy", "telegram", "feishu", "wecom", "discord", "slack", "matrix", "email", "webhook"]);
+  const channelModes = Object.fromEntries(plugin.listNotificationChannels().map((channel) => [channel.id, channel.receiveMode]));
+  assert.deepEqual(channelModes, {
+    ntfy: "poll",
+    telegram: "poll",
+    feishu: "send-only",
+    wecom: "send-only",
+    discord: "send-only",
+    slack: "send-only",
+    matrix: "poll",
+    email: "send-only",
+    webhook: "forward",
+  });
   for (const channelId of channelIds) {
     const channelPreview = await plugin.simulateNotification({
       title: "Channel preview",

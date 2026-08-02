@@ -211,7 +211,7 @@ Set `AI webhook token` if the receiving service expects a Bearer token.
 
 ## Notification Hub And Social Connections
 
-Version `0.6.2` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, inbox, deduplication, and quiet queue. It adds OpenClaw-style multi-account channels: every provider can have multiple named accounts with independent credentials, enabled state, and configuration.
+Version `0.6.3` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, inbox, deduplication, and quiet queue. Every built-in provider can have multiple named accounts with independent credentials, enabled state, configuration, and a per-account test action.
 
 The hub uses one **default channel**. Cancip, other Obsidian plugins, and external agents only use the default route unless they explicitly pass channel IDs or request a broadcast. Enabling several connections therefore does not unexpectedly send every message to every service.
 
@@ -225,39 +225,24 @@ Built-in send channels are:
 - Slack bot or webhook
 - Matrix Client-Server API
 - Email through a user-provided HTTP gateway
-- OpenClaw Gateway through its authenticated `/tools/invoke` and `message(action=send)` API
-- QQ Bot through OpenClaw or the official QQ Bot `AppID + AppSecret` REST API
-- WeChat through Tencent's `@tencent-weixin/openclaw-weixin` plugin loaded by OpenClaw
 - Generic Webhook for Codex, Claude Code, custom agents, and automation
 
-The recommended QQ/WeChat route keeps platform login, inbound WebSocket or long-poll processing, allowlists, account state, and context tokens in OpenClaw. Ntfy Notifications calls the real OpenClaw message tool and keeps only the Gateway URL/token, OpenClaw account ID, and delivery target. QQ can also send directly with the official QQ Bot API; direct mode intentionally does not reimplement OpenClaw's WebSocket receive engine. Existing custom `bridgeUrl` accounts migrate to **Legacy HTTP bridge** without losing credentials.
+The plugin does not load OpenClaw, QQ bridge, personal WeChat, desktop daemons, or provider-specific npm packages. QQ and personal WeChat are intentionally not exposed as built-in channels because a small mobile plugin cannot provide their complete login, receive, and account lifecycle without extra components. Configurations saved by version `0.6.2` for those retired sources are kept in plugin data during migration, but they are hidden and cannot be routed or sent.
 
-For WeChat, install and log in on the OpenClaw Gateway host first:
-
-```bash
-openclaw plugins install "@tencent-weixin/openclaw-weixin"
-openclaw config set plugins.entries.openclaw-weixin.enabled true
-openclaw channels login --channel openclaw-weixin
-openclaw gateway restart
-```
-
-For QQ managed by OpenClaw:
-
-```bash
-openclaw plugins install @openclaw/qqbot
-openclaw channels add --channel qqbot --token "AppID:AppSecret"
-openclaw gateway restart
-```
-
-The Gateway's `/tools/invoke` endpoint is an operator surface. Keep it on loopback, a private LAN/tailnet, or another authenticated private ingress; do not publish the Gateway token or endpoint directly to the public internet.
+Email is an optional HTTP contract rather than an embedded mail service. It only works when the user already has a compatible HTTPS mail gateway. No mail package or background process is installed by this plugin.
 
 ### Receiving Messages
 
 The plugin exposes one normalized inbound message format through `plugin.api.receive(input)`. It stores a bounded inbox, checks the contact/group allowlist and attachment size, deduplicates messages, records redacted connection logs, emits an incoming event, and exposes registered-handler APIs. Model selection, session creation, and reply policy belong to the plugin that consumes this interface rather than the Ntfy Notifications settings.
 
-ntfy messages are polled incrementally while Obsidian is in the foreground. The last message ID is persisted and the plugin ignores its own `obntfy-*` messages. Telegram and Matrix also support lightweight foreground polling. Feishu, WeCom, Discord, Slack, and email inbound events should be forwarded to `receive()` by a provider webhook, Agent, or another connector; the mobile plugin does not start a public server or a Node process.
+Receive support is reported per account rather than claimed for every provider:
 
-Inbox deletion and delivery deduplication are intentionally separate. Removing an item from the visible inbox does not allow a provider retry with the same channel/message ID to run again. Poll-delivered messages start consumer work in the background, so a long Cancip or model task does not block later ntfy, Telegram, or Matrix polling. One malformed or oversized attachment is rejected without stopping the rest of the provider batch.
+- The default ntfy, Telegram, and Matrix accounts support lightweight foreground polling.
+- Generic Webhook supports messages forwarded by another installed plugin or agent through `plugin.api.receive(input)`; the plugin does not expose a public HTTP server.
+- Additional ntfy, Telegram, and Matrix accounts currently send only.
+- Feishu/Lark, WeCom, Discord, Slack, and Email accounts currently send only. Their provider event servers are deliberately not reimplemented inside Obsidian.
+
+The last polling cursor is persisted and the plugin ignores its own `obntfy-*` ntfy messages. Inbox deletion and delivery deduplication are intentionally separate. Removing an item from the visible inbox does not allow a provider retry with the same channel/message ID to run again. Poll-delivered messages start consumer work in the background, so a long Cancip or model task does not block later ntfy, Telegram, or Matrix polling. One malformed or oversized attachment is rejected without stopping the rest of the provider batch.
 
 Cancip can register its own handler without Ntfy Notifications importing Cancip:
 
