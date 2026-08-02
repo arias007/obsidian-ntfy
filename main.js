@@ -1492,6 +1492,20 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     });
   }
 
+  latestReplyableIncomingMessage(channel) {
+    if (!channel) return null;
+    const adapter = this.externalChannelAdapters.get(channel.id);
+    return (this.settings.incomingMessages || []).find((message) => {
+      if (!message || message.channelId !== channel.id) return false;
+      if (adapter && typeof adapter.reply === "function") return true;
+      return this.hasRuntimeChannelTarget(channel, { metadata: message.metadata || {} });
+    }) || null;
+  }
+
+  channelHasTestTarget(channel) {
+    return Boolean(channel && (channel.sendConfigured || this.latestReplyableIncomingMessage(channel)));
+  }
+
   async runIncomingPoll(options = {}) {
     if (this.isPollingIncoming) return { ok: false, status: "busy", changed: false, pollers: [] };
     if (!this.settings.socialHubEnabled) return { ok: false, status: "hub-disabled", changed: false, pollers: [] };
@@ -2530,7 +2544,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const metadata = notification && notification.metadata || {};
     const mode = String(descriptor.config && descriptor.config.mode || "").trim().toLowerCase();
     if (descriptor.type === "telegram") return Boolean(String(metadata.chatId || "").trim());
-    if (descriptor.type === "feishu" && mode !== "webhook") return Boolean(String(metadata.feishuReceiveId || "").trim());
+    if (descriptor.type === "feishu" && mode !== "webhook") return Boolean(String(metadata.messageId || metadata.feishuReceiveId || "").trim());
     if (descriptor.type === "wecom" && mode === "app") return Boolean(String(metadata.wecomTarget || "").trim());
     if ((descriptor.type === "discord" || descriptor.type === "slack") && mode === "bot") return Boolean(String(metadata.channelId || "").trim());
     if (descriptor.type === "matrix") return Boolean(String(metadata.roomId || "").trim());
@@ -2662,7 +2676,13 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
           receiveIdType: metadata.feishuReceiveIdType || config.receiveIdType,
           receiveId: metadata.feishuReceiveId || config.receiveId,
         });
-        return { channelAction: "feishu-app", config: dynamicConfig, text: text.slice(0, 20000), notification };
+        return {
+          channelAction: "feishu-app",
+          config: dynamicConfig,
+          text: String(metadata.messageId || "").trim() ? notification.message.slice(0, 20000) : text.slice(0, 20000),
+          notification,
+          replyMessageId: String(metadata.messageId || "").trim(),
+        };
       }
       const url = String(config.webhookUrl || "").trim() || (placeholder ? "https://open.feishu.cn/open-apis/bot/v2/hook/example" : "");
       return {
@@ -2883,16 +2903,24 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       const tokenJson = await this.responseJson(tokenResponse);
       const token = tokenJson && tokenJson.tenant_access_token;
       if (!token || Number(tokenJson.code || 0) !== 0) throw new Error(tokenJson && tokenJson.msg || "Feishu app authentication failed.");
+      const replyMessageId = String(request.replyMessageId || "").trim();
       const response = await this.httpRequest({
-        url: `${apiBase}/open-apis/im/v1/messages?receive_id_type=${encodeURIComponent(config.receiveIdType || "chat_id")}`,
+        url: replyMessageId
+          ? `${apiBase}/open-apis/im/v1/messages/${encodeURIComponent(replyMessageId)}/reply`
+          : `${apiBase}/open-apis/im/v1/messages?receive_id_type=${encodeURIComponent(config.receiveIdType || "chat_id")}`,
         method: "POST",
         headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ receive_id: config.receiveId, msg_type: "text", content: JSON.stringify({ text: request.text }) }),
+        body: JSON.stringify(Object.assign(
+          { msg_type: "text", content: JSON.stringify({ text: request.text }) },
+          replyMessageId ? {} : { receive_id: config.receiveId }
+        )),
         throw: true,
       });
       const json = await this.responseJson(response);
-      if (json && Number(json.code || 0) !== 0) throw new Error(json.msg || `Feishu error ${json.code}`);
-      return { channelId, ok: true, status: "sent", messageId: json && json.data && json.data.message_id || "" };
+      if (!json || Number(json.code || 0) !== 0) throw new Error(json && json.msg || `Feishu error ${json && json.code !== undefined ? json.code : "invalid response"}`);
+      const messageId = String(json.data && json.data.message_id || "").trim();
+      if (!messageId) throw new Error("Feishu message send returned no message ID.");
+      return { channelId, ok: true, status: "sent", messageId };
     }
     if (request.channelAction === "wecom-app") {
       const config = request.config || {};
@@ -4374,30 +4402,40 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const connected = await this.testChannelConnection(channel, { showSuccess: false, showError: true });
     if (!connected) return;
 
-    if (!channel.sendConfigured) {
-      new Notice(`${PLUGIN_NAME}: ${channel.name} credentials verified; proactive send target is optional`);
-      return;
-    }
-
     try {
-      const result = await this.sendNotification({
-        id: `test-${Date.now()}`,
-        source: "notification-hub-test",
-        event: options.simulatedEvent ? "simulated-event" : "test",
-        title: options.simulatedEvent ? "模拟通知测试" : "通知中枢测试",
-        message: `来自 Obsidian 的真实测试消息\n${this.formatLocalDateTime(new Date())}`,
-        channelIds: [channelId],
-        bypassReview: true,
-        bypassQuiet: true,
-      });
-      const delivered = result.results.filter((item) => item.ok).map((item) => item.channelId).join(", ");
+      const testMessage = `来自 Obsidian 的真实测试消息\n${this.formatLocalDateTime(new Date())}`;
+      const runtimeTarget = channel.sendConfigured ? null : this.latestReplyableIncomingMessage(channel);
+      if (!channel.sendConfigured && !runtimeTarget) {
+        const error = `${channel.name} credentials are valid, but no proactive target or received conversation is available.`;
+        new Notice(`${PLUGIN_NAME}: ${error}`);
+        this.updateStatus(`notify: ${channelId} missing target`);
+        return { ok: false, status: "missing-target", channelId, error };
+      }
+      const result = runtimeTarget
+        ? await this.replyToIncomingMessage(runtimeTarget, testMessage)
+        : await this.sendNotification({
+          id: `test-${Date.now()}`,
+          source: "notification-hub-test",
+          event: options.simulatedEvent ? "simulated-event" : "test",
+          title: options.simulatedEvent ? "模拟通知测试" : "通知中枢测试",
+          message: testMessage,
+          channelIds: [channelId],
+          bypassReview: true,
+          bypassQuiet: true,
+        });
+      const delivered = Array.isArray(result && result.results)
+        ? result.results.filter((item) => item.ok).map((item) => item.channelId).join(", ")
+        : result && result.ok !== false ? channelId : "";
+      if (!delivered) throw new Error(`${channel.name} did not confirm delivery.`);
       new Notice(`${PLUGIN_NAME}: test sent through ${delivered || channelId}`);
       this.updateStatus(`notify: ${channelId} test sent`);
+      return result;
     } catch (error) {
       const safeError = this.redactSensitiveText(error.message || String(error), true);
       console.error(`${PLUGIN_NAME}: test failed`, safeError);
       new Notice(`${PLUGIN_NAME} failed: ${safeError}`);
       this.updateStatus("notify: test failed");
+      return { ok: false, status: "failed", channelId, error: safeError };
     }
   }
 
@@ -5913,7 +5951,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
     }
     const testButton = account.querySelector('[data-channel-test="true"]');
     if (testButton) {
-      const label = channel.sendConfigured ? this.uiText("测试当前账号", "Test this account") : this.uiText("验证凭据", "Verify credentials");
+      const label = this.plugin.channelHasTestTarget(channel) ? this.uiText("测试当前账号", "Test this account") : this.uiText("验证凭据", "Verify credentials");
       testButton.disabled = channel.storedEnabled === false || !channel.configured;
       testButton.setAttribute("aria-label", label);
       testButton.setAttribute("title", label);
@@ -6211,7 +6249,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         await this.plugin.removeChannelFromSettings(channel.id);
         this.display();
       });
-      const testButton = addAction("send", !channel.sendConfigured ? this.uiText("验证凭据", "Verify credentials") : this.uiText("测试当前账号", "Test this account"), async () => {
+      const testButton = addAction("send", this.plugin.channelHasTestTarget(channel) ? this.uiText("测试当前账号", "Test this account") : this.uiText("验证凭据", "Verify credentials"), async () => {
         await this.plugin.sendTestNotification({ channelId: channel.id, simulatedEvent: true });
       }, channel.storedEnabled === false || !channel.configured);
       testButton.dataset.channelTest = "true";

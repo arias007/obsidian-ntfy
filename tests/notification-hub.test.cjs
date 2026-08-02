@@ -230,13 +230,60 @@ async function run() {
     sender: "ou_sender",
     conversationId: "oc_runtime",
     text: "Inbound",
-    metadata: { feishuReceiveIdType: "chat_id", feishuReceiveId: "oc_runtime" },
+    metadata: { feishuReceiveIdType: "chat_id", feishuReceiveId: "oc_runtime", messageId: "om_inbound" },
   }, "Reply from Ntfy");
   assert.equal(replyResult.ok, true);
   assert.equal(replyRequests.length, 2);
-  assert.equal(new URL(replyRequests[1].url).searchParams.get("receive_id_type"), "chat_id");
-  assert.equal(JSON.parse(replyRequests[1].body).receive_id, "oc_runtime");
+  assert.equal(replyRequests[1].url.endsWith("/open-apis/im/v1/messages/om_inbound/reply"), true);
+  const replyRequestBody = JSON.parse(replyRequests[1].body);
+  assert.equal(Object.prototype.hasOwnProperty.call(replyRequestBody, "receive_id"), false);
+  assert.equal(JSON.parse(replyRequestBody.content).text, "Reply from Ntfy");
   assert.equal(replyOnlyFeishuPlugin.listNotificationChannels().find((channel) => channel.id === "feishu:reply").sendConfigured, false);
+
+  replyOnlyFeishuPlugin.httpRequest = async (request) => request.url.includes("tenant_access_token")
+    ? { json: { code: 0, tenant_access_token: "tenant-token" } }
+    : { json: { code: 0, data: {} } };
+  await assert.rejects(
+    replyOnlyFeishuPlugin.replyToIncomingMessage({
+      id: "feishu-no-receipt",
+      channelId: "feishu:reply",
+      sender: "ou_sender",
+      conversationId: "oc_runtime",
+      text: "Inbound",
+      metadata: { messageId: "om_no_receipt" },
+    }, "Reply without receipt"),
+    /returned no message ID/
+  );
+
+  replyOnlyFeishuPlugin.settings.incomingMessages = [{
+    id: "feishu-latest-inbound",
+    channelId: "feishu:reply",
+    sender: "ou_sender",
+    conversationId: "oc_runtime",
+    text: "Inbound",
+    receivedAt: new Date().toISOString(),
+    metadata: { feishuReceiveIdType: "chat_id", feishuReceiveId: "oc_runtime", messageId: "om_latest_inbound" },
+  }];
+  replyOnlyFeishuPlugin.testChannelConnection = async () => true;
+  const testRequests = [];
+  replyOnlyFeishuPlugin.httpRequest = async (request) => {
+    testRequests.push(request);
+    if (request.url.includes("tenant_access_token")) return { json: { code: 0, tenant_access_token: "tenant-token" } };
+    return { json: { code: 0, data: { message_id: "om_test_reply" } } };
+  };
+  const feishuTestResult = await replyOnlyFeishuPlugin.sendTestNotification({ channelId: "feishu:reply", simulatedEvent: true });
+  assert.equal(feishuTestResult.ok, true);
+  assert.equal(testRequests[1].url.endsWith("/open-apis/im/v1/messages/om_latest_inbound/reply"), true);
+  assert.match(JSON.parse(JSON.parse(testRequests[1].body).content).text, /^来自 Obsidian 的真实测试消息/);
+  assert.ok(notices.some((message) => message.includes("test sent through feishu:reply")));
+
+  const targetlessFeishuPlugin = createPlugin({ topic: "feishu-targetless" });
+  await targetlessFeishuPlugin.addChannelToSettings("feishu", { accountId: "targetless", name: "Feishu Targetless" });
+  await targetlessFeishuPlugin.updateChannelAccount("feishu:targetless", { config: { mode: "app", appId: "cli_targetless", appSecret: "targetless-secret", receiveId: "" } });
+  targetlessFeishuPlugin.testChannelConnection = async () => true;
+  const targetlessResult = await targetlessFeishuPlugin.sendTestNotification({ channelId: "feishu:targetless", simulatedEvent: true });
+  assert.equal(targetlessResult.status, "missing-target");
+  assert.ok(notices.some((message) => message.includes("no proactive target or received conversation")));
 
   const rejectedQqPlugin = createPlugin({ topic: "qq-auth-error" });
   rejectedQqPlugin.httpRequest = async () => ({ json: { message: "invalid appid or secret" } });

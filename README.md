@@ -211,11 +211,13 @@ Set `AI webhook token` if the receiving service expects a Bearer token.
 
 ## Notification Hub And Social Connections
 
-Version `0.6.8` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, review flow, inbox, deduplication, and quiet queue. Every built-in provider can have multiple named accounts with independent credentials, send/receive state, configuration, cursors, and a per-account test action.
+Version `0.6.9` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, review flow, inbox, deduplication, and quiet queue. Every built-in provider can have multiple named accounts with independent credentials, send/receive state, configuration, cursors, and a per-account test action.
 
 Channel status now separates required-field completion, credential verification, runtime receive connection, and proactive-send readiness. It records redacted failures plus the latest inbound/outbound activity, refreshes the account summary as soon as edited values are saved, and suppresses repeated identical connection errors. Realtime connections and low-frequency polling stay active while Obsidian remains runnable in the background by default; mobile operating systems can still suspend or stop Obsidian, and returning to the foreground reconnects immediately.
 
 Replies from the inbox use the destination carried by the received message, so a receive-only account can answer its original conversation without duplicating that conversation ID in proactive-send settings. An open manager view also refreshes its inbox count and message list as messages arrive.
+
+Feishu inbox replies use the official reply endpoint for the original message and require a real returned message ID before reporting success. This keeps replies attached to the source message and prevents malformed or incomplete API responses from being treated as successful delivery. When no proactive destination is configured, the account test replies to the latest received conversation; if neither target exists, it reports the missing destination instead of claiming that a message was sent.
 
 The hub uses one **default channel**. Cancip, other Obsidian plugins, and external agents only use the default route unless they explicitly pass channel IDs or request a broadcast. Enabling several connections therefore does not unexpectedly send every message to every service.
 
