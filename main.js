@@ -1298,7 +1298,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     let changed = false;
     for (const item of pending) {
       try {
-        const result = await this.dispatchNotification(item.notification, { channelIds: item.channelIds, simulate: false });
+        const result = await this.dispatchNotification(item.notification, {
+          channelIds: item.channelIds,
+          simulate: false,
+          allowRuntimeTarget: item.allowRuntimeTarget === true,
+        });
         for (const delivery of result.results) {
           this.recordConnectionLog(delivery.ok ? "info" : "error", delivery.channelId, `Queued notification ${delivery.status}`, { notificationId: item.id, error: delivery.error || "" });
         }
@@ -1484,6 +1488,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         chatId: message.metadata && message.metadata.chatId ? message.metadata.chatId : message.conversationId,
         roomId: message.metadata && message.metadata.roomId ? message.metadata.roomId : message.conversationId,
       }),
+      allowRuntimeTarget: true,
     });
   }
 
@@ -2421,6 +2426,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         id: notification.id,
         notification,
         channelIds,
+        allowRuntimeTarget: input.allowRuntimeTarget === true,
         createdAt: new Date().toISOString(),
       }].slice(-200);
       this.recordConnectionLog("info", "hub", "Outgoing notification queued for quiet hours", { notificationId: notification.id, channelIds });
@@ -2430,6 +2436,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const result = await this.dispatchNotification(notification, {
       channelIds,
       simulate: false,
+      allowRuntimeTarget: input.allowRuntimeTarget === true,
     });
     for (const item of result.results) {
       this.recordConnectionLog(item.ok ? "info" : "error", item.channelId, `Outgoing notification ${item.status}`, { notificationId: notification.id, error: item.error || "" });
@@ -2472,7 +2479,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         results.push({ channelId, ok: false, status: "unsupported", error: "Unknown notification channel." });
         continue;
       }
-      if ((!descriptor.enabled || !descriptor.sendConfigured) && !options.allowUnconfigured) {
+      const hasRuntimeTarget = options.allowRuntimeTarget === true && this.hasRuntimeChannelTarget(descriptor, notification);
+      if (!options.allowUnconfigured && (!descriptor.enabled || (!descriptor.sendConfigured && !hasRuntimeTarget))) {
         results.push({ channelId, ok: false, status: "not-configured", error: "Channel is disabled or not configured." });
         continue;
       }
@@ -2515,6 +2523,20 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       throw error;
     }
     return { ok, simulated: options.simulate === true, notificationId: notification.id, results };
+  }
+
+  hasRuntimeChannelTarget(descriptor, notification) {
+    if (!descriptor || !descriptor.builtin) return false;
+    const metadata = notification && notification.metadata || {};
+    const mode = String(descriptor.config && descriptor.config.mode || "").trim().toLowerCase();
+    if (descriptor.type === "telegram") return Boolean(String(metadata.chatId || "").trim());
+    if (descriptor.type === "feishu" && mode !== "webhook") return Boolean(String(metadata.feishuReceiveId || "").trim());
+    if (descriptor.type === "wecom" && mode === "app") return Boolean(String(metadata.wecomTarget || "").trim());
+    if ((descriptor.type === "discord" || descriptor.type === "slack") && mode === "bot") return Boolean(String(metadata.channelId || "").trim());
+    if (descriptor.type === "matrix") return Boolean(String(metadata.roomId || "").trim());
+    if (descriptor.type === "qqbot") return Boolean(String(metadata.qqTarget || "").trim());
+    if (descriptor.type === "email") return Boolean(String(metadata.emailReplyTo || metadata.emailFrom || "").trim());
+    return false;
   }
 
   requireHttpUrl(value, label) {
@@ -4579,6 +4601,9 @@ class NtfyManagerView extends ItemView {
   }
 
   async onOpen() {
+    if (this.app.workspace && typeof this.app.workspace.on === "function" && typeof this.registerEvent === "function") {
+      this.registerEvent(this.app.workspace.on("notification-hub:incoming", () => this.refreshIncomingView()));
+    }
     const preload = this.plugin.consumeManagerViewPreload();
     if (preload) this.setPreloadedData(preload);
     await this.render();
@@ -4586,6 +4611,18 @@ class NtfyManagerView extends ItemView {
 
   async onClose() {
     this.viewContentEl().empty();
+  }
+
+  refreshIncomingView() {
+    const contentEl = this.viewContentEl();
+    const inboxTab = contentEl.querySelector('[data-tab-id="inbox"]');
+    const badge = inboxTab && inboxTab.querySelector(".obsidian-ntfy-nav-badge");
+    if (badge) badge.textContent = String((this.plugin.settings.incomingMessages || []).length);
+    if (this.activeTab !== "inbox") return;
+    const body = contentEl.querySelector(".obsidian-ntfy-window-body");
+    if (!body) return;
+    body.empty();
+    this.renderIncomingMessages(body);
   }
 
   viewContentEl() {

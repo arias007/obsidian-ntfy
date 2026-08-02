@@ -103,6 +103,8 @@ async function run() {
   assert.match(source, /text\.inputEl\.addEventListener\("blur"/);
   assert.match(source, /connectFeishuGateway\(account\)/);
   assert.match(source, /callback\/ws\/endpoint/);
+  assert.match(source, /notification-hub:incoming/);
+  assert.match(source, /refreshIncomingView\(\)/);
 
   const plugin = createPlugin({
     topic: "test-topic",
@@ -212,6 +214,29 @@ async function run() {
     assert.equal(descriptor.sendConfigured, false, `${type} optional send target`);
     assert.equal(descriptor.receiveMode, receiveMode, `${type} receive mode`);
   }
+
+  const replyOnlyFeishuPlugin = createPlugin({ topic: "feishu-reply-only" });
+  await replyOnlyFeishuPlugin.addChannelToSettings("feishu", { accountId: "reply", name: "Feishu Reply" });
+  await replyOnlyFeishuPlugin.updateChannelAccount("feishu:reply", { config: { mode: "app", appId: "cli_reply", appSecret: "reply-secret", receiveId: "" } });
+  const replyRequests = [];
+  replyOnlyFeishuPlugin.httpRequest = async (request) => {
+    replyRequests.push(request);
+    if (request.url.includes("tenant_access_token")) return { json: { code: 0, tenant_access_token: "tenant-token" } };
+    return { json: { code: 0, data: { message_id: "om_reply" } } };
+  };
+  const replyResult = await replyOnlyFeishuPlugin.replyToIncomingMessage({
+    id: "feishu-inbound",
+    channelId: "feishu:reply",
+    sender: "ou_sender",
+    conversationId: "oc_runtime",
+    text: "Inbound",
+    metadata: { feishuReceiveIdType: "chat_id", feishuReceiveId: "oc_runtime" },
+  }, "Reply from Ntfy");
+  assert.equal(replyResult.ok, true);
+  assert.equal(replyRequests.length, 2);
+  assert.equal(new URL(replyRequests[1].url).searchParams.get("receive_id_type"), "chat_id");
+  assert.equal(JSON.parse(replyRequests[1].body).receive_id, "oc_runtime");
+  assert.equal(replyOnlyFeishuPlugin.listNotificationChannels().find((channel) => channel.id === "feishu:reply").sendConfigured, false);
 
   const rejectedQqPlugin = createPlugin({ topic: "qq-auth-error" });
   rejectedQqPlugin.httpRequest = async () => ({ json: { message: "invalid appid or secret" } });
