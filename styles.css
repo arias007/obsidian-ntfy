@@ -379,7 +379,9 @@
 .obsidian-ntfy-channel-account-state {
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
+  min-width: 0;
   overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .obsidian-ntfy-channel-summary-actions {
@@ -401,6 +403,10 @@
 
 .obsidian-ntfy-channel-account-state.is-configured {
   color: var(--text-success);
+}
+
+.obsidian-ntfy-channel-account-state.is-error {
+  color: var(--text-error);
 }
 
 .obsidian-ntfy-channel-account-body,
@@ -1020,6 +1026,8 @@
   .obsidian-ntfy-channel-account-state {
     flex-basis: calc(100% - 18px);
     margin-left: 18px;
+    max-width: calc(100% - 18px);
+    width: calc(100% - 18px);
   }
 
   .obsidian-ntfy-channel-summary-actions {

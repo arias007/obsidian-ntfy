@@ -211,7 +211,9 @@ Set `AI webhook token` if the receiving service expects a Bearer token.
 
 ## Notification Hub And Social Connections
 
-Version `0.6.6` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, review flow, inbox, deduplication, and quiet queue. Every built-in provider can have multiple named accounts with independent credentials, send/receive state, configuration, cursors, and a per-account test action.
+Version `0.6.7` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, review flow, inbox, deduplication, and quiet queue. Every built-in provider can have multiple named accounts with independent credentials, send/receive state, configuration, cursors, and a per-account test action.
+
+Channel status now separates required-field completion, credential verification, runtime receive connection, and proactive-send readiness. It records redacted failures plus the latest inbound/outbound activity, refreshes the account summary as soon as edited values are saved, and suppresses repeated identical connection errors. Realtime connections and low-frequency polling stay active while Obsidian remains runnable in the background by default; mobile operating systems can still suspend or stop Obsidian, and returning to the foreground reconnects immediately.
 
 The hub uses one **default channel**. Cancip, other Obsidian plugins, and external agents only use the default route unless they explicitly pass channel IDs or request a broadcast. Enabling several connections therefore does not unexpectedly send every message to every service.
 
@@ -238,9 +240,9 @@ The plugin exposes one normalized inbound message format through `plugin.api.rec
 
 Each account reports its real receive mode:
 
-- `poll`: every configured ntfy, Telegram, and Matrix account is polled independently while Obsidian is in the foreground.
-- `socket`: Discord Bot Gateway, Slack Socket Mode, and QQ official Bot Gateway connect directly while Obsidian is in the foreground.
-- `relay`: Feishu/Lark, WeCom, Email, generic Webhook, Discord webhook mode, and Slack webhook mode poll a user-configured HTTPS callback relay.
+- `poll`: every configured ntfy, Telegram, and Matrix account is polled independently while Obsidian is running; background polling can be disabled.
+- `socket`: Feishu/Lark app persistent connection, Discord Bot Gateway, Slack Socket Mode, and QQ official Bot Gateway connect directly while Obsidian is running; background sockets can be disabled.
+- `relay`: Feishu/Lark webhook mode, WeCom, Email, generic Webhook, Discord webhook mode, and Slack webhook mode poll a user-configured HTTPS callback relay.
 - `disabled` or `unconfigured`: the plugin does not claim that receiving is active.
 
 Obsidian mobile cannot expose a reliable public callback server. Callback-based providers therefore use this small HTTPS relay contract:
@@ -272,9 +274,9 @@ The relay returns either a message array or:
 
 Public relay URLs must use HTTPS and configure a receive token; plain HTTP without a token is accepted only for `localhost`, `127.0.0.1`, or `::1`. The relay is responsible for validating provider signatures and decrypting provider callbacks before returning normalized messages. Provider metadata may include `channelId`, `threadTs`, `qqTargetType`, `qqTarget`, `feishuReceiveIdType`, `feishuReceiveId`, `wecomTargetType`, `wecomTarget`, or `emailReplyTo` so replies return to the original conversation.
 
-Telegram polling requires the bot not to be owned by another `getUpdates` consumer and not to have an active webhook. Discord Bot receive requires the application's Gateway and Message Content intent permissions. Slack receive requires Socket Mode, an `xapp-` app token, a bot token, and the relevant Events API subscriptions. QQ receive uses the intents allowed for that official Bot account; the default covers direct messages, group/C2C messages, and public guild mentions.
+Telegram polling requires the bot not to be owned by another `getUpdates` consumer and not to have an active webhook. Feishu/Lark app receive uses the official persistent connection and requires `im.message.receive_v1`, persistent-connection delivery, granted permissions, and a published app version. Discord Bot receive requires the application's Gateway and Message Content intent permissions. Slack receive requires Socket Mode, an `xapp-` app token, a bot token, and the relevant Events API subscriptions. QQ receive uses the intents allowed for that official Bot account; the default covers direct messages, group/C2C messages, and public guild mentions. QQ error `100016` is returned by the official token endpoint when the AppID and current ClientSecret do not match; regenerate the AppSecret and copy both values from the same bot application.
 
-Polling cursors are persisted per account and the plugin ignores its own `obntfy-*` ntfy messages. Inbox deletion and delivery deduplication are intentionally separate. Removing an item from the visible inbox does not allow a provider retry with the same channel/message ID to run again. Incoming messages start consumer work in the background, so a long Cancip or model task does not block later receive cycles. One malformed or oversized attachment is rejected without stopping the rest of the provider batch. Realtime sockets close when Obsidian enters the background and reconnect with bounded backoff on return to reduce mobile battery use.
+Polling cursors are persisted per account and the plugin ignores its own `obntfy-*` ntfy messages. Inbox deletion and delivery deduplication are intentionally separate. Removing an item from the visible inbox does not allow a provider retry with the same channel/message ID to run again. Incoming messages start consumer work in the background, so a long Cancip or model task does not block later receive cycles. One malformed or oversized attachment is rejected without stopping the rest of the provider batch. Realtime sockets remain active while Obsidian is runnable unless background receiving is disabled; mobile operating systems can still suspend the app, and the sockets reconnect with bounded backoff after Obsidian resumes.
 
 Cancip can register its own handler without Ntfy Notifications importing Cancip:
 

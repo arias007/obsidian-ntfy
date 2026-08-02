@@ -35,7 +35,7 @@ const NOTIFICATION_HUB_API_VERSION = "1";
 const CHANNEL_PROVIDER_DEFINITIONS = Object.freeze([
   { id: "ntfy", name: "ntfy", description: "ntfy topic" },
   { id: "telegram", name: "Telegram Bot", description: "直接连接 Telegram Bot API" },
-  { id: "feishu", name: "飞书 / Lark", description: "直接连接应用 API 或群机器人 Webhook" },
+  { id: "feishu", name: "飞书 / Lark", description: "直接连接应用 API、官方长连接或群机器人 Webhook" },
   { id: "wecom", name: "企业微信", description: "直接连接企业应用 API 或群机器人 Webhook" },
   { id: "discord", name: "Discord", description: "直接连接 Bot API 或 Webhook" },
   { id: "slack", name: "Slack", description: "直接连接 Bot API 或 Webhook" },
@@ -60,6 +60,143 @@ const CHANNEL_ENABLE_SETTING_KEYS = Object.freeze({
   email: "emailChannelEnabled",
   webhook: "agentWebhookEnabled",
 });
+
+function concatUint8Arrays(parts) {
+  const normalized = parts.filter(Boolean).map((part) => part instanceof Uint8Array ? part : new Uint8Array(part));
+  const output = new Uint8Array(normalized.reduce((sum, part) => sum + part.length, 0));
+  let offset = 0;
+  for (const part of normalized) {
+    output.set(part, offset);
+    offset += part.length;
+  }
+  return output;
+}
+
+function encodeProtoVarint(value) {
+  let remaining = typeof value === "bigint" ? value : BigInt(Math.max(0, Number(value || 0)));
+  const bytes = [];
+  while (remaining > 0x7fn) {
+    bytes.push(Number(remaining & 0x7fn) | 0x80);
+    remaining >>= 7n;
+  }
+  bytes.push(Number(remaining));
+  return Uint8Array.from(bytes);
+}
+
+function encodeProtoBytes(field, value) {
+  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value || []);
+  return concatUint8Arrays([encodeProtoVarint((field << 3) | 2), encodeProtoVarint(bytes.length), bytes]);
+}
+
+function encodeProtoString(field, value) {
+  return encodeProtoBytes(field, new TextEncoder().encode(String(value || "")));
+}
+
+function encodeFeishuHeader(header) {
+  return concatUint8Arrays([encodeProtoString(1, header.key), encodeProtoString(2, header.value)]);
+}
+
+function encodeFeishuFrame(frame) {
+  const parts = [
+    concatUint8Arrays([encodeProtoVarint(8), encodeProtoVarint(frame.SeqID || 0)]),
+    concatUint8Arrays([encodeProtoVarint(16), encodeProtoVarint(frame.LogID || 0)]),
+    concatUint8Arrays([encodeProtoVarint(24), encodeProtoVarint(frame.service || 0)]),
+    concatUint8Arrays([encodeProtoVarint(32), encodeProtoVarint(frame.method || 0)]),
+  ];
+  for (const header of frame.headers || []) parts.push(encodeProtoBytes(5, encodeFeishuHeader(header)));
+  if (frame.payloadEncoding !== undefined) parts.push(encodeProtoString(6, frame.payloadEncoding));
+  if (frame.payloadType !== undefined) parts.push(encodeProtoString(7, frame.payloadType));
+  if (frame.payload !== undefined) parts.push(encodeProtoBytes(8, frame.payload));
+  if (frame.LogIDNew !== undefined) parts.push(encodeProtoString(9, frame.LogIDNew));
+  return concatUint8Arrays(parts);
+}
+
+class ProtoReader {
+  constructor(value) {
+    this.bytes = value instanceof Uint8Array ? value : new Uint8Array(value || []);
+    this.position = 0;
+  }
+
+  readVarint() {
+    let value = 0n;
+    let shift = 0n;
+    while (this.position < this.bytes.length && shift <= 70n) {
+      const byte = this.bytes[this.position++];
+      value |= BigInt(byte & 0x7f) << shift;
+      if ((byte & 0x80) === 0) return value;
+      shift += 7n;
+    }
+    throw new Error("Invalid protobuf varint.");
+  }
+
+  readBytes() {
+    const length = Number(this.readVarint());
+    const end = this.position + length;
+    if (!Number.isSafeInteger(length) || length < 0 || end > this.bytes.length) throw new Error("Invalid protobuf byte length.");
+    const value = this.bytes.slice(this.position, end);
+    this.position = end;
+    return value;
+  }
+
+  readString() {
+    return new TextDecoder("utf-8").decode(this.readBytes());
+  }
+
+  skip(wireType) {
+    if (wireType === 0) {
+      this.readVarint();
+      return;
+    }
+    if (wireType === 1) {
+      this.position += 8;
+      return;
+    }
+    if (wireType === 2) {
+      this.readBytes();
+      return;
+    }
+    if (wireType === 5) {
+      this.position += 4;
+      return;
+    }
+    throw new Error(`Unsupported protobuf wire type ${wireType}.`);
+  }
+}
+
+function decodeFeishuHeader(value) {
+  const reader = new ProtoReader(value);
+  const header = { key: "", value: "" };
+  while (reader.position < reader.bytes.length) {
+    const tag = Number(reader.readVarint());
+    const field = tag >>> 3;
+    const wireType = tag & 7;
+    if (field === 1) header.key = reader.readString();
+    else if (field === 2) header.value = reader.readString();
+    else reader.skip(wireType);
+  }
+  return header;
+}
+
+function decodeFeishuFrame(value) {
+  const reader = new ProtoReader(value);
+  const frame = { SeqID: 0n, LogID: 0n, service: 0, method: 0, headers: [] };
+  while (reader.position < reader.bytes.length) {
+    const tag = Number(reader.readVarint());
+    const field = tag >>> 3;
+    const wireType = tag & 7;
+    if (field === 1) frame.SeqID = reader.readVarint();
+    else if (field === 2) frame.LogID = reader.readVarint();
+    else if (field === 3) frame.service = Number(reader.readVarint());
+    else if (field === 4) frame.method = Number(reader.readVarint());
+    else if (field === 5) frame.headers.push(decodeFeishuHeader(reader.readBytes()));
+    else if (field === 6) frame.payloadEncoding = reader.readString();
+    else if (field === 7) frame.payloadType = reader.readString();
+    else if (field === 8) frame.payload = reader.readBytes();
+    else if (field === 9) frame.LogIDNew = reader.readString();
+    else reader.skip(wireType);
+  }
+  return frame;
+}
 
 const DEFAULT_SETTINGS = {
   serverUrl: "https://ntfy.sh",
@@ -127,6 +264,8 @@ const DEFAULT_SETTINGS = {
   incomingSeenKeys: [],
   outboundQueue: [],
   connectionLogs: [],
+  channelHealth: {},
+  backgroundReceiveEnabled: true,
   aiWebhookUrl: "",
   aiWebhookToken: "",
   autoScanEnabled: true,
@@ -276,8 +415,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.restartIncomingPollTimer();
     if (typeof document !== "undefined") {
       this.registerDomEvent(document, "visibilitychange", () => {
-        if (document.hidden) {
+        if (document.hidden && !this.settings.backgroundReceiveEnabled) {
           this.closeIncomingSockets();
+          for (const account of this.settings.channelAccounts || []) this.emitChannelStatus(account.id);
           return;
         }
         this.runIncomingPoll();
@@ -390,6 +530,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       : settings.incomingMessages.map((message) => `${String(message.channelId || "unknown")}:${String(message.id || "")}`).filter((key) => !key.endsWith(":"));
     settings.outboundQueue = Array.isArray(settings.outboundQueue) ? settings.outboundQueue.slice(0, 200) : [];
     settings.connectionLogs = Array.isArray(settings.connectionLogs) ? settings.connectionLogs.slice(0, 200) : [];
+    settings.channelHealth = this.seedChannelHealthFromConnectionLogs(
+      this.normalizeChannelHealth(settings.channelHealth),
+      settings.connectionLogs
+    );
+    settings.backgroundReceiveEnabled = settings.backgroundReceiveEnabled !== false;
     settings.ntfyReceivedIds = Array.isArray(settings.ntfyReceivedIds) ? settings.ntfyReceivedIds.slice(-500) : [];
     settings.autoScanEnabled = settings.autoScanEnabled !== false;
     settings.captureObsidianNotices = settings.captureObsidianNotices !== false;
@@ -429,6 +574,95 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       ? savedDefaultChannel
       : settings.addedChannelIds[0] || (!String(settings.topic || "").trim() && String(settings.aiWebhookUrl || "").trim() ? "webhook" : "ntfy");
     return settings;
+  }
+
+  normalizeChannelHealth(value) {
+    const normalized = {};
+    const allowedStates = new Set(["unchecked", "checking", "verified", "failed"]);
+    for (const [rawId, rawHealth] of Object.entries(value && typeof value === "object" ? value : {})) {
+      const id = String(rawId || "").trim().toLowerCase();
+      if (!id || !rawHealth || typeof rawHealth !== "object") continue;
+      normalized[id] = {
+        verificationState: allowedStates.has(rawHealth.verificationState) ? rawHealth.verificationState : "unchecked",
+        checkedAt: String(rawHealth.checkedAt || "").slice(0, 40),
+        lastConnectedAt: String(rawHealth.lastConnectedAt || "").slice(0, 40),
+        lastInboundAt: String(rawHealth.lastInboundAt || "").slice(0, 40),
+        lastOutboundAt: String(rawHealth.lastOutboundAt || "").slice(0, 40),
+        lastError: String(rawHealth.lastError || "").slice(0, 1000),
+      };
+    }
+    return normalized;
+  }
+
+  seedChannelHealthFromConnectionLogs(value, logs) {
+    const health = Object.assign({}, value || {});
+    for (const entry of Array.isArray(logs) ? logs : []) {
+      const id = String(entry && entry.channelId || "").trim().toLowerCase();
+      const at = String(entry && entry.at || "").slice(0, 40);
+      const message = String(entry && entry.message || "");
+      if (!id || !at) continue;
+      const current = health[id] || this.getChannelHealthDefaults();
+      const patch = {};
+      if (!current.lastInboundAt && message === "Incoming message received") patch.lastInboundAt = at;
+      if (!current.lastOutboundAt && /^Outgoing notification (?:sent|scheduled)$/.test(message)) patch.lastOutboundAt = at;
+      if (!current.lastConnectedAt && message === "Realtime receive connected") patch.lastConnectedAt = at;
+      if (current.verificationState === "unchecked" && message === "Channel credential check passed") {
+        patch.verificationState = "verified";
+        patch.checkedAt = at;
+      }
+      if (Object.keys(patch).length) health[id] = Object.assign({}, current, patch);
+    }
+    return this.normalizeChannelHealth(health);
+  }
+
+  getChannelHealthDefaults() {
+    return {
+      verificationState: "unchecked",
+      checkedAt: "",
+      lastConnectedAt: "",
+      lastInboundAt: "",
+      lastOutboundAt: "",
+      lastError: "",
+    };
+  }
+
+  getChannelHealth(channelId) {
+    const id = String(channelId || "").trim().toLowerCase();
+    const saved = this.settings.channelHealth && this.settings.channelHealth[id];
+    return Object.assign(this.getChannelHealthDefaults(), saved || {});
+  }
+
+  updateChannelHealth(channelId, patch = {}) {
+    const id = String(channelId || "").trim().toLowerCase();
+    if (!id) return null;
+    if (!this.settings.channelHealth || typeof this.settings.channelHealth !== "object") this.settings.channelHealth = {};
+    const next = this.normalizeChannelHealth({
+      [id]: Object.assign({}, this.getChannelHealth(id), patch),
+    })[id];
+    this.settings.channelHealth[id] = next;
+    this.emitChannelStatus(id);
+    return next;
+  }
+
+  emitChannelStatus(channelId) {
+    if (this.app && this.app.workspace && typeof this.app.workspace.trigger === "function") {
+      this.app.workspace.trigger("notification-hub:channel-status", String(channelId || "").trim().toLowerCase());
+    }
+  }
+
+  channelCredentialKeys(type) {
+    return {
+      ntfy: ["serverUrl", "topic", "authToken"],
+      telegram: ["apiRoot", "botToken"],
+      feishu: ["mode", "domain", "appId", "appSecret", "webhookUrl"],
+      wecom: ["mode", "corpId", "agentId", "secret", "webhookUrl"],
+      discord: ["mode", "apiRoot", "botToken", "webhookUrl"],
+      slack: ["mode", "apiRoot", "botToken", "appToken", "webhookUrl"],
+      matrix: ["serverUrl", "accessToken"],
+      qqbot: ["appId", "clientSecret", "apiRoot"],
+      email: ["gatewayUrl", "gatewayToken"],
+      webhook: ["url", "token", "customHeaders"],
+    }[String(type || "").trim().toLowerCase()] || [];
   }
 
   normalizeChannelAccountId(value, fallback = "default") {
@@ -472,7 +706,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const config = Object.assign(this.channelConfigDefaults(provider), legacy, raw);
     if (provider === "ntfy") config.receivedIds = Array.isArray(config.receivedIds) ? config.receivedIds.slice(-500).map(String) : [];
     if (provider === "telegram") config.receiveOffset = Math.max(0, Number(config.receiveOffset || 0));
-    if (provider === "qqbot") config.gatewayIntents = Math.max(0, Number(config.gatewayIntents || QQ_BOT_GATEWAY_INTENTS) >>> 0);
+    if (provider === "qqbot") {
+      config.mode = "official";
+      config.gatewayIntents = Math.max(0, Number(config.gatewayIntents || QQ_BOT_GATEWAY_INTENTS) >>> 0);
+    }
     return config;
   }
 
@@ -629,12 +866,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const channels = this.listNotificationChannels()
       .filter((channel) => channel.builtin && this.isChannelAdded(channel.id))
       .map((channel) => {
-        const state = this.incomingSocketStates && this.incomingSocketStates.get(channel.id);
         return {
           id: channel.id,
           mode: channel.receiveMode,
           configured: channel.receiveConfigured === true,
-          status: channel.receiveMode === "socket" ? state && state.status || "disconnected" : channel.receiveMode,
+          status: channel.connectionStatus || channel.receiveMode,
+          verificationState: channel.verificationState,
+          lastInboundAt: channel.lastInboundAt || "",
+          lastOutboundAt: channel.lastOutboundAt || "",
         };
       });
     return {
@@ -771,7 +1010,16 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (!account) return false;
     if (patch.name !== undefined) account.name = String(patch.name || "").trim().slice(0, 80) || this.channelProvider(account.type).name;
     if (patch.enabled !== undefined) account.enabled = Boolean(patch.enabled);
-    if (patch.config && typeof patch.config === "object") account.config = Object.assign({}, account.config || {}, patch.config);
+    if (patch.config && typeof patch.config === "object") {
+      const credentialChanged = this.channelCredentialKeys(account.type).some((key) => Object.prototype.hasOwnProperty.call(patch.config, key)
+        && String(account.config && account.config[key] || "") !== String(patch.config[key] || ""));
+      account.config = Object.assign({}, account.config || {}, patch.config);
+      if (account.type === "qqbot") account.config.mode = "official";
+      if (credentialChanged) {
+        this.updateChannelHealth(account.id, { verificationState: "unchecked", checkedAt: "", lastError: "" });
+        if (account.type === "qqbot" && this.qqBotAccessTokens) this.qqBotAccessTokens.clear();
+      }
+    }
     this.syncLegacyChannelAccount(account);
     await this.saveSettings();
     return true;
@@ -829,6 +1077,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (account.type === "ntfy") return Boolean(String(config.serverUrl || "").trim() && String(config.topic || "").trim()) || relayConfigured;
     if (account.type === "telegram") return Boolean(String(config.botToken || "").trim()) || relayConfigured;
     if (account.type === "matrix") return Boolean(String(config.serverUrl || "").trim() && String(config.accessToken || "").trim()) || relayConfigured;
+    if (account.type === "feishu") return String(config.mode || "app") === "app"
+      ? Boolean(String(config.appId || "").trim() && String(config.appSecret || "").trim())
+      : relayConfigured;
     if (account.type === "qqbot") return Boolean(String(config.appId || "").trim() && String(config.clientSecret || "").trim());
     if (account.type === "discord") return String(config.mode || "webhook") === "bot"
       ? Boolean(String(config.botToken || "").trim())
@@ -855,6 +1106,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (account.type === "ntfy" && String(config.serverUrl || "").trim() && String(config.topic || "").trim()) return "poll";
     if (account.type === "telegram" && String(config.botToken || "").trim()) return "poll";
     if (account.type === "matrix" && String(config.serverUrl || "").trim() && String(config.accessToken || "").trim()) return "poll";
+    if (account.type === "feishu" && String(config.mode || "app") === "app" && this.channelAccountReceiveConfigured(account)) return "socket";
     if (account.type === "qqbot" && this.channelAccountReceiveConfigured(account)) return "socket";
     if (account.type === "discord" && String(config.mode || "webhook") === "bot" && this.channelAccountReceiveConfigured(account)) return "socket";
     if (account.type === "slack" && String(config.mode || "webhook") === "bot" && this.channelAccountReceiveConfigured(account)) return "socket";
@@ -868,6 +1120,13 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       const receiveMode = this.channelReceiveMode(account);
       const socketState = receiveMode === "socket" && this.incomingSocketStates ? this.incomingSocketStates.get(account.id) : null;
       const latestError = (this.settings.connectionLogs || []).find((entry) => entry.channelId === account.id && entry.level === "error");
+      const health = this.getChannelHealth(account.id);
+      const pausedInBackground = receiveMode === "socket" && typeof document !== "undefined" && document.hidden && !this.settings.backgroundReceiveEnabled;
+      const connectionStatus = receiveMode === "socket"
+        ? pausedInBackground
+          ? "paused-background"
+          : socketState && socketState.status || (health.verificationState === "failed" ? "failed" : "disconnected")
+        : receiveMode;
       return {
         id: account.id,
         type: account.type,
@@ -883,8 +1142,13 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         supportsRemoteSchedule: account.type === "ntfy",
         canReceive: ["poll", "socket", "relay"].includes(receiveMode),
         receiveMode,
-        connectionStatus: receiveMode === "socket" ? socketState && socketState.status || "disconnected" : receiveMode,
-        connectionError: latestError && latestError.details ? String(latestError.details.error || "") : "",
+        connectionStatus,
+        verificationState: health.verificationState,
+        checkedAt: health.checkedAt,
+        lastConnectedAt: health.lastConnectedAt,
+        lastInboundAt: health.lastInboundAt,
+        lastOutboundAt: health.lastOutboundAt,
+        connectionError: health.lastError || (latestError && latestError.details ? String(latestError.details.error || "") : ""),
         builtin: true,
       };
     });
@@ -1056,11 +1320,29 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     } catch (_) {
       safeDetails = {};
     }
+    const at = new Date().toISOString();
+    const normalizedLevel = String(level || "info");
+    const normalizedChannelId = String(channelId || "hub");
+    const normalizedMessage = String(message || "");
+    const latest = this.settings.connectionLogs && this.settings.connectionLogs[0];
+    const sameAsLatest = latest
+      && latest.level === normalizedLevel
+      && latest.channelId === normalizedChannelId
+      && latest.message === normalizedMessage
+      && String(latest.details && latest.details.error || "") === String(safeDetails.error || "")
+      && Date.now() - new Date(latest.at || 0).getTime() < 30_000;
+    if (sameAsLatest) {
+      latest.at = at;
+      latest.details = Object.assign({}, latest.details || {}, safeDetails, {
+        repeatCount: Math.max(1, Number(latest.details && latest.details.repeatCount || 1)) + 1,
+      });
+      return latest;
+    }
     const entry = {
-      at: new Date().toISOString(),
-      level: String(level || "info"),
-      channelId: String(channelId || "hub"),
-      message: String(message || ""),
+      at,
+      level: normalizedLevel,
+      channelId: normalizedChannelId,
+      message: normalizedMessage,
       details: safeDetails,
     };
     this.settings.connectionLogs = [entry, ...(this.settings.connectionLogs || [])].slice(0, 200);
@@ -1091,6 +1373,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.rememberIncomingMessage(message);
     this.settings.incomingMessages = [message, ...(this.settings.incomingMessages || [])].slice(0, 200);
     this.recordConnectionLog("info", message.channelId, "Incoming message received", { sender: message.sender, conversationId: message.conversationId });
+    this.updateChannelHealth(message.channelId, {
+      verificationState: "verified",
+      lastInboundAt: new Date().toISOString(),
+      lastError: "",
+    });
     const quiet = this.isQuietHours();
     if (!quiet) new Notice(`[${message.channelId}] ${message.sender}: ${message.text || message.title}`);
 
@@ -1203,7 +1490,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   async runIncomingPoll(options = {}) {
     if (this.isPollingIncoming) return { ok: false, status: "busy", changed: false, pollers: [] };
     if (!this.settings.socialHubEnabled) return { ok: false, status: "hub-disabled", changed: false, pollers: [] };
-    if (typeof document !== "undefined" && document.hidden && options.force !== true) {
+    if (typeof document !== "undefined" && document.hidden && !this.settings.backgroundReceiveEnabled && options.force !== true) {
       return { ok: false, status: "background", changed: false, pollers: [] };
     }
     this.isPollingIncoming = true;
@@ -1221,10 +1508,17 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         try {
           const pollerChanged = await poller.run();
           changed = pollerChanged || changed;
+          const health = this.getChannelHealth(poller.id);
+          if (health.verificationState !== "verified" || health.lastError) {
+            this.updateChannelHealth(poller.id, { verificationState: "verified", lastError: "" });
+            changed = true;
+          }
           pollResults.push({ id: poller.id, ok: true, changed: Boolean(pollerChanged) });
         } catch (error) {
           changed = true;
-          pollResults.push({ id: poller.id, ok: false, changed: false, error: this.redactSensitiveText(error.message || String(error), true) });
+          const safeError = this.redactSensitiveText(error.message || String(error), true);
+          pollResults.push({ id: poller.id, ok: false, changed: false, error: safeError });
+          this.updateChannelHealth(poller.id, { lastError: safeError });
           this.recordConnectionLog("error", poller.id, "Incoming poll failed", { error: error.message || String(error) });
         }
       }
@@ -1310,8 +1604,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   shouldRunIncomingSocket(channelId) {
     const account = this.getChannelAccount(channelId);
-    const foreground = typeof document === "undefined" || !document.hidden;
-    return Boolean(!this.isUnloading && foreground && account && this.settings.socialHubEnabled !== false && this.isChannelAdded(account.id) && account.enabled !== false && this.channelReceiveMode(account) === "socket");
+    const receiveAllowed = typeof document === "undefined" || !document.hidden || this.settings.backgroundReceiveEnabled;
+    return Boolean(!this.isUnloading && receiveAllowed && account && this.settings.socialHubEnabled !== false && this.isChannelAdded(account.id) && account.enabled !== false && this.channelReceiveMode(account) === "socket");
+  }
+
+  isTerminalChannelAuthError(error) {
+    return /(?:invalid\s+appid\s+or\s+secret|invalid\s+bot\s+id|invalid\s+client\s*secret|authentication\s+failed|auth[_ -]?failed|unauthori[sz]ed|forbidden|\b401\b|\b403\b|\b514\b)/i.test(String(error && (error.message || error) || ""));
   }
 
   incomingSocketConfigKey(account) {
@@ -1320,7 +1618,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       ? [config.apiRoot, config.botToken]
       : account && account.type === "slack"
         ? [config.apiRoot, config.botToken, config.appToken]
-        : [config.apiRoot, config.appId, config.clientSecret, config.gatewayIntents];
+        : account && account.type === "feishu"
+          ? [config.domain, config.appId, config.appSecret]
+          : [config.apiRoot, config.appId, config.clientSecret, config.gatewayIntents];
     return this.hash(JSON.stringify(relevant));
   }
 
@@ -1358,8 +1658,19 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       try {
         await this.connectIncomingSocket(account);
       } catch (error) {
-        this.recordConnectionLog("error", account.id, "Realtime receive connection failed", { error: error.message || String(error) });
-        this.scheduleIncomingSocketReconnect(account.id);
+        const safeError = this.redactSensitiveText(error.message || String(error), true);
+        const terminal = this.isTerminalChannelAuthError(error);
+        const state = this.incomingSocketStates.get(account.id) || { channelId: account.id, configKey: this.incomingSocketConfigKey(account) };
+        state.status = terminal ? "failed" : "reconnecting";
+        state.lastError = safeError;
+        this.incomingSocketStates.set(account.id, state);
+        this.updateChannelHealth(account.id, Object.assign({ lastError: safeError }, terminal ? {
+          verificationState: "failed",
+          checkedAt: new Date().toISOString(),
+        } : {}));
+        this.recordConnectionLog("error", account.id, "Realtime receive connection failed", { error: safeError });
+        if (terminal) await this.saveSettings();
+        else this.scheduleIncomingSocketReconnect(account.id);
       }
     }
   }
@@ -1418,6 +1729,23 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       });
     }, delay);
     this.incomingSocketStates.set(channelId, existing);
+    this.emitChannelStatus(channelId);
+  }
+
+  markRealtimeConnected(account, state) {
+    const wasConnected = state.status === "connected";
+    state.status = "connected";
+    state.reconnectAttempts = 0;
+    if (this.incomingReconnectAttempts) this.incomingReconnectAttempts.delete(account.id);
+    this.updateChannelHealth(account.id, {
+      verificationState: "verified",
+      lastConnectedAt: new Date().toISOString(),
+      lastError: "",
+    });
+    if (!wasConnected) {
+      this.recordConnectionLog("info", account.id, "Realtime receive connected");
+      this.saveSettings().catch((error) => console.warn(`${PLUGIN_NAME}: failed to persist channel status`, error));
+    }
   }
 
   attachIncomingSocket(account, socket, messageHandler) {
@@ -1427,10 +1755,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     state.closed = false;
     this.incomingSocketStates.set(account.id, state);
     socket.onopen = () => {
-      state.status = "connected";
-      state.reconnectAttempts = 0;
-      if (this.incomingReconnectAttempts) this.incomingReconnectAttempts.delete(account.id);
-      this.recordConnectionLog("info", account.id, "Realtime receive connected");
+      if (account.type === "slack" || account.type === "feishu") {
+        this.markRealtimeConnected(account, state);
+        if (account.type === "feishu") this.startFeishuHeartbeat(state);
+      }
+      else {
+        state.status = "connecting";
+        this.emitChannelStatus(account.id);
+      }
     };
     socket.onmessage = (event) => {
       Promise.resolve(messageHandler(event && event.data, state, socket)).catch((error) => {
@@ -1445,6 +1777,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       state.heartbeatTimer = null;
       state.socket = null;
       state.status = "closed";
+      this.emitChannelStatus(account.id);
       if (!state.closed) this.scheduleIncomingSocketReconnect(account.id);
     };
     return state;
@@ -1464,6 +1797,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.incomingSocketStates.set(account.id, state);
     if (account.type === "discord") return await this.connectDiscordGateway(account);
     if (account.type === "slack") return await this.connectSlackSocketMode(account);
+    if (account.type === "feishu") return await this.connectFeishuGateway(account);
     if (account.type === "qqbot") return await this.connectQqBotGateway(account);
     this.incomingSocketStates.delete(account.id);
     throw new Error(`Unsupported realtime channel '${account.type}'.`);
@@ -1495,6 +1829,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       }
       if (payload.op === 7 || payload.op === 9) {
         currentSocket.close();
+        return;
+      }
+      if (payload.op === 0 && (payload.t === "READY" || payload.t === "RESUMED")) {
+        this.markRealtimeConnected(account, current);
         return;
       }
       if (payload.op !== 0 || payload.t !== "MESSAGE_CREATE" || !payload.d || payload.d.author && payload.d.author.bot) return;
@@ -1543,6 +1881,192 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     });
   }
 
+  feishuApiBase(config = {}) {
+    const domain = String(config.domain || "feishu").trim().toLowerCase();
+    if (domain === "lark") return "https://open.larksuite.com";
+    if (domain.startsWith("http")) return this.requireHttpUrl(domain, "Feishu domain").replace(/\/+$/, "");
+    return "https://open.feishu.cn";
+  }
+
+  encodeFeishuFrame(frame) {
+    return encodeFeishuFrame(frame);
+  }
+
+  decodeFeishuFrame(value) {
+    return decodeFeishuFrame(value);
+  }
+
+  async getFeishuGateway(config) {
+    const appId = String(config.appId || "").trim();
+    const appSecret = String(config.appSecret || "").trim();
+    if (!appId || !appSecret) throw new Error("Feishu App ID and App Secret are required.");
+    const response = await this.httpRequest({
+      url: `${this.feishuApiBase(config)}/callback/ws/endpoint`,
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ AppID: appId, AppSecret: appSecret }),
+      throw: true,
+    });
+    const json = await this.responseJson(response);
+    const data = json && json.data || {};
+    if (!json || Number(json.code || 0) !== 0 || !data.URL) {
+      const code = json && json.code !== undefined ? ` code=${json.code}` : "";
+      throw new Error(`Feishu persistent connection failed:${code} ${String(json && json.msg || "gateway URL is unavailable").trim()}`);
+    }
+    const url = new URL(String(data.URL));
+    if (!/^wss?:$/.test(url.protocol)) throw new Error("Feishu persistent connection returned an invalid WebSocket URL.");
+    const clientConfig = data.ClientConfig && typeof data.ClientConfig === "object" ? data.ClientConfig : {};
+    return {
+      url: url.toString(),
+      serviceId: Math.max(0, Number(url.searchParams.get("service_id") || 0)),
+      pingIntervalMs: Math.max(5_000, Number(clientConfig.PingInterval || 90) * 1000),
+    };
+  }
+
+  startFeishuHeartbeat(state) {
+    if (state.heartbeatTimer) window.clearInterval(state.heartbeatTimer);
+    const send = () => {
+      if (!state.socket || state.socket.readyState !== 1) return;
+      state.socket.send(encodeFeishuFrame({
+        SeqID: 0,
+        LogID: 0,
+        service: state.feishuServiceId || 0,
+        method: 0,
+        headers: [{ key: "type", value: "ping" }],
+      }));
+    };
+    state.heartbeatTimer = window.setInterval(send, Math.max(5_000, Number(state.feishuPingIntervalMs || 90_000)));
+    send();
+  }
+
+  async readFeishuSocketBytes(raw) {
+    if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
+    if (ArrayBuffer.isView(raw)) return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+    if (typeof Blob !== "undefined" && raw instanceof Blob) return new Uint8Array(await raw.arrayBuffer());
+    throw new Error("Feishu persistent connection returned a non-binary frame.");
+  }
+
+  mergeFeishuFramePayload(state, frame, headers) {
+    const messageId = String(headers.message_id || frame.LogIDNew || frame.LogID || "");
+    const total = Math.max(1, Number(headers.sum || 1));
+    const sequence = Math.max(0, Number(headers.seq || 0));
+    if (total === 1) return frame.payload || new Uint8Array();
+    if (!state.feishuChunks) state.feishuChunks = new Map();
+    const now = Date.now();
+    for (const [id, entry] of state.feishuChunks) {
+      if (now - entry.createdAt > 15_000) state.feishuChunks.delete(id);
+    }
+    const entry = state.feishuChunks.get(messageId) || { createdAt: now, parts: new Array(total) };
+    entry.parts[sequence] = frame.payload || new Uint8Array();
+    state.feishuChunks.set(messageId, entry);
+    if (!entry.parts.every((part) => part instanceof Uint8Array)) return null;
+    state.feishuChunks.delete(messageId);
+    return concatUint8Arrays(entry.parts);
+  }
+
+  extractFeishuMessageText(content, messageType) {
+    let parsed = content;
+    if (typeof parsed === "string") {
+      try { parsed = JSON.parse(parsed); } catch (_) { return parsed.trim(); }
+    }
+    const text = [];
+    const visit = (value, key = "") => {
+      if (typeof value === "string") {
+        if (key === "text" || key === "title" || key === "content") text.push(value);
+        return;
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) visit(item, key);
+        return;
+      }
+      if (value && typeof value === "object") {
+        for (const [childKey, child] of Object.entries(value)) visit(child, childKey);
+      }
+    };
+    visit(parsed);
+    return text.map((item) => item.trim()).filter(Boolean).join("\n") || `[${String(messageType || "message")}]`;
+  }
+
+  async ingestFeishuEvent(account, envelope) {
+    const header = envelope && envelope.header || {};
+    if (header.event_type && header.event_type !== "im.message.receive_v1") return false;
+    const event = envelope && envelope.event || {};
+    const message = event.message || {};
+    const sender = event.sender || {};
+    if (!message.message_id || sender.sender_type === "app") return false;
+    const senderId = sender.sender_id || {};
+    const chatId = String(message.chat_id || "");
+    const timestamp = Number(message.create_time || header.create_time || 0);
+    const receivedAt = timestamp > 0 ? new Date(timestamp).toISOString() : new Date().toISOString();
+    await this.ingestIncomingMessage({
+      id: `feishu-${message.message_id}`,
+      channelId: account.id,
+      sender: String(senderId.open_id || senderId.user_id || senderId.union_id || sender.sender_type || "feishu"),
+      conversationId: chatId,
+      text: this.extractFeishuMessageText(message.content, message.message_type),
+      receivedAt,
+      metadata: {
+        feishuReceiveIdType: "chat_id",
+        feishuReceiveId: chatId,
+        messageId: String(message.message_id),
+        rootId: String(message.root_id || ""),
+        parentId: String(message.parent_id || ""),
+        messageType: String(message.message_type || ""),
+        chatType: String(message.chat_type || ""),
+      },
+    }, { awaitHandler: false });
+    return true;
+  }
+
+  sendFeishuFrameAcknowledgement(socket, frame, startedAt) {
+    if (!socket || socket.readyState !== 1) return;
+    socket.send(encodeFeishuFrame(Object.assign({}, frame, {
+      headers: [...(frame.headers || []), { key: "biz_rt", value: String(Math.max(0, Date.now() - startedAt)) }],
+      payload: new TextEncoder().encode(JSON.stringify({ code: 200 })),
+    })));
+  }
+
+  async handleFeishuSocketFrame(account, state, socket, raw) {
+    const frame = decodeFeishuFrame(await this.readFeishuSocketBytes(raw));
+    const headers = Object.fromEntries((frame.headers || []).map((header) => [header.key, header.value]));
+    if (frame.method === 0) {
+      if (headers.type === "pong" && frame.payload && frame.payload.length) {
+        try {
+          const config = JSON.parse(new TextDecoder("utf-8").decode(frame.payload));
+          const nextInterval = Math.max(5_000, Number(config.PingInterval || 0) * 1000);
+          if (Number.isFinite(nextInterval) && nextInterval !== state.feishuPingIntervalMs) {
+            state.feishuPingIntervalMs = nextInterval;
+            this.startFeishuHeartbeat(state);
+          }
+        } catch (_) {}
+      }
+      return;
+    }
+    if (frame.method !== 1 || headers.type !== "event") return;
+    const payload = this.mergeFeishuFramePayload(state, frame, headers);
+    if (!payload) return;
+    const startedAt = Date.now();
+    try {
+      const envelope = JSON.parse(new TextDecoder("utf-8").decode(payload));
+      await this.ingestFeishuEvent(account, envelope);
+    } finally {
+      this.sendFeishuFrameAcknowledgement(socket, frame, startedAt);
+    }
+  }
+
+  async connectFeishuGateway(account) {
+    const gateway = await this.getFeishuGateway(account.config || {});
+    const socket = new WebSocket(gateway.url);
+    socket.binaryType = "arraybuffer";
+    const state = this.attachIncomingSocket(account, socket, async (raw, current, currentSocket) => {
+      await this.handleFeishuSocketFrame(account, current, currentSocket, raw);
+    });
+    state.feishuServiceId = gateway.serviceId;
+    state.feishuPingIntervalMs = gateway.pingIntervalMs;
+    state.feishuChunks = new Map();
+    return state;
+  }
+
   async connectQqBotGateway(account) {
     const config = account.config || {};
     const gateway = await this.getQqBotGateway(config);
@@ -1576,6 +2100,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         currentSocket.close();
         return;
       }
+      if (payload.op === 0 && (payload.t === "READY" || payload.t === "RESUMED")) {
+        if (payload.d && payload.d.session_id) current.sessionId = String(payload.d.session_id);
+        this.markRealtimeConnected(account, current);
+        return;
+      }
       if (payload.op !== 0 || !payload.d || !["C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "AT_MESSAGE_CREATE", "DIRECT_MESSAGE_CREATE", "MESSAGE_CREATE"].includes(payload.t)) return;
       const message = payload.d;
       const author = message.author || {};
@@ -1603,16 +2132,24 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return { accessToken, url: String(json.url), shards: Math.max(1, Number(json.shards || 1)) };
   }
 
-  async testChannelConnection(channel) {
+  async testChannelConnection(channel, options = {}) {
     const config = channel && channel.config || {};
     const type = String(channel && channel.type || "");
     const mode = String(config.mode || "").trim().toLowerCase();
+    const checkedAt = new Date().toISOString();
+    let probed = false;
+    this.updateChannelHealth(channel.id, { verificationState: "checking", lastError: "" });
     try {
-      if (type === "telegram") {
+      if (type === "ntfy") {
+        const account = this.getChannelAccount(channel.id);
+        if (account) await this.pollNtfyIncoming(account);
+        probed = true;
+      } else if (type === "telegram") {
         const token = String(config.botToken || "").trim();
         const apiRoot = this.requireHttpUrl(config.apiRoot || "https://api.telegram.org", "Telegram API root").replace(/\/+$/, "");
         const json = await this.responseJson(await this.httpRequest({ url: `${apiRoot}/bot${token}/getMe`, method: "GET", throw: true }));
         if (!json || json.ok === false) throw new Error(json && json.description || "Telegram bot authentication failed.");
+        probed = true;
       } else if (type === "feishu" && mode !== "webhook") {
         const domain = String(config.domain || "feishu").trim().toLowerCase();
         const apiBase = domain === "lark" ? "https://open.larksuite.com" : domain.startsWith("http") ? this.requireHttpUrl(domain, "Feishu domain").replace(/\/+$/, "") : "https://open.feishu.cn";
@@ -1624,6 +2161,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
           throw: true,
         }));
         if (!json || Number(json.code || 0) !== 0 || !json.tenant_access_token) throw new Error(json && json.msg || "Feishu app authentication failed.");
+        probed = true;
       } else if (type === "wecom" && mode === "app") {
         const json = await this.responseJson(await this.httpRequest({
           url: `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${encodeURIComponent(config.corpId || "")}&corpsecret=${encodeURIComponent(config.secret || "")}`,
@@ -1631,35 +2169,50 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
           throw: true,
         }));
         if (!json || Number(json.errcode || 0) !== 0 || !json.access_token) throw new Error(json && json.errmsg || "WeCom app authentication failed.");
+        probed = true;
       } else if (type === "discord" && mode === "bot") {
         const apiRoot = this.requireHttpUrl(config.apiRoot || "https://discord.com/api/v10", "Discord API root").replace(/\/+$/, "");
         const json = await this.responseJson(await this.httpRequest({ url: `${apiRoot}/users/@me`, method: "GET", headers: { Authorization: `Bot ${String(config.botToken || "").trim()}` }, throw: true }));
         if (!json || json.message && !json.id) throw new Error(json && json.message || "Discord bot authentication failed.");
+        probed = true;
       } else if (type === "slack" && mode === "bot") {
         const apiRoot = this.requireHttpUrl(config.apiRoot || "https://slack.com/api", "Slack API root").replace(/\/+$/, "");
         const json = await this.responseJson(await this.httpRequest({ url: `${apiRoot}/auth.test`, method: "POST", headers: { Authorization: `Bearer ${String(config.botToken || "").trim()}`, "Content-Type": "application/x-www-form-urlencoded" }, body: "", throw: true }));
         if (!json || json.ok === false) throw new Error(json && json.error || "Slack bot authentication failed.");
+        probed = true;
       } else if (type === "matrix") {
         const base = this.requireHttpUrl(config.serverUrl, "Matrix server").replace(/\/+$/, "");
         const json = await this.responseJson(await this.httpRequest({ url: `${base}/_matrix/client/v3/account/whoami`, method: "GET", headers: { Authorization: `Bearer ${String(config.accessToken || "").trim()}` }, throw: true }));
         if (!json || json.errcode || !json.user_id) throw new Error(json && (json.error || json.errcode) || "Matrix authentication failed.");
+        probed = true;
       } else if (type === "qqbot") {
         await this.getQqBotGateway(config);
+        probed = true;
       } else if (type === "email") {
         this.requireHttpUrl(config.gatewayUrl, "Email HTTP gateway");
       }
-      this.recordConnectionLog("info", channel.id, "Channel connection check passed");
-      try {
-        await this.refreshChannelConnection(channel.id);
-      } catch (refreshError) {
-        this.recordConnectionLog("warning", channel.id, "Channel receive refresh failed after a successful connection check", { error: refreshError.message || String(refreshError) });
+      this.updateChannelHealth(channel.id, {
+        verificationState: probed ? "verified" : "unchecked",
+        checkedAt: probed ? checkedAt : "",
+        lastError: "",
+      });
+      this.recordConnectionLog("info", channel.id, probed ? "Channel credential check passed" : "Channel configuration check passed");
+      if (options.refresh !== false && type !== "ntfy") {
+        try {
+          await this.refreshChannelConnection(channel.id);
+        } catch (refreshError) {
+          this.recordConnectionLog("warning", channel.id, "Channel receive refresh failed after a successful connection check", { error: refreshError.message || String(refreshError) });
+        }
       }
-      new Notice(`${PLUGIN_NAME}: ${channel.name} connection check passed`);
+      await this.saveSettings();
+      if (options.showSuccess !== false) new Notice(`${PLUGIN_NAME}: ${channel.name} ${probed ? "credentials verified" : "configuration complete"}`);
       return true;
     } catch (error) {
       const safeError = this.redactSensitiveText(error.message || String(error), true);
+      this.updateChannelHealth(channel.id, { verificationState: "failed", checkedAt, lastError: safeError });
       this.recordConnectionLog("error", channel.id, "Channel connection check failed", { error: safeError });
-      new Notice(`${PLUGIN_NAME}: ${safeError}`);
+      await this.saveSettings();
+      if (options.showError !== false) new Notice(`${PLUGIN_NAME}: ${safeError}`);
       return false;
     }
   }
@@ -1880,6 +2433,17 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     });
     for (const item of result.results) {
       this.recordConnectionLog(item.ok ? "info" : "error", item.channelId, `Outgoing notification ${item.status}`, { notificationId: notification.id, error: item.error || "" });
+      if (item.ok && ["sent", "scheduled"].includes(item.status)) {
+        this.updateChannelHealth(item.channelId, {
+          verificationState: "verified",
+          lastOutboundAt: new Date().toISOString(),
+          lastError: "",
+        });
+      } else if (!item.ok) {
+        const safeError = this.redactSensitiveText(item.error || item.status || "Outgoing notification failed", true);
+        const authFailure = /(?:auth|credential|token|secret|appid|unauthori[sz]ed|forbidden|\b401\b|\b403\b)/i.test(safeError);
+        this.updateChannelHealth(item.channelId, Object.assign({ lastError: safeError }, authFailure ? { verificationState: "failed", checkedAt: new Date().toISOString() } : {}));
+      }
     }
     await this.saveSettings();
     return result;
@@ -2241,7 +2805,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (!token) {
       const message = String(json && (json.message || json.msg) || "QQ Bot authentication failed.").trim();
       if (/invalid\s+appid\s+or\s+secret/i.test(message)) {
-        throw new Error("QQ Bot authentication failed: invalid Bot ID/AppID or ClientSecret. Re-copy both values from the same QQ Open Platform bot.");
+        const code = json && json.code !== undefined ? ` (${json.code})` : "";
+        throw new Error(`QQ Bot authentication failed${code}: this AppID and ClientSecret do not match. Regenerate the current AppSecret in QQ Open Platform, then copy it together with the AppID from the same bot application.`);
       }
       throw new Error(message);
     }
@@ -3784,8 +4349,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       return;
     }
 
+    const connected = await this.testChannelConnection(channel, { showSuccess: false, showError: true });
+    if (!connected) return;
+
     if (!channel.sendConfigured) {
-      await this.testChannelConnection(channel);
+      new Notice(`${PLUGIN_NAME}: ${channel.name} credentials verified; proactive send target is optional`);
       return;
     }
 
@@ -5173,6 +5741,9 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
+    if (app && app.workspace && typeof app.workspace.on === "function" && typeof plugin.registerEvent === "function") {
+      plugin.registerEvent(app.workspace.on("notification-hub:channel-status", (channelId) => this.refreshChannelAccountSummary(channelId)));
+    }
   }
 
   isChineseUi() {
@@ -5242,6 +5813,15 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       enabled ? this.uiText("已启用", "Enabled") : this.uiText("已停用", "Disabled"),
       channel.configured ? this.uiText("基础配置完成", "Basic setup complete") : this.uiText("等待基础配置", "Basic setup required"),
     ];
+    if (channel.configured) {
+      const verificationLabels = {
+        checking: this.uiText("正在验证凭据", "Checking credentials"),
+        verified: this.uiText("凭据已验证", "Credentials verified"),
+        failed: this.uiText("凭据验证失败", "Credential check failed"),
+        unchecked: this.uiText("凭据待验证", "Credentials not verified"),
+      };
+      status.push(verificationLabels[channel.verificationState] || verificationLabels.unchecked);
+    }
     if (channel.configured && !channel.sendConfigured) {
       status.push(this.uiText("主动发送目标未设置", "Proactive send target not set"));
     }
@@ -5257,14 +5837,50 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       authorizing: this.uiText("正在鉴权", "Authorizing"),
       connecting: this.uiText("正在连接", "Connecting"),
       reconnecting: this.uiText("连接失败，正在重试", "Connection failed; retrying"),
+      "paused-background": this.uiText("后台收件已暂停", "Background receive paused"),
+      failed: this.uiText("实时收件连接失败", "Realtime receive failed"),
       closed: this.uiText("实时连接已断开", "Realtime disconnected"),
       disconnected: this.uiText("等待实时连接", "Waiting for realtime connection"),
     };
     status.push(channel.receiveMode === "socket"
       ? socketLabels[channel.connectionStatus] || this.uiText("实时收件", "Realtime receive")
       : receiveLabels[channel.receiveMode] || this.uiText("等待接收配置", "Receive needs setup"));
+    const activity = [];
+    if (channel.lastInboundAt) activity.push(`${this.uiText("最近收件", "Last in")} ${this.formatChannelStatusTime(channel.lastInboundAt)}`);
+    if (channel.lastOutboundAt) activity.push(`${this.uiText("最近发件", "Last out")} ${this.formatChannelStatusTime(channel.lastOutboundAt)}`);
+    if (activity.length) status.push(activity.join(" / "));
     if (this.plugin.settings.defaultChannelId === channel.id) status.unshift(this.uiText("默认发送", "Default route"));
     return status.join(" · ");
+  }
+
+  formatChannelStatusTime(value) {
+    const date = new Date(value || 0);
+    if (Number.isNaN(date.getTime())) return "";
+    return this.plugin.formatLocalDateTime(date).slice(5, 16);
+  }
+
+  refreshChannelAccountSummary(channelId) {
+    if (!this.settingsContainerEl || !this.settingsContainerEl.isConnected) return;
+    const id = String(channelId || "").trim().toLowerCase();
+    const channel = this.plugin.listNotificationChannels().find((item) => item.id === id);
+    if (!channel) return;
+    const account = [...this.settingsContainerEl.querySelectorAll(".obsidian-ntfy-channel-account")]
+      .find((element) => element.dataset.channelId === id);
+    if (!account) return;
+    const state = account.querySelector(".obsidian-ntfy-channel-account-state");
+    if (state) {
+      state.textContent = this.channelStatusText(channel);
+      state.toggleClass("is-configured", channel.configured && channel.verificationState !== "failed");
+      state.toggleClass("is-error", channel.verificationState === "failed");
+      state.setAttribute("title", channel.connectionError || "");
+    }
+    const testButton = account.querySelector('[data-channel-test="true"]');
+    if (testButton) {
+      const label = channel.sendConfigured ? this.uiText("测试当前账号", "Test this account") : this.uiText("验证凭据", "Verify credentials");
+      testButton.disabled = channel.storedEnabled === false || !channel.configured;
+      testButton.setAttribute("aria-label", label);
+      testButton.setAttribute("title", label);
+    }
   }
 
   addChannelTextSetting(containerEl, channel, key, name, placeholder = "", password = false, description = "", options = {}) {
@@ -5273,15 +5889,17 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
     setting.addText((text) => {
       text.setPlaceholder(placeholder).setValue(String(channel.config && channel.config[key] || "")).onChange(async (value) => {
         await this.plugin.updateChannelAccount(channel.id, { config: { [key]: value.trim() } });
+        this.refreshChannelAccountSummary(channel.id);
       });
       if (password) text.inputEl.type = "password";
-      if (options.refreshOnBlur || options.reconnectOnBlur) {
-        text.inputEl.addEventListener("blur", () => {
-          this.plugin.refreshChannelConnection(channel.id).catch((error) => {
-            this.plugin.recordConnectionLog("error", channel.id, "Channel connection refresh failed", { error: error.message || String(error) });
-          });
-        });
-      }
+      text.inputEl.addEventListener("blur", async () => {
+        this.refreshChannelAccountSummary(channel.id);
+        if (!options.refreshOnBlur && !options.reconnectOnBlur) return;
+        const fresh = this.plugin.listNotificationChannels().find((item) => item.id === channel.id);
+        if (!fresh || !fresh.configured) return;
+        await this.plugin.testChannelConnection(fresh, { showSuccess: false, showError: false });
+        this.refreshChannelAccountSummary(channel.id);
+      });
     });
     return setting;
   }
@@ -5337,8 +5955,8 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       if (String(config.mode || "app") === "webhook") {
         this.addChannelTextSetting(containerEl, channel, "webhookUrl", "Webhook URL", "https://open.feishu.cn/open-apis/bot/v2/hook/...", true);
       } else {
-        this.addChannelTextSetting(containerEl, channel, "appId", "App ID", "cli_...");
-        this.addChannelTextSetting(containerEl, channel, "appSecret", "App secret", "...", true);
+        this.addChannelTextSetting(containerEl, channel, "appId", "App ID", "cli_...", false, "", { refreshOnBlur: true });
+        this.addChannelTextSetting(containerEl, channel, "appSecret", "App secret", "...", true, "", { refreshOnBlur: true });
         const sending = this.createChannelOptionGroup(containerEl, this.uiText("主动发送（可选）", "Proactive sending (optional)"));
         new Setting(sending).setName("Receive ID type").addDropdown((dropdown) => dropdown
           .addOption("chat_id", "chat_id")
@@ -5362,9 +5980,9 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       if (String(config.mode || "webhook") === "webhook") {
         this.addChannelTextSetting(containerEl, channel, "webhookUrl", "Webhook URL", "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...", true);
       } else {
-        this.addChannelTextSetting(containerEl, channel, "corpId", "Corp ID", "ww...");
-        this.addChannelTextSetting(containerEl, channel, "agentId", "Agent ID", "1000002");
-        this.addChannelTextSetting(containerEl, channel, "secret", "Secret", "...", true);
+        this.addChannelTextSetting(containerEl, channel, "corpId", "Corp ID", "ww...", false, "", { refreshOnBlur: true });
+        this.addChannelTextSetting(containerEl, channel, "agentId", "Agent ID", "1000002", false, "", { refreshOnBlur: true });
+        this.addChannelTextSetting(containerEl, channel, "secret", "Secret", "...", true, "", { refreshOnBlur: true });
         const sending = this.createChannelOptionGroup(containerEl, this.uiText("主动发送（可选）", "Proactive sending (optional)"));
         new Setting(sending).setName(this.uiText("接收对象类型", "Target type")).addDropdown((dropdown) => dropdown
           .addOption("touser", "touser")
@@ -5402,20 +6020,20 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         containerEl,
         channel,
         "appId",
-        this.uiText("机器人 ID（AppID）", "Bot ID (AppID)"),
+        this.uiText("应用 ID（AppID）", "App ID"),
         "102...",
         false,
-        this.uiText("必填。使用 QQ 开放平台机器人详情中的机器人 ID。填写完成后自动尝试连接。", "Required. Use the Bot ID from the QQ Open Platform bot details. Connection starts automatically after editing."),
+        this.uiText("必填。填写 QQ 开放平台开发设置中的 AppID，不是机器人 QQ 号或资料页里的机器人 ID。", "Required. Use the AppID from QQ Open Platform developer settings, not the bot's QQ number or profile ID."),
         { reconnectOnBlur: true }
       );
       this.addChannelTextSetting(
         containerEl,
         channel,
         "clientSecret",
-        this.uiText("机器人密钥（ClientSecret）", "Bot secret (ClientSecret)"),
+        this.uiText("应用密钥（ClientSecret）", "ClientSecret"),
         "...",
         true,
-        this.uiText("必填。必须与上面的机器人 ID 来自同一个机器人；不是 QQ 号或旧 Token。", "Required. It must belong to the same bot as the ID above; it is not a QQ number or legacy token."),
+        this.uiText("必填。必须与上面的 AppID 来自同一个机器人应用；不是旧 Token。", "Required. It must belong to the same bot application as the AppID; it is not a legacy token."),
         { reconnectOnBlur: true }
       );
 
@@ -5478,12 +6096,14 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
 
     const mode = String(config.mode || "").trim().toLowerCase();
     const nativePoll = ["ntfy", "telegram", "matrix"].includes(channel.type);
-    const nativeSocket = channel.type === "qqbot" || ((channel.type === "discord" || channel.type === "slack") && mode === "bot");
+    const nativeSocket = channel.type === "qqbot"
+      || channel.type === "feishu" && mode === "app"
+      || (channel.type === "discord" || channel.type === "slack") && mode === "bot";
     const needsRelay = !nativePoll && !nativeSocket;
     const receiveDescription = nativePoll
-      ? this.uiText("Obsidian 在前台时按账号低频轮询，进入后台后暂停。", "Polls this account while Obsidian is in the foreground and pauses in the background.")
+      ? this.uiText("Obsidian 仍在运行时按账号低频轮询；可用上方总开关关闭后台收件。", "Polls this account while Obsidian remains running; background receive can be disabled above.")
       : nativeSocket
-        ? this.uiText("Obsidian 在前台时连接平台官方实时 Gateway，进入后台后断开以节省电量。", "Uses the provider's official realtime Gateway in the foreground and disconnects in the background to save power.")
+        ? this.uiText("Obsidian 仍在运行时保持平台官方实时连接；移动系统结束应用后会在返回前台时重连。", "Keeps the provider's official realtime connection while Obsidian remains running and reconnects after the app returns to the foreground.")
         : this.uiText("通过轻量 HTTPS 中继轮询平台回调；中继只需返回约定的标准消息 JSON。", "Polls provider callbacks through a lightweight HTTPS relay that returns the documented normalized message JSON.");
     const receiveOptions = this.createChannelOptionGroup(containerEl, this.uiText("收件设置（可选）", "Receive settings (optional)"));
     new Setting(receiveOptions)
@@ -5523,6 +6143,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
   renderChannelAccountDetails(containerEl, channel, active) {
     if (!this.openChannelEditors) this.openChannelEditors = new Set();
     const details = containerEl.createEl("details", { cls: "obsidian-ntfy-channel-account" });
+    details.dataset.channelId = channel.id;
     details.open = this.openChannelEditors.has(channel.id);
     const summary = details.createEl("summary", { cls: "obsidian-ntfy-channel-account-summary" });
     const identity = summary.createSpan({ cls: "obsidian-ntfy-channel-account-identity" });
@@ -5553,11 +6174,15 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         await this.plugin.removeChannelFromSettings(channel.id);
         this.display();
       });
-      addAction("send", !channel.sendConfigured ? this.uiText("测试连接", "Test connection") : this.uiText("测试当前账号", "Test this account"), async () => {
+      const testButton = addAction("send", !channel.sendConfigured ? this.uiText("验证凭据", "Verify credentials") : this.uiText("测试当前账号", "Test this account"), async () => {
         await this.plugin.sendTestNotification({ channelId: channel.id, simulatedEvent: true });
       }, channel.storedEnabled === false || !channel.configured);
+      testButton.dataset.channelTest = "true";
     }
-    summary.createSpan({ cls: `obsidian-ntfy-channel-account-state ${channel.configured ? "is-configured" : ""}`, text: this.channelStatusText(channel) });
+    const stateClasses = ["obsidian-ntfy-channel-account-state"];
+    if (channel.configured && channel.verificationState !== "failed") stateClasses.push("is-configured");
+    if (channel.verificationState === "failed") stateClasses.push("is-error");
+    summary.createSpan({ cls: stateClasses.join(" "), text: this.channelStatusText(channel), attr: { title: channel.connectionError || "" } });
     details.addEventListener("toggle", () => {
       if (details.open) this.openChannelEditors.add(channel.id);
       else this.openChannelEditors.delete(channel.id);
@@ -5687,6 +6312,19 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.socialHubEnabled)).onChange(async (value) => {
         this.plugin.settings.socialHubEnabled = value;
         await this.plugin.saveSettings();
+        this.display();
+      }));
+    new Setting(hubGroup)
+      .setName(this.uiText("后台保持收件", "Keep receiving in background"))
+      .setDesc(this.uiText(
+        "Obsidian 仍在运行时保持实时连接和低频轮询；移动系统休眠或结束 Obsidian 后无法保证持续在线，返回前台会立即重连。",
+        "Keeps realtime connections and low-frequency polling while Obsidian is running. Mobile OS suspension can still pause delivery; foregrounding reconnects immediately."
+      ))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.backgroundReceiveEnabled)).onChange(async (value) => {
+        this.plugin.settings.backgroundReceiveEnabled = value;
+        await this.plugin.saveSettings();
+        if (!value && typeof document !== "undefined" && document.hidden) this.plugin.closeIncomingSockets();
+        else await this.plugin.runIncomingPoll({ force: true });
         this.display();
       }));
     this.renderChannelOverview(hubGroup);

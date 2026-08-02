@@ -74,8 +74,13 @@ class FakeWebSocket {
     if (this.onmessage) this.onmessage({ data: JSON.stringify(payload) });
   }
 
+  messageRaw(payload) {
+    if (this.onmessage) this.onmessage({ data: payload });
+  }
+
   send(payload) {
-    this.sent.push(JSON.parse(String(payload)));
+    if (typeof payload === "string") this.sent.push(JSON.parse(payload));
+    else this.sent.push(payload instanceof Uint8Array ? payload : new Uint8Array(payload));
   }
 
   close() {
@@ -94,6 +99,10 @@ async function run() {
   assert.equal((managerHeader.match(/this\.renderNavItem\(/g) || []).length, 4);
   assert.doesNotMatch(managerHeader, /["']connections["']/);
   assert.match(styles, /grid-template-columns:\s*repeat\(4,\s*minmax\(0,\s*1fr\)\)/);
+  assert.match(source, /refreshChannelAccountSummary\(channelId\)/);
+  assert.match(source, /text\.inputEl\.addEventListener\("blur"/);
+  assert.match(source, /connectFeishuGateway\(account\)/);
+  assert.match(source, /callback\/ws\/endpoint/);
 
   const plugin = createPlugin({
     topic: "test-topic",
@@ -105,6 +114,18 @@ async function run() {
   assert.equal(status.ready, true);
   assert.equal(status.defaultChannelId, "ntfy");
   assert.deepEqual(plugin.settings.addedChannelIds, ["ntfy"]);
+  assert.equal(plugin.settings.backgroundReceiveEnabled, true);
+  assert.deepEqual(plugin.settings.channelHealth, {});
+
+  const healthMigrationPlugin = createPlugin({
+    topic: "health-migration",
+    connectionLogs: [
+      { at: "2026-08-02T01:02:03.000Z", level: "info", channelId: "ntfy", message: "Outgoing notification sent", details: {} },
+      { at: "2026-08-02T01:01:03.000Z", level: "info", channelId: "ntfy", message: "Incoming message received", details: {} },
+    ],
+  });
+  assert.equal(healthMigrationPlugin.getChannelHealth("ntfy").lastOutboundAt, "2026-08-02T01:02:03.000Z");
+  assert.equal(healthMigrationPlugin.getChannelHealth("ntfy").lastInboundAt, "2026-08-02T01:01:03.000Z");
 
   const migratedPlugin = createPlugin({
     topic: "legacy-topic",
@@ -147,9 +168,34 @@ async function run() {
   assert.equal(receiveOnlyQqChannel.sendConfigured, false);
   assert.equal(receiveOnlyQqChannel.receiveMode, "socket");
 
+  const legacyModeQqPlugin = createPlugin({
+    channelAccounts: [{ id: "qqbot", type: "qqbot", accountId: "default", name: "QQ Bot", enabled: true, config: { mode: "openclaw", appId: "qq-app", clientSecret: "qq-secret" } }],
+    addedChannelIds: ["qqbot"],
+  });
+  assert.equal(legacyModeQqPlugin.getChannelAccount("qqbot").config.mode, "official");
+
+  const originalDocument = global.document;
+  global.document = { hidden: true };
+  assert.equal(receiveOnlyQqPlugin.shouldRunIncomingSocket("qqbot:receive"), true);
+  receiveOnlyQqPlugin.settings.backgroundReceiveEnabled = false;
+  assert.equal(receiveOnlyQqPlugin.shouldRunIncomingSocket("qqbot:receive"), false);
+  assert.equal(receiveOnlyQqPlugin.listNotificationChannels().find((channel) => channel.id === "qqbot:receive").connectionStatus, "paused-background");
+  if (originalDocument === undefined) delete global.document;
+  else global.document = originalDocument;
+
+  receiveOnlyQqPlugin.updateChannelHealth("qqbot:receive", { verificationState: "verified", checkedAt: "2026-08-02T00:00:00.000Z" });
+  await receiveOnlyQqPlugin.updateChannelAccount("qqbot:receive", { config: { appId: "qq-app-updated" } });
+  assert.equal(receiveOnlyQqPlugin.getChannelHealth("qqbot:receive").verificationState, "unchecked");
+
+  const dedupLogPlugin = createPlugin({ topic: "dedup-log" });
+  dedupLogPlugin.recordConnectionLog("error", "qqbot", "Realtime receive connection failed", { error: "same error" });
+  dedupLogPlugin.recordConnectionLog("error", "qqbot", "Realtime receive connection failed", { error: "same error" });
+  assert.equal(dedupLogPlugin.settings.connectionLogs.length, 1);
+  assert.equal(dedupLogPlugin.settings.connectionLogs[0].details.repeatCount, 2);
+
   const baseOnlyChannelCases = [
     ["telegram", { botToken: "123456:base-token", chatId: "" }, "poll"],
-    ["feishu", { mode: "app", appId: "cli_base", appSecret: "base-secret", receiveId: "" }, "unconfigured"],
+    ["feishu", { mode: "app", appId: "cli_base", appSecret: "base-secret", receiveId: "" }, "socket"],
     ["wecom", { mode: "app", corpId: "ww_base", agentId: "1000002", secret: "base-secret", target: "" }, "unconfigured"],
     ["discord", { mode: "bot", botToken: "discord-base", channelId: "" }, "socket"],
     ["slack", { mode: "bot", botToken: "xoxb-base", appToken: "", channelId: "" }, "unconfigured"],
@@ -171,7 +217,7 @@ async function run() {
   rejectedQqPlugin.httpRequest = async () => ({ json: { message: "invalid appid or secret" } });
   await assert.rejects(
     rejectedQqPlugin.getQqBotAccessToken({ appId: "bad-app", clientSecret: "bad-secret" }),
-    /invalid Bot ID\/AppID or ClientSecret/
+    /AppID and ClientSecret do not match/
   );
 
   const channelSettingsPlugin = createPlugin({
@@ -503,6 +549,61 @@ async function run() {
   global.WebSocket = FakeWebSocket;
   FakeWebSocket.instances = [];
 
+  const feishuGatewayPlugin = createPlugin({ topic: "feishu-gateway" });
+  await feishuGatewayPlugin.addChannelToSettings("feishu", { accountId: "app", name: "Feishu Gateway" });
+  await feishuGatewayPlugin.updateChannelAccount("feishu:app", { config: { mode: "app", appId: "cli_app", appSecret: "feishu-secret" } });
+  feishuGatewayPlugin.httpRequest = async (request) => {
+    assert.equal(request.url.endsWith("/callback/ws/endpoint"), true);
+    assert.deepEqual(JSON.parse(request.body), { AppID: "cli_app", AppSecret: "feishu-secret" });
+    return { json: { code: 0, data: { URL: "wss://feishu.test/ws?service_id=42&device_id=device", ClientConfig: { PingInterval: 90 } } } };
+  };
+  await feishuGatewayPlugin.connectFeishuGateway(feishuGatewayPlugin.getChannelAccount("feishu:app"));
+  const feishuSocket = FakeWebSocket.instances.at(-1);
+  feishuSocket.open();
+  assert.equal(feishuGatewayPlugin.incomingSocketStates.get("feishu:app").status, "connected");
+  const feishuPing = feishuGatewayPlugin.decodeFeishuFrame(feishuSocket.sent[0]);
+  assert.equal(feishuPing.service, 42);
+  assert.equal(feishuPing.headers.find((header) => header.key === "type").value, "ping");
+  const feishuEnvelope = {
+    schema: "2.0",
+    header: { event_type: "im.message.receive_v1", create_time: "1785632523000" },
+    event: {
+      sender: { sender_id: { open_id: "ou_sender" }, sender_type: "user" },
+      message: { message_id: "om_in", chat_id: "oc_chat", chat_type: "p2p", message_type: "text", content: JSON.stringify({ text: "Feishu inbound" }), create_time: "1785632523000" },
+    },
+  };
+  feishuSocket.messageRaw(feishuGatewayPlugin.encodeFeishuFrame({
+    SeqID: 1,
+    LogID: 2,
+    service: 42,
+    method: 1,
+    headers: [
+      { key: "type", value: "event" },
+      { key: "message_id", value: "frame-message" },
+      { key: "sum", value: "1" },
+      { key: "seq", value: "0" },
+      { key: "trace_id", value: "trace" },
+    ],
+    payload: new TextEncoder().encode(JSON.stringify(feishuEnvelope)),
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(feishuGatewayPlugin.settings.incomingMessages[0].text, "Feishu inbound");
+  assert.equal(feishuGatewayPlugin.settings.incomingMessages[0].metadata.feishuReceiveId, "oc_chat");
+  const feishuAck = feishuGatewayPlugin.decodeFeishuFrame(feishuSocket.sent.at(-1));
+  assert.equal(JSON.parse(new TextDecoder().decode(feishuAck.payload)).code, 200);
+  assert.equal(feishuAck.headers.some((header) => header.key === "biz_rt"), true);
+  feishuGatewayPlugin.closeIncomingSockets();
+
+  const terminalQqPlugin = createPlugin({ topic: "qq-terminal-auth" });
+  await terminalQqPlugin.addChannelToSettings("qqbot", { accountId: "terminal", name: "QQ Terminal" });
+  await terminalQqPlugin.updateChannelAccount("qqbot:terminal", { config: { appId: "bad-app", clientSecret: "bad-secret" } });
+  terminalQqPlugin.httpRequest = async () => ({ json: { message: "invalid appid or secret" } });
+  await terminalQqPlugin.ensureRealtimeIncomingConnections();
+  assert.equal(terminalQqPlugin.incomingSocketStates.get("qqbot:terminal").status, "failed");
+  assert.equal(terminalQqPlugin.incomingSocketStates.get("qqbot:terminal").reconnectTimer, null);
+  assert.equal(terminalQqPlugin.getChannelHealth("qqbot:terminal").verificationState, "failed");
+
   const discordGatewayPlugin = createPlugin({ topic: "discord-gateway" });
   await discordGatewayPlugin.addChannelToSettings("discord", { accountId: "bot", name: "Discord Gateway" });
   await discordGatewayPlugin.updateChannelAccount("discord:bot", { config: { mode: "bot", botToken: "discord-token", channelId: "default-channel" } });
@@ -512,6 +613,8 @@ async function run() {
   discordSocket.open();
   discordSocket.message({ op: 10, d: { heartbeat_interval: 60000 } });
   assert.equal(discordSocket.sent.some((item) => item.op === 2 && item.d.intents === 37377), true);
+  discordSocket.message({ op: 0, t: "READY", s: 1, d: { session_id: "discord-session" } });
+  assert.equal(discordGatewayPlugin.incomingSocketStates.get("discord:bot").status, "connected");
   discordSocket.message({ op: 0, t: "MESSAGE_CREATE", s: 1, d: { id: "discord-in", channel_id: "discord-room", content: "Discord inbound", timestamp: "2026-08-02T00:00:00.000Z", author: { id: "user", username: "Murat", bot: false }, attachments: [] } });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(discordGatewayPlugin.settings.incomingMessages[0].metadata.channelId, "discord-room");
@@ -551,6 +654,9 @@ async function run() {
   const qqIdentify = qqSocket.sent.find((item) => item.op === 2);
   assert.equal(qqIdentify.d.intents, 1107300352);
   assert.equal(qqIdentify.d.properties.$os, "obsidian");
+  qqSocket.message({ op: 0, t: "READY", s: 1, d: { session_id: "qq-session" } });
+  assert.equal(qqGatewayPlugin.incomingSocketStates.get("qqbot:bot").status, "connected");
+  assert.equal(qqGatewayPlugin.getChannelHealth("qqbot:bot").verificationState, "verified");
   qqSocket.message({ op: 0, t: "GROUP_AT_MESSAGE_CREATE", s: 2, d: { id: "qq-in", group_openid: "group-in", content: "QQ inbound", timestamp: "2026-08-02T00:00:00.000Z", author: { member_openid: "member-in" }, attachments: [] } });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(qqGatewayPlugin.settings.incomingMessages[0].metadata.qqTarget, "group-in");
