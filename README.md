@@ -211,7 +211,7 @@ Set `AI webhook token` if the receiving service expects a Bearer token.
 
 ## Notification Hub And Social Connections
 
-Version `0.6.3` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, inbox, deduplication, and quiet queue. Every built-in provider can have multiple named accounts with independent credentials, enabled state, configuration, and a per-account test action.
+Version `0.6.4` keeps the existing ntfy reminder queue, delayed delivery, repeating reminders, scheduled-message cancellation, review flow, inbox, deduplication, and quiet queue. Every built-in provider can have multiple named accounts with independent credentials, send/receive state, configuration, cursors, and a per-account test action.
 
 The hub uses one **default channel**. Cancip, other Obsidian plugins, and external agents only use the default route unless they explicitly pass channel IDs or request a broadcast. Enabling several connections therefore does not unexpectedly send every message to every service.
 
@@ -224,25 +224,57 @@ Built-in send channels are:
 - Discord bot or webhook
 - Slack bot or webhook
 - Matrix Client-Server API
+- QQ official Bot API
 - Email through a user-provided HTTP gateway
 - Generic Webhook for Codex, Claude Code, custom agents, and automation
 
-The plugin does not load OpenClaw, QQ bridge, personal WeChat, desktop daemons, or provider-specific npm packages. QQ and personal WeChat are intentionally not exposed as built-in channels because a small mobile plugin cannot provide their complete login, receive, and account lifecycle without extra components. Configurations saved by version `0.6.2` for those retired sources are kept in plugin data during migration, but they are hidden and cannot be routed or sent.
+The plugin does not load OpenClaw, a QQ-to-HTTP bridge, personal WeChat, desktop daemons, or provider-specific npm packages. QQ uses the official Bot access-token API, message API, and Gateway directly. Old official QQ Bot settings saved by `0.6.2` are restored automatically; retired OpenClaw and personal-WeChat settings remain preserved but inactive.
 
 Email is an optional HTTP contract rather than an embedded mail service. It only works when the user already has a compatible HTTPS mail gateway. No mail package or background process is installed by this plugin.
 
 ### Receiving Messages
 
-The plugin exposes one normalized inbound message format through `plugin.api.receive(input)`. It stores a bounded inbox, checks the contact/group allowlist and attachment size, deduplicates messages, records redacted connection logs, emits an incoming event, and exposes registered-handler APIs. Model selection, session creation, and reply policy belong to the plugin that consumes this interface rather than the Ntfy Notifications settings.
+The plugin exposes one normalized inbound message format through `plugin.api.receive(input)`. It stores a bounded inbox, checks the contact/group allowlist and attachment size, deduplicates messages, records redacted connection logs, emits an incoming event, and exposes registered-handler APIs. Model selection, session creation, and reply policy belong to the consuming plugin rather than Ntfy Notifications.
 
-Receive support is reported per account rather than claimed for every provider:
+Each account reports its real receive mode:
 
-- The default ntfy, Telegram, and Matrix accounts support lightweight foreground polling.
-- Generic Webhook supports messages forwarded by another installed plugin or agent through `plugin.api.receive(input)`; the plugin does not expose a public HTTP server.
-- Additional ntfy, Telegram, and Matrix accounts currently send only.
-- Feishu/Lark, WeCom, Discord, Slack, and Email accounts currently send only. Their provider event servers are deliberately not reimplemented inside Obsidian.
+- `poll`: every configured ntfy, Telegram, and Matrix account is polled independently while Obsidian is in the foreground.
+- `socket`: Discord Bot Gateway, Slack Socket Mode, and QQ official Bot Gateway connect directly while Obsidian is in the foreground.
+- `relay`: Feishu/Lark, WeCom, Email, generic Webhook, Discord webhook mode, and Slack webhook mode poll a user-configured HTTPS callback relay.
+- `disabled` or `unconfigured`: the plugin does not claim that receiving is active.
 
-The last polling cursor is persisted and the plugin ignores its own `obntfy-*` ntfy messages. Inbox deletion and delivery deduplication are intentionally separate. Removing an item from the visible inbox does not allow a provider retry with the same channel/message ID to run again. Poll-delivered messages start consumer work in the background, so a long Cancip or model task does not block later ntfy, Telegram, or Matrix polling. One malformed or oversized attachment is rejected without stopping the rest of the provider batch.
+Obsidian mobile cannot expose a reliable public callback server. Callback-based providers therefore use this small HTTPS relay contract:
+
+```http
+GET <receiveUrl>?channelId=<channel-id>&cursor=<cursor>&limit=50
+Authorization: Bearer <receiveToken>
+Accept: application/json
+```
+
+The relay returns either a message array or:
+
+```json
+{
+  "messages": [
+    {
+      "id": "provider-message-id",
+      "sender": "sender-id",
+      "text": "message",
+      "conversationId": "conversation-id",
+      "receivedAt": "2026-08-02T00:00:00.000Z",
+      "attachments": [],
+      "metadata": {}
+    }
+  ],
+  "nextCursor": "next-cursor"
+}
+```
+
+Public relay URLs must use HTTPS and configure a receive token; plain HTTP without a token is accepted only for `localhost`, `127.0.0.1`, or `::1`. The relay is responsible for validating provider signatures and decrypting provider callbacks before returning normalized messages. Provider metadata may include `channelId`, `threadTs`, `qqTargetType`, `qqTarget`, `feishuReceiveIdType`, `feishuReceiveId`, `wecomTargetType`, `wecomTarget`, or `emailReplyTo` so replies return to the original conversation.
+
+Telegram polling requires the bot not to be owned by another `getUpdates` consumer and not to have an active webhook. Discord Bot receive requires the application's Gateway and Message Content intent permissions. Slack receive requires Socket Mode, an `xapp-` app token, a bot token, and the relevant Events API subscriptions. QQ receive uses the intents allowed for that official Bot account; the default covers direct messages, group/C2C messages, and public guild mentions.
+
+Polling cursors are persisted per account and the plugin ignores its own `obntfy-*` ntfy messages. Inbox deletion and delivery deduplication are intentionally separate. Removing an item from the visible inbox does not allow a provider retry with the same channel/message ID to run again. Incoming messages start consumer work in the background, so a long Cancip or model task does not block later receive cycles. One malformed or oversized attachment is rejected without stopping the rest of the provider batch. Realtime sockets close when Obsidian enters the background and reconnect with bounded backoff on return to reduce mobile battery use.
 
 Cancip can register its own handler without Ntfy Notifications importing Cancip:
 

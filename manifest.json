@@ -1,9 +1,9 @@
 {
   "id": "android-ntfy-notifier",
   "name": "Ntfy Notifications",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "minAppVersion": "1.5.0",
-  "description": "Lightweight mobile notification and social channel hub for ntfy, agents, Telegram, Feishu, WeCom, Discord, Slack, Matrix, and email gateways.",
+  "description": "Lightweight mobile notification and bidirectional channel hub for ntfy, Telegram, Feishu, WeCom, Discord, Slack, Matrix, QQ Bot, and email gateways.",
   "author": "Codex",
   "authorUrl": "https://ntfy.sh",
   "isDesktopOnly": false

@@ -2,6 +2,12 @@ const assert = require("node:assert/strict");
 const Module = require("node:module");
 
 const notices = [];
+global.window = global.window || {
+  setInterval,
+  clearInterval,
+  setTimeout,
+  clearTimeout,
+};
 class EmptyClass {}
 class Plugin {}
 class Notice {
@@ -38,10 +44,42 @@ function createPlugin(settings = {}) {
   const plugin = new NotificationHubPlugin();
   plugin.externalChannelAdapters = new Map();
   plugin.incomingMessageHandlers = new Map();
+  plugin.incomingSocketStates = new Map();
+  plugin.incomingReconnectAttempts = new Map();
+  plugin.isUnloading = false;
   plugin.settings = plugin.normalizeSettings(settings);
   plugin.saveSettings = async () => {};
   plugin.app = {};
   return plugin;
+}
+
+class FakeWebSocket {
+  static instances = [];
+
+  constructor(url) {
+    this.url = url;
+    this.readyState = 0;
+    this.sent = [];
+    FakeWebSocket.instances.push(this);
+  }
+
+  open() {
+    this.readyState = 1;
+    if (this.onopen) this.onopen();
+  }
+
+  message(payload) {
+    if (this.onmessage) this.onmessage({ data: JSON.stringify(payload) });
+  }
+
+  send(payload) {
+    this.sent.push(JSON.parse(String(payload)));
+  }
+
+  close() {
+    this.readyState = 3;
+    if (this.onclose) this.onclose({ code: 1000 });
+  }
 }
 
 async function run() {
@@ -76,6 +114,15 @@ async function run() {
   assert.equal(await retiredChannelPlugin.addChannelToSettings("wechat"), false);
   const reloadedRetiredPlugin = createPlugin(retiredChannelPlugin.settings);
   assert.equal(reloadedRetiredPlugin.settings.retiredChannelAccounts[0].config.bridgeUrl, "https://legacy.example/send");
+
+  const restoredQqPlugin = createPlugin({
+    retiredChannelAccounts: [{ id: "qqbot", type: "qqbot", accountId: "default", name: "QQ Bot", config: { appId: "qq-app", clientSecret: "qq-secret", targetType: "c2c", target: "qq-openid" } }],
+    addedChannelIds: ["qqbot"],
+    defaultChannelId: "qqbot",
+  });
+  assert.equal(restoredQqPlugin.getChannelAccount("qqbot").config.appId, "qq-app");
+  assert.equal(restoredQqPlugin.settings.retiredChannelAccounts.some((account) => account.type === "qqbot"), false);
+  assert.equal(restoredQqPlugin.listNotificationChannels().find((channel) => channel.id === "qqbot").receiveMode, "socket");
 
   const channelSettingsPlugin = createPlugin({
     topic: "settings-topic",
@@ -173,7 +220,7 @@ async function run() {
   const telegramPreview = await appChannelPlugin.simulateNotification({ title: "Bot", message: "Telegram", channelIds: ["telegram:work"] });
   assert.equal(telegramPreview.results[0].request.url.endsWith("/bot***/sendMessage"), true);
   assert.equal(JSON.parse(telegramPreview.results[0].request.body).chat_id, "-100123");
-  assert.equal(appChannelPlugin.listNotificationChannels().find((channel) => channel.id === "telegram:work").receiveMode, "send-only");
+  assert.equal(appChannelPlugin.listNotificationChannels().find((channel) => channel.id === "telegram:work").receiveMode, "poll");
   assert.equal(JSON.stringify(telegramPreview).includes("telegram-secret"), false);
 
   await appChannelPlugin.addChannelToSettings("slack", { accountId: "bot", name: "Slack Bot" });
@@ -182,6 +229,11 @@ async function run() {
   assert.equal(slackPreview.results[0].request.url.endsWith("/chat.postMessage"), true);
   assert.equal(JSON.parse(slackPreview.results[0].request.body).channel, "C123");
   assert.equal(JSON.stringify(slackPreview).includes("slack-secret"), false);
+  const slackReplyPreview = await appChannelPlugin.simulateNotification({ title: "Reply", message: "Slack", channelIds: ["slack:bot"], metadata: { channelId: "C-INCOMING", threadTs: "171.25" } });
+  assert.deepEqual(JSON.parse(slackReplyPreview.results[0].request.body), { channel: "C-INCOMING", text: "Reply\nSlack", thread_ts: "171.25" });
+
+  const discordReplyPreview = await appChannelPlugin.simulateNotification({ title: "Reply", message: "Discord", channelIds: ["discord:bot"], metadata: { channelId: "98765" } });
+  assert.equal(discordReplyPreview.results[0].request.url.endsWith("/channels/98765/messages"), true);
 
   await appChannelPlugin.addChannelToSettings("matrix", { accountId: "work", name: "工作 Matrix" });
   await appChannelPlugin.updateChannelAccount("matrix:work", { config: { serverUrl: "https://matrix.example", accessToken: "matrix-secret", roomId: "!room:matrix.example" } });
@@ -190,13 +242,30 @@ async function run() {
   assert.equal(matrixPreview.results[0].request.url.includes("/_matrix/client/v3/rooms/"), true);
   assert.equal(JSON.stringify(matrixPreview).includes("matrix-secret"), false);
 
+  await appChannelPlugin.addChannelToSettings("qqbot", { accountId: "official", name: "QQ Official" });
+  await appChannelPlugin.updateChannelAccount("qqbot:official", { config: { appId: "qq-app", clientSecret: "qq-secret", targetType: "c2c", target: "default-openid" } });
+  const qqRequests = [];
+  appChannelPlugin.httpRequest = async (request) => {
+    qqRequests.push(request);
+    if (request.url.includes("getAppAccessToken")) return { json: { access_token: "qq-access", expires_in: "7200" } };
+    return { json: { id: "qq-message" } };
+  };
+  const qqResult = await appChannelPlugin.sendNotification({ title: "Reply", message: "QQ", channelIds: ["qqbot:official"], metadata: { qqTargetType: "group", qqTarget: "group-openid", messageId: "incoming-message" } });
+  assert.equal(qqResult.results[0].status, "sent");
+  assert.equal(qqRequests[1].url.endsWith("/v2/groups/group-openid/messages"), true);
+  assert.deepEqual(JSON.parse(qqRequests[1].body), { content: "Reply\nQQ", msg_type: 0, msg_id: "incoming-message" });
+  await appChannelPlugin.sendNotification({ title: "Reply", message: "QQ DM", channelIds: ["qqbot:official"], metadata: { qqTargetType: "dms", qqTarget: "guild-id", messageId: "dm-message" } });
+  assert.equal(qqRequests[2].url.endsWith("/dms/guild-id/messages"), true);
+  assert.deepEqual(JSON.parse(qqRequests[2].body), { content: "Reply\nQQ DM", msg_id: "dm-message" });
+
   await appChannelPlugin.addChannelToSettings("webhook", { accountId: "agent", name: "Agent Webhook" });
-  await appChannelPlugin.updateChannelAccount("webhook:agent", { config: { url: "https://agent.example/receive", token: "webhook-secret", customHeaders: '{"X-API-Key":"header-secret"}' } });
+  await appChannelPlugin.updateChannelAccount("webhook:agent", { config: { url: "https://agent.example/receive", token: "webhook-secret", customHeaders: '{"X-API-Key":"header-secret"}', receiveUrl: "https://relay.example/inbox", receiveToken: "relay-secret" } });
   const webhookPreview = await appChannelPlugin.simulateNotification({ title: "Bot", message: "Webhook", channelIds: ["webhook:agent"] });
   assert.equal(webhookPreview.results[0].request.url, "***");
   assert.equal(webhookPreview.results[0].request.headers.Authorization, "***");
   assert.equal(webhookPreview.results[0].request.headers["X-API-Key"], "***");
-  assert.equal(appChannelPlugin.listNotificationChannels().find((channel) => channel.id === "webhook:agent").receiveMode, "forward");
+  assert.equal(appChannelPlugin.listNotificationChannels().find((channel) => channel.id === "webhook:agent").receiveMode, "relay");
+  assert.equal(appChannelPlugin.redactSensitiveText("https://relay.example/inbox", true).includes("relay.example"), false);
 
   const preview = await plugin.simulateNotification({
     title: "Preview",
@@ -220,18 +289,19 @@ async function run() {
   assert.equal(JSON.parse(wecomPreview.results[0].request.body).msgtype, "text");
 
   const channelIds = plugin.listNotificationChannels().map((channel) => channel.id);
-  assert.deepEqual(channelIds, ["ntfy", "telegram", "feishu", "wecom", "discord", "slack", "matrix", "email", "webhook"]);
+  assert.deepEqual(channelIds, ["ntfy", "telegram", "feishu", "wecom", "discord", "slack", "matrix", "qqbot", "email", "webhook"]);
   const channelModes = Object.fromEntries(plugin.listNotificationChannels().map((channel) => [channel.id, channel.receiveMode]));
   assert.deepEqual(channelModes, {
     ntfy: "poll",
-    telegram: "poll",
-    feishu: "send-only",
-    wecom: "send-only",
-    discord: "send-only",
-    slack: "send-only",
-    matrix: "poll",
-    email: "send-only",
-    webhook: "forward",
+    telegram: "unconfigured",
+    feishu: "unconfigured",
+    wecom: "unconfigured",
+    discord: "unconfigured",
+    slack: "unconfigured",
+    matrix: "unconfigured",
+    qqbot: "unconfigured",
+    email: "unconfigured",
+    webhook: "unconfigured",
   });
   for (const channelId of channelIds) {
     const channelPreview = await plugin.simulateNotification({
@@ -349,15 +419,104 @@ async function run() {
   assert.equal(receivePlugin.settings.incomingMessages.length, 1);
   assert.equal(receivePlugin.settings.ntfyReceiveSince, "obntfy-own-message");
 
+  const additionalTelegramPlugin = createPlugin({ topic: "multi-receive" });
+  await additionalTelegramPlugin.addChannelToSettings("telegram", { accountId: "work", name: "Work Telegram" });
+  await additionalTelegramPlugin.updateChannelAccount("telegram:work", { config: { botToken: "123456:work-token", chatId: "configured-chat" } });
+  additionalTelegramPlugin.httpRequest = async () => ({
+    json: {
+      ok: true,
+      result: [{ update_id: 41, message: { message_id: 7, date: 1700000000, text: "from work", chat: { id: -10077 }, from: { id: 5, username: "worker" } } }],
+    },
+  });
+  assert.equal(await additionalTelegramPlugin.pollTelegramIncoming(additionalTelegramPlugin.getChannelAccount("telegram:work")), true);
+  assert.equal(additionalTelegramPlugin.settings.incomingMessages[0].channelId, "telegram:work");
+  assert.equal(additionalTelegramPlugin.getChannelAccount("telegram:work").config.receiveOffset, 42);
+
+  const relayPlugin = createPlugin({ topic: "relay-topic" });
+  await relayPlugin.addChannelToSettings("feishu", { accountId: "relay", name: "Feishu Relay" });
+  await relayPlugin.updateChannelAccount("feishu:relay", { config: { mode: "webhook", webhookUrl: "https://open.feishu.cn/open-apis/bot/v2/hook/send", receiveUrl: "https://relay.example/inbox", receiveToken: "receive-secret", receiveCursor: "cursor-1" } });
+  let relayRequest = null;
+  relayPlugin.httpRequest = async (request) => {
+    relayRequest = request;
+    return { json: { messages: [{ id: "relay-message", sender: "ou_test", conversationId: "oc_test", text: "relay inbound", metadata: { feishuReceiveIdType: "chat_id", feishuReceiveId: "oc_test" } }], nextCursor: "cursor-2" } };
+  };
+  assert.equal(await relayPlugin.pollRelayIncoming(relayPlugin.getChannelAccount("feishu:relay")), true);
+  assert.equal(new URL(relayRequest.url).searchParams.get("cursor"), "cursor-1");
+  assert.equal(relayRequest.headers.Authorization, "Bearer receive-secret");
+  assert.equal(relayPlugin.getChannelAccount("feishu:relay").config.receiveCursor, "cursor-2");
+  assert.equal(relayPlugin.settings.incomingMessages[0].channelId, "feishu:relay");
+  assert.throws(() => relayPlugin.requireReceiveRelayUrl("http://relay.example/inbox", "relay"), /must use HTTPS/);
+  assert.throws(() => relayPlugin.requireReceiveRelayConfig({ receiveUrl: "https://relay.example/inbox" }, "relay"), /requires a receive token/);
+  assert.equal(relayPlugin.requireReceiveRelayUrl("http://127.0.0.1:8787/inbox", "relay").startsWith("http://127.0.0.1:8787/"), true);
+
+  const originalWebSocket = global.WebSocket;
+  global.WebSocket = FakeWebSocket;
+  FakeWebSocket.instances = [];
+
+  const discordGatewayPlugin = createPlugin({ topic: "discord-gateway" });
+  await discordGatewayPlugin.addChannelToSettings("discord", { accountId: "bot", name: "Discord Gateway" });
+  await discordGatewayPlugin.updateChannelAccount("discord:bot", { config: { mode: "bot", botToken: "discord-token", channelId: "default-channel" } });
+  discordGatewayPlugin.httpRequest = async () => ({ json: { url: "wss://gateway.discord.test" } });
+  await discordGatewayPlugin.connectDiscordGateway(discordGatewayPlugin.getChannelAccount("discord:bot"));
+  const discordSocket = FakeWebSocket.instances.at(-1);
+  discordSocket.open();
+  discordSocket.message({ op: 10, d: { heartbeat_interval: 60000 } });
+  assert.equal(discordSocket.sent.some((item) => item.op === 2 && item.d.intents === 37377), true);
+  discordSocket.message({ op: 0, t: "MESSAGE_CREATE", s: 1, d: { id: "discord-in", channel_id: "discord-room", content: "Discord inbound", timestamp: "2026-08-02T00:00:00.000Z", author: { id: "user", username: "Murat", bot: false }, attachments: [] } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(discordGatewayPlugin.settings.incomingMessages[0].metadata.channelId, "discord-room");
+  discordGatewayPlugin.closeIncomingSockets();
+
+  const slackGatewayPlugin = createPlugin({ topic: "slack-gateway" });
+  await slackGatewayPlugin.addChannelToSettings("slack", { accountId: "bot", name: "Slack Socket" });
+  await slackGatewayPlugin.updateChannelAccount("slack:bot", { config: { mode: "bot", botToken: "xoxb-token", appToken: "xapp-token", channelId: "CDEFAULT" } });
+  slackGatewayPlugin.httpRequest = async (request) => {
+    assert.equal(request.url.endsWith("/apps.connections.open"), true);
+    assert.equal(request.headers.Authorization, "Bearer xapp-token");
+    return { json: { ok: true, url: "wss://slack.test/socket" } };
+  };
+  await slackGatewayPlugin.connectSlackSocketMode(slackGatewayPlugin.getChannelAccount("slack:bot"));
+  const slackSocket = FakeWebSocket.instances.at(-1);
+  slackSocket.open();
+  slackSocket.message({ envelope_id: "envelope-1", payload: { event: { type: "message", client_msg_id: "slack-in", ts: "1700000000.5", channel: "C-IN", user: "U-IN", text: "Slack inbound" } } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(slackSocket.sent[0], { envelope_id: "envelope-1" });
+  assert.equal(slackGatewayPlugin.settings.incomingMessages[0].conversationId, "C-IN");
+  slackGatewayPlugin.closeIncomingSockets();
+
+  const qqGatewayPlugin = createPlugin({ topic: "qq-gateway" });
+  await qqGatewayPlugin.addChannelToSettings("qqbot", { accountId: "bot", name: "QQ Gateway" });
+  await qqGatewayPlugin.updateChannelAccount("qqbot:bot", { config: { appId: "qq-app", clientSecret: "qq-secret", targetType: "c2c", target: "default-openid" } });
+  const qqGatewayRequests = [];
+  qqGatewayPlugin.httpRequest = async (request) => {
+    qqGatewayRequests.push(request);
+    if (request.url.includes("getAppAccessToken")) return { json: { access_token: "qq-access", expires_in: "7200" } };
+    return { json: { url: "wss://qq.test/websocket", shards: 1 } };
+  };
+  await qqGatewayPlugin.connectQqBotGateway(qqGatewayPlugin.getChannelAccount("qqbot:bot"));
+  assert.equal(qqGatewayRequests[1].url.endsWith("/gateway/bot"), true);
+  const qqSocket = FakeWebSocket.instances.at(-1);
+  qqSocket.open();
+  qqSocket.message({ op: 10, d: { heartbeat_interval: 60000 } });
+  const qqIdentify = qqSocket.sent.find((item) => item.op === 2);
+  assert.equal(qqIdentify.d.intents, 1107300352);
+  assert.equal(qqIdentify.d.properties.$os, "obsidian");
+  qqSocket.message({ op: 0, t: "GROUP_AT_MESSAGE_CREATE", s: 2, d: { id: "qq-in", group_openid: "group-in", content: "QQ inbound", timestamp: "2026-08-02T00:00:00.000Z", author: { member_openid: "member-in" }, attachments: [] } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(qqGatewayPlugin.settings.incomingMessages[0].metadata.qqTarget, "group-in");
+  qqGatewayPlugin.closeIncomingSockets();
+  global.WebSocket = originalWebSocket;
+
   let sentRequest = null;
   plugin.httpRequest = async (request) => {
     sentRequest = request;
-    return { text: "{}", json: {} };
+    return { json: { id: "ntfy-server-id" } };
   };
   await plugin.sendTestNotification({ simulatedEvent: true });
   assert.ok(sentRequest);
   assert.equal(sentRequest.method, "POST");
   assert.equal(sentRequest.url, "https://ntfy.sh/test-topic");
+  assert.equal(plugin.getChannelAccount("ntfy").config.receivedIds.includes("ntfy-server-id"), true);
   assert.ok(notices.some((message) => message.includes("test sent through ntfy")));
 
   process.stdout.write("notification-hub tests passed\n");
