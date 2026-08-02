@@ -790,26 +790,34 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const mode = String(config.mode || "").trim().toLowerCase();
     if (!account) return false;
     if (account.type === "ntfy") return Boolean(String(config.serverUrl || "").trim() && String(config.topic || "").trim());
-    if (account.type === "telegram") return Boolean(String(config.botToken || "").trim() && String(config.chatId || "").trim());
+    if (account.type === "telegram") return Boolean(String(config.botToken || "").trim());
     if (account.type === "feishu") return mode === "webhook"
       ? Boolean(String(config.webhookUrl || "").trim())
-      : Boolean(String(config.appId || "").trim() && String(config.appSecret || "").trim() && String(config.receiveId || "").trim());
+      : Boolean(String(config.appId || "").trim() && String(config.appSecret || "").trim());
     if (account.type === "wecom") return mode === "app"
-      ? Boolean(String(config.corpId || "").trim() && String(config.agentId || "").trim() && String(config.secret || "").trim() && String(config.target || "").trim())
+      ? Boolean(String(config.corpId || "").trim() && String(config.agentId || "").trim() && String(config.secret || "").trim())
       : Boolean(String(config.webhookUrl || "").trim());
     if (account.type === "discord" || account.type === "slack") return mode === "bot"
-      ? Boolean(String(config.botToken || "").trim() && String(config.channelId || "").trim())
+      ? Boolean(String(config.botToken || "").trim())
       : Boolean(String(config.webhookUrl || "").trim());
-    if (account.type === "matrix") return Boolean(String(config.serverUrl || "").trim() && String(config.accessToken || "").trim() && String(config.roomId || "").trim());
+    if (account.type === "matrix") return Boolean(String(config.serverUrl || "").trim() && String(config.accessToken || "").trim());
     if (account.type === "qqbot") return Boolean(String(config.appId || "").trim() && String(config.clientSecret || "").trim());
-    if (account.type === "email") return Boolean(String(config.gatewayUrl || "").trim() && String(config.to || "").trim());
+    if (account.type === "email") return Boolean(String(config.gatewayUrl || "").trim());
     if (account.type === "webhook") return Boolean(String(config.url || "").trim());
     return false;
   }
 
   channelAccountSendConfigured(account) {
     if (!this.channelAccountConfigured(account)) return false;
-    if (account.type === "qqbot") return Boolean(String(account.config && account.config.target || "").trim());
+    const config = account.config || {};
+    const mode = String(config.mode || "").trim().toLowerCase();
+    if (account.type === "telegram") return Boolean(String(config.chatId || "").trim());
+    if (account.type === "feishu" && mode !== "webhook") return Boolean(String(config.receiveId || "").trim());
+    if (account.type === "wecom" && mode === "app") return Boolean(String(config.target || "").trim());
+    if ((account.type === "discord" || account.type === "slack") && mode === "bot") return Boolean(String(config.channelId || "").trim());
+    if (account.type === "matrix") return Boolean(String(config.roomId || "").trim());
+    if (account.type === "qqbot") return Boolean(String(config.target || "").trim());
+    if (account.type === "email") return Boolean(String(config.to || "").trim());
     return true;
   }
 
@@ -1375,6 +1383,25 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return true;
   }
 
+  async refreshChannelConnection(channelId) {
+    const id = String(channelId || "").trim().toLowerCase();
+    const account = this.getChannelAccount(id);
+    if (!account || !this.channelAccountConfigured(account)) return false;
+    const mode = this.channelReceiveMode(account);
+    if (mode === "socket") return await this.refreshRealtimeChannel(id);
+    if (mode === "poll") {
+      if (account.type === "ntfy") await this.pollNtfyIncoming(account);
+      if (account.type === "telegram") await this.pollTelegramIncoming(account);
+      if (account.type === "matrix") await this.pollMatrixIncoming(account);
+      return true;
+    }
+    if (mode === "relay") {
+      await this.pollRelayIncoming(account);
+      return true;
+    }
+    return false;
+  }
+
   scheduleIncomingSocketReconnect(channelId) {
     const existing = this.incomingSocketStates.get(channelId) || { channelId };
     if (existing.reconnectTimer || !this.shouldRunIncomingSocket(channelId)) return;
@@ -1574,6 +1601,67 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const json = await this.responseJson(response);
     if (!json || !json.url) throw new Error(json && (json.message || json.msg) || "QQ Bot Gateway URL is unavailable.");
     return { accessToken, url: String(json.url), shards: Math.max(1, Number(json.shards || 1)) };
+  }
+
+  async testChannelConnection(channel) {
+    const config = channel && channel.config || {};
+    const type = String(channel && channel.type || "");
+    const mode = String(config.mode || "").trim().toLowerCase();
+    try {
+      if (type === "telegram") {
+        const token = String(config.botToken || "").trim();
+        const apiRoot = this.requireHttpUrl(config.apiRoot || "https://api.telegram.org", "Telegram API root").replace(/\/+$/, "");
+        const json = await this.responseJson(await this.httpRequest({ url: `${apiRoot}/bot${token}/getMe`, method: "GET", throw: true }));
+        if (!json || json.ok === false) throw new Error(json && json.description || "Telegram bot authentication failed.");
+      } else if (type === "feishu" && mode !== "webhook") {
+        const domain = String(config.domain || "feishu").trim().toLowerCase();
+        const apiBase = domain === "lark" ? "https://open.larksuite.com" : domain.startsWith("http") ? this.requireHttpUrl(domain, "Feishu domain").replace(/\/+$/, "") : "https://open.feishu.cn";
+        const json = await this.responseJson(await this.httpRequest({
+          url: `${apiBase}/open-apis/auth/v3/tenant_access_token/internal`,
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+          body: JSON.stringify({ app_id: config.appId, app_secret: config.appSecret }),
+          throw: true,
+        }));
+        if (!json || Number(json.code || 0) !== 0 || !json.tenant_access_token) throw new Error(json && json.msg || "Feishu app authentication failed.");
+      } else if (type === "wecom" && mode === "app") {
+        const json = await this.responseJson(await this.httpRequest({
+          url: `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${encodeURIComponent(config.corpId || "")}&corpsecret=${encodeURIComponent(config.secret || "")}`,
+          method: "GET",
+          throw: true,
+        }));
+        if (!json || Number(json.errcode || 0) !== 0 || !json.access_token) throw new Error(json && json.errmsg || "WeCom app authentication failed.");
+      } else if (type === "discord" && mode === "bot") {
+        const apiRoot = this.requireHttpUrl(config.apiRoot || "https://discord.com/api/v10", "Discord API root").replace(/\/+$/, "");
+        const json = await this.responseJson(await this.httpRequest({ url: `${apiRoot}/users/@me`, method: "GET", headers: { Authorization: `Bot ${String(config.botToken || "").trim()}` }, throw: true }));
+        if (!json || json.message && !json.id) throw new Error(json && json.message || "Discord bot authentication failed.");
+      } else if (type === "slack" && mode === "bot") {
+        const apiRoot = this.requireHttpUrl(config.apiRoot || "https://slack.com/api", "Slack API root").replace(/\/+$/, "");
+        const json = await this.responseJson(await this.httpRequest({ url: `${apiRoot}/auth.test`, method: "POST", headers: { Authorization: `Bearer ${String(config.botToken || "").trim()}`, "Content-Type": "application/x-www-form-urlencoded" }, body: "", throw: true }));
+        if (!json || json.ok === false) throw new Error(json && json.error || "Slack bot authentication failed.");
+      } else if (type === "matrix") {
+        const base = this.requireHttpUrl(config.serverUrl, "Matrix server").replace(/\/+$/, "");
+        const json = await this.responseJson(await this.httpRequest({ url: `${base}/_matrix/client/v3/account/whoami`, method: "GET", headers: { Authorization: `Bearer ${String(config.accessToken || "").trim()}` }, throw: true }));
+        if (!json || json.errcode || !json.user_id) throw new Error(json && (json.error || json.errcode) || "Matrix authentication failed.");
+      } else if (type === "qqbot") {
+        await this.getQqBotGateway(config);
+      } else if (type === "email") {
+        this.requireHttpUrl(config.gatewayUrl, "Email HTTP gateway");
+      }
+      this.recordConnectionLog("info", channel.id, "Channel connection check passed");
+      try {
+        await this.refreshChannelConnection(channel.id);
+      } catch (refreshError) {
+        this.recordConnectionLog("warning", channel.id, "Channel receive refresh failed after a successful connection check", { error: refreshError.message || String(refreshError) });
+      }
+      new Notice(`${PLUGIN_NAME}: ${channel.name} connection check passed`);
+      return true;
+    } catch (error) {
+      const safeError = this.redactSensitiveText(error.message || String(error), true);
+      this.recordConnectionLog("error", channel.id, "Channel connection check failed", { error: safeError });
+      new Notice(`${PLUGIN_NAME}: ${safeError}`);
+      return false;
+    }
   }
 
   async pollNtfyIncoming(account = this.getChannelAccount("ntfy")) {
@@ -3696,17 +3784,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       return;
     }
 
-    if (channel.type === "qqbot" && !channel.sendConfigured) {
-      try {
-        await this.getQqBotGateway(channel.config || {});
-        this.recordConnectionLog("info", channel.id, "QQ Bot authentication and Gateway check passed");
-        await this.refreshRealtimeChannel(channel.id);
-        new Notice(`${PLUGIN_NAME}: QQ Bot connected; send target remains optional`);
-      } catch (error) {
-        const safeError = this.redactSensitiveText(error.message || String(error), true);
-        this.recordConnectionLog("error", channel.id, "QQ Bot connection test failed", { error: safeError });
-        new Notice(`${PLUGIN_NAME}: ${safeError}`);
-      }
+    if (!channel.sendConfigured) {
+      await this.testChannelConnection(channel);
       return;
     }
 
@@ -5163,7 +5242,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       enabled ? this.uiText("已启用", "Enabled") : this.uiText("已停用", "Disabled"),
       channel.configured ? this.uiText("基础配置完成", "Basic setup complete") : this.uiText("等待基础配置", "Basic setup required"),
     ];
-    if (channel.type === "qqbot" && channel.configured && !channel.sendConfigured) {
+    if (channel.configured && !channel.sendConfigured) {
       status.push(this.uiText("主动发送目标未设置", "Proactive send target not set"));
     }
     const receiveLabels = {
@@ -5196,15 +5275,26 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         await this.plugin.updateChannelAccount(channel.id, { config: { [key]: value.trim() } });
       });
       if (password) text.inputEl.type = "password";
-      if (options.reconnectOnBlur) {
+      if (options.refreshOnBlur || options.reconnectOnBlur) {
         text.inputEl.addEventListener("blur", () => {
-          this.plugin.refreshRealtimeChannel(channel.id).catch((error) => {
-            this.plugin.recordConnectionLog("error", channel.id, "Realtime connection refresh failed", { error: error.message || String(error) });
+          this.plugin.refreshChannelConnection(channel.id).catch((error) => {
+            this.plugin.recordConnectionLog("error", channel.id, "Channel connection refresh failed", { error: error.message || String(error) });
           });
         });
       }
     });
     return setting;
+  }
+
+  createChannelOptionGroup(containerEl, title, open = false) {
+    const details = containerEl.createEl("details", { cls: "obsidian-ntfy-channel-options" });
+    details.open = Boolean(open);
+    details.createEl("summary", { text: title });
+    return details.createDiv({ cls: "obsidian-ntfy-channel-options-body" });
+  }
+
+  renderChannelBasicHeading(containerEl) {
+    containerEl.createEl("h5", { cls: "obsidian-ntfy-channel-subheading", text: this.uiText("基础配置", "Basic setup") });
   }
 
   addChannelModeSetting(containerEl, channel, values) {
@@ -5214,6 +5304,9 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         for (const [value, label] of Object.entries(values)) dropdown.addOption(value, label);
         dropdown.setValue(String(channel.config.mode || Object.keys(values)[0])).onChange(async (value) => {
           await this.plugin.updateChannelAccount(channel.id, { config: { mode: value } });
+          await this.plugin.refreshChannelConnection(channel.id).catch((error) => {
+            this.plugin.recordConnectionLog("error", channel.id, "Channel connection refresh failed", { error: error.message || String(error) });
+          });
           if (!this.openChannelEditors) this.openChannelEditors = new Set();
           this.openChannelEditors.add(channel.id);
           this.display();
@@ -5224,38 +5317,47 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
   renderChannelAccountConfig(containerEl, channel, active) {
     const config = channel.config || {};
     if (channel.type === "ntfy") {
-      this.addChannelTextSetting(containerEl, channel, "serverUrl", this.uiText("服务器", "Server"), "https://ntfy.sh");
-      this.addChannelTextSetting(containerEl, channel, "topic", "Topic", "random-private-topic");
-      this.addChannelTextSetting(containerEl, channel, "authToken", this.uiText("认证 token", "Auth token"), "tk_...", true);
+      this.renderChannelBasicHeading(containerEl);
+      this.addChannelTextSetting(containerEl, channel, "serverUrl", this.uiText("服务器", "Server"), "https://ntfy.sh", false, "", { refreshOnBlur: true });
+      this.addChannelTextSetting(containerEl, channel, "topic", "Topic", "random-private-topic", false, "", { refreshOnBlur: true });
+      const advanced = this.createChannelOptionGroup(containerEl, this.uiText("高级配置（可选）", "Advanced settings (optional)"));
+      this.addChannelTextSetting(advanced, channel, "authToken", this.uiText("认证 token", "Auth token"), "tk_...", true, this.uiText("仅私有或受保护的 ntfy Topic 需要。", "Only required for private or protected ntfy topics."), { refreshOnBlur: true });
     }
     if (channel.type === "telegram") {
-      this.addChannelTextSetting(containerEl, channel, "apiRoot", "API root", "https://api.telegram.org");
-      this.addChannelTextSetting(containerEl, channel, "botToken", "Bot token", "123456:ABC...", true);
-      this.addChannelTextSetting(containerEl, channel, "chatId", "Chat ID", "-100...");
+      this.renderChannelBasicHeading(containerEl);
+      this.addChannelTextSetting(containerEl, channel, "botToken", "Bot token", "123456:ABC...", true, this.uiText("必填。填写后即可验证机器人并接收消息。", "Required. This is enough to validate the bot and receive messages."), { refreshOnBlur: true });
+      const sending = this.createChannelOptionGroup(containerEl, this.uiText("主动发送（可选）", "Proactive sending (optional)"));
+      this.addChannelTextSetting(sending, channel, "chatId", "Chat ID", "-100...", false, this.uiText("仅主动推送需要；回复收到的消息使用原聊天。", "Only required for proactive sends; replies use the originating chat."));
+      const advanced = this.createChannelOptionGroup(containerEl, this.uiText("高级配置（可选）", "Advanced settings (optional)"));
+      this.addChannelTextSetting(advanced, channel, "apiRoot", "API root", "https://api.telegram.org", false, this.uiText("默认使用 Telegram 官方 API，通常无需修改。", "Uses the official Telegram API by default."), { refreshOnBlur: true });
     }
     if (channel.type === "feishu") {
+      this.renderChannelBasicHeading(containerEl);
       this.addChannelModeSetting(containerEl, channel, { app: this.uiText("应用", "App"), webhook: "Webhook" });
       if (String(config.mode || "app") === "webhook") {
         this.addChannelTextSetting(containerEl, channel, "webhookUrl", "Webhook URL", "https://open.feishu.cn/open-apis/bot/v2/hook/...", true);
       } else {
-        new Setting(containerEl).setName(this.uiText("域", "Domain")).addDropdown((dropdown) => dropdown
-          .addOption("feishu", "Feishu")
-          .addOption("lark", "Lark")
-          .setValue(String(config.domain || "feishu"))
-          .onChange(async (value) => await this.plugin.updateChannelAccount(channel.id, { config: { domain: value } })));
         this.addChannelTextSetting(containerEl, channel, "appId", "App ID", "cli_...");
         this.addChannelTextSetting(containerEl, channel, "appSecret", "App secret", "...", true);
-        new Setting(containerEl).setName("Receive ID type").addDropdown((dropdown) => dropdown
+        const sending = this.createChannelOptionGroup(containerEl, this.uiText("主动发送（可选）", "Proactive sending (optional)"));
+        new Setting(sending).setName("Receive ID type").addDropdown((dropdown) => dropdown
           .addOption("chat_id", "chat_id")
           .addOption("open_id", "open_id")
           .addOption("user_id", "user_id")
           .addOption("email", "email")
           .setValue(String(config.receiveIdType || "chat_id"))
           .onChange(async (value) => await this.plugin.updateChannelAccount(channel.id, { config: { receiveIdType: value } })));
-        this.addChannelTextSetting(containerEl, channel, "receiveId", "Receive ID", "oc_... / ou_...");
+        this.addChannelTextSetting(sending, channel, "receiveId", "Receive ID", "oc_... / ou_...", false, this.uiText("仅主动推送需要；回复收到的消息使用原会话。", "Only required for proactive sends; replies use the originating conversation."));
+        const advanced = this.createChannelOptionGroup(containerEl, this.uiText("高级配置（可选）", "Advanced settings (optional)"));
+        new Setting(advanced).setName(this.uiText("域", "Domain")).addDropdown((dropdown) => dropdown
+          .addOption("feishu", "Feishu")
+          .addOption("lark", "Lark")
+          .setValue(String(config.domain || "feishu"))
+          .onChange(async (value) => await this.plugin.updateChannelAccount(channel.id, { config: { domain: value } })));
       }
     }
     if (channel.type === "wecom") {
+      this.renderChannelBasicHeading(containerEl);
       this.addChannelModeSetting(containerEl, channel, { webhook: this.uiText("群机器人 Webhook", "Group webhook"), app: this.uiText("企业应用", "App") });
       if (String(config.mode || "webhook") === "webhook") {
         this.addChannelTextSetting(containerEl, channel, "webhookUrl", "Webhook URL", "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...", true);
@@ -5263,33 +5365,39 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         this.addChannelTextSetting(containerEl, channel, "corpId", "Corp ID", "ww...");
         this.addChannelTextSetting(containerEl, channel, "agentId", "Agent ID", "1000002");
         this.addChannelTextSetting(containerEl, channel, "secret", "Secret", "...", true);
-        new Setting(containerEl).setName(this.uiText("接收对象类型", "Target type")).addDropdown((dropdown) => dropdown
+        const sending = this.createChannelOptionGroup(containerEl, this.uiText("主动发送（可选）", "Proactive sending (optional)"));
+        new Setting(sending).setName(this.uiText("接收对象类型", "Target type")).addDropdown((dropdown) => dropdown
           .addOption("touser", "touser")
           .addOption("toparty", "toparty")
           .addOption("totag", "totag")
           .setValue(String(config.targetType || "touser"))
           .onChange(async (value) => await this.plugin.updateChannelAccount(channel.id, { config: { targetType: value } })));
-        this.addChannelTextSetting(containerEl, channel, "target", this.uiText("接收对象", "Target"), "@all / user id");
+        this.addChannelTextSetting(sending, channel, "target", this.uiText("接收对象", "Target"), "@all / user id", false, this.uiText("仅主动推送需要。", "Only required for proactive sends."));
       }
     }
     if (channel.type === "discord" || channel.type === "slack") {
+      this.renderChannelBasicHeading(containerEl);
       this.addChannelModeSetting(containerEl, channel, { webhook: "Webhook", bot: "Bot" });
       if (String(config.mode || "webhook") === "webhook") {
         this.addChannelTextSetting(containerEl, channel, "webhookUrl", "Webhook URL", "https://...", true);
       } else {
-        this.addChannelTextSetting(containerEl, channel, "apiRoot", "API root", channel.type === "discord" ? "https://discord.com/api/v10" : "https://slack.com/api");
-        this.addChannelTextSetting(containerEl, channel, "botToken", "Bot token", "...", true);
-        if (channel.type === "slack") this.addChannelTextSetting(containerEl, channel, "appToken", "App token (Socket Mode)", "xapp-...", true);
-        this.addChannelTextSetting(containerEl, channel, "channelId", "Channel ID", "...");
+        this.addChannelTextSetting(containerEl, channel, "botToken", "Bot token", "...", true, "", { refreshOnBlur: true });
+        const sending = this.createChannelOptionGroup(containerEl, this.uiText("主动发送（可选）", "Proactive sending (optional)"));
+        this.addChannelTextSetting(sending, channel, "channelId", "Channel ID", "...", false, this.uiText("仅主动推送需要；回复收到的消息使用原频道。", "Only required for proactive sends; replies use the originating channel."));
+        const advanced = this.createChannelOptionGroup(containerEl, this.uiText("高级配置与收件（可选）", "Advanced and receive settings (optional)"));
+        this.addChannelTextSetting(advanced, channel, "apiRoot", "API root", channel.type === "discord" ? "https://discord.com/api/v10" : "https://slack.com/api", false, "", { refreshOnBlur: true });
+        if (channel.type === "slack") this.addChannelTextSetting(advanced, channel, "appToken", "App token (Socket Mode)", "xapp-...", true, this.uiText("仅 Slack 实时收件需要；主动发送不需要。", "Only required for Slack Socket Mode receive; proactive sending does not need it."), { refreshOnBlur: true });
       }
     }
     if (channel.type === "matrix") {
-      this.addChannelTextSetting(containerEl, channel, "serverUrl", this.uiText("服务器", "Server"), "https://matrix.example");
-      this.addChannelTextSetting(containerEl, channel, "accessToken", "Access token", "syt_...", true);
-      this.addChannelTextSetting(containerEl, channel, "roomId", "Room ID", "!room:matrix.example");
+      this.renderChannelBasicHeading(containerEl);
+      this.addChannelTextSetting(containerEl, channel, "serverUrl", this.uiText("服务器", "Server"), "https://matrix.example", false, "", { refreshOnBlur: true });
+      this.addChannelTextSetting(containerEl, channel, "accessToken", "Access token", "syt_...", true, "", { refreshOnBlur: true });
+      const sending = this.createChannelOptionGroup(containerEl, this.uiText("房间与主动发送（可选）", "Room and proactive sending (optional)"));
+      this.addChannelTextSetting(sending, channel, "roomId", "Room ID", "!room:matrix.example", false, this.uiText("主动发送和限制收件房间时使用；留空可接收账号可见房间。", "Used for proactive sending and receive filtering; leave empty to receive from visible rooms."));
     }
     if (channel.type === "qqbot") {
-      containerEl.createEl("h5", { cls: "obsidian-ntfy-channel-subheading", text: this.uiText("基础配置", "Basic setup") });
+      this.renderChannelBasicHeading(containerEl);
       this.addChannelTextSetting(
         containerEl,
         channel,
@@ -5311,9 +5419,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         { reconnectOnBlur: true }
       );
 
-      const sendOptions = containerEl.createEl("details", { cls: "obsidian-ntfy-channel-options" });
-      sendOptions.createEl("summary", { text: this.uiText("主动发送（可选）", "Proactive sending (optional)") });
-      const sendOptionsBody = sendOptions.createDiv({ cls: "obsidian-ntfy-channel-options-body" });
+      const sendOptionsBody = this.createChannelOptionGroup(containerEl, this.uiText("主动发送（可选）", "Proactive sending (optional)"));
       new Setting(sendOptionsBody).setName(this.uiText("发送目标类型", "Target type")).addDropdown((dropdown) => dropdown
         .addOption("c2c", "C2C")
         .addOption("group", this.uiText("群聊", "Group"))
@@ -5331,9 +5437,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         this.uiText("仅主动推送时需要；回复收到的 QQ 消息不需要预填。", "Only required for proactive sends; replies to received QQ messages use the original conversation automatically.")
       );
 
-      const advancedOptions = containerEl.createEl("details", { cls: "obsidian-ntfy-channel-options" });
-      advancedOptions.createEl("summary", { text: this.uiText("高级配置（可选）", "Advanced settings (optional)") });
-      const advancedOptionsBody = advancedOptions.createDiv({ cls: "obsidian-ntfy-channel-options-body" });
+      const advancedOptionsBody = this.createChannelOptionGroup(containerEl, this.uiText("高级配置（可选）", "Advanced settings (optional)"));
       this.addChannelTextSetting(
         advancedOptionsBody,
         channel,
@@ -5356,15 +5460,20 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       );
     }
     if (channel.type === "email") {
+      this.renderChannelBasicHeading(containerEl);
       this.addChannelTextSetting(containerEl, channel, "gatewayUrl", this.uiText("HTTP 邮件网关", "HTTP email gateway"), "https://mail.example/send");
-      this.addChannelTextSetting(containerEl, channel, "gatewayToken", "Gateway token", "...", true);
-      this.addChannelTextSetting(containerEl, channel, "from", "From", "obsidian@example.com");
-      this.addChannelTextSetting(containerEl, channel, "to", "To", "you@example.com");
+      const sending = this.createChannelOptionGroup(containerEl, this.uiText("主动发送（可选）", "Proactive sending (optional)"));
+      this.addChannelTextSetting(sending, channel, "to", "To", "you@example.com", false, this.uiText("主动发送邮件时需要；回复收到的邮件可使用原发件人。", "Required for proactive email; replies can use the original sender."));
+      const advanced = this.createChannelOptionGroup(containerEl, this.uiText("高级配置（可选）", "Advanced settings (optional)"));
+      this.addChannelTextSetting(advanced, channel, "gatewayToken", "Gateway token", "...", true);
+      this.addChannelTextSetting(advanced, channel, "from", "From", "obsidian@example.com");
     }
     if (channel.type === "webhook") {
+      this.renderChannelBasicHeading(containerEl);
       this.addChannelTextSetting(containerEl, channel, "url", "Webhook URL", "https://agent.example/notification");
-      this.addChannelTextSetting(containerEl, channel, "token", "Bearer token", "...", true);
-      this.addChannelTextSetting(containerEl, channel, "customHeaders", this.uiText("自定义请求头 JSON", "Custom headers JSON"), '{"X-API-Key":"..."}', false);
+      const advanced = this.createChannelOptionGroup(containerEl, this.uiText("高级配置（可选）", "Advanced settings (optional)"));
+      this.addChannelTextSetting(advanced, channel, "token", "Bearer token", "...", true);
+      this.addChannelTextSetting(advanced, channel, "customHeaders", this.uiText("自定义请求头 JSON", "Custom headers JSON"), '{"X-API-Key":"..."}', false);
     }
 
     const mode = String(config.mode || "").trim().toLowerCase();
@@ -5376,7 +5485,8 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       : nativeSocket
         ? this.uiText("Obsidian 在前台时连接平台官方实时 Gateway，进入后台后断开以节省电量。", "Uses the provider's official realtime Gateway in the foreground and disconnects in the background to save power.")
         : this.uiText("通过轻量 HTTPS 中继轮询平台回调；中继只需返回约定的标准消息 JSON。", "Polls provider callbacks through a lightweight HTTPS relay that returns the documented normalized message JSON.");
-    new Setting(containerEl)
+    const receiveOptions = this.createChannelOptionGroup(containerEl, this.uiText("收件设置（可选）", "Receive settings (optional)"));
+    new Setting(receiveOptions)
       .setName(this.uiText("接收消息", "Receive messages"))
       .setDesc(receiveDescription)
       .addToggle((toggle) => toggle.setValue(config.receiveEnabled !== false).onChange(async (value) => {
@@ -5385,10 +5495,10 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         this.display();
       }));
     if (needsRelay) {
-      this.addChannelTextSetting(containerEl, channel, "receiveUrl", this.uiText("HTTPS 接收中继", "HTTPS receive relay"), "https://relay.example/inbox", false, this.uiText("GET 请求携带 channelId、cursor、limit；公网地址必须使用 HTTPS。", "GET receives channelId, cursor, and limit; public endpoints must use HTTPS."));
-      this.addChannelTextSetting(containerEl, channel, "receiveToken", this.uiText("接收中继 token", "Receive relay token"), "...", true);
+      this.addChannelTextSetting(receiveOptions, channel, "receiveUrl", this.uiText("HTTPS 接收中继", "HTTPS receive relay"), "https://relay.example/inbox", false, this.uiText("GET 请求携带 channelId、cursor、limit；公网地址必须使用 HTTPS。", "GET receives channelId, cursor, and limit; public endpoints must use HTTPS."));
+      this.addChannelTextSetting(receiveOptions, channel, "receiveToken", this.uiText("接收中继 token", "Receive relay token"), "...", true);
       if (config.receiveCursor) {
-        new Setting(containerEl)
+        new Setting(receiveOptions)
           .setName(this.uiText("接收游标", "Receive cursor"))
           .setDesc(this.uiText("清除后将由中继重新决定起点。", "Clearing lets the relay choose a new starting point."))
           .addExtraButton((button) => button.setIcon("rotate-ccw").setTooltip(this.uiText("清除游标", "Clear cursor")).onClick(async () => {
@@ -5398,7 +5508,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       }
     }
     if (channel.type === "ntfy" && channel.accountId === "default") {
-      this.addChannelTextSetting(containerEl, channel, "pollIntervalSeconds", this.uiText("轮询间隔（秒）", "Poll interval (seconds)"), "60");
+      this.addChannelTextSetting(receiveOptions, channel, "pollIntervalSeconds", this.uiText("轮询间隔（秒）", "Poll interval (seconds)"), "60");
     }
 
     if (!active) {
@@ -5443,7 +5553,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         await this.plugin.removeChannelFromSettings(channel.id);
         this.display();
       });
-      addAction("send", channel.type === "qqbot" && !channel.sendConfigured ? this.uiText("测试 QQ 连接", "Test QQ connection") : this.uiText("测试当前账号", "Test this account"), async () => {
+      addAction("send", !channel.sendConfigured ? this.uiText("测试连接", "Test connection") : this.uiText("测试当前账号", "Test this account"), async () => {
         await this.plugin.sendTestNotification({ channelId: channel.id, simulatedEvent: true });
       }, channel.storedEnabled === false || !channel.configured);
     }

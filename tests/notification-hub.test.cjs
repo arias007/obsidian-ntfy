@@ -147,6 +147,26 @@ async function run() {
   assert.equal(receiveOnlyQqChannel.sendConfigured, false);
   assert.equal(receiveOnlyQqChannel.receiveMode, "socket");
 
+  const baseOnlyChannelCases = [
+    ["telegram", { botToken: "123456:base-token", chatId: "" }, "poll"],
+    ["feishu", { mode: "app", appId: "cli_base", appSecret: "base-secret", receiveId: "" }, "unconfigured"],
+    ["wecom", { mode: "app", corpId: "ww_base", agentId: "1000002", secret: "base-secret", target: "" }, "unconfigured"],
+    ["discord", { mode: "bot", botToken: "discord-base", channelId: "" }, "socket"],
+    ["slack", { mode: "bot", botToken: "xoxb-base", appToken: "", channelId: "" }, "unconfigured"],
+    ["matrix", { serverUrl: "https://matrix.example", accessToken: "matrix-base", roomId: "" }, "poll"],
+    ["email", { gatewayUrl: "https://mail.example/send", to: "" }, "unconfigured"],
+  ];
+  for (const [type, config, receiveMode] of baseOnlyChannelCases) {
+    const basePlugin = createPlugin({ topic: `${type}-base-only` });
+    const id = `${type}:base`;
+    await basePlugin.addChannelToSettings(type, { accountId: "base", name: `${type} base` });
+    await basePlugin.updateChannelAccount(id, { config });
+    const descriptor = basePlugin.listNotificationChannels().find((channel) => channel.id === id);
+    assert.equal(descriptor.configured, true, `${type} basic setup`);
+    assert.equal(descriptor.sendConfigured, false, `${type} optional send target`);
+    assert.equal(descriptor.receiveMode, receiveMode, `${type} receive mode`);
+  }
+
   const rejectedQqPlugin = createPlugin({ topic: "qq-auth-error" });
   rejectedQqPlugin.httpRequest = async () => ({ json: { message: "invalid appid or secret" } });
   await assert.rejects(
