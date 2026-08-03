@@ -33,6 +33,12 @@ Current built-in language targets:
 
 The original Chinese/English UI remains the complete baseline. Other languages cover common settings, manager labels, command names, status labels, and notices first; any missing string falls back to English instead of showing a broken label.
 
+## Fast Manager Tabs
+
+- The four manager tabs keep their rendered content and scroll position in memory.
+- Switching tabs shows cached content immediately, then refreshes that tab in the background.
+- Unchanged background results do not rebuild the visible list.
+
 ## Supported Reminder Syntax
 
 The plugin scans unchecked tasks and standalone reminder lines in Markdown files.

@@ -5301,6 +5301,11 @@ class NtfyManagerView extends ItemView {
     this.vaultTasks = [];
     this.remoteScheduled = [];
     this.scanError = "";
+    this.bodyEl = null;
+    this.tabPanels = new Map();
+    this.tabSignatures = new Map();
+    this.tabScrollPositions = new Map();
+    this.tabRefreshes = new Map();
   }
 
   getViewType() {
@@ -5326,18 +5331,16 @@ class NtfyManagerView extends ItemView {
 
   async onClose() {
     this.viewContentEl().empty();
+    this.bodyEl = null;
+    this.tabPanels.clear();
+    this.tabSignatures.clear();
+    this.tabScrollPositions.clear();
+    this.tabRefreshes.clear();
   }
 
   refreshIncomingView() {
-    const contentEl = this.viewContentEl();
-    const inboxTab = contentEl.querySelector('[data-tab-id="inbox"]');
-    const badge = inboxTab && inboxTab.querySelector(".obsidian-ntfy-nav-badge");
-    if (badge) badge.textContent = String((this.plugin.settings.incomingMessages || []).length);
-    if (this.activeTab !== "inbox") return;
-    const body = contentEl.querySelector(".obsidian-ntfy-window-body");
-    if (!body) return;
-    body.empty();
-    this.renderIncomingMessages(body);
+    this.updateNavCounts();
+    this.syncTabPanels(["inbox"]);
   }
 
   viewContentEl() {
@@ -5355,36 +5358,165 @@ class NtfyManagerView extends ItemView {
 
   async render() {
     const contentEl = this.viewContentEl();
-    contentEl.empty();
-    contentEl.addClass("obsidian-ntfy-manager");
-
     const preload = this.preloadedData;
     this.preloadedData = null;
     if (preload) {
       this.setPreloadedData(preload);
       this.preloadedData = null;
-    } else {
-      try {
-        this.notificationTasks = await this.plugin.collectNotificationTasks();
-        this.vaultTasks = await this.plugin.collectVaultTasks();
-        this.remoteScheduled = await this.loadRemoteScheduledQuietly();
-        this.scanError = "";
-      } catch (error) {
-        this.notificationTasks = [];
-        this.vaultTasks = [];
-        this.scanError = error.message || String(error);
-      }
     }
 
-    this.plugin.setStatusCountsFromNotificationTasks(this.notificationTasks);
+    const mountedBody = contentEl.querySelector(".obsidian-ntfy-window-body");
+    if (!this.bodyEl || mountedBody !== this.bodyEl) this.renderShell(contentEl);
+    else {
+      this.updateNavCounts();
+      this.syncTabPanels(this.managerTabIds());
+    }
+
+    this.refreshTabInBackground(this.activeTab);
+  }
+
+  managerTabIds() {
+    return ["pending", "completed", "tasks", "inbox"];
+  }
+
+  renderShell(contentEl) {
+    contentEl.empty();
+    contentEl.addClass("obsidian-ntfy-manager");
+    this.tabPanels.clear();
+    this.tabSignatures.clear();
     this.renderHeader(contentEl);
-    const body = contentEl.createDiv({ cls: "obsidian-ntfy-window-body" });
-    if (this.activeTab === "pending") this.renderNotificationTasks(body);
-    if (this.activeTab === "queue") this.renderQueueWorkspace(body);
-    if (this.activeTab === "completed") this.renderCompletedTasks(body);
-    if (this.activeTab === "tasks") this.renderVaultTasks(body);
-    if (this.activeTab === "inbox") this.renderIncomingMessages(body);
-    if (this.activeTab === "connections") this.renderConnectionStatus(body);
+    this.bodyEl = contentEl.createDiv({ cls: "obsidian-ntfy-window-body" });
+    this.ensureTabPanel(this.activeTab);
+    this.showActiveTabPanel();
+  }
+
+  ensureTabPanel(tabId) {
+    if (!this.bodyEl) return null;
+    let panel = this.tabPanels.get(tabId);
+    if (panel) return panel;
+    panel = this.bodyEl.createDiv({
+      cls: "obsidian-ntfy-tab-panel",
+      attr: { "data-panel-id": tabId },
+    });
+    this.tabPanels.set(tabId, panel);
+    this.renderTabPanel(tabId);
+    return panel;
+  }
+
+  renderTabPanel(tabId) {
+    const panel = this.tabPanels.get(tabId);
+    if (!panel) return;
+    const scrollTop = this.activeTab === tabId && this.bodyEl ? this.bodyEl.scrollTop : null;
+    panel.empty();
+    if (tabId === "pending") this.renderNotificationTasks(panel);
+    if (tabId === "queue") this.renderQueueWorkspace(panel);
+    if (tabId === "completed") this.renderCompletedTasks(panel);
+    if (tabId === "tasks") this.renderVaultTasks(panel);
+    if (tabId === "inbox") this.renderIncomingMessages(panel);
+    if (tabId === "connections") this.renderConnectionStatus(panel);
+    this.tabSignatures.set(tabId, this.tabDataSignature(tabId));
+    if (scrollTop !== null && this.bodyEl) this.bodyEl.scrollTop = scrollTop;
+  }
+
+  tabDataSignature(tabId) {
+    let value = null;
+    if (tabId === "pending") value = { tasks: this.notificationTasks, scanError: this.scanError };
+    else if (tabId === "completed" || tabId === "tasks") value = this.vaultTasks;
+    else if (tabId === "inbox") value = this.plugin.settings.incomingMessages || [];
+    else if (tabId === "queue") value = { queue: this.plugin.settings.queue || [], notices: this.plugin.settings.obsidianNotices || [] };
+    else if (tabId === "connections") value = { channels: this.plugin.settings.channelAccounts || [], logs: this.plugin.settings.connectionLogs || [] };
+    try {
+      return JSON.stringify(value);
+    } catch (error) {
+      console.warn(`${PLUGIN_NAME}: failed to fingerprint manager cache`, error);
+      return String(Date.now());
+    }
+  }
+
+  syncTabPanels(tabIds) {
+    let changed = false;
+    for (const tabId of tabIds) {
+      if (!this.tabPanels.has(tabId)) continue;
+      const signature = this.tabDataSignature(tabId);
+      if (this.tabSignatures.get(tabId) === signature) continue;
+      this.renderTabPanel(tabId);
+      changed = true;
+    }
+    return changed;
+  }
+
+  showActiveTabPanel() {
+    for (const [tabId, panel] of this.tabPanels.entries()) {
+      panel.toggleClass("is-active", tabId === this.activeTab);
+    }
+  }
+
+  updateNavSelection() {
+    this.viewContentEl().querySelectorAll(".obsidian-ntfy-nav-item").forEach((tab) => {
+      tab.toggleClass("is-active", tab.getAttribute("data-tab-id") === this.activeTab);
+    });
+  }
+
+  activateTab(tabId) {
+    if (!this.managerTabIds().includes(tabId)) return;
+    if (this.bodyEl) this.tabScrollPositions.set(this.activeTab, this.bodyEl.scrollTop || 0);
+    this.ensureTabPanel(tabId);
+    this.activeTab = tabId;
+    this.updateNavSelection();
+    this.showActiveTabPanel();
+    if (this.bodyEl) this.bodyEl.scrollTop = this.tabScrollPositions.get(tabId) || 0;
+    this.refreshTabInBackground(tabId);
+  }
+
+  refreshScopeForTab(tabId) {
+    if (tabId === "pending") return "pending";
+    if (tabId === "completed" || tabId === "tasks") return "vault";
+    if (tabId === "inbox") return "inbox";
+    return "";
+  }
+
+  affectedTabsForScope(scope) {
+    if (scope === "pending") return ["pending"];
+    if (scope === "vault") return ["completed", "tasks"];
+    if (scope === "inbox") return ["inbox"];
+    return [];
+  }
+
+  refreshTabInBackground(tabId) {
+    const scope = this.refreshScopeForTab(tabId);
+    if (!scope) return Promise.resolve(false);
+    if (this.tabRefreshes.has(scope)) return this.tabRefreshes.get(scope);
+
+    const refresh = (async () => {
+      const affectedTabs = this.affectedTabsForScope(scope);
+      const previousSignatures = new Map(affectedTabs.map((id) => [id, this.tabDataSignature(id)]));
+      try {
+        if (scope === "pending") {
+          this.notificationTasks = await this.plugin.collectNotificationTasks();
+          this.scanError = "";
+        } else if (scope === "vault") {
+          this.vaultTasks = await this.plugin.collectVaultTasks();
+        } else if (scope === "inbox") {
+          await this.plugin.runIncomingPoll();
+        }
+        const dataChanged = affectedTabs.some((id) => previousSignatures.get(id) !== this.tabDataSignature(id));
+        if (!dataChanged) return false;
+        if (scope === "pending") this.plugin.setStatusCountsFromNotificationTasks(this.notificationTasks);
+        this.updateNavCounts();
+        return this.syncTabPanels(affectedTabs);
+      } catch (error) {
+        if (scope === "pending" && !this.notificationTasks.length) {
+          this.scanError = error.message || String(error);
+          this.syncTabPanels(["pending"]);
+        }
+        console.warn(`${PLUGIN_NAME}: background manager refresh failed`, error);
+        return false;
+      }
+    })().finally(() => {
+      this.tabRefreshes.delete(scope);
+    });
+    this.tabRefreshes.set(scope, refresh);
+    return refresh;
   }
 
   async loadRemoteScheduledQuietly() {
@@ -5492,10 +5624,7 @@ class NtfyManagerView extends ItemView {
     if (typeof setIcon === "function") setIcon(iconEl, icon);
     else iconEl.textContent = label.slice(0, 1);
     tab.createSpan({ cls: "obsidian-ntfy-nav-label", text: label });
-    tab.addEventListener("click", async () => {
-      this.activeTab = id;
-      await this.render();
-    });
+    tab.addEventListener("click", () => this.activateTab(id));
   }
 
   renderSectionHeader(containerEl, title, count, desc) {
@@ -5595,8 +5724,10 @@ class NtfyManagerView extends ItemView {
       this.scanError = "";
       this.updateNavCounts();
       this.plugin.setStatusCountsFromNotificationTasks(this.notificationTasks);
+      this.syncTabPanels(["pending", "completed", "tasks"]);
     } catch (error) {
       this.scanError = error.message || String(error);
+      this.syncTabPanels(["pending"]);
       console.error(error);
     }
   }
@@ -5610,6 +5741,7 @@ class NtfyManagerView extends ItemView {
       if (id === "pending") badge.textContent = String(this.notificationTasks.length);
       if (id === "completed") badge.textContent = String(taskGroups.done.length);
       if (id === "tasks") badge.textContent = String(taskGroups.openUntimed.length);
+      if (id === "inbox") badge.textContent = String((this.plugin.settings.incomingMessages || []).length);
     });
   }
 

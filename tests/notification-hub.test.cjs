@@ -105,6 +105,14 @@ async function run() {
   assert.match(source, /callback\/ws\/endpoint/);
   assert.match(source, /notification-hub:incoming/);
   assert.match(source, /refreshIncomingView\(\)/);
+  assert.match(source, /this\.tabPanels = new Map\(\)/);
+  assert.match(source, /this\.ensureTabPanel\(this\.activeTab\)/);
+  assert.match(source, /refreshTabInBackground\(tabId\)/);
+  assert.match(source, /if \(!dataChanged\) return false/);
+  assert.match(source, /return this\.syncTabPanels\(affectedTabs\)/);
+  assert.match(source, /tab\.addEventListener\("click", \(\) => this\.activateTab\(id\)\)/);
+  assert.doesNotMatch(source, /tab\.addEventListener\("click", async \(\) => \{\s*this\.activeTab = id;\s*await this\.render\(\)/);
+  assert.match(styles, /\.obsidian-ntfy-tab-panel\.is-active\s*\{\s*display:\s*block/);
 
   const plugin = createPlugin({
     topic: "test-topic",

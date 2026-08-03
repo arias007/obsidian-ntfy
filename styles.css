@@ -138,6 +138,14 @@
   padding-bottom: calc(128px + env(safe-area-inset-bottom));
 }
 
+.obsidian-ntfy-tab-panel {
+  display: none;
+}
+
+.obsidian-ntfy-tab-panel.is-active {
+  display: block;
+}
+
 .obsidian-ntfy-section {
   border-top: 1px solid var(--background-modifier-border);
   margin-top: 14px;
