@@ -119,6 +119,14 @@ async function run() {
   assert.equal(plugin.settings.backgroundReceiveEnabled, true);
   assert.deepEqual(plugin.settings.channelHealth, {});
 
+  const spanishPlugin = createPlugin({ uiLanguage: "es" });
+  assert.equal(spanishPlugin.currentUiLanguage(), "es");
+  assert.equal(spanishPlugin.uiText("通知中枢总开关", "Notification hub"), "Centro de notificaciones");
+  const arabicPlugin = createPlugin({ uiLanguage: "ar" });
+  assert.equal(arabicPlugin.isRtlUi(), true);
+  const fallbackLanguagePlugin = createPlugin({ uiLanguage: "missing-locale" });
+  assert.equal(fallbackLanguagePlugin.settings.uiLanguage, "auto");
+
   const healthMigrationPlugin = createPlugin({
     topic: "health-migration",
     connectionLogs: [

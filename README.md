@@ -12,6 +12,27 @@ Why ntfy: Obsidian mobile plugins cannot directly create Android system notifica
 
 Use a long random topic if you use the public server `https://ntfy.sh`, for example `murat-ob-9c4f0b2d7a1e4b90`.
 
+## Multilingual Interface
+
+The plugin includes an interface language selector in settings. It can follow Obsidian/system language or be set manually.
+
+Current built-in language targets:
+
+- English
+- 简体中文
+- 日本語
+- 한국어
+- Español
+- Français
+- Deutsch
+- Русский
+- Português
+- العربية
+- Türkçe
+- Italiano
+
+The original Chinese/English UI remains the complete baseline. Other languages cover common settings, manager labels, command names, status labels, and notices first; any missing string falls back to English instead of showing a broken label.
+
 ## Supported Reminder Syntax
 
 The plugin scans unchecked tasks and standalone reminder lines in Markdown files.

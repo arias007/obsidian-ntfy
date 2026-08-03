@@ -32,6 +32,370 @@ const {
 const PLUGIN_NAME = "Ntfy Notifications";
 const VIEW_TYPE_NTFY_MANAGER = "obsidian-ntfy-manager-view";
 const NOTIFICATION_HUB_API_VERSION = "1";
+const UI_LANGUAGE_OPTIONS = [
+  ["auto", "Follow Obsidian/system"],
+  ["en", "English"],
+  ["zh", "简体中文"],
+  ["ja", "日本語"],
+  ["ko", "한국어"],
+  ["es", "Español"],
+  ["fr", "Français"],
+  ["de", "Deutsch"],
+  ["ru", "Русский"],
+  ["pt", "Português"],
+  ["ar", "العربية"],
+  ["tr", "Türkçe"],
+  ["it", "Italiano"],
+];
+const RTL_UI_LANGUAGES = new Set(["ar"]);
+const UI_TRANSLATIONS = {
+  ja: {
+    "Follow Obsidian/system": "Obsidian/システムに従う",
+    "Language": "言語",
+    "Use one interface language for settings, manager labels, commands, and notices when translations are available. Missing strings fall back to English.": "翻訳がある場合は、設定、管理画面、コマンド、通知を同じ言語で表示します。未翻訳の文字列は英語に戻ります。",
+    "A lightweight notification hub for Obsidian, plugins, and external tools through a shared channel interface.": "共有チャンネルインターフェースで Obsidian、プラグイン、外部ツールをつなぐ軽量通知ハブ。",
+    "Channels": "チャンネル",
+    "Manage active connections, status, and available providers.": "使用中の接続、状態、利用可能なプロバイダーを管理します。",
+    "Notification hub": "通知ハブ",
+    "Stops all sending, receiving, and polling while preserving channel configuration.": "チャンネル設定を保持したまま、送信、受信、ポーリングを停止します。",
+    "Keep receiving in background": "バックグラウンド受信を維持",
+    "Keeps realtime connections and low-frequency polling while Obsidian is running. Mobile OS suspension can still pause delivery; foregrounding reconnects immediately.": "Obsidian の実行中はリアルタイム接続と低頻度ポーリングを維持します。モバイル OS による停止中は配信が止まる場合があり、前面に戻るとすぐ再接続します。",
+    "Enable channel": "チャンネルを有効化",
+    "Server": "サーバー",
+    "Advanced settings (optional)": "詳細設定（任意）",
+    "Proactive sending (optional)": "能動送信（任意）",
+    "Basic setup": "基本設定",
+    "Testing, send review, and quiet-hour queueing.": "テスト、送信前確認、静音時間キュー。",
+    "Real delivery test": "実送信テスト",
+    "Send test": "テスト送信",
+    "Review before sending": "送信前に確認",
+    "Enable quiet hours": "静音時間を有効化",
+    "Quiet start": "静音開始",
+    "Quiet end": "静音終了",
+    "Inbound interface": "受信インターフェース",
+    "Contact and group allowlist": "連絡先・グループ許可リスト",
+    "Attachment limit (MB)": "添付サイズ上限（MB）",
+    "Agent URI interface": "Agent URI インターフェース",
+    "Scan and schedule reminders": "リマインダーをスキャンして予約",
+    "Send test notification": "テスト通知を送信",
+    "Simulate test notification": "テスト通知をシミュレーション",
+    "Schedule delayed notification": "遅延通知を予約",
+    "Open ntfy notification manager": "ntfy 通知マネージャーを開く",
+    "Insert ntfy/Tasks reminder date": "ntfy/Tasks リマインダー日時を挿入",
+    "Clear sent/scheduled cache": "送信済み/予約済みキャッシュを消去",
+    "Notifications on": "通知オン",
+    "Notifications off": "通知オフ",
+    "Enabled": "有効",
+    "Disabled": "無効",
+    "Basic setup complete": "基本設定完了",
+    "Basic setup required": "基本設定が必要",
+    "Checking credentials": "認証情報を確認中",
+    "Credentials verified": "認証情報を確認済み",
+    "Credential check failed": "認証情報の確認に失敗",
+    "Credentials not verified": "認証情報未確認",
+    "Current default": "現在の既定",
+    "Set default": "既定にする",
+    "Test this account": "このアカウントをテスト",
+    "Verify credentials": "認証情報を確認",
+    "Add to in use": "使用中に追加",
+    "Saved accounts": "保存済みアカウント",
+    "Providers": "プロバイダー",
+    "Provider": "プロバイダー",
+    "Account ID": "アカウント ID",
+    "Display name": "表示名",
+  },
+  ko: {
+    "Follow Obsidian/system": "Obsidian/시스템 따르기",
+    "Language": "언어",
+    "Use one interface language for settings, manager labels, commands, and notices when translations are available. Missing strings fall back to English.": "번역이 있는 경우 설정, 관리자 라벨, 명령, 알림에 같은 언어를 사용합니다. 없는 문구는 영어로 표시됩니다.",
+    "A lightweight notification hub for Obsidian, plugins, and external tools through a shared channel interface.": "공유 채널 인터페이스로 Obsidian, 플러그인, 외부 도구를 연결하는 가벼운 알림 허브입니다.",
+    "Channels": "채널",
+    "Manage active connections, status, and available providers.": "활성 연결, 상태, 사용 가능한 제공자를 관리합니다.",
+    "Notification hub": "알림 허브",
+    "Stops all sending, receiving, and polling while preserving channel configuration.": "채널 설정은 유지하고 모든 송신, 수신, 폴링을 중지합니다.",
+    "Keep receiving in background": "백그라운드 수신 유지",
+    "Enable channel": "채널 사용",
+    "Server": "서버",
+    "Advanced settings (optional)": "고급 설정(선택)",
+    "Proactive sending (optional)": "능동 전송(선택)",
+    "Basic setup": "기본 설정",
+    "Real delivery test": "실제 전송 테스트",
+    "Send test": "테스트 전송",
+    "Review before sending": "전송 전 검토",
+    "Enable quiet hours": "방해 금지 시간 사용",
+    "Quiet start": "시작 시간",
+    "Quiet end": "종료 시간",
+    "Inbound interface": "수신 인터페이스",
+    "Contact and group allowlist": "연락처 및 그룹 허용 목록",
+    "Attachment limit (MB)": "첨부 제한(MB)",
+    "Agent URI interface": "Agent URI 인터페이스",
+    "Scan and schedule reminders": "리마인더 스캔 및 예약",
+    "Send test notification": "테스트 알림 보내기",
+    "Simulate test notification": "테스트 알림 시뮬레이션",
+    "Schedule delayed notification": "지연 알림 예약",
+    "Open ntfy notification manager": "ntfy 알림 관리자 열기",
+    "Insert ntfy/Tasks reminder date": "ntfy/Tasks 리마인더 날짜 삽입",
+    "Clear sent/scheduled cache": "전송/예약 캐시 지우기",
+    "Notifications on": "알림 켜짐",
+    "Notifications off": "알림 꺼짐",
+    "Enabled": "사용",
+    "Disabled": "중지",
+    "Current default": "현재 기본값",
+    "Set default": "기본값으로 설정",
+  },
+  es: {
+    "Follow Obsidian/system": "Seguir Obsidian/sistema",
+    "Language": "Idioma",
+    "Use one interface language for settings, manager labels, commands, and notices when translations are available. Missing strings fall back to English.": "Usa un idioma de interfaz para ajustes, gestor, comandos y avisos cuando haya traducción. Los textos faltantes vuelven a inglés.",
+    "A lightweight notification hub for Obsidian, plugins, and external tools through a shared channel interface.": "Un centro ligero de notificaciones para Obsidian, plugins y herramientas externas mediante una interfaz de canales compartida.",
+    "Channels": "Canales",
+    "Manage active connections, status, and available providers.": "Gestiona conexiones activas, estado y proveedores disponibles.",
+    "Notification hub": "Centro de notificaciones",
+    "Stops all sending, receiving, and polling while preserving channel configuration.": "Detiene envíos, recepción y sondeos conservando la configuración de canales.",
+    "Keep receiving in background": "Mantener recepción en segundo plano",
+    "Enable channel": "Activar canal",
+    "Server": "Servidor",
+    "Advanced settings (optional)": "Ajustes avanzados (opcional)",
+    "Proactive sending (optional)": "Envío proactivo (opcional)",
+    "Basic setup": "Configuración básica",
+    "Real delivery test": "Prueba de entrega real",
+    "Send test": "Enviar prueba",
+    "Review before sending": "Revisar antes de enviar",
+    "Enable quiet hours": "Activar horas silenciosas",
+    "Quiet start": "Inicio silencioso",
+    "Quiet end": "Fin silencioso",
+    "Inbound interface": "Interfaz entrante",
+    "Contact and group allowlist": "Lista permitida de contactos y grupos",
+    "Attachment limit (MB)": "Límite de adjuntos (MB)",
+    "Agent URI interface": "Interfaz URI de Agent",
+    "Scan and schedule reminders": "Escanear y programar recordatorios",
+    "Send test notification": "Enviar notificación de prueba",
+    "Simulate test notification": "Simular notificación de prueba",
+    "Schedule delayed notification": "Programar notificación diferida",
+    "Open ntfy notification manager": "Abrir gestor de notificaciones ntfy",
+    "Insert ntfy/Tasks reminder date": "Insertar fecha de recordatorio ntfy/Tasks",
+    "Clear sent/scheduled cache": "Borrar caché enviada/programada",
+    "Notifications on": "Notificaciones activas",
+    "Notifications off": "Notificaciones desactivadas",
+    "Enabled": "Activado",
+    "Disabled": "Desactivado",
+    "Current default": "Predeterminado actual",
+    "Set default": "Hacer predeterminado",
+  },
+  fr: {
+    "Follow Obsidian/system": "Suivre Obsidian/système",
+    "Language": "Langue",
+    "Use one interface language for settings, manager labels, commands, and notices when translations are available. Missing strings fall back to English.": "Utilise une seule langue pour les réglages, le gestionnaire, les commandes et les avis lorsque la traduction existe. Les textes manquants reviennent à l'anglais.",
+    "A lightweight notification hub for Obsidian, plugins, and external tools through a shared channel interface.": "Un hub de notifications léger pour Obsidian, les plugins et les outils externes via une interface de canaux partagée.",
+    "Channels": "Canaux",
+    "Manage active connections, status, and available providers.": "Gérer les connexions actives, leur état et les fournisseurs disponibles.",
+    "Notification hub": "Hub de notifications",
+    "Stops all sending, receiving, and polling while preserving channel configuration.": "Arrête l'envoi, la réception et l'interrogation en conservant la configuration des canaux.",
+    "Keep receiving in background": "Recevoir en arrière-plan",
+    "Enable channel": "Activer le canal",
+    "Server": "Serveur",
+    "Advanced settings (optional)": "Paramètres avancés (optionnel)",
+    "Proactive sending (optional)": "Envoi proactif (optionnel)",
+    "Basic setup": "Configuration de base",
+    "Real delivery test": "Test d'envoi réel",
+    "Send test": "Envoyer un test",
+    "Review before sending": "Vérifier avant l'envoi",
+    "Enable quiet hours": "Activer les heures silencieuses",
+    "Quiet start": "Début du silence",
+    "Quiet end": "Fin du silence",
+    "Inbound interface": "Interface entrante",
+    "Contact and group allowlist": "Liste autorisée contacts/groupes",
+    "Attachment limit (MB)": "Limite des pièces jointes (MB)",
+    "Agent URI interface": "Interface URI Agent",
+    "Scan and schedule reminders": "Scanner et planifier les rappels",
+    "Send test notification": "Envoyer une notification de test",
+    "Simulate test notification": "Simuler une notification de test",
+    "Schedule delayed notification": "Planifier une notification différée",
+    "Open ntfy notification manager": "Ouvrir le gestionnaire ntfy",
+    "Insert ntfy/Tasks reminder date": "Insérer une date de rappel ntfy/Tasks",
+    "Clear sent/scheduled cache": "Vider le cache envoyé/planifié",
+    "Notifications on": "Notifications activées",
+    "Notifications off": "Notifications désactivées",
+    "Enabled": "Activé",
+    "Disabled": "Désactivé",
+    "Current default": "Défaut actuel",
+    "Set default": "Définir par défaut",
+  },
+  de: {
+    "Follow Obsidian/system": "Obsidian/System folgen",
+    "Language": "Sprache",
+    "Use one interface language for settings, manager labels, commands, and notices when translations are available. Missing strings fall back to English.": "Verwendet eine Oberflächensprache für Einstellungen, Manager, Befehle und Hinweise, sofern Übersetzungen vorhanden sind. Fehlende Texte fallen auf Englisch zurück.",
+    "A lightweight notification hub for Obsidian, plugins, and external tools through a shared channel interface.": "Ein leichtes Benachrichtigungszentrum für Obsidian, Plugins und externe Werkzeuge über eine gemeinsame Channel-Schnittstelle.",
+    "Channels": "Kanäle",
+    "Manage active connections, status, and available providers.": "Aktive Verbindungen, Status und verfügbare Anbieter verwalten.",
+    "Notification hub": "Benachrichtigungszentrum",
+    "Stops all sending, receiving, and polling while preserving channel configuration.": "Stoppt Senden, Empfangen und Abfragen, behält aber die Channel-Konfiguration.",
+    "Keep receiving in background": "Im Hintergrund empfangen",
+    "Enable channel": "Kanal aktivieren",
+    "Server": "Server",
+    "Advanced settings (optional)": "Erweiterte Einstellungen (optional)",
+    "Proactive sending (optional)": "Proaktives Senden (optional)",
+    "Basic setup": "Grundeinrichtung",
+    "Real delivery test": "Echter Zustelltest",
+    "Send test": "Test senden",
+    "Review before sending": "Vor dem Senden prüfen",
+    "Enable quiet hours": "Ruhezeiten aktivieren",
+    "Quiet start": "Ruhezeit Beginn",
+    "Quiet end": "Ruhezeit Ende",
+    "Inbound interface": "Eingangs-Schnittstelle",
+    "Contact and group allowlist": "Kontakt- und Gruppen-Zulassungsliste",
+    "Attachment limit (MB)": "Anhangslimit (MB)",
+    "Agent URI interface": "Agent-URI-Schnittstelle",
+    "Scan and schedule reminders": "Erinnerungen scannen und planen",
+    "Send test notification": "Testbenachrichtigung senden",
+    "Simulate test notification": "Testbenachrichtigung simulieren",
+    "Schedule delayed notification": "Verzögerte Benachrichtigung planen",
+    "Open ntfy notification manager": "ntfy-Benachrichtigungsmanager öffnen",
+    "Insert ntfy/Tasks reminder date": "ntfy/Tasks-Erinnerungsdatum einfügen",
+    "Clear sent/scheduled cache": "Gesendet/geplant Cache leeren",
+    "Notifications on": "Benachrichtigungen ein",
+    "Notifications off": "Benachrichtigungen aus",
+    "Enabled": "Aktiviert",
+    "Disabled": "Deaktiviert",
+    "Current default": "Aktueller Standard",
+    "Set default": "Als Standard setzen",
+  },
+  ru: {
+    "Follow Obsidian/system": "Как в Obsidian/системе",
+    "Language": "Язык",
+    "Use one interface language for settings, manager labels, commands, and notices when translations are available. Missing strings fall back to English.": "Использует один язык интерфейса для настроек, менеджера, команд и уведомлений, если перевод есть. Отсутствующие строки показываются на английском.",
+    "A lightweight notification hub for Obsidian, plugins, and external tools through a shared channel interface.": "Легкий центр уведомлений для Obsidian, плагинов и внешних инструментов через общий интерфейс каналов.",
+    "Channels": "Каналы",
+    "Manage active connections, status, and available providers.": "Управление активными подключениями, состоянием и доступными провайдерами.",
+    "Notification hub": "Центр уведомлений",
+    "Stops all sending, receiving, and polling while preserving channel configuration.": "Останавливает отправку, прием и опрос, сохраняя настройки каналов.",
+    "Keep receiving in background": "Получать в фоне",
+    "Enable channel": "Включить канал",
+    "Server": "Сервер",
+    "Advanced settings (optional)": "Дополнительные настройки (необязательно)",
+    "Proactive sending (optional)": "Инициативная отправка (необязательно)",
+    "Basic setup": "Базовая настройка",
+    "Real delivery test": "Реальный тест доставки",
+    "Send test": "Отправить тест",
+    "Review before sending": "Проверять перед отправкой",
+    "Enable quiet hours": "Включить тихие часы",
+    "Quiet start": "Начало тихих часов",
+    "Quiet end": "Конец тихих часов",
+    "Inbound interface": "Входящий интерфейс",
+    "Contact and group allowlist": "Разрешенные контакты и группы",
+    "Attachment limit (MB)": "Лимит вложений (МБ)",
+    "Agent URI interface": "Интерфейс URI Agent",
+    "Scan and schedule reminders": "Сканировать и запланировать напоминания",
+    "Send test notification": "Отправить тестовое уведомление",
+    "Simulate test notification": "Симулировать тестовое уведомление",
+    "Schedule delayed notification": "Запланировать отложенное уведомление",
+    "Open ntfy notification manager": "Открыть менеджер уведомлений ntfy",
+    "Insert ntfy/Tasks reminder date": "Вставить дату напоминания ntfy/Tasks",
+    "Clear sent/scheduled cache": "Очистить кэш отправленных/запланированных",
+    "Notifications on": "Уведомления включены",
+    "Notifications off": "Уведомления выключены",
+    "Enabled": "Включено",
+    "Disabled": "Отключено",
+    "Current default": "Текущий по умолчанию",
+    "Set default": "Сделать по умолчанию",
+  },
+  pt: {
+    "Follow Obsidian/system": "Seguir Obsidian/sistema",
+    "Language": "Idioma",
+    "Use one interface language for settings, manager labels, commands, and notices when translations are available. Missing strings fall back to English.": "Usa um idioma de interface para configurações, gerenciador, comandos e avisos quando houver tradução. Textos ausentes voltam para inglês.",
+    "Channels": "Canais",
+    "Notification hub": "Central de notificações",
+    "Keep receiving in background": "Manter recebimento em segundo plano",
+    "Enable channel": "Ativar canal",
+    "Server": "Servidor",
+    "Advanced settings (optional)": "Configurações avançadas (opcional)",
+    "Proactive sending (optional)": "Envio proativo (opcional)",
+    "Basic setup": "Configuração básica",
+    "Send test": "Enviar teste",
+    "Review before sending": "Revisar antes de enviar",
+    "Enable quiet hours": "Ativar horário silencioso",
+    "Inbound interface": "Interface de entrada",
+    "Scan and schedule reminders": "Verificar e agendar lembretes",
+    "Send test notification": "Enviar notificação de teste",
+    "Open ntfy notification manager": "Abrir gerenciador ntfy",
+    "Notifications on": "Notificações ligadas",
+    "Notifications off": "Notificações desligadas",
+    "Enabled": "Ativado",
+    "Disabled": "Desativado",
+  },
+  ar: {
+    "Follow Obsidian/system": "اتباع Obsidian/النظام",
+    "Language": "اللغة",
+    "Use one interface language for settings, manager labels, commands, and notices when translations are available. Missing strings fall back to English.": "يستخدم لغة واجهة واحدة للإعدادات والمدير والأوامر والتنبيهات عند توفر الترجمة. النصوص غير المترجمة تعود إلى الإنجليزية.",
+    "Channels": "القنوات",
+    "Notification hub": "مركز الإشعارات",
+    "Keep receiving in background": "استمرار الاستقبال في الخلفية",
+    "Enable channel": "تفعيل القناة",
+    "Server": "الخادم",
+    "Advanced settings (optional)": "إعدادات متقدمة (اختياري)",
+    "Proactive sending (optional)": "إرسال استباقي (اختياري)",
+    "Basic setup": "الإعداد الأساسي",
+    "Send test": "إرسال اختبار",
+    "Review before sending": "المراجعة قبل الإرسال",
+    "Enable quiet hours": "تفعيل ساعات الهدوء",
+    "Inbound interface": "واجهة الوارد",
+    "Scan and schedule reminders": "فحص وجدولة التذكيرات",
+    "Send test notification": "إرسال إشعار اختباري",
+    "Open ntfy notification manager": "فتح مدير إشعارات ntfy",
+    "Notifications on": "الإشعارات مفعلة",
+    "Notifications off": "الإشعارات متوقفة",
+    "Enabled": "مفعل",
+    "Disabled": "معطل",
+  },
+  tr: {
+    "Follow Obsidian/system": "Obsidian/sistem dilini kullan",
+    "Language": "Dil",
+    "Use one interface language for settings, manager labels, commands, and notices when translations are available. Missing strings fall back to English.": "Çeviri varsa ayarlar, yönetici etiketleri, komutlar ve bildirimler için aynı arayüz dilini kullanır. Eksik metinler İngilizceye döner.",
+    "Channels": "Kanallar",
+    "Notification hub": "Bildirim merkezi",
+    "Keep receiving in background": "Arka planda almaya devam et",
+    "Enable channel": "Kanalı etkinleştir",
+    "Server": "Sunucu",
+    "Advanced settings (optional)": "Gelişmiş ayarlar (isteğe bağlı)",
+    "Proactive sending (optional)": "Proaktif gönderim (isteğe bağlı)",
+    "Basic setup": "Temel kurulum",
+    "Send test": "Test gönder",
+    "Review before sending": "Göndermeden önce incele",
+    "Enable quiet hours": "Sessiz saatleri etkinleştir",
+    "Inbound interface": "Gelen arayüzü",
+    "Scan and schedule reminders": "Hatırlatıcıları tara ve planla",
+    "Send test notification": "Test bildirimi gönder",
+    "Open ntfy notification manager": "ntfy bildirim yöneticisini aç",
+    "Notifications on": "Bildirimler açık",
+    "Notifications off": "Bildirimler kapalı",
+    "Enabled": "Etkin",
+    "Disabled": "Devre dışı",
+  },
+  it: {
+    "Follow Obsidian/system": "Segui Obsidian/sistema",
+    "Language": "Lingua",
+    "Use one interface language for settings, manager labels, commands, and notices when translations are available. Missing strings fall back to English.": "Usa una lingua di interfaccia per impostazioni, gestore, comandi e avvisi quando la traduzione è disponibile. Le stringhe mancanti tornano in inglese.",
+    "Channels": "Canali",
+    "Notification hub": "Centro notifiche",
+    "Keep receiving in background": "Ricevi in background",
+    "Enable channel": "Abilita canale",
+    "Server": "Server",
+    "Advanced settings (optional)": "Impostazioni avanzate (opzionale)",
+    "Proactive sending (optional)": "Invio proattivo (opzionale)",
+    "Basic setup": "Configurazione di base",
+    "Send test": "Invia test",
+    "Review before sending": "Rivedi prima di inviare",
+    "Enable quiet hours": "Abilita ore silenziose",
+    "Inbound interface": "Interfaccia in ingresso",
+    "Scan and schedule reminders": "Scansiona e pianifica promemoria",
+    "Send test notification": "Invia notifica di test",
+    "Open ntfy notification manager": "Apri gestore notifiche ntfy",
+    "Notifications on": "Notifiche attive",
+    "Notifications off": "Notifiche disattivate",
+    "Enabled": "Abilitato",
+    "Disabled": "Disabilitato",
+  },
+};
 const CHANNEL_PROVIDER_DEFINITIONS = Object.freeze([
   { id: "ntfy", name: "ntfy", description: "ntfy topic" },
   { id: "telegram", name: "Telegram Bot", description: "直接连接 Telegram Bot API" },
@@ -199,6 +563,7 @@ function decodeFeishuFrame(value) {
 }
 
 const DEFAULT_SETTINGS = {
+  uiLanguage: "auto",
   serverUrl: "https://ntfy.sh",
   topic: "",
   authToken: "",
@@ -310,6 +675,33 @@ const TASKS_DATE_LABELS = {
   "❌": "cancelled",
 };
 
+function normalizeUiLanguage(value) {
+  const lang = String(value || "auto").trim().toLowerCase();
+  return UI_LANGUAGE_OPTIONS.some(([id]) => id === lang) ? lang : "auto";
+}
+
+function languageFromLocale(locale) {
+  const value = String(locale || "").trim().toLowerCase();
+  if (/^(zh|cmn|yue)/i.test(value)) return "zh";
+  for (const [id] of UI_LANGUAGE_OPTIONS) {
+    if (id !== "auto" && (value === id || value.startsWith(`${id}-`))) return id;
+  }
+  return "en";
+}
+
+function resolveUiLanguage(settingValue, localeValue) {
+  const configured = normalizeUiLanguage(settingValue);
+  return configured === "auto" ? languageFromLocale(localeValue) : configured;
+}
+
+function translateUiText(language, zh, en) {
+  const lang = normalizeUiLanguage(language);
+  if (lang === "zh") return zh;
+  if (lang === "en" || lang === "auto") return en;
+  const dictionary = UI_TRANSLATIONS[lang] || {};
+  return dictionary[en] || dictionary[zh] || en || zh || "";
+}
+
 module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   async onload() {
     this.settings = this.normalizeSettings(await this.loadData());
@@ -350,37 +742,37 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
     this.addCommand({
       id: "scan-and-schedule-reminders",
-      name: "Scan and schedule reminders",
+      name: this.uiText("扫描并安排提醒", "Scan and schedule reminders"),
       callback: async () => this.scanAndSchedule({ showNotice: true }),
     });
 
     this.addCommand({
       id: "send-test-notification",
-      name: "Send test notification",
+      name: this.uiText("发送测试通知", "Send test notification"),
       callback: async () => this.sendTestNotification(),
     });
 
     this.addCommand({
       id: "simulate-test-notification",
-      name: "Simulate test notification",
+      name: this.uiText("模拟测试通知", "Simulate test notification"),
       callback: async () => this.simulateTestNotification(),
     });
 
     this.addCommand({
       id: "schedule-delayed-notification",
-      name: "Schedule delayed notification",
+      name: this.uiText("安排延迟通知", "Schedule delayed notification"),
       callback: async () => this.scheduleDelayedNotificationPrompt(),
     });
 
     this.addCommand({
       id: "open-ntfy-manager",
-      name: "Open ntfy notification manager",
+      name: this.uiText("打开 ntfy 通知管理器", "Open ntfy notification manager"),
       callback: async () => this.openNtfyManager(),
     });
 
     this.addCommand({
       id: "insert-tasks-reminder-date",
-      name: "Insert ntfy/Tasks reminder date",
+      name: this.uiText("插入 ntfy/Tasks 提醒日期", "Insert ntfy/Tasks reminder date"),
       editorCallback: (editor) => {
         new NtfyReminderInsertModal(this.app, this, editor).open();
       },
@@ -388,7 +780,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
     this.addCommand({
       id: "clear-sent-cache",
-      name: "Clear sent/scheduled cache",
+      name: this.uiText("清空已发送/已安排缓存", "Clear sent/scheduled cache"),
       callback: async () => {
         this.settings.sent = {};
         await this.saveSettings();
@@ -511,8 +903,31 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
+  systemLocale() {
+    const docLang = typeof document !== "undefined" && document.documentElement ? document.documentElement.lang : "";
+    const navLang = typeof navigator !== "undefined" ? navigator.language : "";
+    return String(docLang || navLang || "").toLowerCase();
+  }
+
+  isChineseLocale() {
+    return this.currentUiLanguage() === "zh";
+  }
+
+  currentUiLanguage() {
+    return resolveUiLanguage(this.settings && this.settings.uiLanguage, this.systemLocale());
+  }
+
+  isRtlUi() {
+    return RTL_UI_LANGUAGES.has(this.currentUiLanguage());
+  }
+
+  uiText(zh, en) {
+    return translateUiText(this.currentUiLanguage(), zh, en);
+  }
+
   normalizeSettings(data) {
     const settings = Object.assign({}, DEFAULT_SETTINGS, data || {});
+    settings.uiLanguage = normalizeUiLanguage(settings.uiLanguage);
     settings.scanIntervalMinutes = this.safePositiveNumber(settings.scanIntervalMinutes, DEFAULT_SETTINGS.scanIntervalMinutes);
     settings.dailyBatchTime = this.normalizeClockTime(settings.dailyBatchTime, DEFAULT_SETTINGS.dailyBatchTime);
     settings.maxFutureDays = this.safePositiveNumber(settings.maxFutureDays, DEFAULT_SETTINGS.maxFutureDays);
@@ -5124,18 +5539,20 @@ class NtfyManagerView extends ItemView {
     else button.textContent = label;
   }
 
-  systemLocale() {
-    const docLang = typeof document !== "undefined" && document.documentElement ? document.documentElement.lang : "";
-    const navLang = typeof navigator !== "undefined" ? navigator.language : "";
-    return String(docLang || navLang || "").toLowerCase();
+  isChineseLocale() {
+    return this.plugin.currentUiLanguage() === "zh";
   }
 
-  isChineseLocale() {
-    return /^(zh|cmn|yue)/i.test(this.systemLocale());
+  currentUiLanguage() {
+    return this.plugin.currentUiLanguage();
+  }
+
+  isRtlUi() {
+    return this.plugin.isRtlUi();
   }
 
   uiText(zh, en) {
-    return this.isChineseLocale() ? zh : en;
+    return this.plugin.uiText(zh, en);
   }
 
   renderNotificationToggle(parentEl, reminder, enabled) {
@@ -6084,13 +6501,11 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
   }
 
   isChineseUi() {
-    const navLang = typeof navigator !== "undefined" ? navigator.language : "";
-    const languages = typeof navigator !== "undefined" && Array.isArray(navigator.languages) ? navigator.languages : [];
-    return [navLang, ...languages].filter(Boolean).some((lang) => String(lang).toLowerCase().startsWith("zh"));
+    return this.plugin.currentUiLanguage() === "zh";
   }
 
   uiText(zh, en) {
-    return this.isChineseUi() ? zh : en;
+    return this.plugin.uiText(zh, en);
   }
 
   renderSupportQrCodes(containerEl) {
@@ -6628,6 +7043,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
     this.settingsContainerEl = containerEl;
     containerEl.empty();
     containerEl.addClass("obsidian-ntfy-settings-root");
+    containerEl.setAttr("dir", this.plugin.isRtlUi() ? "rtl" : "ltr");
 
     containerEl.createEl("h2", { text: PLUGIN_NAME });
     containerEl.createEl("p", {
@@ -6636,6 +7052,23 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         "A lightweight notification hub for Obsidian, plugins, and external tools through a shared channel interface."
       ),
     });
+
+    new Setting(containerEl)
+      .setName(this.uiText("界面语言", "Language"))
+      .setDesc(this.uiText(
+        "设置页、管理器、命令和通知在有翻译时使用同一语言；未翻译内容回退到 English。",
+        "Use one interface language for settings, manager labels, commands, and notices when translations are available. Missing strings fall back to English."
+      ))
+      .addDropdown((dropdown) => {
+        for (const [id, label] of UI_LANGUAGE_OPTIONS) {
+          dropdown.addOption(id, id === "auto" ? this.uiText("跟随 Obsidian/系统", "Follow Obsidian/system") : label);
+        }
+        dropdown.setValue(normalizeUiLanguage(this.plugin.settings.uiLanguage)).onChange(async (value) => {
+          this.plugin.settings.uiLanguage = normalizeUiLanguage(value);
+          await this.plugin.saveSettings();
+          this.display();
+        });
+      });
 
     const hubGroup = this.createSettingsSection(
       containerEl,
