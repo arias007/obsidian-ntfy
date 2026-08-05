@@ -1,0 +1,11 @@
+{
+  "name": "obsidian-ntfy",
+  "version": "1.0.4",
+  "private": true,
+  "description": "Mobile notifications and a bidirectional channel hub for Obsidian.",
+  "license": "MIT",
+  "scripts": {
+    "check": "node --check main.js",
+    "test": "node tests/notification-hub.test.cjs"
+  }
+}

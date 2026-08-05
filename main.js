@@ -645,6 +645,8 @@ const DEFAULT_SETTINGS = {
   includeTaskText: true,
   includeTasksPluginDates: true,
   captureObsidianNotices: true,
+  showObsidianReminderNotices: true,
+  internalReminderNoticeSince: "",
   scheduleFutureWithNtfy: true,
   maxFutureDays: 3,
   ntfyHandoffLeadMinutes: 60,
@@ -705,6 +707,8 @@ function translateUiText(language, zh, en) {
 module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   async onload() {
     this.settings = this.normalizeSettings(await this.loadData());
+    this.localReminderTimer = null;
+    this.isQueueHandoffRunning = false;
     if (!this.settings.agentProtocolToken) {
       this.settings.agentProtocolToken = this.generateLocalToken();
       await this.saveSettings();
@@ -718,6 +722,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.isUnloading = false;
     this.api = this.createNotificationHubApi();
     this.isScanning = false;
+    this.lastReminderScanFiles = new Set();
     this.doneDateWriteGuards = new Set();
     this.doneDateTimers = new Map();
     this.reminderScanTimer = null;
@@ -816,10 +821,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       });
     }
     this.scheduleDailyBatchScan();
+    this.scheduleNextObsidianReminderNotice();
     this.register(() => {
       this.clearDailyBatchScan();
       this.clearQueuedReminderScan();
       this.clearStatusCountRefresh();
+      this.clearObsidianReminderTimer();
     });
     this.registerEvent(this.app.vault.on("modify", (file) => {
       this.queueEnsureDoneDates(file);
@@ -831,6 +838,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       this.queueStatusCountRefresh();
       this.runAutoScan();
       this.runIncomingPoll();
+      this.scheduleNextObsidianReminderNotice();
       if (typeof this.app.workspace.trigger === "function") {
         this.app.workspace.trigger("notification-hub:ready", this.api);
       }
@@ -899,8 +907,57 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     }, delay);
   }
 
+  clearObsidianReminderTimer() {
+    if (this.localReminderTimer) window.clearTimeout(this.localReminderTimer);
+    this.localReminderTimer = null;
+  }
+
+  shouldShowObsidianReminderNotice(entry) {
+    if (!entry || entry.obsidianNotified || entry.ntfyDeleted || entry.sourceInactiveAt) return false;
+    const dueMs = new Date(entry.obsidianDue || entry.due || 0).getTime();
+    if (Number.isNaN(dueMs)) return false;
+    const sinceMs = new Date(this.settings.internalReminderNoticeSince || 0).getTime();
+    return Number.isNaN(sinceMs) || dueMs >= sinceMs - 1000;
+  }
+
+  scheduleNextObsidianReminderNotice() {
+    this.clearObsidianReminderTimer();
+    if (this.isUnloading || !this.settings.showObsidianReminderNotices || typeof window === "undefined") return;
+    const now = Date.now();
+    const candidates = Object.values(this.settings && this.settings.sent || {})
+      .filter((entry) => this.shouldShowObsidianReminderNotice(entry))
+      .map((entry) => new Date(entry.obsidianDue || entry.due || 0).getTime())
+      .filter((dueMs) => !Number.isNaN(dueMs))
+      .sort((a, b) => a - b);
+    if (!candidates.length) return;
+    const delay = Math.max(0, candidates[0] - now);
+    this.localReminderTimer = window.setTimeout(() => {
+      this.localReminderTimer = null;
+      this.showDueObsidianReminderNotices().catch((error) => console.warn(`${PLUGIN_NAME}: internal reminder failed`, error));
+    }, Math.min(delay, 2147483647));
+  }
+
+  async showDueObsidianReminderNotices(nowValue = Date.now()) {
+    const now = Number(nowValue) || Date.now();
+    let changed = false;
+    for (const [id, entry] of Object.entries(this.settings.sent || {})) {
+      if (!this.shouldShowObsidianReminderNotice(entry)) continue;
+      const dueMs = new Date(entry.obsidianDue || entry.due || 0).getTime();
+      if (Number.isNaN(dueMs) || dueMs > now + 1000) continue;
+      new Notice(this.uiText(`提醒：${entry.text || entry.file || id}`, `Reminder: ${entry.text || entry.file || id}`), 10000);
+      this.settings.sent[id] = Object.assign({}, entry, {
+        obsidianNotified: true,
+      });
+      changed = true;
+    }
+    if (changed) await this.saveData(this.settings);
+    this.scheduleNextObsidianReminderNotice();
+    return changed;
+  }
+
   async saveSettings() {
     await this.saveData(this.settings);
+    this.scheduleNextObsidianReminderNotice();
   }
 
   systemLocale() {
@@ -936,6 +993,17 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     settings.sentMaxEntries = this.safePositiveNumber(settings.sentMaxEntries, DEFAULT_SETTINGS.sentMaxEntries);
     settings.obsidianNoticeMaxEntries = this.safePositiveNumber(settings.obsidianNoticeMaxEntries, DEFAULT_SETTINGS.obsidianNoticeMaxEntries);
     settings.sent = settings.sent && typeof settings.sent === "object" ? settings.sent : {};
+    const hadInternalNoticeSince = Boolean(data && data.internalReminderNoticeSince);
+    settings.internalReminderNoticeSince = hadInternalNoticeSince
+      ? String(data.internalReminderNoticeSince)
+      : new Date().toISOString();
+    if (!hadInternalNoticeSince) {
+      for (const entry of Object.values(settings.sent)) {
+        if (!entry || typeof entry !== "object") continue;
+        delete entry.obsidianNotifiedAt;
+        delete entry.obsidianNotified;
+      }
+    }
     settings.ignoredReminders = settings.ignoredReminders && typeof settings.ignoredReminders === "object" ? settings.ignoredReminders : {};
     settings.queue = Array.isArray(settings.queue) ? settings.queue : [];
     settings.obsidianNotices = Array.isArray(settings.obsidianNotices) ? settings.obsidianNotices : [];
@@ -953,6 +1021,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     settings.ntfyReceivedIds = Array.isArray(settings.ntfyReceivedIds) ? settings.ntfyReceivedIds.slice(-500) : [];
     settings.autoScanEnabled = settings.autoScanEnabled !== false;
     settings.captureObsidianNotices = settings.captureObsidianNotices !== false;
+    settings.showObsidianReminderNotices = settings.showObsidianReminderNotices !== false;
     settings.socialHubEnabled = settings.socialHubEnabled !== false;
     settings.ntfyChannelEnabled = settings.ntfyChannelEnabled !== false;
     settings.ntfyReceiveEnabled = settings.ntfyReceiveEnabled !== false;
@@ -1231,7 +1300,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       cancelScheduled: (notificationId, channelId) => this.cancelScheduledNotification(notificationId, channelId),
       listReminders: () => [...(this.settings.queue || [])],
       addReminder: (input) => this.addApiReminder(input || {}),
-      updateReminder: (id, patch) => this.updateQueueItem(id, patch || {}),
+      updateReminder: (id, patch) => this.rescheduleQueueItem(id, patch || {}),
       removeReminder: (id) => this.deleteQueueItem(id),
       sendReminderNow: (id) => this.sendQueueItemNow(id),
       scanReminders: () => this.scanAndSchedule({ showNotice: false }),
@@ -1574,7 +1643,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         sendConfigured: this.channelAccountSendConfigured(account),
         receiveConfigured: this.channelAccountReceiveConfigured(account),
         config: account.config || {},
-        supportsRemoteSchedule: account.type === "ntfy",
+        supportsRemoteSchedule: account.type === "ntfy" && this.settings.scheduleFutureWithNtfy !== false,
         canReceive: ["poll", "socket", "relay"].includes(receiveMode),
         receiveMode,
         connectionStatus,
@@ -3876,6 +3945,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   async deleteSentEntry(id) {
     if (!this.settings.sent || !this.settings.sent[id]) return;
+    const entry = this.settings.sent[id];
+    if (entry.ntfyScheduled && !entry.ntfyDeleted) {
+      const cancelled = await this.cancelSentEntry(id);
+      if (!cancelled) {
+        await this.saveSettings();
+        throw new Error("Remote ntfy schedule could not be cancelled.");
+      }
+    }
     delete this.settings.sent[id];
     await this.saveSettings();
     this.updateStatusCount();
@@ -3998,20 +4075,28 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const previousEntry = arguments.length > 3 && arguments[3] ? arguments[3] : null;
     const results = Array.isArray(publishResults) ? publishResults : publishResults && Array.isArray(publishResults.results) ? publishResults.results : [];
     const ntfyResult = results.find((result) => result && result.channelId === "ntfy" && result.ok);
-    const remoteScheduled = Boolean(ntfyResult && ntfyResult.status === "scheduled");
+    const submittedAt = new Date().toISOString();
+    const due = reminder.due.toISOString();
+    const sameDue = Boolean(previousEntry && String(previousEntry.due || "") === due);
+    const remoteScheduled = Boolean(
+      ntfyResult && ntfyResult.status === "scheduled"
+      || sameDue && previousEntry && previousEntry.ntfyScheduled && !previousEntry.ntfyDeleted
+    );
     const channels = Object.assign({}, previousEntry && previousEntry.channels ? previousEntry.channels : {});
     for (const result of results) {
       if (!result || !result.channelId) continue;
       channels[result.channelId] = {
         status: result.status || (result.ok ? "sent" : "failed"),
-        at: new Date().toISOString(),
+        at: submittedAt,
         due: result.due || "",
         error: result.error || "",
       };
     }
     return {
-      at: new Date().toISOString(),
-      due: reminder.due.toISOString(),
+      at: submittedAt,
+      due,
+      obsidianDue: scheduleFuture ? due : submittedAt,
+      obsidianNotified: sameDue && Boolean(previousEntry.obsidianNotified),
       file: reminder.filePath,
       line: reminder.lineNumber,
       text: reminder.text,
@@ -4020,6 +4105,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       ntfyId: ntfyResult && ntfyResult.messageId ? ntfyResult.messageId : previousEntry && previousEntry.ntfyId ? previousEntry.ntfyId : "",
       ntfyScheduled: remoteScheduled,
       ntfyDeleted: false,
+      sourceInactiveAt: "",
     };
   }
 
@@ -4082,9 +4168,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       this.settings.sent[id] = Object.assign({}, entry, {
         ntfyDeleted: true,
         ntfyDeletedAt: new Date().toISOString(),
+        ntfyCancelError: "",
       });
       return true;
     } catch (error) {
+      this.settings.sent[id] = Object.assign({}, entry, {
+        ntfyCancelFailedAt: new Date().toISOString(),
+        ntfyCancelError: this.redactSensitiveText(error.message || String(error), true),
+      });
       console.warn(`${PLUGIN_NAME}: failed to cancel ntfy scheduled message`, error);
       return false;
     }
@@ -4101,6 +4192,30 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       if (await this.cancelSentEntry(id)) cancelled++;
     }
     return cancelled;
+  }
+
+  async reconcileInactiveSentEntries(reminders, nowMs = Date.now()) {
+    const activeKeys = new Set((reminders || []).map((reminder) => reminder.key));
+    const activeLocations = new Set((reminders || []).map((reminder) => `${reminder.filePath}:${reminder.lineNumber}`));
+    let changed = false;
+    for (const [id, entry] of Object.entries(this.settings.sent || {})) {
+      if (!entry || !entry.ntfyScheduled || entry.ntfyDeleted || entry.sourceInactiveAt) continue;
+      const dueMs = new Date(entry.due || 0).getTime();
+      const line = Number(entry.line || 0);
+      const source = String(entry.source || "");
+      const noteManaged = Boolean(entry.file && line > 0 && !/^(?:manual|api|queue|obsidian-notice|notification-hub-api|ntfy:manual)$/i.test(source));
+      if (!noteManaged || Number.isNaN(dueMs) || dueMs <= nowMs + 1000) continue;
+      const sourcePath = String(entry.file || "").replace(/\\/g, "/");
+      const sourceFile = this.app.vault.getAbstractFileByPath(sourcePath);
+      if (sourceFile && !this.lastReminderScanFiles.has(sourcePath)) continue;
+      if (activeKeys.has(id) || activeLocations.has(`${entry.file}:${line}`)) continue;
+      await this.cancelSentEntry(id);
+      this.settings.sent[id] = Object.assign({}, this.settings.sent[id] || entry, {
+        sourceInactiveAt: new Date().toISOString(),
+      });
+      changed = true;
+    }
+    return changed;
   }
 
   async openNtfyManager() {
@@ -4149,6 +4264,29 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return Boolean(channel && channel.deliveryReady);
   }
 
+  hasRemoteScheduleDestination() {
+    return this.resolveChannelIds({}).some((channelId) => {
+      const channel = this.listNotificationChannels().find((item) => item.id === channelId);
+      return Boolean(channel && channel.deliveryReady && channel.supportsRemoteSchedule);
+    });
+  }
+
+  async handoffQueuedReminders() {
+    if (this.isScanning || this.isQueueHandoffRunning || !this.hasRemoteScheduleDestination()) return { sent: 0, failed: 0 };
+    this.isQueueHandoffRunning = true;
+    try {
+      const now = Date.now();
+      const maxFutureMs = Math.max(1, Number(this.settings.maxFutureDays || 3)) * 24 * 60 * 60 * 1000;
+      const result = await this.flushDueQueue(now, maxFutureMs, this.shouldFlushDailyBatch(new Date(now)));
+      this.settings.sent = this.pruneSentCache(this.settings.sent || {});
+      await this.saveSettings();
+      this.updateStatusCount(result.failed ? `(${result.failed} fail)` : "");
+      return result;
+    } finally {
+      this.isQueueHandoffRunning = false;
+    }
+  }
+
   async scanAndSchedule({ showNotice, forceDailyBatch = false } = {}) {
     if (this.isScanning) {
       if (showNotice) new Notice(`${PLUGIN_NAME}: scan already running`);
@@ -4175,6 +4313,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
     const nowDate = new Date();
     const now = nowDate.getTime();
+    await this.reconcileInactiveSentEntries(reminders, now);
     const sent = this.settings.sent || {};
     const maxFutureMs = Math.max(1, Number(this.settings.maxFutureDays || 3)) * 24 * 60 * 60 * 1000;
     const queueLookaheadMs = Math.max(1, Number(this.settings.queueLookaheadDays || 30)) * 24 * 60 * 60 * 1000;
@@ -4217,8 +4356,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         continue;
       }
 
+      const scheduledReminder = Object.assign({}, reminder, { due: scheduleDue });
       try {
-        const scheduledReminder = Object.assign({}, reminder, { due: scheduleDue });
         await this.cancelMatchingSentEntries(scheduledReminder);
         const scheduleFuture = scheduleMs > now + 1000;
         const results = await this.publishReminder(scheduledReminder, scheduleFuture, previousEntry);
@@ -4226,6 +4365,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         scheduled++;
       } catch (error) {
         console.error(`${PLUGIN_NAME} publish failed`, error);
+        const failureResults = Array.isArray(error.results) && error.results.length
+          ? error.results
+          : [{ channelId: String(this.settings.defaultChannelId || "ntfy"), ok: false, status: "failed", error: this.redactSensitiveText(error.message || String(error), true) }];
+        sent[reminder.key] = this.sentEntry(scheduledReminder, failureResults, scheduleMs > now + 1000, previousEntry);
         failed++;
       }
     }
@@ -4443,6 +4586,64 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.updateStatusCount();
   }
 
+  async updateSourceReminderDue(reminder, nextDue) {
+    const due = nextDue instanceof Date ? nextDue : new Date(nextDue);
+    if (Number.isNaN(due.getTime())) throw new Error("invalid date/time");
+    const path = String(reminder.filePath || reminder.file || "").replace(/\\/g, "/");
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!file) throw new Error("source not found");
+    const lineIndex = Math.max(0, Number(reminder.lineNumber || reminder.line || 1) - 1);
+    const content = await this.app.vault.read(file);
+    const lines = content.split(/\r?\n/);
+    const currentLine = lines[lineIndex];
+    if (currentLine === undefined) throw new Error("line not found");
+
+    const dateTimeText = this.formatLocalDateTime(due);
+    const tasksDate = this.settings.includeTasksPluginDates ? this.extractTasksDate(currentLine) : null;
+    const delayedLine = this.extractDelayedLine(String(currentLine).trim());
+    const inlineDelay = this.extractInlineDelay(currentLine);
+    let nextLine = currentLine;
+    if (tasksDate) {
+      const pattern = new RegExp(`(${tasksDate.signifier}\\s*)\\d{4}-\\d{2}-\\d{2}(?:[\\sT　]\\d{1,2}:\\d{2})?`, "u");
+      nextLine = currentLine.replace(pattern, `$1${dateTimeText}`);
+    } else if (delayedLine) {
+      const indent = (currentLine.match(/^\s*/) || [""])[0];
+      nextLine = `${indent}ntfy:: ${dateTimeText} ${delayedLine.text || "Obsidian reminder"}`;
+    } else if (inlineDelay) {
+      nextLine = `${currentLine.replace(INLINE_DELAY_RE, "").replace(/\s{2,}/g, " ").trimEnd()} 📅 ${dateTimeText}`;
+    } else if (/(?:➕|✅|✓|❌)\s*\d{4}-\d{2}-\d{2}/u.test(currentLine)) {
+      nextLine = `${currentLine.trimEnd()} 📅 ${dateTimeText}`;
+    } else if (DATE_TIME_RE.test(currentLine)) {
+      nextLine = currentLine.replace(DATE_TIME_RE, dateTimeText);
+    } else {
+      const taskMatch = currentLine.match(/^(\s*[-*+]\s+\[[^\]]\]\s+)(.*)$/u);
+      nextLine = taskMatch
+        ? `${taskMatch[1]}${taskMatch[2].replace(TIME_PREFIX_RE, "").trim()} 📅 ${dateTimeText}`
+        : `${currentLine.trimEnd()} 📅 ${dateTimeText}`;
+    }
+    if (nextLine === currentLine) return this.parseReminderLine(currentLine, path, lineIndex + 1);
+
+    const wasIgnored = Boolean(this.settings.ignoredReminders && this.settings.ignoredReminders[reminder.key]);
+    await this.cancelMatchingSentEntries(reminder);
+    this.settings.queue = (this.settings.queue || []).filter((item) => item.id !== reminder.key);
+    if (wasIgnored) delete this.settings.ignoredReminders[reminder.key];
+    lines[lineIndex] = nextLine;
+    await this.app.vault.modify(file, lines.join("\n"));
+    const updatedReminder = this.parseReminderLine(nextLine, path, lineIndex + 1);
+    if (wasIgnored && updatedReminder) {
+      this.settings.ignoredReminders[updatedReminder.key] = {
+        at: new Date().toISOString(),
+        text: updatedReminder.text,
+        due: updatedReminder.due.toISOString(),
+        file: updatedReminder.filePath,
+        line: updatedReminder.lineNumber,
+      };
+    }
+    await this.saveSettings();
+    if (!wasIgnored) await this.scanAndSchedule({ showNotice: false });
+    return updatedReminder;
+  }
+
   async sendReminderNow(reminder) {
     if (!this.hasDestination()) {
       new Notice(`${PLUGIN_NAME}: configure the default channel first`);
@@ -4471,6 +4672,16 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       const repeatSeconds = Math.max(0, Number(item.repeatSeconds || 0));
       const previousEntry = this.settings.sent[item.id] || null;
       if (previousEntry && repeatSeconds <= 0 && !this.hasPendingNotificationDelivery(previousEntry, now)) continue;
+      if (
+        previousEntry
+        && repeatSeconds > 0
+        && previousEntry.ntfyScheduled
+        && !previousEntry.ntfyDeleted
+        && new Date(previousEntry.due || 0).getTime() > now + 1000
+      ) {
+        remaining.push(item);
+        continue;
+      }
       const dueMs = due.getTime();
       if (item.batchOnly && dueMs <= now + 1000 && !flushDailyBatch) {
         remaining.push(item);
@@ -4512,6 +4723,18 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         if (!failedResults.length) sent++;
       } catch (error) {
         item.lastError = error.message || String(error);
+        const reminder = {
+          key: item.id,
+          due,
+          text: item.text,
+          filePath: item.file || "queue",
+          lineNumber: item.line || 0,
+          source: item.source || "ntfy:queue",
+        };
+        const failureResults = Array.isArray(error.results) && error.results.length
+          ? error.results
+          : [{ channelId: String(this.settings.defaultChannelId || "ntfy"), ok: false, status: "failed", error: this.redactSensitiveText(error.message || String(error), true) }];
+        this.settings.sent[item.id] = this.sentEntry(reminder, failureResults, dueMs > now + 1000, previousEntry);
         remaining.push(item);
         failed++;
       }
@@ -4565,6 +4788,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.settings.queue.sort((a, b) => this.queueSortTime(a) - this.queueSortTime(b));
     await this.saveSettings();
     this.updateStatusCount();
+    await this.handoffQueuedReminders();
     return id;
   }
 
@@ -4593,7 +4817,17 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.updateStatusCount();
   }
 
+  async rescheduleQueueItem(id, patch) {
+    const item = (this.settings.queue || []).find((entry) => entry.id === id);
+    if (!item) return { ok: false, status: "not-found", id };
+    await this.cancelSentEntry(id);
+    await this.updateQueueItem(id, patch || {});
+    const result = await this.handoffQueuedReminders();
+    return { ok: true, status: result.sent > 0 ? "scheduled" : "queued", id };
+  }
+
   async deleteQueueItem(id) {
+    await this.cancelSentEntry(id);
     this.settings.queue = (this.settings.queue || []).filter((item) => item.id !== id);
     await this.saveSettings();
     this.updateStatusCount();
@@ -4652,10 +4886,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   async collectReminders() {
     const files = this.app.vault.getMarkdownFiles();
     const reminders = [];
+    const scannedFiles = new Set();
 
     for (const file of files) {
       try {
         const content = await this.app.vault.cachedRead(file);
+        scannedFiles.add(file.path);
         const lines = content.split(/\r?\n/);
         for (let i = 0; i < lines.length; i++) {
           const parsed = this.parseReminderLine(lines[i], file.path, i + 1);
@@ -4666,6 +4902,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       }
     }
 
+    this.lastReminderScanFiles = scannedFiles;
     reminders.sort((a, b) => a.due.getTime() - b.due.getTime());
     return reminders;
   }
@@ -5923,12 +6160,20 @@ class NtfyManagerView extends ItemView {
     return "obsidian-ntfy-task-time-future";
   }
 
-  renderTaskTime(containerEl, dueText, dueDate) {
+  renderTaskTime(containerEl, dueText, dueDate, onClick) {
     if (!dueText) return;
-    containerEl.createSpan({
-      cls: `obsidian-ntfy-task-time ${this.timeClass(dueDate)}`,
-      text: dueText,
-    });
+    const className = `obsidian-ntfy-task-time ${this.timeClass(dueDate)}${typeof onClick === "function" ? " is-editable" : ""}`;
+    const timeEl = typeof onClick === "function"
+      ? containerEl.createEl("button", { cls: className, text: dueText, attr: { type: "button", title: "修改时间", "aria-label": `修改时间 ${dueText}` } })
+      : containerEl.createSpan({ cls: className, text: dueText });
+    if (typeof onClick === "function") {
+      timeEl.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onClick();
+      });
+    }
+    return timeEl;
   }
 
   renderCompletedTaskTime(containerEl, doneText) {
@@ -5968,7 +6213,7 @@ class NtfyManagerView extends ItemView {
           if (taskLike.completed) {
             this.renderCompletedTaskTime(timeContainer, this.plugin.formatDoneDateTime(taskLike.doneAt || new Date()));
           } else if (options.dueText) {
-            this.renderTaskTime(timeContainer, options.dueText, options.dueDate);
+            this.renderTaskTime(timeContainer, options.dueText, options.dueDate, options.onDueClick);
             if (typeof options.renderActions === "function") options.renderActions(timeContainer);
           }
         }
@@ -5992,7 +6237,7 @@ class NtfyManagerView extends ItemView {
       if (taskLike.completed && options.completedText) {
         this.renderCompletedTaskTime(actions, options.completedText);
       } else {
-        this.renderTaskTime(actions, options.dueText, options.dueDate);
+        this.renderTaskTime(actions, options.dueText, options.dueDate, options.onDueClick);
       }
       if (typeof options.renderActions === "function") options.renderActions(actions);
     }
@@ -6132,6 +6377,14 @@ class NtfyManagerView extends ItemView {
       }, {
         dueDate: due,
         dueText: Number.isNaN(due.getTime()) ? "时间无效" : `${item.batchOnly ? "批次 " : ""}${this.plugin.formatLocalDateTime(due)}`,
+        onDueClick: Number.isNaN(due.getTime()) ? null : () => this.openSourceTimePicker({
+          key: item.id,
+          due,
+          text: item.text,
+          filePath: item.file,
+          lineNumber: item.line || 1,
+          source: item.source,
+        }),
         renderActions: (actions) => {
           this.iconButton(actions, "bell-off", "不通知", "danger", async () => {
             await this.plugin.deleteQueueItem(item.id);
@@ -6142,10 +6395,14 @@ class NtfyManagerView extends ItemView {
       });
     } else {
       meta.createEl("strong", { text: item.text || "Obsidian reminder" });
-      meta.createEl("div", {
-        cls: "obsidian-ntfy-muted",
-        text: Number.isNaN(due.getTime()) ? "时间无效" : `${item.batchOnly ? "每日批次: " : "到期: "}${this.plugin.formatLocalDateTime(due)}`,
-      });
+      const timeRow = meta.createEl("div", { cls: "obsidian-ntfy-muted" });
+      timeRow.appendText(item.batchOnly ? "每日批次: " : "到期: ");
+      this.renderTaskTime(
+        timeRow,
+        Number.isNaN(due.getTime()) ? "时间无效" : this.plugin.formatLocalDateTime(due),
+        due,
+        Number.isNaN(due.getTime()) ? null : () => this.openQueueTimePicker(item)
+      );
     }
     if (item.batchOnly && item.originalDue) {
       meta.createEl("div", {
@@ -6203,6 +6460,7 @@ class NtfyManagerView extends ItemView {
     }, {
       dueDate: reminder.due,
       dueText: this.plugin.formatLocalDateTime(reminder.due),
+      onDueClick: () => this.openSourceTimePicker(reminder),
       renderActions: (actions) => {
         this.renderNotificationToggle(actions, reminder, reminder.notificationState !== "ignored");
       },
@@ -6303,11 +6561,8 @@ class NtfyManagerView extends ItemView {
       if (entry.ntfyScheduled && entry.ntfyId && !entry.ntfyDeleted) {
         this.iconButton(controls, "undo-2", "撤回 ntfy 定时", "danger", async () => {
           try {
-            await this.plugin.cancelRemoteScheduled(entry);
-            this.plugin.settings.sent[id] = Object.assign({}, entry, {
-              ntfyDeleted: true,
-              ntfyDeletedAt: new Date().toISOString(),
-            });
+            const cancelled = await this.plugin.cancelSentEntry(id);
+            if (!cancelled) throw new Error("ntfy scheduled message was not cancelled");
             await this.plugin.saveSettings();
             new Notice(`${PLUGIN_NAME}: ntfy scheduled message cancelled`);
           } catch (error) {
@@ -6319,7 +6574,12 @@ class NtfyManagerView extends ItemView {
         });
       }
       this.iconButton(controls, "trash-2", "删除记录", "secondary", async () => {
-        await this.plugin.deleteSentEntry(id);
+        try {
+          await this.plugin.deleteSentEntry(id);
+        } catch (error) {
+          new Notice(`${PLUGIN_NAME}: cancel failed; record kept`);
+          console.error(error);
+        }
         await this.render();
       });
     }
@@ -6370,6 +6630,7 @@ class NtfyManagerView extends ItemView {
         dueDate: displayDate,
         dueText: !task.completed && displayDate ? this.plugin.formatLocalDateTime(displayDate) : "无时间",
         completedText: task.completed && displayDate ? this.plugin.formatDoneDateTime(displayDate) : "无完成时间",
+        onDueClick: !task.completed && displayDate ? () => this.openSourceTimePicker(task) : null,
         renderActions: task.due && !task.completed ? (actions) => {
           this.renderNotificationToggle(actions, {
             key: task.key,
@@ -6385,60 +6646,76 @@ class NtfyManagerView extends ItemView {
     if (tasks.length > limit) block.createEl("p", { cls: "obsidian-ntfy-muted", text: `还有 ${tasks.length - limit} 条未显示。` });
   }
 
-  openEditModal(item) {
-    const due = new Date(item.due);
+  openDateTimePicker(dueValue, onSave) {
+    if (typeof document === "undefined" || !document.body) {
+      new Notice(`${PLUGIN_NAME}: time picker unavailable`);
+      return;
+    }
+    const due = dueValue instanceof Date ? dueValue : new Date(dueValue);
     const currentDue = Number.isNaN(due.getTime()) ? new Date(Date.now() + 30 * 60 * 1000) : due;
-    let textValue = item.text || "Obsidian reminder";
-    let dueValue = this.plugin.formatDateTimeLocal(currentDue);
-    const repeatParts = this.plugin.durationParts(item.repeatSeconds || 0);
+    const input = document.createElement("input");
+    input.type = "datetime-local";
+    input.value = this.plugin.formatDateTimeLocal(currentDue);
+    input.setAttribute("aria-label", "修改提醒时间");
+    Object.assign(input.style, {
+      position: "fixed",
+      left: "-10000px",
+      top: "0",
+      width: "1px",
+      height: "1px",
+      opacity: "0",
+      pointerEvents: "none",
+    });
+    document.body.appendChild(input);
 
-    const modal = new Modal(this.app);
-    modal.onOpen = () => {
-      const { contentEl } = modal;
-      contentEl.empty();
-      contentEl.addClass("obsidian-ntfy-manager");
-      contentEl.createEl("h2", { text: "编辑通知" });
-
-      new Setting(contentEl)
-        .setName("内容")
-        .addText((text) => text.setValue(textValue).onChange((value) => { textValue = value; }));
-
-      new Setting(contentEl)
-        .setName("到期时间")
-        .addText((text) => {
-          text.setValue(dueValue).onChange((value) => { dueValue = value; });
-          text.inputEl.type = "datetime-local";
-        });
-
-      this.renderDurationInputs(contentEl, "循环间隔", repeatParts, "0 表示不循环");
-
-      new Setting(contentEl)
-        .setName("操作")
-        .addButton((button) =>
-          button
-            .setButtonText("保存")
-            .setCta()
-            .onClick(async () => {
-              const parsedDue = this.plugin.parseDateTimeLocal(dueValue);
-              if (!parsedDue) {
-                new Notice(`${PLUGIN_NAME}: invalid date/time`);
-                return;
-              }
-              const repeatSeconds = this.plugin.durationFromParts(repeatParts.days, repeatParts.hours, repeatParts.minutes, repeatParts.seconds);
-              await this.plugin.updateQueueItem(item.id, {
-                text: textValue.trim() || "Obsidian reminder",
-                due: parsedDue.toISOString(),
-                repeatSeconds,
-              });
-              modal.close();
-              this.render();
-            })
-        )
-        .addButton((button) =>
-          button.setButtonText("取消").onClick(() => modal.close())
-        );
+    let cleanupTimer = null;
+    const cleanup = () => {
+      if (cleanupTimer !== null) window.clearTimeout(cleanupTimer);
+      cleanupTimer = null;
+      input.remove();
     };
-    modal.open();
+    input.addEventListener("change", async () => {
+      const parsedDue = this.plugin.parseDateTimeLocal(input.value);
+      if (!parsedDue) {
+        cleanup();
+        new Notice(`${PLUGIN_NAME}: invalid date/time`);
+        return;
+      }
+      try {
+        await onSave(parsedDue);
+      } catch (error) {
+        new Notice(`${PLUGIN_NAME}: time update failed`);
+        console.error(error);
+      } finally {
+        cleanup();
+      }
+    }, { once: true });
+    input.addEventListener("cancel", cleanup, { once: true });
+    cleanupTimer = window.setTimeout(cleanup, 5 * 60 * 1000);
+
+    try {
+      input.focus({ preventScroll: true });
+      if (typeof input.showPicker === "function") input.showPicker();
+      else input.click();
+    } catch (error) {
+      cleanup();
+      new Notice(`${PLUGIN_NAME}: time picker unavailable`);
+      console.error(error);
+    }
+  }
+
+  openSourceTimePicker(reminder) {
+    this.openDateTimePicker(reminder.due, async (nextDue) => {
+      await this.plugin.updateSourceReminderDue(reminder, nextDue);
+      await this.refreshTaskCaches();
+    });
+  }
+
+  openQueueTimePicker(item) {
+    this.openDateTimePicker(item.due, async (nextDue) => {
+      await this.plugin.rescheduleQueueItem(item.id, { due: nextDue.toISOString() });
+      await this.render();
+    });
   }
 }
 
@@ -6453,7 +6730,7 @@ class NtfyReminderSuggest extends EditorSuggest {
     const match = line.match(/(?:^|\s)(ntfy|提醒|notify|remind|todo|task|待办|今天|明天|后天|下周|今晚|早八|上午|中午|下午|30分钟|1小时|📅|⏰|➕|⏲)$/i);
     const taskLine = /^\s*[-*+]\s+\[[^\]]\]/.test(line);
     const emojiTrigger = line.match(/(?:📅|⏰|➕|⏲)\s*$/u);
-    const dateNeedsTimeTrigger = /[📅⏰]\s*\d{4}-\d{2}-\d{2}\s*$/u.test(line);
+    const dateNeedsTimeTrigger = line.match(/[📅⏰]\s*\d{4}-\d{2}-\d{2}(\s*)$/u);
     const taskTextTrigger = taskLine && /[\p{L}\p{N}\u4e00-\u9fff]$/u.test(line) && !/[📅⏰]\s*\d{4}-\d{2}-\d{2}/u.test(line);
     if (!match && !(taskLine && emojiTrigger) && !taskTextTrigger && !dateNeedsTimeTrigger) return null;
     const trigger = match ? match[1] : emojiTrigger ? emojiTrigger[0].trim() : "";
@@ -6465,7 +6742,7 @@ class NtfyReminderSuggest extends EditorSuggest {
           : emojiTrigger
           ? cursor.ch - emojiTrigger[0].length
           : dateNeedsTimeTrigger
-          ? cursor.ch
+          ? cursor.ch - dateNeedsTimeTrigger[1].length
           : cursor.ch,
       },
       end: cursor,
@@ -6510,6 +6787,10 @@ class NtfyReminderSuggest extends EditorSuggest {
     const currentLine = this.context.editor.getLine(this.context.start.line);
     const text = suggestion.insertText || this.tasksFields(suggestion.due, currentLine);
     this.context.editor.replaceRange(text, this.context.start, this.context.end);
+    this.context.editor.setCursor({
+      line: this.context.start.line,
+      ch: this.context.start.ch + text.length,
+    });
   }
 }
 
@@ -6539,6 +6820,7 @@ class NtfyReminderInsertModal extends SuggestModal {
     const currentLine = this.editor.getLine(cursor.line);
     const text = suggestion.insertText || ntfyTasksFields(this.plugin, suggestion.due, currentLine);
     this.editor.replaceRange(text, cursor);
+    this.editor.setCursor({ line: cursor.line, ch: cursor.ch + text.length });
   }
 }
 
@@ -6608,7 +6890,7 @@ function ntfyTimeSuggestions(plugin, currentLine, now) {
       due,
       note: plugin.formatLocalDateTime(due),
       hint: "选择时间",
-      insertText: plugin.formatLocalDateTime(due).slice(11),
+      insertText: ` ${plugin.formatLocalDateTime(due).slice(11)}`,
     };
   });
 }
@@ -7276,7 +7558,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       .setDesc(this.uiText("建议使用足够长的随机 topic。公开 topic 被猜到后别人也可以订阅。", "Use a long random topic. Anyone who guesses a public topic can subscribe to it."))
       .addText((text) =>
         text
-          .setPlaceholder("murat-ob-random-long-topic")
+          .setPlaceholder("obsidian-notify-random-long-topic")
           .setValue(this.plugin.settings.topic)
           .onChange(async (value) => {
             this.plugin.settings.topic = value.trim();
@@ -7657,6 +7939,21 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       );
 
     new Setting(scanGroup)
+      .setName(this.uiText("OB 内部到点提醒", "Show reminders inside Obsidian"))
+      .setDesc(this.uiText("ntfy 负责系统通知；Obsidian 开着时也在到点后弹出同一提醒。", "ntfy handles system delivery; when Obsidian is open, it also shows the reminder when due."))
+      .addToggle((toggle) =>
+        toggle
+          .setValue(Boolean(this.plugin.settings.showObsidianReminderNotices))
+          .onChange(async (value) => {
+            if (value && !this.plugin.settings.showObsidianReminderNotices) {
+              this.plugin.settings.internalReminderNoticeSince = new Date().toISOString();
+            }
+            this.plugin.settings.showObsidianReminderNotices = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(scanGroup)
       .setName(this.uiText("Obsidian 通知缓存上限", "Obsidian notice cache limit"))
       .setDesc(this.uiText("通知管理中最多保留多少条已捕获的 OB 或插件通知。", "Maximum captured OB/plugin notices to keep in the manager."))
       .addText((text) =>
@@ -7778,6 +8075,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.scheduleFutureWithNtfy = value;
             await this.plugin.saveSettings();
+            if (value) await this.plugin.scanAndSchedule({ showNotice: false });
           })
       );
 
@@ -7791,6 +8089,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.maxFutureDays = Math.max(1, Number(value || 3));
             await this.plugin.saveSettings();
+            await this.plugin.scanAndSchedule({ showNotice: false });
           })
       );
 

@@ -10,7 +10,7 @@ Why ntfy: Obsidian mobile plugins cannot directly create Android system notifica
 2. Subscribe to the same topic that you configure in this plugin.
 3. Enable Android notifications for the ntfy app.
 
-Use a long random topic if you use the public server `https://ntfy.sh`, for example `murat-ob-9c4f0b2d7a1e4b90`.
+Use a long random topic if you use the public server `https://ntfy.sh`, for example `obsidian-notify-9c4f0b2d7a1e4b90`.
 
 ## Multilingual Interface
 
@@ -93,15 +93,19 @@ The `设定通知` section is collapsed by default and is only for creating a ma
 
 The status bar shows `ntfy local/total`, where `local` is the number of scheduled queue items not yet handed off to ntfy, and `total` is the full managed notification count.
 
+Time badges in the manager are editable. Click a pending or queued reminder time to change it; note-backed reminders update the source line, cancel the old ntfy schedule when supported, and submit the replacement schedule immediately.
+
 In the editor, type `ntfy `, `提醒 `, `notify `, `remind `, or `⏲ ` to open minute-level reminder suggestions such as `30m`, `1h`, today 09:00, and tomorrow 09:00.
 
-New dated tasks are added by the automatic scanner. Tasks inside the configured ntfy scheduling window, default `3` days, are handed off to ntfy immediately as scheduled messages. Tasks with an explicit hour/minute are scheduled for that time. Date-only tasks, daily-note tasks without a time, and overdue unsent tasks are scheduled for the daily batch at `08:00` by default. Already sent tasks stay in the sent cache and are not pushed again.
+New dated tasks are added by the automatic scanner. Tasks inside the configured ntfy scheduling window, default `3` days, are handed off to ntfy immediately as scheduled messages. Manual and API reminders also attempt this handoff as soon as they are created or edited. Tasks with an explicit hour/minute are scheduled for that time. Date-only tasks, daily-note tasks without a time, and overdue unsent tasks are scheduled for the daily batch at `08:00` by default. Stable delivery records prevent the same reminder from being submitted repeatedly.
 
 Repeating notifications are handled by Ntfy Notifications' local queue. ntfy scheduled delivery is one-shot; after a repeating item is sent successfully, the plugin calculates and queues the next due time.
 
 Auto scan is enabled by default. While Obsidian is running, the plugin scans notes on the configured interval, keeps future reminders in the editable local queue, and hands queue items to ntfy only when they are close to due time. In daily-note folders such as `日记`, tasks without an explicit time use the date in the daily note filename plus the default time.
 
 The manager can refresh scheduled messages already handed off to ntfy and can cancel those scheduled ntfy messages when the server supports the ntfy delete API. Scheduled messages are published with a stable `X-Message-ID` so they can be matched later. Turning off a reminder with the bell button or editing the same task line cancels the old scheduled ntfy message before the new state is saved.
+
+ntfy remains responsible for delivery while Obsidian is closed. When Obsidian is open, the plugin also keeps a local due-time timer and shows the same reminder through Obsidian's Notice UI once, with persisted local-delivery state to avoid duplicate popups.
 
 Obsidian/plugin notices are captured by wrapping Obsidian's `Notice` API after this plugin loads. This covers most later notices, but a plugin that cached its own `Notice` reference before Ntfy Notifications loaded may not be captured.
 
@@ -180,6 +184,15 @@ For long-term reminders, keep them in the local queue and let later scans hand t
    - maximum future days, usually `3` for public `ntfy.sh`
    - local queue lookahead days
 4. Run command `Ntfy Notifications: Send test notification`.
+
+## Development
+
+The plugin ships as readable JavaScript and has no compilation step. Run the source checks with:
+
+```bash
+npm run check
+npm test
+```
 
 ## AI Webhook
 

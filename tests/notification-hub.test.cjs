@@ -50,6 +50,7 @@ function createPlugin(settings = {}) {
   plugin.incomingReconnectAttempts = new Map();
   plugin.isUnloading = false;
   plugin.settings = plugin.normalizeSettings(settings);
+  plugin.saveData = async () => {};
   plugin.saveSettings = async () => {};
   plugin.app = {};
   return plugin;
@@ -113,6 +114,17 @@ async function run() {
   assert.match(source, /tab\.addEventListener\("click", \(\) => this\.activateTab\(id\)\)/);
   assert.doesNotMatch(source, /tab\.addEventListener\("click", async \(\) => \{\s*this\.activeTab = id;\s*await this\.render\(\)/);
   assert.match(styles, /\.obsidian-ntfy-tab-panel\.is-active\s*\{\s*display:\s*block/);
+  assert.match(styles, /\.obsidian-ntfy-task-time\.is-editable/);
+  assert.match(source, /selectSuggestion\(suggestion\)[\s\S]*?replaceRange\([\s\S]*?setCursor\(/);
+  assert.match(source, /onChooseSuggestion\(suggestion\)[\s\S]*?replaceRange\([\s\S]*?setCursor\(/);
+  assert.match(source, /dateNeedsTimeTrigger = line\.match\(\/\[📅⏰\][\s\S]*?\(\\s\*\)\$\/u\)/);
+  assert.match(source, /cursor\.ch - dateNeedsTimeTrigger\[1\]\.length/);
+  assert.match(source, /insertText: ` \$\{plugin\.formatLocalDateTime\(due\)\.slice\(11\)\}`/);
+  assert.match(source, /openDateTimePicker\(dueValue, onSave\)/);
+  assert.match(source, /typeof input\.showPicker === "function"/);
+  assert.match(source, /openSourceTimePicker\(reminder\)/);
+  assert.match(source, /openQueueTimePicker\(item\)/);
+  assert.doesNotMatch(source, /openSourceTimeModal\(/);
 
   const plugin = createPlugin({
     topic: "test-topic",
@@ -125,7 +137,78 @@ async function run() {
   assert.equal(status.defaultChannelId, "ntfy");
   assert.deepEqual(plugin.settings.addedChannelIds, ["ntfy"]);
   assert.equal(plugin.settings.backgroundReceiveEnabled, true);
+  assert.equal(plugin.settings.showObsidianReminderNotices, true);
   assert.deepEqual(plugin.settings.channelHealth, {});
+
+  const migratedInternalNoticePlugin = createPlugin({
+    sent: {
+      legacy: { due: new Date(Date.now() - 60_000).toISOString(), at: new Date(Date.now() - 120_000).toISOString(), text: "Legacy reminder" },
+    },
+  });
+  assert.ok(migratedInternalNoticePlugin.settings.internalReminderNoticeSince);
+  assert.equal(migratedInternalNoticePlugin.shouldShowObsidianReminderNotice(migratedInternalNoticePlugin.settings.sent.legacy), false, "legacy history should not produce an upgrade notice burst");
+
+  const internalNoticePlugin = createPlugin({ topic: "internal-notice" });
+  internalNoticePlugin.settings.internalReminderNoticeSince = new Date(Date.now() - 60_000).toISOString();
+  const internalNoticeCount = notices.length;
+  internalNoticePlugin.settings.sent = {
+    "internal-reminder": {
+      due: new Date(Date.now() - 1_000).toISOString(),
+      obsidianDue: new Date(Date.now() - 1_000).toISOString(),
+      text: "Internal due reminder",
+      file: "Tasks.md",
+    },
+  };
+  await internalNoticePlugin.showDueObsidianReminderNotices();
+  assert.equal(notices.length, internalNoticeCount + 1);
+  assert.match(notices.at(-1), /Internal due reminder/);
+  await internalNoticePlugin.showDueObsidianReminderNotices();
+  assert.equal(notices.length, internalNoticeCount + 1, "internal reminder should only appear once");
+
+  const failedScanPlugin = createPlugin({ topic: "offline-reminder", scheduleFutureWithNtfy: true });
+  failedScanPlugin.updateStatus = () => {};
+  failedScanPlugin.updateStatusCount = () => {};
+  failedScanPlugin.queueStatusCountRefresh = () => {};
+  const failedScanDue = new Date(Date.now() + 60_000);
+  failedScanPlugin.settings.internalReminderNoticeSince = new Date(Date.now() - 1_000).toISOString();
+  failedScanPlugin.collectReminders = async () => [{
+    key: "offline-note-reminder",
+    due: failedScanDue,
+    text: "Offline note reminder",
+    filePath: "Tasks.md",
+    lineNumber: 4,
+    source: "obsidian-ntfy",
+    hasExplicitTime: true,
+  }];
+  failedScanPlugin.httpRequest = async () => { throw new Error("temporary network failure"); };
+  await failedScanPlugin.scanAndSchedule({ showNotice: false });
+  const failedScanEntry = failedScanPlugin.settings.sent["offline-note-reminder"];
+  assert.equal(failedScanEntry.channels.ntfy.status, "failed");
+  assert.equal(failedScanEntry.ntfyScheduled, false);
+  assert.equal(failedScanEntry.obsidianDue, failedScanDue.toISOString());
+  assert.equal(failedScanPlugin.hasPendingNotificationDelivery(failedScanEntry), true, "failed ntfy delivery should remain retryable");
+  const failedScanNoticeCount = notices.length;
+  await failedScanPlugin.showDueObsidianReminderNotices(failedScanDue.getTime() + 2_000);
+  assert.equal(notices.length, failedScanNoticeCount + 1, "failed ntfy delivery should still notify inside Obsidian");
+  await failedScanPlugin.showDueObsidianReminderNotices(failedScanDue.getTime() + 3_000);
+  assert.equal(notices.length, failedScanNoticeCount + 1, "failed delivery fallback should only notify once");
+
+  const failedQueuePlugin = createPlugin({ topic: "offline-queue", scheduleFutureWithNtfy: true });
+  const failedQueueDue = new Date(Date.now() + 90_000);
+  failedQueuePlugin.settings.queue = [{
+    id: "offline-queue-reminder",
+    text: "Offline queue reminder",
+    due: failedQueueDue.toISOString(),
+    file: "queue",
+    line: 0,
+    source: "ntfy:queue",
+  }];
+  failedQueuePlugin.httpRequest = async () => { throw new Error("temporary queue failure"); };
+  const failedQueueResult = await failedQueuePlugin.flushDueQueue(Date.now(), 3 * 24 * 60 * 60 * 1000);
+  assert.equal(failedQueueResult.failed, 1);
+  assert.equal(failedQueuePlugin.settings.queue.length, 1, "failed queue reminder should remain queued for retry");
+  assert.equal(failedQueuePlugin.settings.sent["offline-queue-reminder"].channels.ntfy.status, "failed");
+  assert.equal(failedQueuePlugin.hasPendingNotificationDelivery(failedQueuePlugin.settings.sent["offline-queue-reminder"]), true);
 
   const spanishPlugin = createPlugin({ uiLanguage: "es" });
   assert.equal(spanishPlugin.currentUiLanguage(), "es");
@@ -462,7 +545,7 @@ async function run() {
 
   await appChannelPlugin.addChannelToSettings("wecom", { accountId: "app", name: "企业微信应用" });
   await appChannelPlugin.updateChannelAccount("wecom:app", {
-    config: { mode: "app", corpId: "ww_test", agentId: "1000002", secret: "wecom-secret", targetType: "touser", target: "murat" },
+    config: { mode: "app", corpId: "ww_test", agentId: "1000002", secret: "wecom-secret", targetType: "touser", target: "example-user" },
   });
   const wecomRequests = [];
   appChannelPlugin.httpRequest = async (request) => {
@@ -472,7 +555,7 @@ async function run() {
   };
   const wecomAppResult = await appChannelPlugin.sendNotification({ title: "App", message: "WeCom", channelIds: ["wecom:app"] });
   assert.equal(wecomAppResult.results[0].status, "sent");
-  assert.equal(JSON.parse(wecomRequests[1].body).touser, "murat");
+  assert.equal(JSON.parse(wecomRequests[1].body).touser, "example-user");
   appChannelPlugin.httpRequest = async (request) => request.url.includes("gettoken")
     ? { json: { errcode: 0, access_token: "wecom-token" } }
     : { json: { errcode: 0 } };
@@ -829,7 +912,7 @@ async function run() {
   assert.equal(discordSocket.sent.some((item) => item.op === 2 && item.d.intents === 37377), true);
   discordSocket.message({ op: 0, t: "READY", s: 1, d: { session_id: "discord-session" } });
   assert.equal(discordGatewayPlugin.incomingSocketStates.get("discord:bot").status, "connected");
-  discordSocket.message({ op: 0, t: "MESSAGE_CREATE", s: 1, d: { id: "discord-in", channel_id: "discord-room", content: "Discord inbound", timestamp: "2026-08-02T00:00:00.000Z", author: { id: "user", username: "Murat", bot: false }, attachments: [] } });
+  discordSocket.message({ op: 0, t: "MESSAGE_CREATE", s: 1, d: { id: "discord-in", channel_id: "discord-room", content: "Discord inbound", timestamp: "2026-08-02T00:00:00.000Z", author: { id: "user", username: "Example User", bot: false }, attachments: [] } });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(discordGatewayPlugin.settings.incomingMessages[0].metadata.channelId, "discord-room");
   discordGatewayPlugin.closeIncomingSockets();
@@ -876,6 +959,44 @@ async function run() {
   assert.equal(qqGatewayPlugin.settings.incomingMessages[0].metadata.qqTarget, "group-in");
   qqGatewayPlugin.closeIncomingSockets();
   global.WebSocket = originalWebSocket;
+
+  const handoffPlugin = createPlugin({ topic: "handoff-topic", scheduleFutureWithNtfy: true, maxFutureDays: 3 });
+  handoffPlugin.updateStatusCount = () => {};
+  const handoffRequests = [];
+  handoffPlugin.httpRequest = async (request) => {
+    handoffRequests.push(request);
+    return { json: { id: "remote-scheduled-id" } };
+  };
+  const handoffDue = new Date(Date.now() + 90_000);
+  const handoffId = await handoffPlugin.addQueueItem("Handoff early", handoffDue, { id: "handoff-reminder" });
+  assert.equal(handoffId, "handoff-reminder");
+  assert.equal(handoffPlugin.settings.queue.some((item) => item.id === handoffId), false);
+  assert.equal(handoffPlugin.settings.sent[handoffId].ntfyScheduled, true);
+  assert.equal(handoffRequests[0].headers.At, Math.floor(handoffPlugin.normalizeScheduledAt(handoffDue).getTime() / 1000).toString());
+  await handoffPlugin.handoffQueuedReminders();
+  assert.equal(handoffRequests.length, 1, "persisted handoff should not be submitted twice");
+  const cancelled = await handoffPlugin.cancelSentEntry(handoffId);
+  assert.equal(cancelled, true);
+  assert.equal(handoffRequests[1].method, "DELETE");
+  assert.equal(handoffPlugin.settings.sent[handoffId].ntfyDeleted, true);
+
+  const sourceTimePlugin = createPlugin({ topic: "source-time" });
+  let sourceText = "- [ ] Review chart 📅 2026-08-10 09:00";
+  const sourceFile = { path: "Tasks.md", extension: "md" };
+  sourceTimePlugin.app = {
+    vault: {
+      getAbstractFileByPath: (value) => value === sourceFile.path ? sourceFile : null,
+      read: async () => sourceText,
+      modify: async (_file, value) => { sourceText = value; },
+    },
+  };
+  sourceTimePlugin.cancelMatchingSentEntries = async () => 0;
+  sourceTimePlugin.scanAndSchedule = async () => {};
+  const sourceReminder = sourceTimePlugin.parseReminderLine(sourceText, sourceFile.path, 1);
+  const changedDue = new Date(2026, 7, 11, 15, 45, 0, 0);
+  const changedReminder = await sourceTimePlugin.updateSourceReminderDue(sourceReminder, changedDue);
+  assert.match(sourceText, /📅 2026-08-11 15:45/);
+  assert.equal(changedReminder.due.getTime(), changedDue.getTime());
 
   let sentRequest = null;
   plugin.httpRequest = async (request) => {
