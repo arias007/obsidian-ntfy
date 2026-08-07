@@ -350,6 +350,19 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
   padding-bottom: calc(128px + env(safe-area-inset-bottom));
 }
 
+.obsidian-ntfy-manager.obsidian-ntfy-inbox-active .obsidian-ntfy-window-body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.obsidian-ntfy-manager.obsidian-ntfy-inbox-active .obsidian-ntfy-tab-panel.is-active {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 .obsidian-ntfy-tab-panel {
   display: none;
 }
@@ -1169,11 +1182,18 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
 .obsidian-ntfy-chat {
   border: 1px solid var(--background-modifier-border);
   display: grid;
+  flex: 1 1 auto;
   grid-template-columns: minmax(220px, 32%) minmax(0, 1fr);
-  height: max(460px, calc(100vh - 176px));
-  max-height: 820px;
+  height: auto;
+  max-height: none;
   min-height: 0;
   overflow: hidden;
+}
+
+.obsidian-ntfy-manager.obsidian-ntfy-inbox-active .obsidian-ntfy-chat {
+  height: auto;
+  max-height: none;
+  min-height: 0;
 }
 
 .obsidian-ntfy-chat-sidebar,
@@ -1611,7 +1631,7 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
 
   .obsidian-ntfy-chat {
     display: block;
-    height: calc(100vh - 148px);
+    height: auto;
     max-height: none;
   }
 

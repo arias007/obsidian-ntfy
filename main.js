@@ -8385,6 +8385,7 @@ class NtfyManagerView extends ItemView {
     for (const [tabId, panel] of this.tabPanels.entries()) {
       panel.toggleClass("is-active", tabId === this.activeTab);
     }
+    this.viewContentEl().toggleClass("obsidian-ntfy-inbox-active", this.activeTab === "inbox");
   }
 
   updateNavSelection() {
