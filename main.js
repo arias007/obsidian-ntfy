@@ -8593,6 +8593,22 @@ class NtfyManagerView extends ItemView {
       });
     }
 
+    // New conversations should open at the newest message. The second pass
+    // accounts for attachment/layout measurements that settle after render.
+    const alignToLatest = () => {
+      if (!messageList.isConnected) return;
+      messageList.scrollTop = messageList.scrollHeight;
+    };
+    const scrollToLatest = () => {
+      alignToLatest();
+      if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+        window.requestAnimationFrame(alignToLatest);
+      }
+      if (typeof window !== "undefined" && typeof window.setTimeout === "function") {
+        window.setTimeout(alignToLatest, 120);
+      }
+    };
+
     const composer = conversation.createDiv({ cls: "obsidian-ntfy-chat-composer" });
     const selected = composer.createDiv({ cls: "obsidian-ntfy-chat-selected-files" });
     const renderSelected = () => {
@@ -8649,6 +8665,7 @@ class NtfyManagerView extends ItemView {
       input.disabled = true;
       send.disabled = true;
     }
+    scrollToLatest();
   }
 
   chatTime(value, includeSeconds = false) {
