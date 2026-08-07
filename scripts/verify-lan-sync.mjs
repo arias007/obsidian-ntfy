@@ -143,11 +143,14 @@ try {
     NtfyLanSync,
     LanStatusBarTakeover,
     buildLanConflictPath,
+    classifyLanLinkType,
     createLanSyncRequestHeaders,
     decryptLanSyncPayload,
     encryptLanSyncPayload,
     isPrivateLanAddress,
+    ipv4BroadcastAddress,
     normalizeLanSyncPath,
+    normalizeManualLanPeer,
     planLanSyncReconciliation,
     verifyLanSyncRequest
   } = require(bundle);
@@ -174,6 +177,16 @@ try {
   assert.equal(normalizeLanSyncPath(".obsidian/hotkeys.json"), null, "Config path was enabled without the setting");
   for (const address of ["127.0.0.1", "10.0.0.2", "172.20.1.2", "192.168.1.8", "169.254.2.3"]) assert.equal(isPrivateLanAddress(address), true);
   for (const address of ["8.8.8.8", "1.1.1.1", "example.com"]) assert.equal(isPrivateLanAddress(address), false);
+  assert.equal(classifyLanLinkType("Wi-Fi"), "wifi");
+  assert.equal(classifyLanLinkType("Bluetooth Network Connection"), "bluetooth-pan");
+  assert.equal(classifyLanLinkType("Remote NDIS Compatible Device"), "usb");
+  assert.equal(classifyLanLinkType("Local Area Connection* 10"), "hotspot");
+  assert.equal(ipv4BroadcastAddress("192.168.137.1", "255.255.255.0"), "192.168.137.255");
+  assert.deepEqual(normalizeManualLanPeer("192.168.137.2:43190"), { address: "192.168.137.2", port: 43190 });
+  assert.deepEqual(normalizeManualLanPeer("10.0.0.5"), { address: "10.0.0.5", port: 43190 });
+  for (const unsafePeer of ["example.com:43190", "8.8.8.8:43190", "https://192.168.1.2:43190", "192.168.1.2:80/path", "192.168.1.2:80", "192.168.1.2:65528"]) {
+    assert.equal(normalizeManualLanPeer(unsafePeer), null, `Unsafe manual peer accepted: ${unsafePeer}`);
+  }
 
   const secret = "s".repeat(43);
   const encrypted = await encryptLanSyncPayload(secret, { text: "private note", count: 2 });
@@ -285,9 +298,6 @@ try {
     addresses: ["127.0.0.1"],
     updatedAt: new Date().toISOString()
   });
-  storageA.putText(`${storageA.identityRoot}/peers/${deviceB}.json`, descriptor(deviceB, portB));
-  storageB.putText(`${storageB.identityRoot}/peers/${deviceA}.json`, descriptor(deviceA, portA));
-
   const httpRequest = async (request) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), request.timeoutMs);
@@ -315,6 +325,7 @@ try {
       configDir: ".obsidian",
       port,
       maxFileBytes: 1024 * 1024,
+      manualPeers: [],
       ...overrides
     };
     return {
@@ -328,13 +339,18 @@ try {
     };
   };
   const optionsB = commonOptions(storageB, portB, deviceB, progressB);
-  const optionsA = commonOptions(storageA, portA, deviceA, progressA);
+  const optionsA = commonOptions(storageA, portA, deviceA, progressA, { autoDiscovery: false, manualPeers: [`127.0.0.1:${portB}`] });
+  const messagesB = [];
+  optionsB.onMessage = (message) => messagesB.push(message);
   const serviceB = new NtfyLanSync(optionsB);
   const serviceA = new NtfyLanSync(optionsA);
   try {
     await serviceB.start();
     await serviceA.start();
     await waitFor(() => serviceA.status().peerCount === 1, "authenticated same-Vault peer");
+    assert.equal(serviceA.listPeers()[0].deviceId, deviceB, "Manual endpoint was not rebound to the authenticated device ID");
+    assert.equal(serviceA.listPeers()[0].linkType, "manual");
+    serviceA.requestSync();
     await waitFor(() => storageA.text("Notes/from-b.md") === "from B" && storageB.text("Notes/from-a.md") === "from A", "automatic bidirectional LAN transfer");
     await waitFor(() => storageA.text("Notes/shared.md") === "newer B" && storageB.text("Notes/shared.md") === "newer B", "conflict convergence");
     const conflictPath = [...storageA.files.keys()].find((path) => path.includes("LAN conflict"));
@@ -373,12 +389,23 @@ try {
     await waitFor(() => storageB.text("Notes/from-a.md") === null, "deletion push");
     storageA.putText("Notes/from-a.md", "recreated A", 900);
     serviceA.notifyVaultChange("Notes/from-a.md");
+    serviceA.requestSync();
     await waitFor(() => storageB.text("Notes/from-a.md") === "recreated A", "recreated path after cloud deletion");
 
     optionsA.runtimeSettings.mode = "delete-pull";
     storageB.files.delete("Notes/from-b.md");
     serviceA.requestSync();
     await waitFor(() => storageA.text("Notes/from-b.md") === null, "deletion pull");
+
+    storageA.putText("Share/manual.txt", "explicit file from A", 800);
+    storageB.putText("Share/manual.txt", "existing file from B", 801);
+    const sentAttachment = await serviceA.sendFile(deviceB, "Share/manual.txt");
+    assert.notEqual(sentAttachment.path, "Share/manual.txt", "Explicit file send overwrote a conflicting remote path");
+    assert.equal(storageB.text(sentAttachment.path), "explicit file from A");
+    const sentMessage = await serviceA.sendMessage(deviceB, { text: "encrypted hello", attachments: [sentAttachment] });
+    await waitFor(() => messagesB.some((message) => message.id === sentMessage.id), "authenticated LAN message delivery");
+    assert.equal(messagesB.find((message) => message.id === sentMessage.id).text, "encrypted hello");
+    assert.equal(messagesB.find((message) => message.id === sentMessage.id).attachments[0].path, sentAttachment.path);
   } finally {
     await Promise.all([serviceA.stop(), serviceB.stop()]);
   }
@@ -403,6 +430,7 @@ try {
     await mobileService.start();
     await waitFor(() => mobileService.status().peerCount === 1, "mobile authenticated desktop endpoint");
     await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "automatic mobile-initiated LAN synchronization");
+    await waitFor(() => mobileProgress.some((value) => value.phase === "complete"), "mobile synchronization completion");
     assert.ok(mobileProgress.some((value) => value.phase === "complete"), "Mobile client waited for the lower desktop device ID");
   } finally {
     await Promise.all([mobileService.stop(), desktopService.stop()]);

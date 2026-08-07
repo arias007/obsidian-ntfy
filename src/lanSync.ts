@@ -10,6 +10,26 @@ export type LanSyncRuntimeSettings = {
   configDir: string;
   port: number;
   maxFileBytes: number;
+  manualPeers: string[];
+};
+
+export type LanLinkType = "ethernet" | "wifi" | "hotspot" | "bluetooth-pan" | "usb" | "lan" | "manual";
+
+export type LanSyncPeerInfo = {
+  deviceId: string;
+  address: string;
+  port: number;
+  linkType: LanLinkType;
+  verified: boolean;
+  lastSeenAt: number;
+};
+
+export type LanSyncIncomingMessage = {
+  id: string;
+  deviceId: string;
+  text: string;
+  sentAt: string;
+  attachments: Array<{ name: string; path: string; size: number; hash: string }>;
 };
 
 export type LanSyncMode = "bidirectional" | "incremental-push" | "incremental-pull" | "delete-push" | "delete-pull";
@@ -98,6 +118,8 @@ export type LanSyncServiceOptions = {
   storage: LanSyncStorage;
   httpRequest(request: LanSyncHttpRequest): Promise<LanSyncHttpResponse>;
   onProgress(progress: LanSyncProgress): void;
+  onMessage?(message: LanSyncIncomingMessage): void | Promise<void>;
+  onPeersChanged?(peers: LanSyncPeerInfo[]): void;
   localStore?: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null;
   now?: () => number;
 };
@@ -144,7 +166,16 @@ type LanSyncPeer = {
   lastProbeAt: number;
   lastSyncAt: number;
   probing: boolean;
+  manual: boolean;
   policy: LanSyncPolicy;
+};
+
+type LanNetworkInterface = {
+  name: string;
+  address: string;
+  netmask: string;
+  broadcast: string;
+  linkType: LanLinkType;
 };
 
 type LanSyncEnvelope = {
@@ -182,6 +213,8 @@ const HARD_MAX_REQUEST_BYTES = 960 * 1024 * 1024;
 const RATE_WINDOW_MS = 60_000;
 const RATE_LIMIT = 1200;
 const DEVICE_ID_STORAGE_KEY = "cancip.lan-sync.device-id.v1";
+const MAX_MESSAGE_TEXT_LENGTH = 32_000;
+const MAX_MESSAGE_ATTACHMENTS = 12;
 
 class LanSyncProtocolError extends Error {
   constructor(
@@ -384,6 +417,33 @@ export function normalizeLanSyncPath(value: unknown, options: LanSyncPathOptions
   if (lower.startsWith(`${configRoot}/cache/`) || lower.startsWith(`${configRoot}/.cache/`)) return null;
   if (lower === `${configRoot}/plugins/remotely-save` || lower.startsWith(`${configRoot}/plugins/remotely-save/`)) return null;
   return normalized;
+}
+
+export function classifyLanLinkType(name: string, address = ""): LanLinkType {
+  const value = `${name} ${address}`.toLocaleLowerCase();
+  if (/bluetooth|\bbnep\b|\bpan\b/.test(value)) return "bluetooth-pan";
+  if (/\b(?:r?ndis)\b|usb|tether/.test(value)) return "usb";
+  if (/hotspot|mobile hotspot|local area connection\*|192\.168\.137\./.test(value)) return "hotspot";
+  if (/wi-?fi|wlan|wireless|802\.11/.test(value)) return "wifi";
+  if (/ethernet|以太网|\beth\d*\b|en\d+/.test(value)) return "ethernet";
+  return "lan";
+}
+
+export function ipv4BroadcastAddress(address: string, netmask: string): string | null {
+  const addressParts = address.split(".").map(Number);
+  const maskParts = netmask.split(".").map(Number);
+  if (addressParts.length !== 4 || maskParts.length !== 4) return null;
+  if ([...addressParts, ...maskParts].some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return null;
+  return addressParts.map((part, index) => (part | (~maskParts[index] & 255)) >>> 0).join(".");
+}
+
+export function normalizeManualLanPeer(value: unknown, fallbackPort = 43190): { address: string; port: number } | null {
+  const raw = typeof value === "string" ? value.trim() : "";
+  const match = /^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?$/.exec(raw);
+  if (!match || !isPrivateLanAddress(match[1])) return null;
+  if (match[2] && (Number(match[2]) < 1024 || Number(match[2]) > 65527)) return null;
+  const port = normalizedPort(match[2] || fallbackPort, 0);
+  return port ? { address: match[1].split(".").map((part) => String(Number(part))).join("."), port } : null;
 }
 
 export function isLanSyncPathEligible(value: unknown, options: LanSyncPathOptions = {}): value is string {
@@ -780,6 +840,7 @@ export class NtfyLanSync {
   private activityFiles: LanSyncFileActivity[] = [];
   private activityUpdatedAt = 0;
   private lastErrorValue = "";
+  private lastPeerFingerprint = "";
 
   constructor(private readonly options: LanSyncServiceOptions) {}
 
@@ -800,6 +861,71 @@ export class NtfyLanSync {
       progress: { ...this.progressValue },
       files: this.activityFiles.map((file) => ({ ...file }))
     };
+  }
+
+  listPeers(): LanSyncPeerInfo[] {
+    const now = this.now();
+    const localInterfaces = this.localInterfaces();
+    return [...this.peers.values()]
+      .filter((peer) => peer.verifiedAt > 0)
+      .map((peer) => {
+        const address = [...peer.addresses][0] ?? "";
+        const detectedLink = this.linkTypeForAddress(address, localInterfaces);
+        return {
+          deviceId: peer.deviceId,
+          address,
+          port: peer.port,
+          linkType: peer.manual && detectedLink === "lan" ? "manual" : detectedLink,
+          verified: now - peer.verifiedAt <= Math.max(4500, this.settings().checkIntervalSeconds * 3000 + 1000),
+          lastSeenAt: Math.max(peer.lastSeenAt, peer.verifiedAt)
+        };
+      })
+      .filter((peer) => peer.verified)
+      .sort((left, right) => left.deviceId.localeCompare(right.deviceId));
+  }
+
+  async sendMessage(deviceId: string, input: { id?: string; text?: string; attachments?: Array<{ name: string; path: string; size: number; hash: string }> }): Promise<{ id: string }> {
+    const peer = this.activePeers().find((candidate) => candidate.deviceId === deviceId);
+    if (!peer) throw new Error("peer_unavailable");
+    const message = this.normalizeMessagePayload(input, this.deviceId);
+    const response = await this.callPeer(peer, "/message/send", message);
+    if (response.ok !== true || response.id !== message.id) throw new Error("message_delivery_failed");
+    return { id: message.id };
+  }
+
+  async sendFile(deviceId: string, path: string): Promise<{ name: string; path: string; size: number; hash: string }> {
+    const peer = this.activePeers().find((candidate) => candidate.deviceId === deviceId);
+    const normalized = this.normalizePath(path);
+    if (!peer) throw new Error("peer_unavailable");
+    if (!normalized) throw new LanSyncProtocolError("unsafe_path");
+    const stat = await this.options.storage.statFile(normalized);
+    if (!stat || stat.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("file_unavailable", 404);
+    const bytes = new Uint8Array(await this.options.storage.readBinary(normalized));
+    const hash = await sha256Bytes(bytes);
+    this.activityFiles = [{ path: normalized, action: "push", state: "syncing", size: bytes.byteLength }];
+    this.activityUpdatedAt = this.now();
+    this.emit({ ...defaultProgress("syncing"), active: true, peerId: peer.deviceId, total: 1, bytesTotal: bytes.byteLength });
+    try {
+      const remote = await this.callPeer(peer, "/manifest", { syncConfigFolder: false });
+      const entries = this.parseManifest(remote.files, false);
+      const existing = entries.find((entry) => entry.path === normalized);
+      let remotePath = normalized;
+      if (existing && existing.hash !== hash) remotePath = buildLanConflictPath(normalized, this.deviceId, hash, this.pathOptions(false));
+      this.activityFiles[0].path = remotePath;
+      await this.writeRemoteIfMissingOrSame(peer, remotePath, bytes, hash);
+      this.activityFiles[0].state = "complete";
+      this.emit({ ...defaultProgress("complete"), active: true, peerId: peer.deviceId, completed: 1, total: 1, bytesTransferred: bytes.byteLength, bytesTotal: bytes.byteLength, changed: 1 });
+      return {
+        name: remotePath.split("/").pop() || remotePath,
+        path: remotePath,
+        size: bytes.byteLength,
+        hash
+      };
+    } catch (error) {
+      this.activityFiles[0].state = "error";
+      this.emit({ ...defaultProgress("error"), active: true, peerId: peer.deviceId, total: 1, bytesTotal: bytes.byteLength, error: safeErrorCode(error) });
+      throw error;
+    }
   }
 
   status(): { running: boolean; port: number; peerCount: number; error: string; desktop: boolean } {
@@ -836,6 +962,7 @@ export class NtfyLanSync {
         }
       }
       await this.loadRememberedPeers();
+      this.refreshManualPeers();
       this.intervals.push(setInterval(() => this.announce(), ANNOUNCE_INTERVAL_MS));
       this.intervals.push(setInterval(() => void this.probePeers(), settings.checkIntervalSeconds * 1000));
       this.intervals.push(setInterval(() => this.sweepPeers(), PEER_SWEEP_INTERVAL_MS));
@@ -883,6 +1010,7 @@ export class NtfyLanSync {
       ]);
     }
     this.peers.clear();
+    this.emitPeersChanged();
     this.replayCache.clear();
     this.rateByClient.clear();
     this.activityFiles = [];
@@ -911,7 +1039,8 @@ export class NtfyLanSync {
       syncConfigFolder: raw.syncConfigFolder === true,
       configDir: normalizedConfigDir(raw.configDir),
       port: normalizedPort(raw.port),
-      maxFileBytes: normalizedMaxFileBytes(raw.maxFileBytes)
+      maxFileBytes: normalizedMaxFileBytes(raw.maxFileBytes),
+      manualPeers: Array.isArray(raw.manualPeers) ? raw.manualPeers.map(String).slice(0, 32) : []
     };
   }
 
@@ -1014,17 +1143,69 @@ export class NtfyLanSync {
     return next;
   }
 
-  private localAddresses(): string[] {
+  private localInterfaces(): LanNetworkInterface[] {
     const os = nodeRequire<NodeOs>("node:os") ?? nodeRequire<NodeOs>("os");
     if (!os) return [];
-    const addresses: string[] = [];
-    for (const rows of Object.values(os.networkInterfaces())) {
+    const interfaces: LanNetworkInterface[] = [];
+    for (const [name, rows] of Object.entries(os.networkInterfaces())) {
       for (const row of rows ?? []) {
         if (row.family !== "IPv4" || row.internal || !isPrivateLanAddress(row.address) || row.address === "127.0.0.1") continue;
-        addresses.push(row.address);
+        interfaces.push({
+          name,
+          address: row.address,
+          netmask: row.netmask,
+          broadcast: ipv4BroadcastAddress(row.address, row.netmask) ?? "255.255.255.255",
+          linkType: classifyLanLinkType(name, row.address)
+        });
       }
     }
-    return [...new Set(addresses)].sort();
+    return interfaces.sort((left, right) => left.address.localeCompare(right.address));
+  }
+
+  private localAddresses(): string[] {
+    return [...new Set(this.localInterfaces().map((item) => item.address))];
+  }
+
+  private linkTypeForAddress(address: string, interfaces = this.localInterfaces()): LanLinkType {
+    const addressParts = address.split(".").map(Number);
+    for (const item of interfaces) {
+      const localParts = item.address.split(".").map(Number);
+      const maskParts = item.netmask.split(".").map(Number);
+      if (addressParts.length === 4 && maskParts.length === 4 && addressParts.every((part, index) => (part & maskParts[index]) === (localParts[index] & maskParts[index]))) {
+        return item.linkType;
+      }
+    }
+    return "lan";
+  }
+
+  private refreshManualPeers(): void {
+    const configured = new Set<string>();
+    for (const value of this.settings().manualPeers) {
+      const endpoint = normalizeManualLanPeer(value, this.settings().port);
+      if (!endpoint) continue;
+      const endpointKey = `${endpoint.address}:${endpoint.port}`;
+      configured.add(endpointKey);
+      const existing = [...this.peers.values()].find((peer) => peer.manual && peer.port === endpoint.port && peer.addresses.has(endpoint.address));
+      if (existing) continue;
+      const key = `manual:${endpoint.address}:${endpoint.port}`;
+      const peer = this.upsertPeer(key, endpoint.port, [endpoint.address], 0, true, true);
+      peer.manual = true;
+    }
+    for (const [key, peer] of this.peers) {
+      if (peer.manual && ![...peer.addresses].some((address) => configured.has(`${address}:${peer.port}`))) this.peers.delete(key);
+    }
+  }
+
+  private emitPeersChanged(): void {
+    const peers = this.listPeers();
+    const fingerprint = JSON.stringify(peers);
+    if (fingerprint === this.lastPeerFingerprint) return;
+    this.lastPeerFingerprint = fingerprint;
+    try {
+      this.options.onPeersChanged?.(peers);
+    } catch {
+      // Peer UI updates must not interrupt discovery.
+    }
   }
 
   private async publishPeerDescriptor(): Promise<void> {
@@ -1078,7 +1259,7 @@ export class NtfyLanSync {
         if (!descriptor || descriptor.vaultId !== this.identity.vaultId || descriptor.deviceId === this.deviceId) continue;
         const updatedAt = Date.parse(descriptor.updatedAt);
         if (!Number.isFinite(updatedAt) || this.now() - updatedAt > REMEMBERED_PEER_MAX_AGE_MS) continue;
-        this.upsertPeer(descriptor.deviceId, descriptor.port, descriptor.addresses, 0, true);
+        this.upsertPeer(descriptor.deviceId, descriptor.port, descriptor.addresses, 0, true, false);
       } catch {
         // Ignore malformed/stale descriptors without changing them.
       }
@@ -1160,6 +1341,9 @@ export class NtfyLanSync {
     if (packet.byteLength > 1024) return;
     this.socket.send(packet, DISCOVERY_PORT, MULTICAST_ADDRESS, () => undefined);
     this.socket.send(packet, DISCOVERY_PORT, "255.255.255.255", () => undefined);
+    for (const broadcast of new Set(this.localInterfaces().map((item) => item.broadcast))) {
+      if (broadcast !== "255.255.255.255") this.socket.send(packet, DISCOVERY_PORT, broadcast, () => undefined);
+    }
   }
 
   private handleAnnouncement(message: Buffer, remote: RemoteInfo): void {
@@ -1171,14 +1355,14 @@ export class NtfyLanSync {
       const port = normalizedPort(raw.port, 0);
       const address = normalizeRemoteAddress(remote.address);
       if (!port || !isPrivateLanAddress(address)) return;
-      const peer = this.upsertPeer(raw.deviceId, port, [address], this.now(), true);
+      const peer = this.upsertPeer(raw.deviceId, port, [address], this.now(), true, false);
       void this.verifyPeer(peer);
     } catch {
       // Discovery packets are untrusted and intentionally ignored on failure.
     }
   }
 
-  private upsertPeer(deviceId: string, port: number, addresses: string[], seenAt: number, canHost: boolean): LanSyncPeer {
+  private upsertPeer(deviceId: string, port: number, addresses: string[], seenAt: number, canHost: boolean, manual = false): LanSyncPeer {
     let peer = this.peers.get(deviceId);
     if (!peer) {
       peer = {
@@ -1191,12 +1375,14 @@ export class NtfyLanSync {
         lastProbeAt: 0,
         lastSyncAt: 0,
         probing: false,
+        manual,
         policy: passivePeerPolicy()
       };
       this.peers.set(deviceId, peer);
     }
     peer.port = normalizedPort(port);
     peer.canHost = peer.canHost || canHost;
+    peer.manual = peer.manual || manual;
     peer.lastSeenAt = Math.max(peer.lastSeenAt, seenAt);
     for (const address of addresses.map(normalizeRemoteAddress)) {
       if (isPrivateLanAddress(address)) peer.addresses.add(address);
@@ -1211,7 +1397,8 @@ export class NtfyLanSync {
       this.peers.get(deviceId)?.port ?? this.settings().port,
       isPrivateLanAddress(address) ? [address] : [],
       this.now(),
-      this.peers.get(deviceId)?.canHost === true
+      this.peers.get(deviceId)?.canHost === true,
+      false
     );
     peer.verifiedAt = this.now();
     this.lastTransferAt = this.now();
@@ -1221,6 +1408,7 @@ export class NtfyLanSync {
       active: true,
       peerId: deviceId
     });
+    this.emitPeersChanged();
   }
 
   private beginInboundFileActivity(deviceId: string, route: string, payload: Record<string, unknown>): number | null {
@@ -1271,6 +1459,43 @@ export class NtfyLanSync {
     });
   }
 
+  private normalizeMessagePayload(value: unknown, deviceId: string): LanSyncIncomingMessage {
+    const raw = isRecord(value) ? value : {};
+    const id = typeof raw.id === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(raw.id) ? raw.id : randomId(18);
+    const text = typeof raw.text === "string" ? raw.text.trim().slice(0, MAX_MESSAGE_TEXT_LENGTH) : "";
+    const sentAtDate = new Date(typeof raw.sentAt === "string" ? raw.sentAt : this.now());
+    const sentAt = Number.isFinite(sentAtDate.getTime()) ? sentAtDate.toISOString() : new Date(this.now()).toISOString();
+    const attachments = (Array.isArray(raw.attachments) ? raw.attachments : []).slice(0, MAX_MESSAGE_ATTACHMENTS).map((item) => {
+      if (!isRecord(item)) throw new LanSyncProtocolError("invalid_message_attachment");
+      const path = this.normalizePath(item.path, false);
+      const hash = typeof item.hash === "string" ? item.hash : "";
+      const size = Number(item.size);
+      if (!path || !/^[A-Za-z0-9_-]{32,64}$/.test(hash) || !Number.isFinite(size) || size < 0 || size > this.settings().maxFileBytes) {
+        throw new LanSyncProtocolError("invalid_message_attachment");
+      }
+      return {
+        name: String(item.name || path.split("/").pop() || "attachment").slice(0, 240),
+        path,
+        size,
+        hash
+      };
+    });
+    if (!text && !attachments.length) throw new LanSyncProtocolError("empty_message");
+    return { id, deviceId, text, sentAt, attachments };
+  }
+
+  private async handleIncomingMessage(deviceId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const message = this.normalizeMessagePayload(payload, deviceId);
+    for (const attachment of message.attachments) {
+      const stat = await this.options.storage.statFile(attachment.path);
+      if (!stat || stat.size !== attachment.size || stat.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("message_attachment_unavailable", 409);
+      const hash = await sha256Bytes(await this.options.storage.readBinary(attachment.path));
+      if (hash !== attachment.hash) throw new LanSyncProtocolError("message_attachment_mismatch", 409);
+    }
+    await this.options.onMessage?.(message);
+    return { ok: true, id: message.id };
+  }
+
   private async verifyPeer(peer: LanSyncPeer): Promise<void> {
     const now = this.now();
     const minimumProbeInterval = Math.max(300, this.settings().checkIntervalSeconds * 1000);
@@ -1279,12 +1504,29 @@ export class NtfyLanSync {
     peer.lastProbeAt = now;
     try {
       const response = await this.callPeer(peer, "/ping", {});
-      if (response.protocolVersion !== PROTOCOL_VERSION || response.deviceId !== peer.deviceId) throw new Error("peer_identity_mismatch");
+      const responseDeviceId = typeof response.deviceId === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(response.deviceId) ? response.deviceId : "";
+      if (response.protocolVersion !== PROTOCOL_VERSION || !responseDeviceId) throw new Error("peer_identity_mismatch");
+      if (responseDeviceId !== peer.deviceId) {
+        if (!peer.manual) throw new Error("peer_identity_mismatch");
+        const oldKey = [...this.peers.entries()].find(([, candidate]) => candidate === peer)?.[0] ?? "";
+        const existing = this.peers.get(responseDeviceId);
+        if (existing && existing !== peer) {
+          for (const address of peer.addresses) existing.addresses.add(address);
+          existing.port = peer.port;
+          existing.manual = true;
+          peer = existing;
+        } else {
+          peer.deviceId = responseDeviceId;
+          this.peers.set(responseDeviceId, peer);
+        }
+        if (oldKey && oldKey !== responseDeviceId) this.peers.delete(oldKey);
+      }
       peer.policy = policyFromRaw(response.policy);
       peer.verifiedAt = this.now();
       peer.lastSeenAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
       this.lastErrorValue = "";
       this.emit({ ...defaultProgress("connected"), active: true, peerId: peer.deviceId });
+      this.emitPeersChanged();
       this.scheduleSync(20);
     } catch {
       // A remembered endpoint can be offline or reassigned. It is not active
@@ -1297,7 +1539,9 @@ export class NtfyLanSync {
   private async probePeers(): Promise<void> {
     if (!this.runningValue) return;
     await this.refreshIdentityIfChanged();
+    this.refreshManualPeers();
     await Promise.all([...this.peers.values()].slice(0, 16).map(async (peer) => await this.verifyPeer(peer)));
+    this.emitPeersChanged();
   }
 
   private activePeers(): LanSyncPeer[] {
@@ -1312,6 +1556,7 @@ export class NtfyLanSync {
     const active = this.activePeers();
     if (!active.length) {
       if (this.progressValue.active) this.emit({ ...defaultProgress("discovering"), active: false });
+      this.emitPeersChanged();
       return;
     }
     if (this.progressValue.phase === "syncing" && !this.syncRunning && this.now() - this.lastTransferAt > 500) {
@@ -1365,7 +1610,7 @@ export class NtfyLanSync {
       this.syncRunning = false;
       if (this.syncQueued) {
         this.syncQueued = false;
-        this.scheduleSync(120);
+        this.scheduleSync(120, true);
       }
     }
   }
@@ -1786,6 +2031,8 @@ export class NtfyLanSync {
         result = await this.handleWriteFile(payload);
       } else if (path === `${API_PREFIX}/file/delete`) {
         result = await this.handleDeleteFile(payload);
+      } else if (path === `${API_PREFIX}/message/send`) {
+        result = await this.handleIncomingMessage(deviceId, payload);
       } else {
         throw new LanSyncProtocolError("not_found", 404);
       }

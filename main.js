@@ -629,6 +629,8 @@ const DEFAULT_SETTINGS = {
   quietHoursStart: "22:00",
   quietHoursEnd: "07:00",
   incomingMessages: [],
+  conversationMessages: [],
+  conversationPreferences: {},
   incomingSeenKeys: [],
   outboundQueue: [],
   connectionLogs: [],
@@ -668,6 +670,7 @@ const DEFAULT_SETTINGS = {
   lanSyncSyncConfigFolder: false,
   lanSyncPort: 43190,
   lanSyncMaxFileMb: 50,
+  lanSyncManualPeers: "",
 };
 
 const DATE_TIME_RE = /(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})(?:日)?(?:[\sT　]+(\d{1,2}:\d{2}))?/;
@@ -753,12 +756,15 @@ var NtfyLanSyncRuntime = (() => {
     LanStatusBarTakeover: () => LanStatusBarTakeover,
     NtfyLanSync: () => NtfyLanSync,
     buildLanConflictPath: () => buildLanConflictPath,
+    classifyLanLinkType: () => classifyLanLinkType,
     createLanSyncRequestHeaders: () => createLanSyncRequestHeaders,
     decryptLanSyncPayload: () => decryptLanSyncPayload,
     encryptLanSyncPayload: () => encryptLanSyncPayload,
+    ipv4BroadcastAddress: () => ipv4BroadcastAddress,
     isLanSyncPathEligible: () => isLanSyncPathEligible,
     isPrivateLanAddress: () => isPrivateLanAddress,
     normalizeLanSyncPath: () => normalizeLanSyncPath,
+    normalizeManualLanPeer: () => normalizeManualLanPeer,
     planLanSyncReconciliation: () => planLanSyncReconciliation,
     verifyLanSyncRequest: () => verifyLanSyncRequest
   });
@@ -781,6 +787,8 @@ var NtfyLanSyncRuntime = (() => {
   var RATE_WINDOW_MS = 6e4;
   var RATE_LIMIT = 1200;
   var DEVICE_ID_STORAGE_KEY = "cancip.lan-sync.device-id.v1";
+  var MAX_MESSAGE_TEXT_LENGTH = 32e3;
+  var MAX_MESSAGE_ATTACHMENTS = 12;
   var LanSyncProtocolError = class extends Error {
     constructor(code, status = 400) {
       super(code);
@@ -946,6 +954,30 @@ var NtfyLanSyncRuntime = (() => {
     if (lower.startsWith(`${configRoot}/cache/`) || lower.startsWith(`${configRoot}/.cache/`)) return null;
     if (lower === `${configRoot}/plugins/remotely-save` || lower.startsWith(`${configRoot}/plugins/remotely-save/`)) return null;
     return normalized;
+  }
+  function classifyLanLinkType(name, address = "") {
+    const value = `${name} ${address}`.toLocaleLowerCase();
+    if (/bluetooth|\bbnep\b|\bpan\b/.test(value)) return "bluetooth-pan";
+    if (/\b(?:r?ndis)\b|usb|tether/.test(value)) return "usb";
+    if (/hotspot|mobile hotspot|local area connection\*|192\.168\.137\./.test(value)) return "hotspot";
+    if (/wi-?fi|wlan|wireless|802\.11/.test(value)) return "wifi";
+    if (/ethernet|以太网|\beth\d*\b|en\d+/.test(value)) return "ethernet";
+    return "lan";
+  }
+  function ipv4BroadcastAddress(address, netmask) {
+    const addressParts = address.split(".").map(Number);
+    const maskParts = netmask.split(".").map(Number);
+    if (addressParts.length !== 4 || maskParts.length !== 4) return null;
+    if ([...addressParts, ...maskParts].some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return null;
+    return addressParts.map((part, index) => (part | ~maskParts[index] & 255) >>> 0).join(".");
+  }
+  function normalizeManualLanPeer(value, fallbackPort = 43190) {
+    const raw = typeof value === "string" ? value.trim() : "";
+    const match = /^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?$/.exec(raw);
+    if (!match || !isPrivateLanAddress(match[1])) return null;
+    if (match[2] && (Number(match[2]) < 1024 || Number(match[2]) > 65527)) return null;
+    const port = normalizedPort(match[2] || fallbackPort, 0);
+    return port ? { address: match[1].split(".").map((part) => String(Number(part))).join("."), port } : null;
   }
   function isLanSyncPathEligible(value, options = {}) {
     return normalizeLanSyncPath(value, options) !== null;
@@ -1294,6 +1326,7 @@ ${bodyHash}`;
     activityFiles = [];
     activityUpdatedAt = 0;
     lastErrorValue = "";
+    lastPeerFingerprint = "";
     running() {
       return this.runningValue;
     }
@@ -1308,6 +1341,64 @@ ${bodyHash}`;
         progress: { ...this.progressValue },
         files: this.activityFiles.map((file) => ({ ...file }))
       };
+    }
+    listPeers() {
+      const now = this.now();
+      const localInterfaces = this.localInterfaces();
+      return [...this.peers.values()].filter((peer) => peer.verifiedAt > 0).map((peer) => {
+        const address = [...peer.addresses][0] ?? "";
+        const detectedLink = this.linkTypeForAddress(address, localInterfaces);
+        return {
+          deviceId: peer.deviceId,
+          address,
+          port: peer.port,
+          linkType: peer.manual && detectedLink === "lan" ? "manual" : detectedLink,
+          verified: now - peer.verifiedAt <= Math.max(4500, this.settings().checkIntervalSeconds * 3e3 + 1e3),
+          lastSeenAt: Math.max(peer.lastSeenAt, peer.verifiedAt)
+        };
+      }).filter((peer) => peer.verified).sort((left, right) => left.deviceId.localeCompare(right.deviceId));
+    }
+    async sendMessage(deviceId, input) {
+      const peer = this.activePeers().find((candidate) => candidate.deviceId === deviceId);
+      if (!peer) throw new Error("peer_unavailable");
+      const message = this.normalizeMessagePayload(input, this.deviceId);
+      const response = await this.callPeer(peer, "/message/send", message);
+      if (response.ok !== true || response.id !== message.id) throw new Error("message_delivery_failed");
+      return { id: message.id };
+    }
+    async sendFile(deviceId, path) {
+      const peer = this.activePeers().find((candidate) => candidate.deviceId === deviceId);
+      const normalized = this.normalizePath(path);
+      if (!peer) throw new Error("peer_unavailable");
+      if (!normalized) throw new LanSyncProtocolError("unsafe_path");
+      const stat = await this.options.storage.statFile(normalized);
+      if (!stat || stat.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("file_unavailable", 404);
+      const bytes = new Uint8Array(await this.options.storage.readBinary(normalized));
+      const hash = await sha256Bytes(bytes);
+      this.activityFiles = [{ path: normalized, action: "push", state: "syncing", size: bytes.byteLength }];
+      this.activityUpdatedAt = this.now();
+      this.emit({ ...defaultProgress("syncing"), active: true, peerId: peer.deviceId, total: 1, bytesTotal: bytes.byteLength });
+      try {
+        const remote = await this.callPeer(peer, "/manifest", { syncConfigFolder: false });
+        const entries = this.parseManifest(remote.files, false);
+        const existing = entries.find((entry) => entry.path === normalized);
+        let remotePath = normalized;
+        if (existing && existing.hash !== hash) remotePath = buildLanConflictPath(normalized, this.deviceId, hash, this.pathOptions(false));
+        this.activityFiles[0].path = remotePath;
+        await this.writeRemoteIfMissingOrSame(peer, remotePath, bytes, hash);
+        this.activityFiles[0].state = "complete";
+        this.emit({ ...defaultProgress("complete"), active: true, peerId: peer.deviceId, completed: 1, total: 1, bytesTransferred: bytes.byteLength, bytesTotal: bytes.byteLength, changed: 1 });
+        return {
+          name: remotePath.split("/").pop() || remotePath,
+          path: remotePath,
+          size: bytes.byteLength,
+          hash
+        };
+      } catch (error) {
+        this.activityFiles[0].state = "error";
+        this.emit({ ...defaultProgress("error"), active: true, peerId: peer.deviceId, total: 1, bytesTotal: bytes.byteLength, error: safeErrorCode(error) });
+        throw error;
+      }
     }
     status() {
       return {
@@ -1342,6 +1433,7 @@ ${bodyHash}`;
           }
         }
         await this.loadRememberedPeers();
+        this.refreshManualPeers();
         this.intervals.push(setInterval(() => this.announce(), ANNOUNCE_INTERVAL_MS));
         this.intervals.push(setInterval(() => void this.probePeers(), settings.checkIntervalSeconds * 1e3));
         this.intervals.push(setInterval(() => this.sweepPeers(), PEER_SWEEP_INTERVAL_MS));
@@ -1387,6 +1479,7 @@ ${bodyHash}`;
         ]);
       }
       this.peers.clear();
+      this.emitPeersChanged();
       this.replayCache.clear();
       this.rateByClient.clear();
       this.activityFiles = [];
@@ -1412,7 +1505,8 @@ ${bodyHash}`;
         syncConfigFolder: raw.syncConfigFolder === true,
         configDir: normalizedConfigDir(raw.configDir),
         port: normalizedPort(raw.port),
-        maxFileBytes: normalizedMaxFileBytes(raw.maxFileBytes)
+        maxFileBytes: normalizedMaxFileBytes(raw.maxFileBytes),
+        manualPeers: Array.isArray(raw.manualPeers) ? raw.manualPeers.map(String).slice(0, 32) : []
       };
     }
     policy() {
@@ -1503,17 +1597,64 @@ ${bodyHash}`;
       }
       return next;
     }
-    localAddresses() {
+    localInterfaces() {
       const os = nodeRequire("node:os") ?? nodeRequire("os");
       if (!os) return [];
-      const addresses = [];
-      for (const rows of Object.values(os.networkInterfaces())) {
+      const interfaces = [];
+      for (const [name, rows] of Object.entries(os.networkInterfaces())) {
         for (const row of rows ?? []) {
           if (row.family !== "IPv4" || row.internal || !isPrivateLanAddress(row.address) || row.address === "127.0.0.1") continue;
-          addresses.push(row.address);
+          interfaces.push({
+            name,
+            address: row.address,
+            netmask: row.netmask,
+            broadcast: ipv4BroadcastAddress(row.address, row.netmask) ?? "255.255.255.255",
+            linkType: classifyLanLinkType(name, row.address)
+          });
         }
       }
-      return [...new Set(addresses)].sort();
+      return interfaces.sort((left, right) => left.address.localeCompare(right.address));
+    }
+    localAddresses() {
+      return [...new Set(this.localInterfaces().map((item) => item.address))];
+    }
+    linkTypeForAddress(address, interfaces = this.localInterfaces()) {
+      const addressParts = address.split(".").map(Number);
+      for (const item of interfaces) {
+        const localParts = item.address.split(".").map(Number);
+        const maskParts = item.netmask.split(".").map(Number);
+        if (addressParts.length === 4 && maskParts.length === 4 && addressParts.every((part, index) => (part & maskParts[index]) === (localParts[index] & maskParts[index]))) {
+          return item.linkType;
+        }
+      }
+      return "lan";
+    }
+    refreshManualPeers() {
+      const configured = /* @__PURE__ */ new Set();
+      for (const value of this.settings().manualPeers) {
+        const endpoint = normalizeManualLanPeer(value, this.settings().port);
+        if (!endpoint) continue;
+        const endpointKey = `${endpoint.address}:${endpoint.port}`;
+        configured.add(endpointKey);
+        const existing = [...this.peers.values()].find((peer2) => peer2.manual && peer2.port === endpoint.port && peer2.addresses.has(endpoint.address));
+        if (existing) continue;
+        const key = `manual:${endpoint.address}:${endpoint.port}`;
+        const peer = this.upsertPeer(key, endpoint.port, [endpoint.address], 0, true, true);
+        peer.manual = true;
+      }
+      for (const [key, peer] of this.peers) {
+        if (peer.manual && ![...peer.addresses].some((address) => configured.has(`${address}:${peer.port}`))) this.peers.delete(key);
+      }
+    }
+    emitPeersChanged() {
+      const peers = this.listPeers();
+      const fingerprint = JSON.stringify(peers);
+      if (fingerprint === this.lastPeerFingerprint) return;
+      this.lastPeerFingerprint = fingerprint;
+      try {
+        this.options.onPeersChanged?.(peers);
+      } catch {
+      }
     }
     async publishPeerDescriptor() {
       if (!this.identity || !this.boundPort) return;
@@ -1561,7 +1702,7 @@ ${bodyHash}`;
           if (!descriptor || descriptor.vaultId !== this.identity.vaultId || descriptor.deviceId === this.deviceId) continue;
           const updatedAt = Date.parse(descriptor.updatedAt);
           if (!Number.isFinite(updatedAt) || this.now() - updatedAt > REMEMBERED_PEER_MAX_AGE_MS) continue;
-          this.upsertPeer(descriptor.deviceId, descriptor.port, descriptor.addresses, 0, true);
+          this.upsertPeer(descriptor.deviceId, descriptor.port, descriptor.addresses, 0, true, false);
         } catch {
         }
       }
@@ -1637,6 +1778,9 @@ ${bodyHash}`;
       if (packet.byteLength > 1024) return;
       this.socket.send(packet, DISCOVERY_PORT, MULTICAST_ADDRESS, () => void 0);
       this.socket.send(packet, DISCOVERY_PORT, "255.255.255.255", () => void 0);
+      for (const broadcast of new Set(this.localInterfaces().map((item) => item.broadcast))) {
+        if (broadcast !== "255.255.255.255") this.socket.send(packet, DISCOVERY_PORT, broadcast, () => void 0);
+      }
     }
     handleAnnouncement(message, remote) {
       if (!this.identity || message.byteLength > 1024) return;
@@ -1647,12 +1791,12 @@ ${bodyHash}`;
         const port = normalizedPort(raw.port, 0);
         const address = normalizeRemoteAddress(remote.address);
         if (!port || !isPrivateLanAddress(address)) return;
-        const peer = this.upsertPeer(raw.deviceId, port, [address], this.now(), true);
+        const peer = this.upsertPeer(raw.deviceId, port, [address], this.now(), true, false);
         void this.verifyPeer(peer);
       } catch {
       }
     }
-    upsertPeer(deviceId, port, addresses, seenAt, canHost) {
+    upsertPeer(deviceId, port, addresses, seenAt, canHost, manual = false) {
       let peer = this.peers.get(deviceId);
       if (!peer) {
         peer = {
@@ -1665,12 +1809,14 @@ ${bodyHash}`;
           lastProbeAt: 0,
           lastSyncAt: 0,
           probing: false,
+          manual,
           policy: passivePeerPolicy()
         };
         this.peers.set(deviceId, peer);
       }
       peer.port = normalizedPort(port);
       peer.canHost = peer.canHost || canHost;
+      peer.manual = peer.manual || manual;
       peer.lastSeenAt = Math.max(peer.lastSeenAt, seenAt);
       for (const address of addresses.map(normalizeRemoteAddress)) {
         if (isPrivateLanAddress(address)) peer.addresses.add(address);
@@ -1684,7 +1830,8 @@ ${bodyHash}`;
         this.peers.get(deviceId)?.port ?? this.settings().port,
         isPrivateLanAddress(address) ? [address] : [],
         this.now(),
-        this.peers.get(deviceId)?.canHost === true
+        this.peers.get(deviceId)?.canHost === true,
+        false
       );
       peer.verifiedAt = this.now();
       this.lastTransferAt = this.now();
@@ -1694,6 +1841,7 @@ ${bodyHash}`;
         active: true,
         peerId: deviceId
       });
+      this.emitPeersChanged();
     }
     beginInboundFileActivity(deviceId, route, payload) {
       if (!route.includes("/file/")) return null;
@@ -1734,6 +1882,41 @@ ${bodyHash}`;
         error: phase === "error" ? "inbound_transfer_failed" : ""
       });
     }
+    normalizeMessagePayload(value, deviceId) {
+      const raw = isRecord(value) ? value : {};
+      const id = typeof raw.id === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(raw.id) ? raw.id : randomId(18);
+      const text = typeof raw.text === "string" ? raw.text.trim().slice(0, MAX_MESSAGE_TEXT_LENGTH) : "";
+      const sentAtDate = new Date(typeof raw.sentAt === "string" ? raw.sentAt : this.now());
+      const sentAt = Number.isFinite(sentAtDate.getTime()) ? sentAtDate.toISOString() : new Date(this.now()).toISOString();
+      const attachments = (Array.isArray(raw.attachments) ? raw.attachments : []).slice(0, MAX_MESSAGE_ATTACHMENTS).map((item) => {
+        if (!isRecord(item)) throw new LanSyncProtocolError("invalid_message_attachment");
+        const path = this.normalizePath(item.path, false);
+        const hash = typeof item.hash === "string" ? item.hash : "";
+        const size = Number(item.size);
+        if (!path || !/^[A-Za-z0-9_-]{32,64}$/.test(hash) || !Number.isFinite(size) || size < 0 || size > this.settings().maxFileBytes) {
+          throw new LanSyncProtocolError("invalid_message_attachment");
+        }
+        return {
+          name: String(item.name || path.split("/").pop() || "attachment").slice(0, 240),
+          path,
+          size,
+          hash
+        };
+      });
+      if (!text && !attachments.length) throw new LanSyncProtocolError("empty_message");
+      return { id, deviceId, text, sentAt, attachments };
+    }
+    async handleIncomingMessage(deviceId, payload) {
+      const message = this.normalizeMessagePayload(payload, deviceId);
+      for (const attachment of message.attachments) {
+        const stat = await this.options.storage.statFile(attachment.path);
+        if (!stat || stat.size !== attachment.size || stat.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("message_attachment_unavailable", 409);
+        const hash = await sha256Bytes(await this.options.storage.readBinary(attachment.path));
+        if (hash !== attachment.hash) throw new LanSyncProtocolError("message_attachment_mismatch", 409);
+      }
+      await this.options.onMessage?.(message);
+      return { ok: true, id: message.id };
+    }
     async verifyPeer(peer) {
       const now = this.now();
       const minimumProbeInterval = Math.max(300, this.settings().checkIntervalSeconds * 1e3);
@@ -1742,12 +1925,29 @@ ${bodyHash}`;
       peer.lastProbeAt = now;
       try {
         const response = await this.callPeer(peer, "/ping", {});
-        if (response.protocolVersion !== PROTOCOL_VERSION || response.deviceId !== peer.deviceId) throw new Error("peer_identity_mismatch");
+        const responseDeviceId = typeof response.deviceId === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(response.deviceId) ? response.deviceId : "";
+        if (response.protocolVersion !== PROTOCOL_VERSION || !responseDeviceId) throw new Error("peer_identity_mismatch");
+        if (responseDeviceId !== peer.deviceId) {
+          if (!peer.manual) throw new Error("peer_identity_mismatch");
+          const oldKey = [...this.peers.entries()].find(([, candidate]) => candidate === peer)?.[0] ?? "";
+          const existing = this.peers.get(responseDeviceId);
+          if (existing && existing !== peer) {
+            for (const address of peer.addresses) existing.addresses.add(address);
+            existing.port = peer.port;
+            existing.manual = true;
+            peer = existing;
+          } else {
+            peer.deviceId = responseDeviceId;
+            this.peers.set(responseDeviceId, peer);
+          }
+          if (oldKey && oldKey !== responseDeviceId) this.peers.delete(oldKey);
+        }
         peer.policy = policyFromRaw(response.policy);
         peer.verifiedAt = this.now();
         peer.lastSeenAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
         this.lastErrorValue = "";
         this.emit({ ...defaultProgress("connected"), active: true, peerId: peer.deviceId });
+        this.emitPeersChanged();
         this.scheduleSync(20);
       } catch {
       } finally {
@@ -1757,7 +1957,9 @@ ${bodyHash}`;
     async probePeers() {
       if (!this.runningValue) return;
       await this.refreshIdentityIfChanged();
+      this.refreshManualPeers();
       await Promise.all([...this.peers.values()].slice(0, 16).map(async (peer) => await this.verifyPeer(peer)));
+      this.emitPeersChanged();
     }
     activePeers() {
       const now = this.now();
@@ -1768,6 +1970,7 @@ ${bodyHash}`;
       const active = this.activePeers();
       if (!active.length) {
         if (this.progressValue.active) this.emit({ ...defaultProgress("discovering"), active: false });
+        this.emitPeersChanged();
         return;
       }
       if (this.progressValue.phase === "syncing" && !this.syncRunning && this.now() - this.lastTransferAt > 500) {
@@ -1817,7 +2020,7 @@ ${bodyHash}`;
         this.syncRunning = false;
         if (this.syncQueued) {
           this.syncQueued = false;
-          this.scheduleSync(120);
+          this.scheduleSync(120, true);
         }
       }
     }
@@ -2210,6 +2413,8 @@ ${bodyHash}`;
           result = await this.handleWriteFile(payload);
         } else if (path === `${API_PREFIX}/file/delete`) {
           result = await this.handleDeleteFile(payload);
+        } else if (path === `${API_PREFIX}/message/send`) {
+          result = await this.handleIncomingMessage(deviceId, payload);
         } else {
           throw new LanSyncProtocolError("not_found", 404);
         }
@@ -2459,6 +2664,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.lanSyncProgress = this.emptyLanSyncProgress();
     this.remotelySaveStatusTakeover = new LanStatusBarTakeover();
     this.lanStatusBarEl = null;
+    this.lanStatusBarIconEl = null;
     this.lanStatusBarTextEl = null;
     this.localReminderTimer = null;
     this.isQueueHandoffRunning = false;
@@ -2775,6 +2981,16 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     settings.queue = Array.isArray(settings.queue) ? settings.queue : [];
     settings.obsidianNotices = Array.isArray(settings.obsidianNotices) ? settings.obsidianNotices : [];
     settings.incomingMessages = Array.isArray(settings.incomingMessages) ? settings.incomingMessages.slice(0, 200) : [];
+    const migratedConversationMessages = settings.incomingMessages.map((message) => this.normalizeConversationMessage(Object.assign({}, message, {
+      direction: "incoming",
+      status: "received",
+      timestamp: message.receivedAt,
+    }))).filter(Boolean);
+    settings.conversationMessages = (data && Array.isArray(data.conversationMessages) ? data.conversationMessages : migratedConversationMessages)
+      .map((message) => this.normalizeConversationMessage(message))
+      .filter(Boolean)
+      .slice(-1000);
+    settings.conversationPreferences = this.normalizeConversationPreferences(settings.conversationPreferences);
     settings.incomingSeenKeys = data && Array.isArray(data.incomingSeenKeys)
       ? data.incomingSeenKeys.map(String).filter(Boolean).slice(-1000)
       : settings.incomingMessages.map((message) => `${String(message.channelId || "unknown")}:${String(message.id || "")}`).filter((key) => !key.endsWith(":"));
@@ -2801,6 +3017,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     settings.lanSyncSyncConfigFolder = settings.lanSyncSyncConfigFolder === true;
     settings.lanSyncPort = Math.max(1024, Math.min(65527, this.safePositiveNumber(settings.lanSyncPort, DEFAULT_SETTINGS.lanSyncPort)));
     settings.lanSyncMaxFileMb = Math.max(1, Math.min(512, this.safePositiveNumber(settings.lanSyncMaxFileMb, DEFAULT_SETTINGS.lanSyncMaxFileMb)));
+    settings.lanSyncManualPeers = String(settings.lanSyncManualPeers || "").slice(0, 4096);
     settings.qqbotGatewayIntents = Math.max(0, Number(settings.qqbotGatewayIntents || QQ_BOT_GATEWAY_INTENTS) >>> 0);
     settings.agentWebhookEnabled = data && typeof data.agentWebhookEnabled === "boolean"
       ? data.agentWebhookEnabled
@@ -2888,6 +3105,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       error: service?.error ?? this.lanSyncProgress.error,
       desktop: !Platform.isMobileApp,
       phase: this.lanSyncProgress.phase,
+      peers: this.lanSync?.listPeers?.() || [],
     };
   }
 
@@ -2920,6 +3138,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         configDir,
         port: this.settings.lanSyncPort,
         maxFileBytes: this.settings.lanSyncMaxFileMb * 1024 * 1024,
+        manualPeers: String(this.settings.lanSyncManualPeers || "").split(/[,;\n]/).map((value) => value.trim()).filter(Boolean),
       }),
       storage: {
         identityRoot,
@@ -2999,6 +3218,22 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         this.renderLanSyncStatusBar();
         this.lanSyncDetailsModal?.refresh();
       },
+      onPeersChanged: () => {
+        if (this.app?.workspace?.trigger) this.app.workspace.trigger("notification-hub:peers-changed", this.lanSync?.listPeers?.() || []);
+      },
+      onMessage: async (message) => {
+        const peer = this.lanSync?.listPeers?.().find((item) => item.deviceId === message.deviceId);
+        await this.ingestIncomingMessage({
+          id: message.id,
+          channelId: "lan",
+          sender: peer?.address || message.deviceId.slice(0, 8),
+          conversationId: message.deviceId,
+          text: message.text,
+          attachments: message.attachments.map((attachment) => Object.assign({ type: "application/octet-stream" }, attachment)),
+          receivedAt: message.sentAt,
+          metadata: { lanDeviceId: message.deviceId, lanLinkType: peer?.linkType || "lan" },
+        }, { awaitHandler: false });
+      },
     });
     this.lanSync = service;
     try {
@@ -3030,6 +3265,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     item.style.display = "none";
     const icon = item.createSpan({ cls: "obsidian-ntfy-lan-statusbar-icon" });
     setIcon(icon, "wifi");
+    this.lanStatusBarIconEl = icon;
     this.lanStatusBarTextEl = item.createSpan({ cls: "obsidian-ntfy-lan-statusbar-text" });
     item.setAttribute("role", "button");
     item.tabIndex = 0;
@@ -3097,6 +3333,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       return;
     }
     const label = this.lanSyncStatusText();
+    const peer = (this.lanSyncStatus().peers || []).find((candidate) => candidate.deviceId === this.lanSyncProgress.peerId) || (this.lanSyncStatus().peers || [])[0];
+    const linkIcon = peer?.linkType === "bluetooth-pan" ? "bluetooth" : peer?.linkType === "usb" ? "usb" : peer?.linkType === "hotspot" ? "radio-tower" : "wifi";
+    if (this.lanStatusBarIconEl) setIcon(this.lanStatusBarIconEl, linkIcon);
     text.setText(label);
     const connectedLabel = this.currentUiLanguage() === "zh" ? "局域网已连接" : "LAN connected";
     const accessibleLabel = label ? `${connectedLabel} ${label}` : connectedLabel;
@@ -3354,6 +3593,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       receive: (input) => this.ingestIncomingMessage(input || {}),
       reply: (messageId, replyText, channelId) => this.replyToStoredIncomingMessage(messageId, replyText, channelId),
       listIncomingMessages: () => [...(this.settings.incomingMessages || [])],
+      listConversations: () => this.conversationContacts(),
+      listConversationMessages: (conversationKey) => (this.settings.conversationMessages || []).filter((message) => !conversationKey || message.conversationKey === conversationKey),
+      sendConversationMessage: (conversationKey, text, filePaths) => this.sendConversationMessage(conversationKey, text, filePaths),
+      markConversationRead: (conversationKey) => this.markConversationRead(conversationKey),
       getIncomingStatus: () => this.getIncomingStatus(),
       pollIncoming: (options) => this.runIncomingPoll(options || {}),
       retryIncoming: (messageId, channelId) => this.retryIncomingMessage(messageId, channelId),
@@ -3779,6 +4022,230 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return Boolean(this.incomingMessageHandlers && this.incomingMessageHandlers.delete(String(consumerId || "").trim().toLowerCase()));
   }
 
+  conversationKey(channelId, conversationId = "") {
+    const channel = String(channelId || "unknown").trim().toLowerCase().slice(0, 64) || "unknown";
+    const conversation = String(conversationId || "default").trim().slice(0, 512) || "default";
+    return `${channel}::${conversation}`;
+  }
+
+  normalizeConversationPreferences(value) {
+    const result = {};
+    if (!value || typeof value !== "object" || Array.isArray(value)) return result;
+    for (const [key, raw] of Object.entries(value).slice(0, 500)) {
+      if (!key.includes("::") || key.length > 600 || !raw || typeof raw !== "object") continue;
+      result[key] = {
+        muted: raw.muted === true,
+        pinned: raw.pinned === true,
+        lastReadAt: String(raw.lastReadAt || "").slice(0, 64),
+      };
+    }
+    return result;
+  }
+
+  normalizeConversationMessage(input = {}) {
+    if (!input || typeof input !== "object") return null;
+    const channelId = String(input.channelId || input.channel || "unknown").trim().toLowerCase().slice(0, 64) || "unknown";
+    const conversationId = String(input.conversationId || input.chatId || input.roomId || input.metadata && input.metadata.lanDeviceId || "default").trim().slice(0, 512) || "default";
+    const direction = input.direction === "outgoing" ? "outgoing" : "incoming";
+    const date = new Date(input.timestamp || input.sentAt || input.receivedAt || Date.now());
+    return {
+      id: String(input.id || this.hash(`${channelId}:${conversationId}:${direction}:${Date.now()}`)).slice(0, 256),
+      channelId,
+      conversationId,
+      conversationKey: this.conversationKey(channelId, conversationId),
+      direction,
+      sender: String(input.sender || (direction === "outgoing" ? "me" : "unknown")).trim().slice(0, 256) || "unknown",
+      title: String(input.title || input.sender || channelId).slice(0, 512),
+      text: String(input.text || input.message || "").slice(0, 100000),
+      attachments: Array.isArray(input.attachments) ? input.attachments.slice(0, 32).map((attachment) => ({
+        name: String(attachment && attachment.name || "attachment").slice(0, 512),
+        type: String(attachment && attachment.type || "").slice(0, 128),
+        size: Math.max(0, Number(attachment && attachment.size || 0)),
+        url: String(attachment && attachment.url || "").slice(0, 4096),
+        path: String(attachment && attachment.path || "").replace(/\\/g, "/").slice(0, 1024),
+        hash: String(attachment && attachment.hash || "").slice(0, 128),
+      })) : [],
+      timestamp: Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString(),
+      status: ["sending", "sent", "failed", "received"].includes(input.status) ? input.status : direction === "outgoing" ? "sent" : "received",
+      error: String(input.error || "").slice(0, 512),
+      metadata: this.normalizeIncomingMetadata(input.metadata),
+    };
+  }
+
+  recordConversationMessage(input) {
+    const message = this.normalizeConversationMessage(input);
+    if (!message) return null;
+    const key = `${message.channelId}:${message.id}:${message.direction}`;
+    const messages = (this.settings.conversationMessages || []).filter((item) => `${item.channelId}:${item.id}:${item.direction}` !== key);
+    this.settings.conversationMessages = [...messages, message].slice(-1000);
+    return message;
+  }
+
+  conversationPreference(key) {
+    return Object.assign({ muted: false, pinned: false, lastReadAt: "" }, this.settings.conversationPreferences && this.settings.conversationPreferences[key] || {});
+  }
+
+  async updateConversationPreference(key, patch) {
+    if (!String(key || "").includes("::")) return;
+    this.settings.conversationPreferences = Object.assign({}, this.settings.conversationPreferences || {}, {
+      [key]: Object.assign(this.conversationPreference(key), patch || {}),
+    });
+    await this.saveSettings();
+    this.app?.workspace?.trigger?.("notification-hub:conversations-changed");
+  }
+
+  async markConversationRead(key) {
+    await this.updateConversationPreference(key, { lastReadAt: new Date().toISOString() });
+  }
+
+  conversationContacts() {
+    const messages = this.settings.conversationMessages || [];
+    const contacts = new Map();
+    const iconByType = { ntfy: "bell", feishu: "message-square", telegram: "send", matrix: "messages-square", qqbot: "message-circle", discord: "messages-square", slack: "hash", wecom: "building-2", email: "mail" };
+    for (const channel of this.listNotificationChannels()) {
+      if (!channel.enabled) continue;
+      const key = this.conversationKey(channel.id, "default");
+      contacts.set(key, {
+        id: key,
+        kind: "channel",
+        channelId: channel.id,
+        conversationId: "default",
+        name: channel.name || channel.id,
+        subtitle: channel.type || channel.id,
+        icon: iconByType[channel.type] || "message-circle",
+        online: channel.deliveryReady === true,
+        metadata: {},
+      });
+    }
+    for (const peer of this.lanSync?.listPeers?.() || []) {
+      const key = this.conversationKey("lan", peer.deviceId);
+      contacts.set(key, {
+        id: key,
+        kind: "lan",
+        channelId: "lan",
+        conversationId: peer.deviceId,
+        deviceId: peer.deviceId,
+        name: peer.address || peer.deviceId.slice(0, 8),
+        subtitle: `${peer.linkType} · ${peer.address}:${peer.port}`,
+        icon: peer.linkType === "bluetooth-pan" ? "bluetooth" : peer.linkType === "usb" ? "usb" : peer.linkType === "hotspot" ? "radio-tower" : "wifi",
+        online: peer.verified === true,
+        metadata: { lanDeviceId: peer.deviceId, lanLinkType: peer.linkType },
+      });
+    }
+    for (const message of messages) {
+      const key = message.conversationKey || this.conversationKey(message.channelId, message.conversationId);
+      const current = contacts.get(key);
+      if (!current) {
+        contacts.set(key, {
+          id: key,
+          kind: message.channelId === "lan" ? "lan" : "conversation",
+          channelId: message.channelId,
+          conversationId: message.conversationId,
+          deviceId: message.metadata && message.metadata.lanDeviceId || "",
+          name: message.title || message.sender || message.conversationId || message.channelId,
+          subtitle: message.channelId,
+          icon: message.channelId === "lan" ? "wifi" : iconByType[message.channelId.split(":")[0]] || "message-circle",
+          online: message.channelId === "lan" ? false : true,
+          metadata: message.metadata || {},
+        });
+      } else if (message.direction === "incoming") {
+        current.name = message.title || message.sender || current.name;
+        current.metadata = Object.assign({}, current.metadata || {}, message.metadata || {});
+      }
+    }
+    const now = Date.now();
+    return [...contacts.values()].map((contact) => {
+      const conversationMessages = messages.filter((message) => message.conversationKey === contact.id);
+      const latest = conversationMessages[conversationMessages.length - 1] || null;
+      const preference = this.conversationPreference(contact.id);
+      const lastRead = new Date(preference.lastReadAt || 0).getTime();
+      return Object.assign(contact, {
+        preference,
+        latest,
+        unread: conversationMessages.filter((message) => message.direction === "incoming" && new Date(message.timestamp).getTime() > lastRead).length,
+        sortTime: latest ? new Date(latest.timestamp).getTime() : contact.online ? now : 0,
+      });
+    }).sort((left, right) => Number(right.preference.pinned) - Number(left.preference.pinned) || right.sortTime - left.sortTime || left.name.localeCompare(right.name));
+  }
+
+  async clearConversation(key) {
+    this.settings.conversationMessages = (this.settings.conversationMessages || []).filter((message) => message.conversationKey !== key);
+    await this.saveSettings();
+    this.app?.workspace?.trigger?.("notification-hub:conversations-changed");
+  }
+
+  async removeConversationMessage(messageId, direction = "") {
+    const before = (this.settings.conversationMessages || []).length;
+    this.settings.conversationMessages = (this.settings.conversationMessages || []).filter((message) => !(String(message.id) === String(messageId) && (!direction || message.direction === direction)));
+    if (before !== this.settings.conversationMessages.length) await this.saveSettings();
+  }
+
+  async sendConversationMessage(contactId, text, filePaths = []) {
+    const contact = this.conversationContacts().find((item) => item.id === contactId);
+    if (!contact) throw new Error("Conversation is unavailable.");
+    const content = String(text || "").trim().slice(0, 32000);
+    const paths = [...new Set((filePaths || []).map((path) => normalizePath(String(path || ""))).filter(Boolean))].slice(0, 12);
+    if (!content && !paths.length) throw new Error("Message or file is required.");
+    if (paths.length && contact.channelId !== "lan") {
+      const account = this.getChannelAccount(contact.channelId);
+      const supportsVaultFiles = account && (account.type === "ntfy" || account.type === "feishu" && String(account.config && account.config.mode || "app") === "app");
+      if (!supportsVaultFiles) throw new Error("This connection cannot upload local Vault files.");
+    }
+    const id = this.hash(`${Date.now()}:${contact.id}:${content}:${paths.join("|")}`);
+    const localAttachments = paths.map((path) => {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) throw new Error(`Vault file not found: ${path}`);
+      return { name: file.name, type: file.extension ? `application/${file.extension}` : "application/octet-stream", size: file.stat.size, path: file.path, url: "" };
+    });
+    this.validateIncomingAttachments({ channelId: contact.channelId, attachments: localAttachments });
+    const message = this.recordConversationMessage({
+      id,
+      channelId: contact.channelId,
+      conversationId: contact.conversationId,
+      direction: "outgoing",
+      sender: "me",
+      title: contact.name,
+      text: content,
+      attachments: localAttachments,
+      timestamp: new Date().toISOString(),
+      status: "sending",
+      metadata: contact.metadata || {},
+    });
+    await this.saveSettings();
+    this.app?.workspace?.trigger?.("notification-hub:conversations-changed");
+    try {
+      let sentAttachments = localAttachments;
+      if (contact.kind === "lan" || contact.channelId === "lan") {
+        if (!this.lanSync) throw new Error("LAN peer is offline.");
+        sentAttachments = [];
+        for (const path of paths) sentAttachments.push(await this.lanSync.sendFile(contact.deviceId || contact.conversationId, path));
+        await this.lanSync.sendMessage(contact.deviceId || contact.conversationId, { id, text: content, attachments: sentAttachments });
+      } else {
+        const latestIncoming = [...(this.settings.conversationMessages || [])].reverse().find((item) => item.conversationKey === contact.id && item.direction === "incoming");
+        await this.sendNotification({
+          id,
+          source: "conversation",
+          event: "message",
+          title: contact.name,
+          message: content || localAttachments.map((attachment) => attachment.name).join(", "),
+          channelIds: [contact.channelId],
+          attachments: localAttachments,
+          metadata: Object.assign({}, latestIncoming && latestIncoming.metadata || {}, contact.metadata || {}, { conversationId: contact.conversationId }),
+          allowRuntimeTarget: true,
+          allowRecentTarget: true,
+        });
+      }
+      Object.assign(message, { status: "sent", attachments: sentAttachments, error: "" });
+    } catch (error) {
+      Object.assign(message, { status: "failed", error: this.redactSensitiveText(error.message || String(error), true) });
+      throw error;
+    } finally {
+      await this.saveSettings();
+      this.app?.workspace?.trigger?.("notification-hub:conversations-changed");
+    }
+    return message;
+  }
+
   normalizeIncomingMessage(input = {}) {
     const channelId = String(input.channelId || input.channel || "ntfy").trim().toLowerCase().slice(0, 64) || "unknown";
     const sender = String(input.sender || input.from || "unknown").trim().slice(0, 256) || "unknown";
@@ -3789,6 +4256,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       type: String(attachment && attachment.type || "").slice(0, 128),
       size: Math.max(0, Number(attachment && attachment.size || 0)),
       url: String(attachment && attachment.url || "").slice(0, 4096),
+      path: String(attachment && attachment.path || "").replace(/\\/g, "/").slice(0, 1024),
+      hash: String(attachment && attachment.hash || "").slice(0, 128),
     })) : [];
     const receivedAt = new Date(input.receivedAt || Date.now());
     return {
@@ -3841,9 +4310,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   }
 
   validateIncomingAttachments(message) {
-    const maxBytes = Math.max(1, Number(this.settings.attachmentLimitMb || 8)) * 1024 * 1024;
+    const maxMb = String(message && message.channelId || "") === "lan"
+      ? Math.max(1, Number(this.settings.lanSyncMaxFileMb || 50))
+      : Math.max(1, Number(this.settings.attachmentLimitMb || 8));
+    const maxBytes = maxMb * 1024 * 1024;
     const oversized = (message.attachments || []).find((attachment) => Number(attachment.size || 0) > maxBytes);
-    if (oversized) throw new Error(`Attachment '${oversized.name}' exceeds ${this.settings.attachmentLimitMb} MB.`);
+    if (oversized) throw new Error(`Attachment '${oversized.name}' exceeds ${maxMb} MB.`);
   }
 
   isQuietHours(date = new Date()) {
@@ -4034,18 +4506,25 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
     this.rememberIncomingMessage(message);
     this.settings.incomingMessages = [message, ...(this.settings.incomingMessages || [])].slice(0, 200);
+    const conversationMessage = this.recordConversationMessage(Object.assign({}, message, {
+      direction: "incoming",
+      status: "received",
+      timestamp: message.receivedAt,
+    }));
     this.recordConnectionLog("info", message.channelId, "Incoming message received", { sender: message.sender, conversationId: message.conversationId });
     this.updateChannelHealth(message.channelId, {
       verificationState: "verified",
       lastInboundAt: new Date().toISOString(),
       lastError: "",
     });
-    const quiet = this.isQuietHours();
+    const muted = conversationMessage ? this.conversationPreference(conversationMessage.conversationKey).muted : false;
+    const quiet = this.isQuietHours() || muted;
     if (!quiet) new Notice(`[${message.channelId}] ${message.sender}: ${message.text || message.title}`);
 
     if (this.app && this.app.workspace && typeof this.app.workspace.trigger === "function") {
       try {
         this.app.workspace.trigger("notification-hub:incoming", message, { hubApi: this.api, quiet });
+        this.app.workspace.trigger("notification-hub:conversations-changed", conversationMessage);
       } catch (error) {
         this.recordConnectionLog("error", message.channelId, "Incoming workspace event failed", { error: error.message || String(error) });
       }
@@ -5109,6 +5588,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         type: String(attachment && attachment.type || ""),
         size: Math.max(0, Number(attachment && attachment.size || 0)),
         url: String(attachment && attachment.url || ""),
+        path: String(attachment && attachment.path || "").replace(/\\/g, "/").slice(0, 1024),
+        hash: String(attachment && attachment.hash || "").slice(0, 128),
       })) : [],
       metadata: input.metadata && typeof input.metadata === "object" ? input.metadata : {},
     };
@@ -5346,6 +5827,15 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       }
       if (config.authToken) headers.Authorization = `Bearer ${String(config.authToken).trim()}`;
       if (notification.scheduledAt) headers.At = Math.floor(this.normalizeScheduledAt(new Date(notification.scheduledAt)).getTime() / 1000).toString();
+      const vaultAttachments = (notification.attachments || []).filter((attachment) => attachment.path);
+      if (!placeholder && vaultAttachments.length) {
+        return {
+          channelAction: "ntfy-vault-files",
+          url: this.requireHttpUrl(url, "ntfy topic"),
+          headers,
+          notification,
+        };
+      }
       return {
         url: this.requireHttpUrl(url, "ntfy topic"),
         method: "POST",
@@ -5579,9 +6069,70 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return token;
   }
 
+  async readVaultConversationFile(attachment) {
+    const path = normalizePath(String(attachment && attachment.path || ""));
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile) || file.path !== path) throw new Error("Vault attachment is unavailable.");
+    const maxBytes = Math.max(1, Number(this.settings.attachmentLimitMb || 8)) * 1024 * 1024;
+    if (file.stat.size > maxBytes) throw new Error(`Attachment '${file.name}' exceeds ${this.settings.attachmentLimitMb} MB.`);
+    const data = new Uint8Array(await this.app.vault.readBinary(file));
+    if (data.byteLength !== file.stat.size) throw new Error("Vault attachment changed while reading.");
+    return { file, data };
+  }
+
+  multipartFileBody(fields, fileName, data) {
+    const boundary = `----obsidian-ntfy-${this.hash(`${Date.now()}:${fileName}`).slice(0, 24)}`;
+    const encoder = new TextEncoder();
+    const parts = [];
+    for (const [name, value] of Object.entries(fields || {})) {
+      parts.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${String(name).replace(/["\r\n]/g, "")}"\r\n\r\n${String(value)}\r\n`));
+    }
+    const safeName = String(fileName || "attachment").replace(/["\r\n]/g, "_");
+    parts.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${safeName}"\r\nContent-Type: application/octet-stream\r\n\r\n`));
+    parts.push(data);
+    parts.push(encoder.encode(`\r\n--${boundary}--\r\n`));
+    const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+    const body = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      body.set(part, offset);
+      offset += part.byteLength;
+    }
+    return { boundary, body: body.buffer };
+  }
+
   async executeBuiltinChannelRequest(descriptor, request) {
     const channelId = descriptor.id;
     const channelType = descriptor.type;
+    if (request.channelAction === "ntfy-vault-files") {
+      const attachments = (request.notification && request.notification.attachments || []).filter((attachment) => attachment.path).slice(0, 12);
+      let messageId = "";
+      const uploadedIds = [];
+      for (let index = 0; index < attachments.length; index += 1) {
+        const { file, data } = await this.readVaultConversationFile(attachments[index]);
+        const headers = Object.assign({}, request.headers, {
+          "Content-Type": "application/octet-stream",
+          Filename: this.safeHeader(file.name),
+          Message: this.safeHeader(index === 0 ? request.notification.message : ""),
+          "X-Message-ID": this.ntfyMessageId(`${request.notification.id}-${index}`),
+        });
+        const response = await this.httpRequest({ url: request.url, method: "POST", headers, body: data.buffer, throw: true });
+        const json = await this.responseJson(response);
+        const currentId = String(json && json.id || "").trim();
+        if (!currentId) throw new Error("ntfy file upload returned no message ID.");
+        uploadedIds.push(currentId);
+        if (!messageId) messageId = currentId;
+      }
+      const account = this.getChannelAccount(channelId);
+      if (account) {
+        const known = new Set(account.config && account.config.receivedIds || []);
+        for (const id of uploadedIds) known.add(id);
+        account.config.receivedIds = [...known].slice(-500);
+        this.syncLegacyChannelAccount(account);
+        await this.saveSettings();
+      }
+      return { channelId, ok: true, status: "sent", messageId, attachmentCount: attachments.length };
+    }
     if (request.channelAction === "qqbot-official") {
       const config = request.config || {};
       const token = await this.getQqBotAccessToken(config);
@@ -5643,7 +6194,38 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       if (!json || Number(json.code || 0) !== 0) throw new Error(json && json.msg || `Feishu error ${json && json.code !== undefined ? json.code : "invalid response"}`);
       const messageId = String(json.data && json.data.message_id || "").trim();
       if (!messageId) throw new Error("Feishu message send returned no message ID.");
-      return { channelId, ok: true, status: "sent", messageId };
+      const attachments = (request.notification && request.notification.attachments || []).filter((attachment) => attachment.path).slice(0, 12);
+      for (const attachment of attachments) {
+        const { file, data } = await this.readVaultConversationFile(attachment);
+        const multipart = this.multipartFileBody({ file_type: "stream", file_name: file.name }, file.name, data);
+        const uploadResponse = await this.httpRequest({
+          url: `${apiBase}/open-apis/im/v1/files`,
+          method: "POST",
+          headers: { "Content-Type": `multipart/form-data; boundary=${multipart.boundary}`, Authorization: `Bearer ${token}` },
+          body: multipart.body,
+          throw: true,
+        });
+        const uploadJson = await this.responseJson(uploadResponse);
+        const fileKey = String(uploadJson && uploadJson.data && uploadJson.data.file_key || "").trim();
+        if (!fileKey || Number(uploadJson && uploadJson.code || 0) !== 0) throw new Error(uploadJson && uploadJson.msg || "Feishu file upload failed.");
+        const fileResponse = await this.httpRequest({
+          url: replyMessageId
+            ? `${apiBase}/open-apis/im/v1/messages/${encodeURIComponent(replyMessageId)}/reply`
+            : `${apiBase}/open-apis/im/v1/messages?receive_id_type=${encodeURIComponent(config.receiveIdType || "chat_id")}`,
+          method: "POST",
+          headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${token}` },
+          body: JSON.stringify(Object.assign(
+            { msg_type: "file", content: JSON.stringify({ file_key: fileKey }) },
+            replyMessageId ? {} : { receive_id: config.receiveId }
+          )),
+          throw: true,
+        });
+        const fileJson = await this.responseJson(fileResponse);
+        if (!fileJson || Number(fileJson.code || 0) !== 0 || !String(fileJson.data && fileJson.data.message_id || "")) {
+          throw new Error(fileJson && fileJson.msg || "Feishu file send failed.");
+        }
+      }
+      return { channelId, ok: true, status: "sent", messageId, attachmentCount: attachments.length };
     }
     if (request.channelAction === "wecom-app") {
       const config = request.config || {};
@@ -7593,6 +8175,34 @@ class IncomingMessageReplyModal extends Modal {
   }
 }
 
+class NtfyVaultFileSuggestModal extends SuggestModal {
+  constructor(app, plugin, onChoose) {
+    super(app);
+    this.plugin = plugin;
+    this.onChoose = onChoose;
+    this.setPlaceholder(plugin.uiText("选择要发送的 Vault 文件", "Select a Vault file to send"));
+  }
+
+  getSuggestions(query) {
+    const value = String(query || "").trim().toLocaleLowerCase();
+    const maxBytes = Math.max(1, Number(this.plugin.settings.lanSyncMaxFileMb || 50), Number(this.plugin.settings.attachmentLimitMb || 8)) * 1024 * 1024;
+    return this.app.vault.getFiles()
+      .filter((file) => file.stat.size <= maxBytes && (!value || file.path.toLocaleLowerCase().includes(value)))
+      .slice(0, 200);
+  }
+
+  renderSuggestion(file, el) {
+    el.addClass("obsidian-ntfy-suggest-item");
+    el.createDiv({ cls: "obsidian-ntfy-suggest-title", text: file.name });
+    const size = file.stat.size < 1024 * 1024 ? `${Math.max(1, Math.ceil(file.stat.size / 1024))} KB` : `${(file.stat.size / 1024 / 1024).toFixed(1)} MB`;
+    el.createDiv({ cls: "obsidian-ntfy-suggest-note", text: `${file.path} · ${size}` });
+  }
+
+  onChooseSuggestion(file) {
+    this.onChoose(file);
+  }
+}
+
 class NtfyManagerView extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
@@ -7607,6 +8217,9 @@ class NtfyManagerView extends ItemView {
     this.tabSignatures = new Map();
     this.tabScrollPositions = new Map();
     this.tabRefreshes = new Map();
+    this.activeConversationId = "";
+    this.mobileConversationOpen = false;
+    this.selectedConversationFiles = [];
   }
 
   getViewType() {
@@ -7624,6 +8237,8 @@ class NtfyManagerView extends ItemView {
   async onOpen() {
     if (this.app.workspace && typeof this.app.workspace.on === "function" && typeof this.registerEvent === "function") {
       this.registerEvent(this.app.workspace.on("notification-hub:incoming", () => this.refreshIncomingView()));
+      this.registerEvent(this.app.workspace.on("notification-hub:conversations-changed", () => this.refreshIncomingView()));
+      this.registerEvent(this.app.workspace.on("notification-hub:peers-changed", () => this.refreshIncomingView()));
     }
     const preload = this.plugin.consumeManagerViewPreload();
     if (preload) this.setPreloadedData(preload);
@@ -7723,7 +8338,11 @@ class NtfyManagerView extends ItemView {
     let value = null;
     if (tabId === "pending") value = { tasks: this.notificationTasks, scanError: this.scanError };
     else if (tabId === "completed" || tabId === "tasks") value = this.vaultTasks;
-    else if (tabId === "inbox") value = this.plugin.settings.incomingMessages || [];
+    else if (tabId === "inbox") value = {
+      messages: this.plugin.settings.conversationMessages || [],
+      preferences: this.plugin.settings.conversationPreferences || {},
+      peers: this.plugin.lanSyncStatus().peers || [],
+    };
     else if (tabId === "queue") value = { queue: this.plugin.settings.queue || [], notices: this.plugin.settings.obsidianNotices || [] };
     else if (tabId === "connections") value = { channels: this.plugin.settings.channelAccounts || [], logs: this.plugin.settings.connectionLogs || [] };
     try {
@@ -7835,56 +8454,208 @@ class NtfyManagerView extends ItemView {
     this.renderNavItem(nav, "pending", "alarm-clock", "待处理", this.notificationTasks.length);
     this.renderNavItem(nav, "completed", "check-check", "已完成", taskGroups.done.length);
     this.renderNavItem(nav, "tasks", "library", "整库待办", taskGroups.openUntimed.length);
-    this.renderNavItem(nav, "inbox", "inbox", "收件", (this.plugin.settings.incomingMessages || []).length);
+    this.renderNavItem(nav, "inbox", "messages-square", "消息", this.plugin.conversationContacts().reduce((sum, contact) => sum + contact.unread, 0));
   }
 
   renderIncomingMessages(containerEl) {
-    const messages = this.plugin.settings.incomingMessages || [];
-    const group = containerEl.createDiv({ cls: "obsidian-ntfy-section" });
-    this.renderSectionHeader(group, "收到的消息", messages.length, "来自 ntfy、Telegram、Matrix 或统一 receive API 的入站消息。");
-    const controls = group.createDiv({ cls: "obsidian-ntfy-controls" });
-    this.iconButton(controls, "refresh-cw", "立即接收", "secondary", async () => {
+    const contacts = this.plugin.conversationContacts();
+    const compact = typeof window !== "undefined" && window.matchMedia && window.matchMedia("(max-width: 600px)").matches;
+    if (this.activeConversationId && !contacts.some((contact) => contact.id === this.activeConversationId)) this.activeConversationId = "";
+    if (!this.activeConversationId && contacts.length && !compact) this.activeConversationId = contacts[0].id;
+    const active = contacts.find((contact) => contact.id === this.activeConversationId) || null;
+    const hub = containerEl.createDiv({ cls: `obsidian-ntfy-chat${this.mobileConversationOpen && active ? " is-conversation-open" : ""}` });
+    const sidebar = hub.createDiv({ cls: "obsidian-ntfy-chat-sidebar" });
+    const sidebarHead = sidebar.createDiv({ cls: "obsidian-ntfy-chat-sidebar-head" });
+    sidebarHead.createEl("h3", { text: this.uiText("消息", "Messages") });
+    const sidebarActions = sidebarHead.createDiv({ cls: "obsidian-ntfy-chat-toolbar" });
+    this.iconButton(sidebarActions, "refresh-cw", this.uiText("立即接收", "Receive now"), "secondary", async () => {
       await this.plugin.runIncomingPoll();
-      await this.render();
+      this.renderTabPanel("inbox");
     });
-    this.iconButton(controls, "trash-2", "清空收件", "danger", async () => {
-      await this.plugin.clearIncomingMessages();
-      await this.render();
-    });
-    if (!messages.length) {
-      group.createEl("p", { cls: "obsidian-ntfy-muted", text: "暂无收到的消息。" });
+    const contactList = sidebar.createDiv({ cls: "obsidian-ntfy-chat-contacts" });
+    if (!contacts.length) {
+      const empty = contactList.createDiv({ cls: "obsidian-ntfy-chat-empty" });
+      setIcon(empty.createSpan(), "messages-square");
+      empty.createDiv({ text: this.uiText("暂无可用连接", "No available connections") });
+    }
+    for (const contact of contacts) {
+      const row = contactList.createEl("button", {
+        cls: `obsidian-ntfy-chat-contact${contact.id === this.activeConversationId ? " is-active" : ""}`,
+        attr: { type: "button", title: contact.subtitle || contact.name },
+      });
+      const avatar = row.createSpan({ cls: "obsidian-ntfy-chat-avatar" });
+      setIcon(avatar, contact.icon || "message-circle");
+      avatar.createSpan({ cls: `obsidian-ntfy-chat-presence${contact.online ? " is-online" : ""}` });
+      const body = row.createSpan({ cls: "obsidian-ntfy-chat-contact-body" });
+      const nameLine = body.createSpan({ cls: "obsidian-ntfy-chat-contact-name-line" });
+      nameLine.createSpan({ cls: "obsidian-ntfy-chat-contact-name", text: contact.name });
+      if (contact.preference.muted) setIcon(nameLine.createSpan({ cls: "obsidian-ntfy-chat-contact-state" }), "bell-off");
+      if (contact.preference.pinned) setIcon(nameLine.createSpan({ cls: "obsidian-ntfy-chat-contact-state" }), "pin");
+      const preview = contact.latest
+        ? contact.latest.text || (contact.latest.attachments || []).map((attachment) => attachment.name).join(", ")
+        : contact.subtitle;
+      body.createSpan({ cls: "obsidian-ntfy-chat-contact-preview", text: preview || "" });
+      const meta = row.createSpan({ cls: "obsidian-ntfy-chat-contact-meta" });
+      if (contact.latest) meta.createSpan({ text: this.chatTime(contact.latest.timestamp) });
+      if (contact.unread) meta.createSpan({ cls: "obsidian-ntfy-chat-unread", text: String(Math.min(99, contact.unread)) });
+      row.addEventListener("click", async () => {
+        this.activeConversationId = contact.id;
+        this.mobileConversationOpen = true;
+        this.selectedConversationFiles = [];
+        await this.plugin.markConversationRead(contact.id);
+        this.renderTabPanel("inbox");
+      });
+    }
+
+    const conversation = hub.createDiv({ cls: "obsidian-ntfy-chat-conversation" });
+    if (!active) {
+      const empty = conversation.createDiv({ cls: "obsidian-ntfy-chat-empty" });
+      setIcon(empty.createSpan(), "message-circle");
+      empty.createDiv({ text: this.uiText("选择一个好友开始会话", "Choose a contact to start a conversation") });
       return;
     }
+    const header = conversation.createDiv({ cls: "obsidian-ntfy-chat-header" });
+    const back = this.iconButton(header, "arrow-left", this.uiText("返回好友列表", "Back to contacts"), "secondary", () => {
+      this.mobileConversationOpen = false;
+      this.renderTabPanel("inbox");
+    });
+    back.addClass("obsidian-ntfy-chat-back");
+    const identity = header.createDiv({ cls: "obsidian-ntfy-chat-identity" });
+    identity.createDiv({ cls: "obsidian-ntfy-chat-title", text: active.name });
+    identity.createDiv({ cls: "obsidian-ntfy-chat-subtitle", text: active.subtitle || active.channelId });
+    const actions = header.createDiv({ cls: "obsidian-ntfy-chat-toolbar" });
+    this.iconButton(actions, active.preference.pinned ? "pin-off" : "pin", active.preference.pinned ? this.uiText("取消置顶", "Unpin") : this.uiText("置顶", "Pin"), "secondary", async () => {
+      await this.plugin.updateConversationPreference(active.id, { pinned: !active.preference.pinned });
+      this.renderTabPanel("inbox");
+    });
+    this.iconButton(actions, active.preference.muted ? "bell" : "bell-off", active.preference.muted ? this.uiText("恢复通知", "Unmute") : this.uiText("静音通知", "Mute"), "secondary", async () => {
+      await this.plugin.updateConversationPreference(active.id, { muted: !active.preference.muted });
+      this.renderTabPanel("inbox");
+    });
+    this.iconButton(actions, "trash-2", this.uiText("清空会话", "Clear conversation"), "danger", async () => {
+      await this.plugin.clearConversation(active.id);
+      this.renderTabPanel("inbox");
+    });
+
+    const messageList = conversation.createDiv({ cls: "obsidian-ntfy-chat-messages" });
+    const messages = (this.plugin.settings.conversationMessages || []).filter((message) => message.conversationKey === active.id);
+    if (!messages.length) {
+      const empty = messageList.createDiv({ cls: "obsidian-ntfy-chat-empty is-compact" });
+      setIcon(empty.createSpan(), active.icon || "message-circle");
+    }
+    let lastDate = "";
     for (const message of messages) {
-      const row = group.createDiv({ cls: "obsidian-ntfy-item obsidian-ntfy-incoming-item" });
-      const content = row.createDiv({ cls: "obsidian-ntfy-task-content" });
-      const meta = content.createDiv({ cls: "obsidian-ntfy-item-meta" });
-      meta.createSpan({ cls: "obsidian-ntfy-tag", text: message.channelId || "channel" });
-      meta.createSpan({ cls: "obsidian-ntfy-muted", text: message.sender || "unknown" });
-      if (message.conversationId) meta.createSpan({ cls: "obsidian-ntfy-muted", text: message.conversationId });
-      content.createDiv({ cls: "obsidian-ntfy-task-text", text: message.text || message.title || "(empty)" });
-      if ((message.attachments || []).length) {
-        content.createDiv({
-          cls: "obsidian-ntfy-muted",
-          text: message.attachments.map((attachment) => `${attachment.name} (${Math.ceil(Number(attachment.size || 0) / 1024)} KB)`).join(" · "),
-        });
+      const date = new Date(message.timestamp);
+      const dateKey = Number.isNaN(date.getTime()) ? "" : date.toLocaleDateString();
+      if (dateKey && dateKey !== lastDate) {
+        messageList.createDiv({ cls: "obsidian-ntfy-chat-date", text: dateKey });
+        lastDate = dateKey;
       }
-      content.createDiv({ cls: "obsidian-ntfy-muted", text: this.plugin.formatLocalDateTime(new Date(message.receivedAt)) });
-      const actions = row.createDiv({ cls: "obsidian-ntfy-controls" });
-      if (this.plugin.settings.incomingAction !== "display") {
-        this.iconButton(actions, "rotate-ccw", "重新交给消费者", "secondary", async () => {
-          await this.plugin.retryIncomingMessage(message.id, message.channelId);
-          await this.render();
-        });
+      const row = messageList.createDiv({ cls: `obsidian-ntfy-chat-message is-${message.direction}` });
+      const bubble = row.createDiv({ cls: "obsidian-ntfy-chat-bubble" });
+      if (message.text) bubble.createDiv({ cls: "obsidian-ntfy-chat-text", text: message.text });
+      for (const attachment of message.attachments || []) this.renderConversationAttachment(bubble, attachment);
+      const messageMeta = bubble.createDiv({ cls: "obsidian-ntfy-chat-message-meta" });
+      messageMeta.createSpan({ text: this.chatTime(message.timestamp, true) });
+      if (message.direction === "outgoing") {
+        const statusIcon = message.status === "failed" ? "circle-alert" : message.status === "sending" ? "clock-3" : "check-check";
+        const status = messageMeta.createSpan({ cls: `obsidian-ntfy-chat-delivery is-${message.status || "sent"}`, attr: { title: message.error || message.status || "sent" } });
+        setIcon(status, statusIcon);
       }
-      this.iconButton(actions, "reply", "回复", "secondary", async () => {
-        new IncomingMessageReplyModal(this.app, this.plugin, message).open();
+      const messageActions = row.createDiv({ cls: "obsidian-ntfy-chat-message-actions" });
+      if (message.status === "failed") this.iconButton(messageActions, "rotate-ccw", this.uiText("重试", "Retry"), "secondary", async () => {
+        try {
+          await this.plugin.sendConversationMessage(active.id, message.text, (message.attachments || []).map((attachment) => attachment.path).filter(Boolean));
+        } catch (error) {
+          new Notice(`${PLUGIN_NAME}: ${error.message || error}`);
+        }
       });
-      this.iconButton(actions, "trash-2", "删除", "danger", async () => {
-        await this.plugin.removeIncomingMessage(message.id, message.channelId);
-        await this.render();
+      this.iconButton(messageActions, "trash-2", this.uiText("删除消息", "Delete message"), "danger", async () => {
+        await this.plugin.removeConversationMessage(message.id, message.direction);
+        this.renderTabPanel("inbox");
       });
     }
+
+    const composer = conversation.createDiv({ cls: "obsidian-ntfy-chat-composer" });
+    const selected = composer.createDiv({ cls: "obsidian-ntfy-chat-selected-files" });
+    const renderSelected = () => {
+      selected.empty();
+      for (const path of this.selectedConversationFiles) {
+        const chip = selected.createSpan({ cls: "obsidian-ntfy-chat-file-chip" });
+        chip.createSpan({ text: path.split("/").pop() || path });
+        const remove = this.iconButton(chip, "x", this.uiText("移除文件", "Remove file"), "secondary", () => {
+          this.selectedConversationFiles = this.selectedConversationFiles.filter((item) => item !== path);
+          renderSelected();
+        });
+        remove.addClass("obsidian-ntfy-chat-file-remove");
+      }
+    };
+    renderSelected();
+    const composeRow = composer.createDiv({ cls: "obsidian-ntfy-chat-compose-row" });
+    const account = this.plugin.getChannelAccount(active.channelId);
+    const canAttach = active.channelId === "lan" || account && (account.type === "ntfy" || account.type === "feishu" && String(account.config && account.config.mode || "app") === "app");
+    const attach = this.iconButton(composeRow, "paperclip", this.uiText("发送 Vault 文件", "Send Vault file"), "secondary", () => {
+      new NtfyVaultFileSuggestModal(this.app, this.plugin, (file) => {
+        if (!this.selectedConversationFiles.includes(file.path)) this.selectedConversationFiles.push(file.path);
+        renderSelected();
+      }).open();
+    });
+    attach.disabled = !canAttach || active.channelId === "lan" && !active.online;
+    const input = composeRow.createEl("textarea", {
+      cls: "obsidian-ntfy-chat-input",
+      attr: { rows: "1", placeholder: this.uiText("输入消息", "Message") },
+    });
+    const send = this.iconButton(composeRow, "send", this.uiText("发送", "Send"), "primary", async () => {
+      const text = input.value.trim();
+      const paths = [...this.selectedConversationFiles];
+      if (!text && !paths.length) return;
+      input.value = "";
+      this.selectedConversationFiles = [];
+      renderSelected();
+      send.disabled = true;
+      try {
+        await this.plugin.sendConversationMessage(active.id, text, paths);
+      } catch (error) {
+        new Notice(`${PLUGIN_NAME}: ${error.message || error}`);
+      } finally {
+        send.disabled = false;
+        this.renderTabPanel("inbox");
+      }
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        send.click();
+      }
+    });
+    if (active.channelId === "lan" && !active.online) {
+      input.disabled = true;
+      send.disabled = true;
+    }
+  }
+
+  chatTime(value, includeSeconds = false) {
+    const date = new Date(value || 0);
+    if (Number.isNaN(date.getTime())) return "";
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: includeSeconds ? "2-digit" : undefined });
+  }
+
+  renderConversationAttachment(containerEl, attachment) {
+    const path = String(attachment && attachment.path || "");
+    const url = String(attachment && attachment.url || "");
+    const label = `${attachment.name || path || "attachment"} · ${Math.max(1, Math.ceil(Number(attachment.size || 0) / 1024))} KB`;
+    const button = containerEl.createEl("button", { cls: "obsidian-ntfy-chat-attachment", attr: { type: "button", title: path || url } });
+    setIcon(button.createSpan(), path && path.toLowerCase().endsWith(".md") ? "file-text" : "file");
+    button.createSpan({ text: label });
+    button.disabled = !path && !/^https?:\/\//i.test(url);
+    button.addEventListener("click", async () => {
+      if (path) {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (file instanceof TFile) await this.app.workspace.getLeaf("tab").openFile(file, { active: true });
+        return;
+      }
+      if (/^https?:\/\//i.test(url)) window.open(url, "_blank", "noopener,noreferrer");
+    });
   }
 
   renderConnectionStatus(containerEl) {
@@ -8042,7 +8813,7 @@ class NtfyManagerView extends ItemView {
       if (id === "pending") badge.textContent = String(this.notificationTasks.length);
       if (id === "completed") badge.textContent = String(taskGroups.done.length);
       if (id === "tasks") badge.textContent = String(taskGroups.openUntimed.length);
-      if (id === "inbox") badge.textContent = String((this.plugin.settings.incomingMessages || []).length);
+      if (id === "inbox") badge.textContent = String(this.plugin.conversationContacts().reduce((sum, contact) => sum + contact.unread, 0));
     });
   }
 
@@ -9151,8 +9922,8 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
     const group = this.createSettingsSection(
       containerEl,
       "lan-sync",
-      this.uiText("局域网同步", "LAN synchronization"),
-      this.uiText("自动检测同库设备并高速同步。", "Automatically finds and quickly synchronizes matching vaults."),
+      this.uiText("近距离快速同步", "Nearby fast synchronization"),
+      this.uiText("自动使用局域网、热点、蓝牙网络共享或 USB 数据线网络同步同库设备。", "Automatically syncs matching vaults over LAN, hotspot, Bluetooth tethering, or USB tethering."),
       false
     );
     const status = this.plugin.lanSyncStatus();
@@ -9161,7 +9932,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       : status.error
         ? this.uiText(`错误：${status.error}`, `Error: ${status.error}`)
         : status.peerCount > 0
-          ? this.uiText(`已连接 ${status.peerCount} 台设备，端口 ${status.port}`, `${status.peerCount} device(s) connected on port ${status.port}`)
+          ? this.uiText(`已连接 ${status.peerCount} 台设备，${(status.peers || []).map((peer) => peer.linkType).filter((value, index, all) => all.indexOf(value) === index).join(" / ")}，端口 ${status.port}`, `${status.peerCount} device(s) connected via ${(status.peers || []).map((peer) => peer.linkType).filter((value, index, all) => all.indexOf(value) === index).join(" / ")} on port ${status.port}`)
           : status.desktop
             ? this.uiText("正在自动检测同库设备", "Automatically finding matching vaults")
             : this.uiText("等待局域网内的桌面端", "Waiting for a desktop peer on the LAN");
@@ -9174,7 +9945,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         .setDisabled(!status.running)
         .onClick(() => this.plugin.requestLanSync()));
     new Setting(group)
-      .setName(this.uiText("启用局域网同步", "Enable LAN synchronization"))
+      .setName(this.uiText("启用近距离同步", "Enable nearby synchronization"))
       .setDesc(this.uiText("默认开启；发现同库设备后自动同步。", "Enabled by default and starts automatically after finding a matching vault."))
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.lanSyncEnabled)).onChange(async (value) => {
         this.plugin.settings.lanSyncEnabled = value;
@@ -9184,13 +9955,27 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       }));
     new Setting(group)
       .setName(this.uiText("自动检测", "Automatic discovery"))
-      .setDesc(this.uiText("通过局域网广播和已记住的设备地址快速发现。", "Uses LAN discovery and remembered peer addresses for fast startup."))
+      .setDesc(this.uiText("对每张私网网卡使用组播和定向广播，自动识别 Wi-Fi、热点、蓝牙 PAN 与 USB/RNDIS。普通蓝牙需先开启蓝牙网络共享。", "Uses multicast and directed broadcast on every private interface and recognizes Wi-Fi, hotspot, Bluetooth PAN, and USB/RNDIS. Standard Bluetooth must have network tethering enabled."))
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.lanSyncAutoDiscovery)).onChange(async (value) => {
         this.plugin.settings.lanSyncAutoDiscovery = value;
         await this.plugin.saveSettings();
         await this.plugin.restartLanSync();
         this.display();
       }));
+    new Setting(group)
+      .setName(this.uiText("手动设备地址", "Manual peer addresses"))
+      .setDesc(this.uiText("用于热点或数据线屏蔽广播时直连。每行一个私网 IPv4，可带端口，例如 192.168.137.2:43190。", "Direct connection when hotspot or tethering blocks discovery. One private IPv4 per line, optionally with a port, such as 192.168.137.2:43190."))
+      .addTextArea((text) => {
+        text.setPlaceholder("192.168.137.2:43190").setValue(String(this.plugin.settings.lanSyncManualPeers || "")).onChange(async (value) => {
+          this.plugin.settings.lanSyncManualPeers = value.slice(0, 4096);
+          await this.plugin.saveSettings();
+        });
+        text.inputEl.rows = 3;
+        text.inputEl.addEventListener("blur", async () => {
+          await this.plugin.restartLanSync();
+          this.display();
+        });
+      });
     new Setting(group)
       .setName(this.uiText("检查间隔（秒）", "Check interval (seconds)"))
       .setDesc(this.uiText("可设置 1-300 秒，默认 2 秒。", "From 1 to 300 seconds; defaults to 2."))

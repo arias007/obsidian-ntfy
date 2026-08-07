@@ -39,17 +39,27 @@ The original Chinese/English UI remains the complete baseline. Other languages c
 - Switching tabs shows cached content immediately, then refreshes that tab in the background.
 - Unchanged background results do not rebuild the visible list.
 
-## Automatic LAN Vault Synchronization
+## Automatic Nearby Vault Synchronization
 
-LAN synchronization is enabled by default. Devices that share the same vault identity discover each other automatically on a private local network and transfer files directly while the normal notification channels continue running.
+Nearby synchronization is enabled by default. Devices that share the same vault identity discover each other automatically through existing private IP interfaces and transfer files directly while the normal notification channels continue running. The plugin only reads existing interfaces; it never enables or changes Windows networking.
 
 - The default bidirectional mode keeps the most recently edited version and preserves a conflict copy when both sides changed independently.
 - Four additional mutually exclusive modes are available: incremental push, incremental pull, deletion push, and deletion pull.
+- Discovery covers Ethernet/LAN, Wi-Fi, phone hotspots, Bluetooth PAN/network tethering, and USB/RNDIS tethering. Bluetooth must already expose a private IP network; generic BLE/OBEX is intentionally not claimed as a high-speed Vault transport.
+- Private IPv4 peers can be entered manually for hotspots or USB links that block broadcast discovery. Public hosts, hostnames, URLs, and arbitrary ports are rejected before any connection attempt; the endpoint is bound to a real device ID only after the encrypted same-vault ping succeeds.
 - The check interval is configurable from 1 to 300 seconds, and the per-file limit is configurable from 1 to 512 MB.
 - The Obsidian configuration folder is excluded by default. When enabled on both peers, safe configuration files are synchronized while workspace state, LAN identity, Remotely Save data, caches, `.git`, and `node_modules` remain excluded.
-- While a peer is connected, the status bar shows only a Wi-Fi icon and live `completed/total` progress. It may temporarily use the Remotely Save status slot without changing Remotely Save settings or background execution.
-- Clicking the Wi-Fi progress opens live file activity. Existing Markdown notes can be opened directly from that view.
+- While a peer is connected, the status bar shows only a link icon (Wi-Fi, hotspot, Bluetooth, or USB) and live `completed/total` progress. It may temporarily use the Remotely Save status slot without changing Remotely Save settings or background execution.
+- Clicking the link progress opens live file activity. Existing Markdown notes can be opened directly from that view.
 - The previous Cancip LAN identity is copied on first migration when available, allowing devices to be upgraded one at a time. The old file is not deleted.
+
+## Unified Message Center
+
+The manager's message tab uses a contact-and-conversation layout for configured ntfy, Feishu, other receive-capable channels, and authenticated nearby peers.
+
+- Incoming and outgoing messages share a persistent conversation history with unread counts, pinning, mute controls, clear conversation, delete message, delivery status, retry, and file attachment actions.
+- Nearby peers show their private IP and detected link type. LAN messages and Vault files use the same encrypted authenticated channel as synchronization; an existing remote path is never overwritten by an explicit file send when the content differs.
+- ntfy binary uploads and Feishu App file messages can send Vault files directly. Webhook-only channels remain text/URL-only so the UI never reports a local file as uploaded when the provider cannot accept it.
 
 ## Supported Reminder Syntax
 

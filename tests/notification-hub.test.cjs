@@ -114,6 +114,12 @@ async function run() {
   assert.match(source, /tab\.addEventListener\("click", \(\) => this\.activateTab\(id\)\)/);
   assert.doesNotMatch(source, /tab\.addEventListener\("click", async \(\) => \{\s*this\.activeTab = id;\s*await this\.render\(\)/);
   assert.match(styles, /\.obsidian-ntfy-tab-panel\.is-active\s*\{\s*display:\s*block/);
+  assert.match(styles, /\.obsidian-ntfy-chat\s*\{[\s\S]*?grid-template-columns:/);
+  assert.match(styles, /\.obsidian-ntfy-chat\.is-conversation-open \.obsidian-ntfy-chat-conversation/);
+  assert.match(source, /notification-hub:conversations-changed/);
+  assert.match(source, /class NtfyVaultFileSuggestModal extends SuggestModal/);
+  assert.match(source, /channelAction: "ntfy-vault-files"/);
+  assert.match(source, /msg_type: "file"/);
   assert.match(styles, /\.obsidian-ntfy-task-time\.is-editable/);
   assert.match(source, /selectSuggestion\(suggestion\)[\s\S]*?replaceRange\([\s\S]*?setCursor\(/);
   assert.match(source, /onChooseSuggestion\(suggestion\)[\s\S]*?replaceRange\([\s\S]*?setCursor\(/);
@@ -720,6 +726,23 @@ async function run() {
   });
   assert.equal(received.status, "received");
   assert.equal(consumed.text, "Continue the task");
+  assert.equal(plugin.settings.conversationMessages.length, 1);
+  const ntfyConversation = plugin.conversationContacts().find((contact) => contact.channelId === "ntfy" && contact.conversationId === "default");
+  assert.ok(ntfyConversation);
+  assert.equal(ntfyConversation.unread, 1);
+  await plugin.markConversationRead(ntfyConversation.id);
+  assert.equal(plugin.conversationContacts().find((contact) => contact.id === ntfyConversation.id).unread, 0);
+  let conversationSend = null;
+  const originalConversationSendNotification = plugin.sendNotification.bind(plugin);
+  plugin.sendNotification = async (input) => {
+    conversationSend = input;
+    return { ok: true, status: "completed", results: [{ channelId: "ntfy", ok: true, status: "sent" }] };
+  };
+  const sentConversationMessage = await plugin.sendConversationMessage(ntfyConversation.id, "Reply from Obsidian");
+  assert.equal(sentConversationMessage.status, "sent");
+  assert.equal(conversationSend.channelIds[0], "ntfy");
+  assert.equal(plugin.settings.conversationMessages.filter((message) => message.conversationKey === ntfyConversation.id).length, 2);
+  plugin.sendNotification = originalConversationSendNotification;
   const duplicate = await plugin.ingestIncomingMessage({
     id: "incoming-1",
     channelId: "ntfy",
@@ -738,6 +761,12 @@ async function run() {
     text: "Webhook retry after inbox deletion",
   });
   assert.equal(duplicateAfterDelete.status, "duplicate");
+
+  const legacyInboxPlugin = createPlugin({
+    incomingMessages: [{ id: "legacy-chat", channelId: "feishu", sender: "Legacy", conversationId: "chat-1", text: "Migrated", receivedAt: "2026-08-01T00:00:00.000Z" }],
+  });
+  assert.equal(legacyInboxPlugin.settings.conversationMessages.length, 1);
+  assert.equal(legacyInboxPlugin.settings.conversationMessages[0].conversationKey, "feishu::chat-1");
 
   const attachmentPlugin = createPlugin({ attachmentLimitMb: 1 });
   const blockedAttachment = await attachmentPlugin.ingestIncomingMessage({

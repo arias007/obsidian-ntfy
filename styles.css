@@ -1166,6 +1166,418 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
   font-size: 12px;
 }
 
+.obsidian-ntfy-chat {
+  border: 1px solid var(--background-modifier-border);
+  display: grid;
+  grid-template-columns: minmax(220px, 32%) minmax(0, 1fr);
+  height: max(460px, calc(100vh - 176px));
+  max-height: 820px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.obsidian-ntfy-chat-sidebar,
+.obsidian-ntfy-chat-conversation {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
+.obsidian-ntfy-chat-sidebar {
+  background: var(--background-secondary);
+  border-right: 1px solid var(--background-modifier-border);
+}
+
+.obsidian-ntfy-chat-sidebar-head,
+.obsidian-ntfy-chat-header {
+  align-items: center;
+  border-bottom: 1px solid var(--background-modifier-border);
+  display: flex;
+  flex: 0 0 52px;
+  gap: 8px;
+  min-height: 52px;
+  padding: 6px 10px;
+}
+
+.obsidian-ntfy-chat-sidebar-head h3 {
+  flex: 1 1 auto;
+  font-size: 15px;
+  margin: 0;
+}
+
+.obsidian-ntfy-chat-toolbar {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+}
+
+.obsidian-ntfy-chat-contacts,
+.obsidian-ntfy-chat-messages {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+.obsidian-ntfy-chat-contact {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--background-modifier-border-hover);
+  border-radius: 0;
+  color: var(--text-normal);
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  min-height: 62px;
+  padding: 8px 9px;
+  text-align: left;
+  width: 100%;
+}
+
+.obsidian-ntfy-chat-contact:hover,
+.obsidian-ntfy-chat-contact.is-active {
+  background: var(--background-modifier-hover);
+}
+
+.obsidian-ntfy-chat-contact.is-active {
+  box-shadow: inset 3px 0 0 var(--interactive-accent);
+}
+
+.obsidian-ntfy-chat-avatar {
+  align-items: center;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  display: inline-flex;
+  height: 38px;
+  justify-content: center;
+  position: relative;
+  width: 38px;
+}
+
+.obsidian-ntfy-chat-avatar > svg {
+  height: 20px;
+  width: 20px;
+}
+
+.obsidian-ntfy-chat-presence {
+  background: var(--text-faint);
+  border: 2px solid var(--background-secondary);
+  border-radius: 50%;
+  bottom: -2px;
+  height: 9px;
+  position: absolute;
+  right: -2px;
+  width: 9px;
+}
+
+.obsidian-ntfy-chat-presence.is-online {
+  background: var(--color-green);
+}
+
+.obsidian-ntfy-chat-contact-body,
+.obsidian-ntfy-chat-contact-name-line,
+.obsidian-ntfy-chat-contact-meta {
+  min-width: 0;
+}
+
+.obsidian-ntfy-chat-contact-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.obsidian-ntfy-chat-contact-name-line {
+  align-items: center;
+  display: flex;
+  gap: 4px;
+}
+
+.obsidian-ntfy-chat-contact-name,
+.obsidian-ntfy-chat-contact-preview {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.obsidian-ntfy-chat-contact-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.obsidian-ntfy-chat-contact-preview,
+.obsidian-ntfy-chat-contact-meta {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.obsidian-ntfy-chat-contact-state {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.obsidian-ntfy-chat-contact-state svg {
+  height: 12px;
+  width: 12px;
+}
+
+.obsidian-ntfy-chat-contact-meta {
+  align-items: flex-end;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  justify-content: space-between;
+}
+
+.obsidian-ntfy-chat-unread {
+  align-items: center;
+  background: var(--color-red);
+  border-radius: 999px;
+  color: white;
+  display: inline-flex;
+  font-size: 10px;
+  height: 18px;
+  justify-content: center;
+  min-width: 18px;
+  padding: 0 5px;
+}
+
+.obsidian-ntfy-chat-conversation {
+  background: var(--background-primary);
+}
+
+.obsidian-ntfy-chat-back {
+  display: none;
+}
+
+.obsidian-ntfy-chat-identity {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.obsidian-ntfy-chat-title,
+.obsidian-ntfy-chat-subtitle {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.obsidian-ntfy-chat-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.obsidian-ntfy-chat-subtitle {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.obsidian-ntfy-chat-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+}
+
+.obsidian-ntfy-chat-date {
+  align-self: center;
+  color: var(--text-faint);
+  font-size: 11px;
+  padding: 4px 8px;
+}
+
+.obsidian-ntfy-chat-message {
+  align-items: flex-end;
+  display: flex;
+  gap: 4px;
+  max-width: 86%;
+}
+
+.obsidian-ntfy-chat-message.is-incoming {
+  align-self: flex-start;
+}
+
+.obsidian-ntfy-chat-message.is-outgoing {
+  align-self: flex-end;
+  flex-direction: row-reverse;
+}
+
+.obsidian-ntfy-chat-bubble {
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  min-width: 72px;
+  overflow: hidden;
+  padding: 8px 10px 5px;
+}
+
+.obsidian-ntfy-chat-message.is-outgoing .obsidian-ntfy-chat-bubble {
+  background: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.obsidian-ntfy-chat-text {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.obsidian-ntfy-chat-message-meta {
+  align-items: center;
+  display: flex;
+  font-size: 10px;
+  gap: 4px;
+  justify-content: flex-end;
+  margin-top: 4px;
+  opacity: 0.72;
+}
+
+.obsidian-ntfy-chat-delivery,
+.obsidian-ntfy-chat-delivery svg {
+  display: inline-flex;
+  height: 12px;
+  width: 12px;
+}
+
+.obsidian-ntfy-chat-delivery.is-failed {
+  color: var(--text-error);
+  opacity: 1;
+}
+
+.obsidian-ntfy-chat-message-actions {
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+}
+
+.obsidian-ntfy-chat-message:hover .obsidian-ntfy-chat-message-actions,
+.obsidian-ntfy-chat-message:focus-within .obsidian-ntfy-chat-message-actions {
+  opacity: 1;
+}
+
+.obsidian-ntfy-chat-message-actions .obsidian-ntfy-icon-button {
+  height: 26px;
+  min-width: 26px;
+  width: 26px;
+}
+
+.obsidian-ntfy-chat-attachment {
+  align-items: center;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  color: inherit;
+  display: flex;
+  font-size: 11px;
+  gap: 6px;
+  margin-top: 6px;
+  max-width: 100%;
+  min-height: 34px;
+  padding: 5px 7px;
+  text-align: left;
+}
+
+.obsidian-ntfy-chat-attachment span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.obsidian-ntfy-chat-attachment svg {
+  flex: 0 0 auto;
+  height: 16px;
+  width: 16px;
+}
+
+.obsidian-ntfy-chat-composer {
+  border-top: 1px solid var(--background-modifier-border);
+  flex: 0 0 auto;
+  padding: 7px 8px calc(7px + env(safe-area-inset-bottom));
+}
+
+.obsidian-ntfy-chat-compose-row {
+  align-items: flex-end;
+  display: flex;
+  gap: 6px;
+}
+
+.obsidian-ntfy-chat-input {
+  box-sizing: border-box;
+  flex: 1 1 auto;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  max-height: 120px;
+  min-height: 36px;
+  min-width: 0;
+  padding: 7px 9px;
+  resize: vertical;
+}
+
+.obsidian-ntfy-chat-selected-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.obsidian-ntfy-chat-selected-files:not(:empty) {
+  margin-bottom: 6px;
+}
+
+.obsidian-ntfy-chat-file-chip {
+  align-items: center;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  display: inline-flex;
+  font-size: 11px;
+  gap: 3px;
+  max-width: 220px;
+  min-height: 26px;
+  padding: 2px 3px 2px 7px;
+}
+
+.obsidian-ntfy-chat-file-chip > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.obsidian-ntfy-chat-file-remove {
+  height: 22px;
+  min-width: 22px;
+  width: 22px;
+}
+
+.obsidian-ntfy-chat-empty {
+  align-items: center;
+  color: var(--text-muted);
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  font-size: 13px;
+  gap: 8px;
+  justify-content: center;
+  min-height: 120px;
+  padding: 20px;
+  text-align: center;
+}
+
+.obsidian-ntfy-chat-empty.is-compact {
+  min-height: 80px;
+}
+
+.obsidian-ntfy-chat-empty svg {
+  height: 24px;
+  width: 24px;
+}
+
 @media (max-width: 600px) {
   .obsidian-ntfy-settings-summary {
     align-items: flex-start;
@@ -1184,6 +1596,45 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
 
   .obsidian-ntfy-manager {
     padding: 12px;
+  }
+
+  .obsidian-ntfy-window-body {
+    padding-bottom: calc(92px + env(safe-area-inset-bottom));
+  }
+
+  .obsidian-ntfy-chat {
+    display: block;
+    height: calc(100vh - 148px);
+    max-height: none;
+  }
+
+  .obsidian-ntfy-chat-sidebar,
+  .obsidian-ntfy-chat-conversation {
+    height: 100%;
+  }
+
+  .obsidian-ntfy-chat-conversation {
+    display: none;
+  }
+
+  .obsidian-ntfy-chat.is-conversation-open .obsidian-ntfy-chat-sidebar {
+    display: none;
+  }
+
+  .obsidian-ntfy-chat.is-conversation-open .obsidian-ntfy-chat-conversation {
+    display: flex;
+  }
+
+  .obsidian-ntfy-chat-back {
+    display: inline-flex;
+  }
+
+  .obsidian-ntfy-chat-message {
+    max-width: 92%;
+  }
+
+  .obsidian-ntfy-chat-message-actions {
+    opacity: 1;
   }
 
   .obsidian-ntfy-window-head {
