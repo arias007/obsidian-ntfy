@@ -1348,6 +1348,7 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
 
 .obsidian-ntfy-chat-conversation {
   background: var(--background-primary);
+  overflow: hidden;
 }
 
 .obsidian-ntfy-chat-back {
@@ -1380,6 +1381,7 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  overscroll-behavior: contain;
   padding: 14px 16px;
 }
 
@@ -1496,9 +1498,14 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
 }
 
 .obsidian-ntfy-chat-composer {
+  background: var(--background-primary);
   border-top: 1px solid var(--background-modifier-border);
   flex: 0 0 auto;
+  position: sticky;
+  bottom: 0;
+  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.08);
   padding: 7px 8px calc(7px + env(safe-area-inset-bottom));
+  z-index: 2;
 }
 
 .obsidian-ntfy-chat-compose-row {

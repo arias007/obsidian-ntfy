@@ -4098,12 +4098,40 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     await this.updateConversationPreference(key, { lastReadAt: new Date().toISOString() });
   }
 
+  conversationChannelIsActive(channel) {
+    if (!channel || channel.enabled !== true) return false;
+    if (channel.verificationState === "failed") return false;
+    const status = String(channel.connectionStatus || "").toLowerCase();
+    if (["disabled", "failed", "unconfigured", "disconnected", "closed"].includes(status)) return false;
+    return Boolean(
+      channel.deliveryReady === true
+      || status === "connected"
+      || status === "poll"
+      || channel.receiveMode === "poll" && channel.receiveConfigured === true
+      || channel.receiveMode === "adapter" && channel.canReceive === true
+    );
+  }
+
+  conversationMessagesFor(contact, messages = this.settings.conversationMessages || []) {
+    if (!contact) return [];
+    if (contact.kind === "channel") {
+      return messages.filter((message) => message.channelId === contact.channelId);
+    }
+    const peerId = String(contact.deviceId || contact.conversationId || "").trim();
+    return messages.filter((message) => {
+      if (message.channelId !== "lan") return false;
+      const messagePeerId = String(message.metadata && message.metadata.lanDeviceId || message.conversationId || "").trim();
+      return messagePeerId === peerId || message.conversationKey === contact.id;
+    });
+  }
+
   conversationContacts() {
     const messages = this.settings.conversationMessages || [];
     const contacts = new Map();
     const iconByType = { ntfy: "bell", feishu: "message-square", telegram: "send", matrix: "messages-square", qqbot: "message-circle", discord: "messages-square", slack: "hash", wecom: "building-2", email: "mail" };
-    for (const channel of this.listNotificationChannels()) {
-      if (!channel.enabled) continue;
+    const channels = this.listNotificationChannels();
+    for (const channel of channels) {
+      if (!this.conversationChannelIsActive(channel)) continue;
       const key = this.conversationKey(channel.id, "default");
       contacts.set(key, {
         id: key,
@@ -4113,11 +4141,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         name: channel.name || channel.id,
         subtitle: channel.type || channel.id,
         icon: iconByType[channel.type] || "message-circle",
-        online: channel.deliveryReady === true,
-        metadata: {},
+        online: channel.deliveryReady === true || ["connected", "poll"].includes(String(channel.connectionStatus || "").toLowerCase()),
+        metadata: { channelType: channel.type, accountId: channel.accountId || "default" },
       });
     }
     for (const peer of this.lanSync?.listPeers?.() || []) {
+      if (peer.verified !== true) continue;
       const key = this.conversationKey("lan", peer.deviceId);
       contacts.set(key, {
         id: key,
@@ -4132,31 +4161,13 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         metadata: { lanDeviceId: peer.deviceId, lanLinkType: peer.linkType },
       });
     }
-    for (const message of messages) {
-      const key = message.conversationKey || this.conversationKey(message.channelId, message.conversationId);
-      const current = contacts.get(key);
-      if (!current) {
-        contacts.set(key, {
-          id: key,
-          kind: message.channelId === "lan" ? "lan" : "conversation",
-          channelId: message.channelId,
-          conversationId: message.conversationId,
-          deviceId: message.metadata && message.metadata.lanDeviceId || "",
-          name: message.title || message.sender || message.conversationId || message.channelId,
-          subtitle: message.channelId,
-          icon: message.channelId === "lan" ? "wifi" : iconByType[message.channelId.split(":")[0]] || "message-circle",
-          online: message.channelId === "lan" ? false : true,
-          metadata: message.metadata || {},
-        });
-      } else if (message.direction === "incoming") {
-        current.name = message.title || message.sender || current.name;
-        current.metadata = Object.assign({}, current.metadata || {}, message.metadata || {});
-      }
-    }
     const now = Date.now();
     return [...contacts.values()].map((contact) => {
-      const conversationMessages = messages.filter((message) => message.conversationKey === contact.id);
-      const latest = conversationMessages[conversationMessages.length - 1] || null;
+      const conversationMessages = this.conversationMessagesFor(contact, messages);
+      const latest = conversationMessages.reduce((result, message) => {
+        if (!result) return message;
+        return new Date(message.timestamp).getTime() >= new Date(result.timestamp).getTime() ? message : result;
+      }, null);
       const preference = this.conversationPreference(contact.id);
       const lastRead = new Date(preference.lastReadAt || 0).getTime();
       return Object.assign(contact, {
@@ -4169,7 +4180,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   }
 
   async clearConversation(key) {
-    this.settings.conversationMessages = (this.settings.conversationMessages || []).filter((message) => message.conversationKey !== key);
+    const contact = this.conversationContacts().find((item) => item.id === key);
+    const messages = contact ? this.conversationMessagesFor(contact) : (this.settings.conversationMessages || []).filter((message) => message.conversationKey === key);
+    const messageKeys = new Set(messages.map((message) => `${message.channelId}:${message.id}:${message.direction}`));
+    this.settings.conversationMessages = (this.settings.conversationMessages || []).filter((message) => !messageKeys.has(`${message.channelId}:${message.id}:${message.direction}`));
     await this.saveSettings();
     this.app?.workspace?.trigger?.("notification-hub:conversations-changed");
   }
@@ -4221,7 +4235,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         for (const path of paths) sentAttachments.push(await this.lanSync.sendFile(contact.deviceId || contact.conversationId, path));
         await this.lanSync.sendMessage(contact.deviceId || contact.conversationId, { id, text: content, attachments: sentAttachments });
       } else {
-        const latestIncoming = [...(this.settings.conversationMessages || [])].reverse().find((item) => item.conversationKey === contact.id && item.direction === "incoming");
+        const latestIncoming = this.conversationMessagesFor(contact)
+          .filter((item) => item.direction === "incoming")
+          .sort((left, right) => new Date(right.timestamp).getTime() - new Date(left.timestamp).getTime())[0] || null;
         await this.sendNotification({
           id,
           source: "conversation",
@@ -8538,7 +8554,7 @@ class NtfyManagerView extends ItemView {
     });
 
     const messageList = conversation.createDiv({ cls: "obsidian-ntfy-chat-messages" });
-    const messages = (this.plugin.settings.conversationMessages || []).filter((message) => message.conversationKey === active.id);
+    const messages = this.plugin.conversationMessagesFor(active);
     if (!messages.length) {
       const empty = messageList.createDiv({ cls: "obsidian-ntfy-chat-empty is-compact" });
       setIcon(empty.createSpan(), active.icon || "message-circle");

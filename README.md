@@ -58,8 +58,10 @@ Nearby synchronization is enabled by default. Devices that share the same vault 
 The manager's message tab uses a contact-and-conversation layout for configured ntfy, Feishu, other receive-capable channels, and authenticated nearby peers.
 
 - Incoming and outgoing messages share a persistent conversation history with unread counts, pinning, mute controls, clear conversation, delete message, delivery status, retry, and file attachment actions.
+- The inbox only lists enabled, configured, and currently usable channels or authenticated nearby peers; disabled, unconfigured, failed, and offline connections stay out of the friend list.
 - Nearby peers show their private IP and detected link type. LAN messages and Vault files use the same encrypted authenticated channel as synchronization; an existing remote path is never overwritten by an explicit file send when the content differs.
 - ntfy binary uploads and Feishu App file messages can send Vault files directly. Webhook-only channels remain text/URL-only so the UI never reports a local file as uploaded when the provider cannot accept it.
+- Each conversation keeps its message area scrollable while the text/file composer remains docked at the bottom for friend-style messaging.
 
 ## Supported Reminder Syntax
 
