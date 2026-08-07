@@ -39,6 +39,18 @@ The original Chinese/English UI remains the complete baseline. Other languages c
 - Switching tabs shows cached content immediately, then refreshes that tab in the background.
 - Unchanged background results do not rebuild the visible list.
 
+## Automatic LAN Vault Synchronization
+
+LAN synchronization is enabled by default. Devices that share the same vault identity discover each other automatically on a private local network and transfer files directly while the normal notification channels continue running.
+
+- The default bidirectional mode keeps the most recently edited version and preserves a conflict copy when both sides changed independently.
+- Four additional mutually exclusive modes are available: incremental push, incremental pull, deletion push, and deletion pull.
+- The check interval is configurable from 1 to 300 seconds, and the per-file limit is configurable from 1 to 512 MB.
+- The Obsidian configuration folder is excluded by default. When enabled on both peers, safe configuration files are synchronized while workspace state, LAN identity, Remotely Save data, caches, `.git`, and `node_modules` remain excluded.
+- While a peer is connected, the status bar shows only a Wi-Fi icon and live `completed/total` progress. It may temporarily use the Remotely Save status slot without changing Remotely Save settings or background execution.
+- Clicking the Wi-Fi progress opens live file activity. Existing Markdown notes can be opened directly from that view.
+- The previous Cancip LAN identity is copied on first migration when available, allowing devices to be upgraded one at a time. The old file is not deleted.
+
 ## Supported Reminder Syntax
 
 The plugin scans unchecked tasks and standalone reminder lines in Markdown files.
@@ -187,9 +199,11 @@ For long-term reminders, keep them in the local queue and let later scans hand t
 
 ## Development
 
-The plugin ships as readable JavaScript and has no compilation step. Run the source checks with:
+The plugin ships as readable JavaScript. The LAN engine is maintained in TypeScript and embedded into `main.js` before checks and release packaging. Run the complete build and source checks with:
 
 ```bash
+npm install
+npm run build
 npm run check
 npm test
 ```
