@@ -8,7 +8,21 @@ export interface ConversationAttachment {
   url?: string;
   path?: string;
   hash?: string;
+  temporary?: boolean;
+  remoteOnly?: boolean;
+  expiresAt?: string;
+  savedPath?: string;
+  savedAt?: string;
+  remotePath?: string;
 }
+
+export type ConversationFileInput = string | File | {
+  path?: string;
+  name?: string;
+  type?: string;
+  data?: ArrayBuffer;
+  file?: File;
+};
 
 export interface ConversationParticipant {
   id?: string;
@@ -186,18 +200,21 @@ export interface NotificationHubApi {
   receive(input: ConversationMessageInput): Promise<unknown>;
   importConversationMessages(input: ConversationImportRequest | ConversationMessageInput[] | string): Promise<ConversationImportResult>;
   exportConversationMessages(input?: ConversationExportRequest): ConversationExportResult;
+  sendConversationMessage(conversationKey: string, text?: string, files?: ConversationFileInput[]): Promise<ConversationMessage>;
+  saveConversationAttachment(messageId: string, attachmentPath: string): Promise<ConversationAttachment>;
   conversations: {
     list(): Array<Record<string, unknown>>;
     get(conversationKey: string): Record<string, unknown> | null;
     messages(conversationKey?: string): ConversationMessage[];
     import(input: ConversationImportRequest | ConversationMessageInput[] | string): Promise<ConversationImportResult>;
     export(input?: ConversationExportRequest): ConversationExportResult;
-    send(conversationKey: string, text?: string, filePaths?: string[]): Promise<ConversationMessage>;
+    send(conversationKey: string, text?: string, files?: ConversationFileInput[]): Promise<ConversationMessage>;
     preference(conversationKey: string): Record<string, unknown>;
     updatePreference(conversationKey: string, patch: Record<string, unknown>): Promise<void>;
     markRead(conversationKey: string): Promise<void>;
     clear(conversationKey: string): Promise<void>;
     removeMessage(messageId: string, direction?: ConversationDirection): Promise<void>;
+    saveAttachment(messageId: string, attachmentPath: string): Promise<ConversationAttachment>;
   };
   messages: {
     ingest(input: ConversationMessageInput): Promise<unknown>;
@@ -206,7 +223,7 @@ export interface NotificationHubApi {
     poll(options?: Record<string, unknown>): Promise<unknown>;
     registerHandler(consumerId: string, handler: ((message: ConversationMessageInput, context: Record<string, unknown>) => unknown) | { handle(message: ConversationMessageInput, context: Record<string, unknown>): unknown }): () => boolean;
     unregisterHandler(consumerId: string): boolean;
-    send(conversationKey: string, text?: string, filePaths?: string[]): Promise<ConversationMessage>;
+    send(conversationKey: string, text?: string, files?: ConversationFileInput[]): Promise<ConversationMessage>;
     reply(messageId: string, replyText: string, channelId?: string): Promise<unknown>;
     retry(messageId: string, channelId?: string): Promise<unknown>;
     remove(messageId: string, channelId?: string): Promise<unknown>;
@@ -229,6 +246,8 @@ export interface NotificationHubApi {
     requestSync(): { ok: boolean; status: string };
     sendMessage(deviceId: string, input: Record<string, unknown>): Promise<unknown>;
     sendFile(deviceId: string, vaultPath: string): Promise<unknown>;
+    sendDeviceFile(deviceId: string, input: { name: string; type?: string; data: ArrayBuffer }): Promise<ConversationAttachment>;
+    cleanupInbox(): Promise<{ removed: number; checked: number }>;
   };
   events: {
     readonly names: readonly string[];

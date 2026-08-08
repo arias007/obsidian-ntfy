@@ -150,6 +150,8 @@ try {
     isPrivateLanAddress,
     ipv4BroadcastAddress,
     normalizeLanSyncPath,
+    normalizeLanInboxAttachmentPath,
+    isLanInboxAttachmentPath,
     normalizeManualLanPeer,
     planLanSyncReconciliation,
     verifyLanSyncRequest
@@ -220,6 +222,18 @@ try {
   const conflict = planLanSyncReconciliation([local], [remote], {});
   assert.equal(conflict[0].kind, "conflict");
   assert.equal(conflict[0].winner, "remote");
+  const largerConflict = planLanSyncReconciliation(
+    [{ ...local, size: 5, mtime: 999 }],
+    [{ ...remote, size: 8, mtime: 1 }],
+    {},
+    { incrementalPush: true, incrementalPull: true, deletePush: false, deletePull: false, syncConfigFolder: false, deleteProtocol: true, conflictRule: "larger" },
+    { incrementalPush: false, incrementalPull: false, deletePush: false, deletePull: false, syncConfigFolder: false, deleteProtocol: false, conflictRule: "larger" }
+  );
+  assert.equal(largerConflict[0].winner, "remote", "Larger-file conflict rule was not applied");
+  const inboxPath = normalizeLanInboxAttachmentPath(".trash/ntfy-inbox/attachment_12345678/demo.txt");
+  assert.equal(inboxPath, ".trash/ntfy-inbox/attachment_12345678/demo.txt");
+  assert.equal(isLanInboxAttachmentPath(inboxPath), true);
+  assert.equal(normalizeLanInboxAttachmentPath(".trash/ntfy-inbox/attachment_12345678/../bad.txt"), null);
   assert.equal(buildLanConflictPath("Folder/Note.md", "device-123456", local.hash), "Folder/Note (LAN conflict device-1 aaaaaaaa).md");
 
   const passivePolicy = {
@@ -228,7 +242,8 @@ try {
     deletePush: false,
     deletePull: false,
     syncConfigFolder: false,
-    deleteProtocol: true
+    deleteProtocol: true,
+    conflictRule: "latest"
   };
   const incrementalPushPolicy = { ...passivePolicy, incrementalPush: true };
   const incrementalPullPolicy = { ...passivePolicy, incrementalPull: true };
@@ -409,9 +424,20 @@ try {
     assert.equal(storageB.text(conflictPath), "older A");
     assert.ok(progressA.some((value) => value.phase === "syncing" && value.active));
     assert.ok(progressA.some((value) => value.phase === "scanning" && value.total > 0 && value.completed > 0), "LAN scan progress did not expose the full local manifest");
+    let previousScanCompleted = -1;
+    let previousScanTotal = 0;
+    for (const value of progressA.filter((candidate) => candidate.phase === "scanning" && candidate.total > 0)) {
+      if (value.total !== previousScanTotal) previousScanCompleted = -1;
+      assert.ok(value.completed >= previousScanCompleted, "LAN scan progress regressed within one scan");
+      previousScanCompleted = value.completed;
+      previousScanTotal = value.total;
+    }
     assert.ok(progressA.some((value) => value.phase === "complete" && value.conflicts === 1));
     assert.ok(progressB.some((value) => value.active), "Receiving peer did not expose LAN status");
     const activityA = serviceA.activity();
+    assert.ok(activityA.scan.total > 0, "Full-vault scan snapshot did not expose total files");
+    assert.equal(activityA.scan.completed, activityA.scan.total, "Full-vault scan did not finish monotonically");
+    assert.ok(activityA.scan.files.some((file) => file.state === "cached" || file.state === "complete"), "Scan file states were not retained");
     assert.ok(activityA.files.some((file) => file.path === "Notes/from-a.md" && file.state === "complete"), "Coordinator did not retain completed file activity");
     assert.ok(activityA.files.some((file) => file.path === "Notes/shared.md" && file.action === "conflict"), "Conflict activity was not exposed");
     const activityB = serviceB.activity();
@@ -457,6 +483,16 @@ try {
     await waitFor(() => messagesB.some((message) => message.id === sentMessage.id), "authenticated LAN message delivery");
     assert.equal(messagesB.find((message) => message.id === sentMessage.id).text, "encrypted hello");
     assert.equal(messagesB.find((message) => message.id === sentMessage.id).attachments[0].path, sentAttachment.path);
+    const deviceAttachment = await serviceA.sendDeviceFile(deviceB, {
+      name: "phone-note.txt",
+      type: "text/plain",
+      data: arrayBuffer(bytes("from phone"))
+    });
+    assert.match(deviceAttachment.path, /^\.trash\/ntfy-inbox\/[A-Za-z0-9_-]+\/phone-note\.txt$/);
+    assert.equal(storageB.text(deviceAttachment.path), "from phone");
+    const deviceMessage = await serviceA.sendMessage(deviceB, { text: "device attachment", attachments: [deviceAttachment] });
+    await waitFor(() => messagesB.some((message) => message.id === deviceMessage.id), "device attachment message delivery");
+    assert.equal(messagesB.find((message) => message.id === deviceMessage.id).attachments[0].temporary, true);
   } finally {
     await Promise.all([serviceA.stop(), serviceB.stop()]);
   }
@@ -481,8 +517,7 @@ try {
     await desktopService.start();
     await mobileService.start();
     await waitFor(() => mobileService.status().peerCount === 1, "mobile authenticated desktop endpoint");
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 150));
-    assert.equal(desktopStorage.text("Mobile/client-created.md"), null, "Disabled automatic sync should wait for an explicit request");
+    await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "automatic full-vault sync");
     desktopService.requestSync();
     await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "desktop-requested mobile LAN synchronization");
     await waitFor(() => mobileProgress.some((value) => value.phase === "complete"), "mobile synchronization completion");
@@ -503,12 +538,21 @@ try {
   assert.match(source, /setIcon\(icon, "wifi"\)/, "Connected LAN status should keep the Wi-Fi icon");
   assert.match(source, /registerDomEvent\(item, "click", \(\) => this\.openLanSyncDetails\(\)\)/, "LAN status item should open live details on click");
   assert.match(source, /class NtfyLanSyncDetailsModal extends Modal/, "LAN sync details modal is missing");
+  assert.match(source, /renderScanSection\(body, scan, chinese\)/, "LAN scan section is missing");
+  assert.match(source, /renderTransferSection\(body, progress, files, chinese\)/, "LAN transfer section is missing");
+  assert.match(source, /createEl\("progress"/, "LAN details should expose progress bars");
+  assert.match(source, /this\.app\.vault\.on\("create"/, "New Vault files should trigger LAN sync");
+  assert.match(source, /attachment\/write/, "LAN attachments should use the temporary inbox route");
+  assert.match(source, /saveConversationAttachment/, "Received attachments should be saveable into the Vault");
   assert.match(source, /getLeaf\("tab"\)\.openFile\(target, \{ active: true \}\)/, "LAN Markdown activity should open the note in Obsidian");
   assert.match(source, /lanSyncDetailsModal\?\.refresh\(\)/, "LAN details should refresh with transfer progress");
   for (const mode of ["bidirectional", "incremental-push", "incremental-pull", "delete-push", "delete-pull"]) {
     assert.match(source, new RegExp(`(?:\\"|^)${mode.replace("-", "\\-")}(?:\\"|$)`), `LAN settings are missing mode ${mode}`);
   }
   assert.match(source, /lanSyncMaxFileMb[^\n]*512/, "LAN settings should allow selecting files larger than 100 MB");
+  assert.match(source, /lanSyncCheckIntervalSeconds[^\n]*60/, "LAN full-vault scan default should be 60 seconds");
+  assert.match(source, /lanSyncSyncConfigFolder[^\n]*true/, "LAN config-folder sync should default to enabled");
+  assert.match(source, /lanSyncConflictRule/, "LAN conflict rule setting is missing");
   assert.match(takeoverSource, /plugins\?\.\["remotely-save"\]\?\.statusBarElement/);
   assert.doesNotMatch(takeoverSource, /isSyncing|currSyncMsg|syncEvent|remotelySave\.settings|candidate\.settings|start-sync/);
   assert.doesNotMatch(takeoverSource, /plugins\/remotely-save|plugins\\remotely-save/);

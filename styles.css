@@ -101,6 +101,50 @@
   font-size: var(--font-ui-smaller);
 }
 
+.obsidian-ntfy-lan-details-section {
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.obsidian-ntfy-lan-details-section > summary {
+  align-items: center;
+  cursor: pointer;
+  display: grid;
+  font-size: var(--font-ui-small);
+  font-weight: 600;
+  gap: 8px;
+  grid-template-columns: minmax(92px, auto) minmax(0, 1fr);
+  min-height: 42px;
+  padding: 6px 2px;
+}
+
+.obsidian-ntfy-lan-details-section-meta {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  font-weight: 400;
+  overflow: hidden;
+  text-align: end;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.obsidian-ntfy-lan-details-section-body {
+  padding: 0 2px 8px;
+}
+
+.obsidian-ntfy-lan-details-progress {
+  display: block;
+  height: 6px;
+  margin: 0 0 8px;
+  width: 100%;
+}
+
+.obsidian-ntfy-lan-details-section-empty {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  min-height: 34px;
+  padding: 8px 2px;
+}
+
 .obsidian-ntfy-lan-details-list {
   display: flex;
   flex-direction: column;
@@ -124,12 +168,14 @@
   height: 14px;
 }
 
-.obsidian-ntfy-lan-details-file.is-syncing .obsidian-ntfy-lan-details-file-state svg {
+.obsidian-ntfy-lan-details-file.is-syncing .obsidian-ntfy-lan-details-file-state svg,
+.obsidian-ntfy-lan-details-file.is-hashing .obsidian-ntfy-lan-details-file-state svg {
   color: var(--interactive-accent);
   animation: obsidian-ntfy-lan-spin 0.9s linear infinite;
 }
 
-.obsidian-ntfy-lan-details-file.is-complete .obsidian-ntfy-lan-details-file-state svg {
+.obsidian-ntfy-lan-details-file.is-complete .obsidian-ntfy-lan-details-file-state svg,
+.obsidian-ntfy-lan-details-file.is-cached .obsidian-ntfy-lan-details-file-state svg {
   color: var(--color-green, #15803d);
 }
 
@@ -213,6 +259,10 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
 
   .obsidian-ntfy-lan-details-file-size {
     display: none;
+  }
+
+  .obsidian-ntfy-lan-details-section > summary {
+    grid-template-columns: minmax(72px, auto) minmax(0, 1fr);
   }
 }
 
@@ -1520,6 +1570,14 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
   width: 26px;
 }
 
+.obsidian-ntfy-chat-attachment-row {
+  align-items: center;
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+  max-width: 100%;
+}
+
 .obsidian-ntfy-chat-attachment {
   align-items: center;
   background: var(--background-primary);
@@ -1529,11 +1587,19 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
   display: flex;
   font-size: 11px;
   gap: 6px;
-  margin-top: 6px;
+  flex: 1 1 auto;
+  margin-top: 0;
   max-width: 100%;
   min-height: 34px;
   padding: 5px 7px;
   text-align: left;
+}
+
+.obsidian-ntfy-chat-attachment-save {
+  flex: 0 0 34px;
+  height: 34px;
+  min-width: 34px;
+  width: 34px;
 }
 
 .obsidian-ntfy-chat-attachment span:last-child {

@@ -6,10 +6,12 @@ export type LanSyncRuntimeSettings = {
   autoDiscovery: boolean;
   checkIntervalSeconds: number;
   mode: LanSyncMode;
+  conflictRule: LanSyncConflictRule;
   syncConfigFolder: boolean;
   configDir: string;
   port: number;
   maxFileBytes: number;
+  inboxRetentionHours: number;
   manualPeers: string[];
 };
 
@@ -29,10 +31,21 @@ export type LanSyncIncomingMessage = {
   deviceId: string;
   text: string;
   sentAt: string;
-  attachments: Array<{ name: string; path: string; size: number; hash: string }>;
+  attachments: LanSyncAttachment[];
 };
 
 export type LanSyncMode = "bidirectional" | "incremental-push" | "incremental-pull" | "delete-push" | "delete-pull";
+export type LanSyncConflictRule = "latest" | "larger";
+
+export type LanSyncAttachment = {
+  name: string;
+  type: string;
+  path: string;
+  size: number;
+  hash: string;
+  temporary: boolean;
+  expiresAt: string;
+};
 
 export type LanSyncPolicy = {
   incrementalPush: boolean;
@@ -41,6 +54,7 @@ export type LanSyncPolicy = {
   deletePull: boolean;
   syncConfigFolder: boolean;
   deleteProtocol: boolean;
+  conflictRule: LanSyncConflictRule;
 };
 
 export type LanSyncPathOptions = {
@@ -107,9 +121,29 @@ export type LanSyncFileActivity = {
   size: number;
 };
 
+export type LanSyncScanFileActivity = {
+  path: string;
+  state: "pending" | "hashing" | "cached" | "complete" | "skipped" | "error";
+  size: number;
+  reason: string;
+};
+
+export type LanSyncScanActivity = {
+  id: string;
+  phase: "idle" | "scanning" | "complete" | "error";
+  completed: number;
+  total: number;
+  cached: number;
+  hashed: number;
+  skipped: number;
+  error: string;
+  files: LanSyncScanFileActivity[];
+};
+
 export type LanSyncActivitySnapshot = {
   progress: LanSyncProgress;
   files: LanSyncFileActivity[];
+  scan: LanSyncScanActivity;
 };
 
 export type LanSyncServiceOptions = {
@@ -204,20 +238,23 @@ const MULTICAST_ADDRESS = "239.255.67.19";
 const DISCOVERY_PORT = 43189;
 const ANNOUNCE_INTERVAL_MS = 750;
 const PEER_SWEEP_INTERVAL_MS = 350;
+const PEER_PROBE_INTERVAL_MS = 900;
 const PEER_MIN_STABLE_GRACE_MS = 30_000;
 const PEER_MAX_ADDRESS_HISTORY = 8;
 const REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 const SYNC_MIN_INTERVAL_MS = 400;
-const HASH_CONCURRENCY = 8;
-const TRANSFER_CONCURRENCY = 4;
+const HASH_CONCURRENCY = 12;
+const TRANSFER_CONCURRENCY = 6;
 const MAX_CLOCK_SKEW_MS = 120_000;
 const REPLAY_TTL_MS = 180_000;
-const MAX_MANIFEST_FILES = 25_000;
-const MAX_LEDGER_ENTRIES = 12_000;
+const MAX_MANIFEST_FILES = 100_000;
+const MAX_LEDGER_ENTRIES = 50_000;
 const HARD_MAX_REQUEST_BYTES = 960 * 1024 * 1024;
 const RATE_WINDOW_MS = 60_000;
 const RATE_LIMIT = 1200;
 const DEVICE_ID_STORAGE_KEY = "cancip.lan-sync.device-id.v1";
+const HASH_CACHE_STORAGE_PREFIX = "ntfy.lan-sync.hash-cache.v1";
+const LAN_INBOX_ROOT = ".trash/ntfy-inbox";
 const MAX_MESSAGE_TEXT_LENGTH = 32_000;
 const MAX_MESSAGE_ATTACHMENTS = 12;
 
@@ -316,7 +353,7 @@ function normalizedMaxFileBytes(value: unknown): number {
 
 function normalizedCheckIntervalSeconds(value: unknown): number {
   const parsed = Number(value);
-  return Number.isFinite(parsed) ? Math.max(1, Math.min(300, Math.floor(parsed))) : 2;
+  return Number.isFinite(parsed) ? Math.max(10, Math.min(3600, Math.floor(parsed))) : 60;
 }
 
 function normalizedMode(value: unknown): LanSyncMode {
@@ -327,6 +364,15 @@ function normalizedMode(value: unknown): LanSyncMode {
     || value === "bidirectional"
     ? value
     : "bidirectional";
+}
+
+function normalizedConflictRule(value: unknown): LanSyncConflictRule {
+  return value === "larger" ? "larger" : "latest";
+}
+
+function normalizedInboxRetentionHours(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(1, Math.min(24 * 90, Math.floor(parsed))) : 168;
 }
 
 function normalizedConfigDir(value: unknown): string {
@@ -347,7 +393,8 @@ function defaultLocalPolicy(): LanSyncPolicy {
     deletePush: false,
     deletePull: false,
     syncConfigFolder: false,
-    deleteProtocol: true
+    deleteProtocol: true,
+    conflictRule: "latest"
   };
 }
 
@@ -358,7 +405,8 @@ function passivePeerPolicy(): LanSyncPolicy {
     deletePush: false,
     deletePull: false,
     syncConfigFolder: false,
-    deleteProtocol: false
+    deleteProtocol: false,
+    conflictRule: "latest"
   };
 }
 
@@ -370,7 +418,8 @@ function policyFromRaw(value: unknown): LanSyncPolicy {
     deletePush: value.deletePush === true,
     deletePull: value.deletePull === true,
     syncConfigFolder: value.syncConfigFolder === true,
-    deleteProtocol: value.deleteProtocol === true
+    deleteProtocol: value.deleteProtocol === true,
+    conflictRule: normalizedConflictRule(value.conflictRule)
   };
 }
 
@@ -453,6 +502,33 @@ export function normalizeManualLanPeer(value: unknown, fallbackPort = 43190): { 
 
 export function isLanSyncPathEligible(value: unknown, options: LanSyncPathOptions = {}): value is string {
   return normalizeLanSyncPath(value, options) !== null;
+}
+
+function safeLanInboxName(value: unknown): string {
+  const raw = typeof value === "string" ? value.trim() : "";
+  const name = raw
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_")
+    .replace(/^\.+|\.+$/g, "")
+    .replace(/\s+/g, " ")
+    .slice(0, 180);
+  return name && name !== "." && name !== ".." ? name : "attachment.bin";
+}
+
+export function normalizeLanInboxAttachmentPath(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 512 || value.includes("\\") || value.includes("\0")) return null;
+  const segments = value.split("/");
+  if (segments.length !== 4 || segments[0] !== ".trash" || segments[1] !== "ntfy-inbox") return null;
+  if (!/^[A-Za-z0-9_-]{16,96}$/.test(segments[2])) return null;
+  const name = safeLanInboxName(segments[3]);
+  return name === segments[3] ? `${LAN_INBOX_ROOT}/${segments[2]}/${name}` : null;
+}
+
+export function isLanInboxAttachmentPath(value: unknown): value is string {
+  return normalizeLanInboxAttachmentPath(value) !== null;
+}
+
+export async function hashLanSyncBytes(value: ArrayBuffer | Uint8Array): Promise<string> {
+  return await sha256Bytes(value);
 }
 
 function isConfigPath(path: string, configDir: string): boolean {
@@ -608,7 +684,8 @@ export async function verifyLanSyncRequest(input: {
   return deviceId;
 }
 
-function manifestWinner(local: LanSyncManifestEntry, remote: LanSyncManifestEntry): "local" | "remote" {
+function manifestWinner(local: LanSyncManifestEntry, remote: LanSyncManifestEntry, rule: LanSyncConflictRule): "local" | "remote" {
+  if (rule === "larger" && local.size !== remote.size) return local.size > remote.size ? "local" : "remote";
   if (local.mtime !== remote.mtime) return local.mtime > remote.mtime ? "local" : "remote";
   return local.hash.localeCompare(remote.hash) >= 0 ? "local" : "remote";
 }
@@ -639,7 +716,7 @@ export function planLanSyncReconciliation(
       } else if (baseline && remoteEntry.hash === baseline) {
         if (canPush) actions.push({ kind: "push", path, local: localEntry, remote: remoteEntry });
       } else if (canPush && canPull) {
-        actions.push({ kind: "conflict", path, local: localEntry, remote: remoteEntry, winner: manifestWinner(localEntry, remoteEntry) });
+        actions.push({ kind: "conflict", path, local: localEntry, remote: remoteEntry, winner: manifestWinner(localEntry, remoteEntry, localPolicy.conflictRule) });
       } else if (canPush) {
         actions.push({ kind: "push", path, local: localEntry, remote: remoteEntry });
       } else if (canPull) {
@@ -835,6 +912,9 @@ export class NtfyLanSync {
   private replayCache = new Map<string, number>();
   private rateByClient = new Map<string, { startedAt: number; count: number }>();
   private hashCache = new Map<string, { signature: string; hash: string }>();
+  private hashCacheLoaded = false;
+  private hashSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private manifestBuild: { includeConfigFolder: boolean; promise: Promise<LanSyncManifestEntry[]> } | null = null;
   private intervals: Array<ReturnType<typeof setInterval>> = [];
   private syncTimer: ReturnType<typeof setTimeout> | null = null;
   private syncRunning = false;
@@ -844,6 +924,7 @@ export class NtfyLanSync {
   private lastTransferAt = 0;
   private progressValue = defaultProgress();
   private activityFiles: LanSyncFileActivity[] = [];
+  private scanValue: LanSyncScanActivity = this.emptyScanActivity();
   private activityUpdatedAt = 0;
   private lastErrorValue = "";
   private lastPeerFingerprint = "";
@@ -862,10 +943,19 @@ export class NtfyLanSync {
     return { ...this.progressValue };
   }
 
+  scanProgress(): Omit<LanSyncScanActivity, "files"> {
+    const { files: _files, ...scan } = this.scanValue;
+    return { ...scan };
+  }
+
   activity(): LanSyncActivitySnapshot {
     return {
       progress: { ...this.progressValue },
-      files: this.activityFiles.map((file) => ({ ...file }))
+      files: this.activityFiles.map((file) => ({ ...file })),
+      scan: {
+        ...this.scanValue,
+        files: this.scanValue.files.map((file) => ({ ...file }))
+      }
     };
   }
 
@@ -890,7 +980,7 @@ export class NtfyLanSync {
       .sort((left, right) => left.deviceId.localeCompare(right.deviceId));
   }
 
-  async sendMessage(deviceId: string, input: { id?: string; text?: string; attachments?: Array<{ name: string; path: string; size: number; hash: string }> }): Promise<{ id: string }> {
+  async sendMessage(deviceId: string, input: { id?: string; text?: string; attachments?: LanSyncAttachment[] }): Promise<{ id: string }> {
     const peer = this.activePeers().find((candidate) => candidate.deviceId === deviceId);
     if (!peer) throw new Error("peer_unavailable");
     const message = this.normalizeMessagePayload(input, this.deviceId);
@@ -899,34 +989,43 @@ export class NtfyLanSync {
     return { id: message.id };
   }
 
-  async sendFile(deviceId: string, path: string): Promise<{ name: string; path: string; size: number; hash: string }> {
-    const peer = this.activePeers().find((candidate) => candidate.deviceId === deviceId);
+  async sendFile(deviceId: string, path: string): Promise<LanSyncAttachment> {
     const normalized = this.normalizePath(path);
-    if (!peer) throw new Error("peer_unavailable");
     if (!normalized) throw new LanSyncProtocolError("unsafe_path");
     const stat = await this.options.storage.statFile(normalized);
     if (!stat || stat.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("file_unavailable", 404);
-    const bytes = new Uint8Array(await this.options.storage.readBinary(normalized));
+    return await this.sendDeviceFile(deviceId, {
+      name: normalized.split("/").pop() || "attachment.bin",
+      type: "application/octet-stream",
+      data: await this.options.storage.readBinary(normalized)
+    });
+  }
+
+  async sendDeviceFile(deviceId: string, input: { name: string; type?: string; data: ArrayBuffer }): Promise<LanSyncAttachment> {
+    const peer = this.activePeers().find((candidate) => candidate.deviceId === deviceId);
+    if (!peer) throw new Error("peer_unavailable");
+    const bytes = new Uint8Array(input.data);
+    if (bytes.byteLength > this.settings().maxFileBytes) throw new LanSyncProtocolError("file_unavailable", 413);
+    const name = safeLanInboxName(input.name);
+    const type = String(input.type || "application/octet-stream").slice(0, 128);
     const hash = await sha256Bytes(bytes);
-    this.activityFiles = [{ path: normalized, action: "push", state: "syncing", size: bytes.byteLength }];
+    const attachmentId = randomId(18);
+    this.activityFiles = [{ path: `${LAN_INBOX_ROOT}/${attachmentId}/${name}`, action: "push", state: "syncing", size: bytes.byteLength }];
     this.activityUpdatedAt = this.now();
     this.emit({ ...defaultProgress("syncing"), active: true, peerId: peer.deviceId, total: 1, bytesTotal: bytes.byteLength });
     try {
-      const remote = await this.callPeer(peer, "/manifest", { syncConfigFolder: false });
-      const entries = this.parseManifest(remote.files, false);
-      const existing = entries.find((entry) => entry.path === normalized);
-      let remotePath = normalized;
-      if (existing && existing.hash !== hash) remotePath = buildLanConflictPath(normalized, this.deviceId, hash, this.pathOptions(false));
-      this.activityFiles[0].path = remotePath;
-      await this.writeRemoteIfMissingOrSame(peer, remotePath, bytes, hash);
+      const response = await this.callPeer(peer, "/attachment/write", {
+        attachmentId,
+        name,
+        type,
+        hash,
+        data: bytesToBase64Url(bytes)
+      }, fileTransferTimeoutMs(bytes.byteLength));
+      const attachment = this.parseAttachment(response);
+      this.activityFiles[0].path = attachment.path;
       this.activityFiles[0].state = "complete";
       this.emit({ ...defaultProgress("complete"), active: true, peerId: peer.deviceId, completed: 1, total: 1, bytesTransferred: bytes.byteLength, bytesTotal: bytes.byteLength, changed: 1 });
-      return {
-        name: remotePath.split("/").pop() || remotePath,
-        path: remotePath,
-        size: bytes.byteLength,
-        hash
-      };
+      return attachment;
     } catch (error) {
       this.activityFiles[0].state = "error";
       this.emit({ ...defaultProgress("error"), active: true, peerId: peer.deviceId, total: 1, bytesTotal: bytes.byteLength, error: safeErrorCode(error) });
@@ -953,6 +1052,7 @@ export class NtfyLanSync {
     }
     this.identity = await this.loadOrCreateIdentity();
     this.deviceId = this.loadOrCreateDeviceId();
+    this.loadHashCache();
     this.runningValue = true;
     this.lastErrorValue = "";
     try {
@@ -970,7 +1070,10 @@ export class NtfyLanSync {
       await this.loadRememberedPeers();
       this.refreshManualPeers();
       this.intervals.push(setInterval(() => this.announce(), ANNOUNCE_INTERVAL_MS));
-      this.intervals.push(setInterval(() => void this.probePeers(), settings.checkIntervalSeconds * 1000));
+      this.intervals.push(setInterval(() => void this.probePeers(), PEER_PROBE_INTERVAL_MS));
+      this.intervals.push(setInterval(() => {
+        if (this.settings().autoDiscovery) this.requestSync();
+      }, settings.checkIntervalSeconds * 1000));
       this.intervals.push(setInterval(() => this.sweepPeers(), PEER_SWEEP_INTERVAL_MS));
       this.announce();
       this.emit({ ...defaultProgress("discovering"), active: false });
@@ -1015,11 +1118,17 @@ export class NtfyLanSync {
         }, 250))
       ]);
     }
+    if (this.hashSaveTimer) {
+      clearTimeout(this.hashSaveTimer);
+      this.hashSaveTimer = null;
+      this.saveHashCache();
+    }
     this.peers.clear();
     this.emitPeersChanged();
     this.replayCache.clear();
     this.rateByClient.clear();
     this.activityFiles = [];
+    this.scanValue = this.emptyScanActivity();
     this.activityUpdatedAt = this.now();
     this.emit(defaultProgress("stopped"));
   }
@@ -1028,7 +1137,10 @@ export class NtfyLanSync {
     const normalized = this.normalizePath(path);
     if (!normalized) return;
     this.hashCache.delete(normalized);
-    this.scheduleSync(120);
+    this.queueHashCacheSave();
+    if (!this.settings().autoDiscovery) return;
+    this.syncRequestId = randomId(18);
+    this.scheduleSync(45, true);
   }
 
   requestSync(): void {
@@ -1046,10 +1158,12 @@ export class NtfyLanSync {
       autoDiscovery: raw.autoDiscovery === true,
       checkIntervalSeconds: normalizedCheckIntervalSeconds(raw.checkIntervalSeconds),
       mode: normalizedMode(raw.mode),
+      conflictRule: normalizedConflictRule(raw.conflictRule),
       syncConfigFolder: raw.syncConfigFolder === true,
       configDir: normalizedConfigDir(raw.configDir),
       port: normalizedPort(raw.port),
       maxFileBytes: normalizedMaxFileBytes(raw.maxFileBytes),
+      inboxRetentionHours: normalizedInboxRetentionHours(raw.inboxRetentionHours),
       manualPeers: Array.isArray(raw.manualPeers) ? raw.manualPeers.map(String).slice(0, 32) : []
     };
   }
@@ -1062,7 +1176,8 @@ export class NtfyLanSync {
       deletePush: settings.mode === "delete-push",
       deletePull: settings.mode === "delete-pull",
       syncConfigFolder: settings.syncConfigFolder,
-      deleteProtocol: true
+      deleteProtocol: true,
+      conflictRule: settings.conflictRule
     };
   }
 
@@ -1080,6 +1195,77 @@ export class NtfyLanSync {
 
   private now(): number {
     return this.options.now?.() ?? Date.now();
+  }
+
+  private emptyScanActivity(): LanSyncScanActivity {
+    return {
+      id: "",
+      phase: "idle",
+      completed: 0,
+      total: 0,
+      cached: 0,
+      hashed: 0,
+      skipped: 0,
+      error: "",
+      files: []
+    };
+  }
+
+  private hashCacheKey(): string {
+    return `${HASH_CACHE_STORAGE_PREFIX}.${this.identity?.vaultId ?? "unknown"}`;
+  }
+
+  private loadHashCache(): void {
+    if (this.hashCacheLoaded) return;
+    this.hashCacheLoaded = true;
+    try {
+      const raw = this.localStore()?.getItem(this.hashCacheKey());
+      if (!raw) return;
+      const parsed = safeJsonObject(raw);
+      if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.entries)) return;
+      for (const item of parsed.entries.slice(-MAX_MANIFEST_FILES)) {
+        if (!Array.isArray(item) || item.length !== 3) continue;
+        const path = this.normalizePath(item[0], true);
+        const signature = typeof item[1] === "string" ? item[1] : "";
+        const hash = typeof item[2] === "string" ? item[2] : "";
+        if (path && /^\d+(?:\.\d+)?:\d+$/.test(signature) && /^[A-Za-z0-9_-]{32,64}$/.test(hash)) {
+          this.hashCache.set(path, { signature, hash });
+        }
+      }
+    } catch {
+      this.hashCache.clear();
+    }
+  }
+
+  private queueHashCacheSave(): void {
+    if (this.hashSaveTimer) clearTimeout(this.hashSaveTimer);
+    this.hashSaveTimer = setTimeout(() => {
+      this.hashSaveTimer = null;
+      this.saveHashCache();
+    }, 250);
+  }
+
+  private saveHashCache(): void {
+    try {
+      const entries = [...this.hashCache.entries()].slice(-MAX_MANIFEST_FILES).map(([path, value]) => [path, value.signature, value.hash]);
+      this.localStore()?.setItem(this.hashCacheKey(), JSON.stringify({ schemaVersion: 1, entries }));
+    } catch {
+      // A memory-only cache is slower after reload but does not affect correctness.
+    }
+  }
+
+  private parseAttachment(value: unknown): LanSyncAttachment {
+    if (!isRecord(value)) throw new LanSyncProtocolError("invalid_message_attachment");
+    const path = normalizeLanInboxAttachmentPath(value.path);
+    const name = safeLanInboxName(value.name);
+    const type = typeof value.type === "string" ? value.type.slice(0, 128) : "application/octet-stream";
+    const size = Number(value.size);
+    const hash = typeof value.hash === "string" ? value.hash : "";
+    const expiresAtDate = new Date(typeof value.expiresAt === "string" ? value.expiresAt : 0);
+    if (!path || path.split("/").pop() !== name || !Number.isFinite(size) || size < 0 || size > this.settings().maxFileBytes || !/^[A-Za-z0-9_-]{32,64}$/.test(hash) || !Number.isFinite(expiresAtDate.getTime())) {
+      throw new LanSyncProtocolError("invalid_message_attachment");
+    }
+    return { name, type, path, size, hash, temporary: true, expiresAt: expiresAtDate.toISOString() };
   }
 
   private localStore(): Pick<Storage, "getItem" | "setItem" | "removeItem"> | null {
@@ -1422,22 +1608,29 @@ export class NtfyLanSync {
       this.peers.get(deviceId)?.canHost === true,
       false
     );
+    const firstVerifiedConnection = peer.verifiedAt <= 0;
     peer.verifiedAt = this.now();
     peer.consecutiveFailures = 0;
     peer.lastFailureAt = 0;
-    this.lastTransferAt = this.now();
-    const transfer = route.includes("/file/");
-    this.emit({
-      ...defaultProgress(transfer ? "syncing" : "connected"),
-      active: true,
-      peerId: deviceId
-    });
+    if (firstVerifiedConnection && route.endsWith("/ping")) this.syncRequestId = randomId(18);
+    const transfer = route.includes("/file/") || route.includes("/attachment/");
+    if (transfer) this.lastTransferAt = this.now();
+    if (transfer || (this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing")) {
+      this.emit({
+        ...defaultProgress(transfer ? "syncing" : "connected"),
+        active: true,
+        peerId: deviceId
+      });
+    }
     this.emitPeersChanged();
   }
 
   private beginInboundFileActivity(deviceId: string, route: string, payload: Record<string, unknown>): number | null {
-    if (!route.includes("/file/")) return null;
-    const path = this.normalizePath(payload.path);
+    if (!route.includes("/file/") && !route.includes("/attachment/")) return null;
+    const attachmentPath = route.endsWith("/attachment/write")
+      ? normalizeLanInboxAttachmentPath(`${LAN_INBOX_ROOT}/${String(payload.attachmentId || "")}/${safeLanInboxName(payload.name)}`)
+      : null;
+    const path = attachmentPath || this.normalizePath(payload.path);
     if (!path) return null;
     const now = this.now();
     if (this.progressValue.peerId !== deviceId || now - this.activityUpdatedAt > 1500) this.activityFiles = [];
@@ -1491,17 +1684,22 @@ export class NtfyLanSync {
     const sentAt = Number.isFinite(sentAtDate.getTime()) ? sentAtDate.toISOString() : new Date(this.now()).toISOString();
     const attachments = (Array.isArray(raw.attachments) ? raw.attachments : []).slice(0, MAX_MESSAGE_ATTACHMENTS).map((item) => {
       if (!isRecord(item)) throw new LanSyncProtocolError("invalid_message_attachment");
-      const path = this.normalizePath(item.path, false);
+      const inboxPath = normalizeLanInboxAttachmentPath(item.path);
+      const path = inboxPath || this.normalizePath(item.path, false);
       const hash = typeof item.hash === "string" ? item.hash : "";
       const size = Number(item.size);
       if (!path || !/^[A-Za-z0-9_-]{32,64}$/.test(hash) || !Number.isFinite(size) || size < 0 || size > this.settings().maxFileBytes) {
         throw new LanSyncProtocolError("invalid_message_attachment");
       }
+      const expiresAtDate = new Date(typeof item.expiresAt === "string" ? item.expiresAt : 0);
       return {
-        name: String(item.name || path.split("/").pop() || "attachment").slice(0, 240),
+        name: safeLanInboxName(item.name || path.split("/").pop() || "attachment"),
+        type: String(item.type || "application/octet-stream").slice(0, 128),
         path,
         size,
-        hash
+        hash,
+        temporary: Boolean(inboxPath),
+        expiresAt: inboxPath && Number.isFinite(expiresAtDate.getTime()) ? expiresAtDate.toISOString() : ""
       };
     });
     if (!text && !attachments.length) throw new LanSyncProtocolError("empty_message");
@@ -1522,10 +1720,11 @@ export class NtfyLanSync {
 
   private async verifyPeer(peer: LanSyncPeer): Promise<void> {
     const now = this.now();
-    const minimumProbeInterval = Math.max(300, this.settings().checkIntervalSeconds * 1000);
+    const minimumProbeInterval = Math.max(300, PEER_PROBE_INTERVAL_MS - 100);
     if (!this.runningValue || !peer.canHost || peer.probing || now - peer.lastProbeAt < minimumProbeInterval || !peer.addresses.size) return;
     peer.probing = true;
     peer.lastProbeAt = now;
+    const firstVerifiedConnection = peer.verifiedAt <= 0;
     try {
       const response = await this.callPeer(peer, "/ping", {});
       const responseDeviceId = typeof response.deviceId === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(response.deviceId) ? response.deviceId : "";
@@ -1556,9 +1755,11 @@ export class NtfyLanSync {
       peer.consecutiveFailures = 0;
       peer.lastFailureAt = 0;
       this.lastErrorValue = "";
-      this.emit({ ...defaultProgress("connected"), active: true, peerId: peer.deviceId });
+      if (this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing") {
+        this.emit({ ...defaultProgress("connected"), active: true, peerId: peer.deviceId });
+      }
       this.emitPeersChanged();
-      this.scheduleSync(remoteRequestedSync ? 0 : 20, remoteRequestedSync);
+      if (firstVerifiedConnection || remoteRequestedSync) this.scheduleSync(remoteRequestedSync ? 0 : 20, true);
     } catch {
       peer.consecutiveFailures = Math.min(100, peer.consecutiveFailures + 1);
       peer.lastFailureAt = this.now();
@@ -1586,8 +1787,7 @@ export class NtfyLanSync {
 
   private isPeerActive(peer: LanSyncPeer, now = this.now()): boolean {
     if (peer.verifiedAt <= 0) return false;
-    const intervalMs = this.settings().checkIntervalSeconds * 1000;
-    const stableGraceMs = Math.max(PEER_MIN_STABLE_GRACE_MS, intervalMs * 8);
+    const stableGraceMs = Math.max(PEER_MIN_STABLE_GRACE_MS, PEER_PROBE_INTERVAL_MS * 12);
     return now - peer.verifiedAt <= stableGraceMs;
   }
 
@@ -1659,21 +1859,8 @@ export class NtfyLanSync {
     this.activityUpdatedAt = this.now();
     this.emit({ ...defaultProgress("scanning"), active: true, peerId: peer.deviceId });
     const localPolicy = this.policy();
-    let lastScanProgressAt = 0;
-    const reportScanProgress = (completed: number, total: number): void => {
-      const now = this.now();
-      if (completed !== total && now - lastScanProgressAt < 100) return;
-      lastScanProgressAt = now;
-      this.emit({
-        ...defaultProgress("scanning"),
-        active: true,
-        peerId: peer.deviceId,
-        completed,
-        total
-      });
-    };
     const [localEntries, remoteResponse, ledger] = await Promise.all([
-      this.buildManifest(localPolicy.syncConfigFolder, reportScanProgress),
+      this.buildManifest(localPolicy.syncConfigFolder),
       this.callPeer(peer, "/manifest", { syncConfigFolder: localPolicy.syncConfigFolder }),
       Promise.resolve(this.loadLedger(peer.deviceId))
     ]);
@@ -1837,25 +2024,109 @@ export class NtfyLanSync {
     includeConfigFolder = this.settings().syncConfigFolder,
     onProgress?: (completed: number, total: number) => void
   ): Promise<LanSyncManifestEntry[]> {
+    if (this.manifestBuild?.includeConfigFolder === includeConfigFolder) {
+      const existing = await this.manifestBuild.promise;
+      onProgress?.(this.scanValue.completed, this.scanValue.total);
+      return existing.map((entry) => ({ ...entry }));
+    }
+    const promise = this.buildManifestOnce(includeConfigFolder, onProgress);
+    this.manifestBuild = { includeConfigFolder, promise };
+    try {
+      return await promise;
+    } finally {
+      if (this.manifestBuild?.promise === promise) this.manifestBuild = null;
+    }
+  }
+
+  private async buildManifestOnce(
+    includeConfigFolder: boolean,
+    onProgress?: (completed: number, total: number) => void
+  ): Promise<LanSyncManifestEntry[]> {
     const maxFileBytes = this.settings().maxFileBytes;
-    const files = (await this.options.storage.listFiles(includeConfigFolder))
-      .map((file) => ({ ...file, path: this.normalizePath(file.path, includeConfigFolder) }))
-      .filter((file): file is Omit<LanSyncFileStat, "path"> & { path: string } => Boolean(file.path) && file.size >= 0 && file.size <= maxFileBytes)
-      .sort((left, right) => left.path.localeCompare(right.path))
-      .slice(0, MAX_MANIFEST_FILES);
-    onProgress?.(0, files.length);
-    let completed = 0;
-    return await mapWithConcurrency(files, HASH_CONCURRENCY, async (file) => {
-      const signature = `${file.mtime}:${file.size}`;
-      let hash = this.hashCache.get(file.path)?.signature === signature ? this.hashCache.get(file.path)?.hash ?? "" : "";
-      if (!hash) {
-        hash = await sha256Bytes(await this.options.storage.readBinary(file.path));
-        this.hashCache.set(file.path, { signature, hash });
+    const rawFiles = (await this.options.storage.listFiles(includeConfigFolder))
+      .map((file) => ({ ...file, originalPath: String(file.path || ""), path: this.normalizePath(file.path, includeConfigFolder) }))
+      .sort((left, right) => left.originalPath.localeCompare(right.originalPath));
+    const scanFiles: LanSyncScanFileActivity[] = [];
+    const candidates: Array<Omit<LanSyncFileStat, "path"> & { path: string; scanIndex: number }> = [];
+    for (const file of rawFiles) {
+      let reason = "";
+      if (!file.path || file.size < 0) reason = "unsafe-path";
+      else if (file.size > maxFileBytes) reason = "too-large";
+      else if (candidates.length >= MAX_MANIFEST_FILES) reason = "manifest-limit";
+      const scanIndex = scanFiles.push({
+        path: file.path || file.originalPath,
+        state: reason ? "skipped" : "pending",
+        size: Math.max(0, Number(file.size) || 0),
+        reason
+      }) - 1;
+      if (!reason && file.path) candidates.push({ path: file.path, size: file.size, mtime: file.mtime, scanIndex });
+    }
+    this.scanValue = {
+      id: randomId(12),
+      phase: "scanning",
+      completed: scanFiles.filter((file) => file.state === "skipped").length,
+      total: scanFiles.length,
+      cached: 0,
+      hashed: 0,
+      skipped: scanFiles.filter((file) => file.state === "skipped").length,
+      error: "",
+      files: scanFiles
+    };
+    let lastReportedAt = 0;
+    const report = (force = false): void => {
+      const now = this.now();
+      if (!force && this.scanValue.completed !== this.scanValue.total && now - lastReportedAt < 60) return;
+      lastReportedAt = now;
+      onProgress?.(this.scanValue.completed, this.scanValue.total);
+      if (this.progressValue.phase !== "syncing") {
+        this.emit({
+          ...defaultProgress("scanning"),
+          active: this.progressValue.active || this.activePeers().length > 0,
+          peerId: this.progressValue.peerId || this.activePeers()[0]?.deviceId || "",
+          completed: this.scanValue.completed,
+          total: this.scanValue.total
+        });
+      } else {
+        this.emit({ ...this.progressValue });
       }
-      completed += 1;
-      onProgress?.(completed, files.length);
-      return { path: file.path, size: file.size, mtime: file.mtime, hash };
-    });
+    };
+    report(true);
+    try {
+      const entries = await mapWithConcurrency(candidates, HASH_CONCURRENCY, async (file) => {
+        const activity = this.scanValue.files[file.scanIndex];
+        const signature = `${file.mtime}:${file.size}`;
+        const cached = this.hashCache.get(file.path);
+        let hash = cached?.signature === signature ? cached.hash : "";
+        if (hash) {
+          activity.state = "cached";
+          this.scanValue.cached += 1;
+        } else {
+          activity.state = "hashing";
+          hash = await sha256Bytes(await this.options.storage.readBinary(file.path));
+          this.hashCache.set(file.path, { signature, hash });
+          activity.state = "complete";
+          this.scanValue.hashed += 1;
+        }
+        this.scanValue.completed += 1;
+        report();
+        return { path: file.path, size: file.size, mtime: file.mtime, hash };
+      });
+      this.scanValue.phase = "complete";
+      this.scanValue.completed = this.scanValue.total;
+      this.queueHashCacheSave();
+      report(true);
+      return entries;
+    } catch (error) {
+      this.scanValue.phase = "error";
+      this.scanValue.error = safeErrorCode(error);
+      const hashing = this.scanValue.files.find((file) => file.state === "hashing");
+      if (hashing) {
+        hashing.state = "error";
+        hashing.reason = this.scanValue.error;
+      }
+      report(true);
+      throw error;
+    }
   }
 
   private parseManifest(value: unknown, includeConfigFolder: boolean): LanSyncManifestEntry[] {
@@ -2101,6 +2372,8 @@ export class NtfyLanSync {
         result = await this.handleWriteFile(payload);
       } else if (path === `${API_PREFIX}/file/delete`) {
         result = await this.handleDeleteFile(payload);
+      } else if (path === `${API_PREFIX}/attachment/write`) {
+        result = await this.handleWriteAttachment(payload);
       } else if (path === `${API_PREFIX}/message/send`) {
         result = await this.handleIncomingMessage(deviceId, payload);
       } else {
@@ -2147,5 +2420,24 @@ export class NtfyLanSync {
     if (!path || !/^[A-Za-z0-9_-]{32,64}$/.test(expectedHash)) throw new LanSyncProtocolError("unsafe_delete");
     await this.deleteLocal(path, expectedHash);
     return { ok: true, deleted: true, path, deletedHash: expectedHash };
+  }
+
+  private async handleWriteAttachment(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const attachmentId = typeof payload.attachmentId === "string" ? payload.attachmentId : "";
+    const name = safeLanInboxName(payload.name);
+    const path = normalizeLanInboxAttachmentPath(`${LAN_INBOX_ROOT}/${attachmentId}/${name}`);
+    const type = String(payload.type || "application/octet-stream").slice(0, 128);
+    const hash = typeof payload.hash === "string" ? payload.hash : "";
+    const encoded = typeof payload.data === "string" ? payload.data : "";
+    if (!path || !/^[A-Za-z0-9_-]{32,64}$/.test(hash)) throw new LanSyncProtocolError("unsafe_attachment");
+    const bytes = base64UrlToBytes(encoded);
+    if (bytes.byteLength > this.settings().maxFileBytes || await sha256Bytes(bytes) !== hash) throw new LanSyncProtocolError("invalid_file_content");
+    if (await this.options.storage.exists(path)) throw new LanSyncProtocolError("attachment_exists", 409);
+    await this.options.storage.ensureFolder(path.split("/").slice(0, -1).join("/"));
+    await this.options.storage.writeBinary(path, arrayBuffer(bytes));
+    const written = await this.options.storage.statFile(path);
+    if (!written || written.size !== bytes.byteLength || await sha256Bytes(await this.options.storage.readBinary(path)) !== hash) throw new Error("write_verification_failed");
+    const expiresAt = new Date(this.now() + this.settings().inboxRetentionHours * 60 * 60_000).toISOString();
+    return { name, type, path, size: bytes.byteLength, hash, temporary: true, expiresAt };
   }
 }
