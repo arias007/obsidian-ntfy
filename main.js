@@ -979,6 +979,8 @@ var NtfyLanSyncRuntime = (() => {
     if (lower === `${configRoot}/workspace.json` || lower === `${configRoot}/workspace-mobile.json`) return null;
     if (lower.startsWith(`${configRoot}/cache/`) || lower.startsWith(`${configRoot}/.cache/`)) return null;
     if (lower === `${configRoot}/plugins/remotely-save` || lower.startsWith(`${configRoot}/plugins/remotely-save/`)) return null;
+    const selfPluginRoot = `${configRoot}/plugins/android-ntfy-notifier`;
+    if (lower === selfPluginRoot || lower.startsWith(`${selfPluginRoot}/`)) return null;
     return normalized;
   }
   function classifyLanLinkType(name, address = "") {

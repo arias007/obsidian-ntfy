@@ -183,6 +183,10 @@ try {
     ".obsidian/workspace-mobile.json",
     ".obsidian/plugins/remotely-save/data.json",
     ".obsidian/plugins/android-ntfy-notifier/lan-sync/identity.json",
+    ".obsidian/plugins/android-ntfy-notifier/data.json",
+    ".obsidian/plugins/android-ntfy-notifier/main.js",
+    ".obsidian/plugins/android-ntfy-notifier/manifest.json",
+    ".obsidian/plugins/android-ntfy-notifier/styles.css",
     ".obsidian/plugins/example/node_modules/cache.bin"
   ]) {
     assert.equal(normalizeLanSyncPath(protectedPath, configPathOptions), null, `Protected config path accepted: ${protectedPath}`);

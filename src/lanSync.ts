@@ -501,6 +501,12 @@ export function normalizeLanSyncPath(value: unknown, options: LanSyncPathOptions
   if (lower === `${configRoot}/workspace.json` || lower === `${configRoot}/workspace-mobile.json`) return null;
   if (lower.startsWith(`${configRoot}/cache/`) || lower.startsWith(`${configRoot}/.cache/`)) return null;
   if (lower === `${configRoot}/plugins/remotely-save` || lower.startsWith(`${configRoot}/plugins/remotely-save/`)) return null;
+  // The plugin's own directory is per-device state (data.json, main.js, manifest.json,
+  // styles.css and channel keys differ per device) and must never be synced. The LAN
+  // identity sub-folder is already excluded above via identityRoot; excluding the whole
+  // plugin directory also prevents plugin files from colliding across devices.
+  const selfPluginRoot = `${configRoot}/plugins/android-ntfy-notifier`;
+  if (lower === selfPluginRoot || lower.startsWith(`${selfPluginRoot}/`)) return null;
   return normalized;
 }
 
