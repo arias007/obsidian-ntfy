@@ -1,6 +1,6 @@
 {
   "name": "obsidian-ntfy",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "private": true,
   "description": "Mobile notifications and a bidirectional channel hub for Obsidian.",
   "license": "MIT",

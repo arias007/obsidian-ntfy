@@ -165,6 +165,8 @@ type LanSyncPeer = {
   verifiedAt: number;
   lastProbeAt: number;
   lastSyncAt: number;
+  consecutiveFailures: number;
+  lastFailureAt: number;
   probing: boolean;
   manual: boolean;
   policy: LanSyncPolicy;
@@ -201,6 +203,8 @@ const MULTICAST_ADDRESS = "239.255.67.19";
 const DISCOVERY_PORT = 43189;
 const ANNOUNCE_INTERVAL_MS = 750;
 const PEER_SWEEP_INTERVAL_MS = 350;
+const PEER_MIN_STABLE_GRACE_MS = 30_000;
+const PEER_MAX_ADDRESS_HISTORY = 8;
 const REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 const SYNC_MIN_INTERVAL_MS = 400;
 const HASH_CONCURRENCY = 8;
@@ -876,7 +880,7 @@ export class NtfyLanSync {
           address,
           port: peer.port,
           linkType: peer.manual && detectedLink === "lan" ? "manual" : detectedLink,
-          verified: now - peer.verifiedAt <= Math.max(4500, this.settings().checkIntervalSeconds * 3000 + 1000),
+          verified: this.isPeerActive(peer, now),
           lastSeenAt: Math.max(peer.lastSeenAt, peer.verifiedAt)
         };
       })
@@ -1198,7 +1202,15 @@ export class NtfyLanSync {
 
   private emitPeersChanged(): void {
     const peers = this.listPeers();
-    const fingerprint = JSON.stringify(peers);
+    // Heartbeats refresh timestamps frequently; those are liveness details,
+    // not contact-list changes that should rebuild an active chat composer.
+    const fingerprint = JSON.stringify(peers.map((peer) => ({
+      deviceId: peer.deviceId,
+      address: peer.address,
+      port: peer.port,
+      linkType: peer.linkType,
+      verified: peer.verified
+    })));
     if (fingerprint === this.lastPeerFingerprint) return;
     this.lastPeerFingerprint = fingerprint;
     try {
@@ -1374,6 +1386,8 @@ export class NtfyLanSync {
         verifiedAt: 0,
         lastProbeAt: 0,
         lastSyncAt: 0,
+        consecutiveFailures: 0,
+        lastFailureAt: 0,
         probing: false,
         manual,
         policy: passivePeerPolicy()
@@ -1384,9 +1398,10 @@ export class NtfyLanSync {
     peer.canHost = peer.canHost || canHost;
     peer.manual = peer.manual || manual;
     peer.lastSeenAt = Math.max(peer.lastSeenAt, seenAt);
-    for (const address of addresses.map(normalizeRemoteAddress)) {
-      if (isPrivateLanAddress(address)) peer.addresses.add(address);
-    }
+    const nextAddresses = addresses
+      .map(normalizeRemoteAddress)
+      .filter((address) => isPrivateLanAddress(address));
+    peer.addresses = new Set([...nextAddresses, ...peer.addresses].slice(0, PEER_MAX_ADDRESS_HISTORY));
     return peer;
   }
 
@@ -1401,6 +1416,8 @@ export class NtfyLanSync {
       false
     );
     peer.verifiedAt = this.now();
+    peer.consecutiveFailures = 0;
+    peer.lastFailureAt = 0;
     this.lastTransferAt = this.now();
     const transfer = route.includes("/file/");
     this.emit({
@@ -1524,13 +1541,17 @@ export class NtfyLanSync {
       peer.policy = policyFromRaw(response.policy);
       peer.verifiedAt = this.now();
       peer.lastSeenAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
+      peer.consecutiveFailures = 0;
+      peer.lastFailureAt = 0;
       this.lastErrorValue = "";
       this.emit({ ...defaultProgress("connected"), active: true, peerId: peer.deviceId });
       this.emitPeersChanged();
       this.scheduleSync(20);
     } catch {
-      // A remembered endpoint can be offline or reassigned. It is not active
-      // until the authenticated ping succeeds.
+      peer.consecutiveFailures = Math.min(100, peer.consecutiveFailures + 1);
+      peer.lastFailureAt = this.now();
+      // Keep an authenticated peer visible through short network jitter. The
+      // stable grace window below decides when it is genuinely offline.
     } finally {
       peer.probing = false;
     }
@@ -1546,10 +1567,16 @@ export class NtfyLanSync {
 
   private activePeers(): LanSyncPeer[] {
     const now = this.now();
-    const activeMs = Math.max(4500, this.settings().checkIntervalSeconds * 3000 + 1000);
     return [...this.peers.values()]
-      .filter((peer) => peer.verifiedAt > 0 && now - peer.verifiedAt <= activeMs)
+      .filter((peer) => this.isPeerActive(peer, now))
       .sort((left, right) => left.deviceId.localeCompare(right.deviceId));
+  }
+
+  private isPeerActive(peer: LanSyncPeer, now = this.now()): boolean {
+    if (peer.verifiedAt <= 0) return false;
+    const intervalMs = this.settings().checkIntervalSeconds * 1000;
+    const stableGraceMs = Math.max(PEER_MIN_STABLE_GRACE_MS, intervalMs * 8);
+    return now - peer.verifiedAt <= stableGraceMs;
   }
 
   private sweepPeers(): void {
@@ -1715,6 +1742,8 @@ export class NtfyLanSync {
     if (failure !== null) throw failure;
     this.saveLedger(peer.deviceId, ledger);
     peer.verifiedAt = this.now();
+    peer.consecutiveFailures = 0;
+    peer.lastFailureAt = 0;
     this.lastErrorValue = "";
     this.emit({
       ...defaultProgress("complete"),
@@ -1960,6 +1989,9 @@ export class NtfyLanSync {
         }
         const decrypted = await decryptLanSyncPayload(this.identity.secret, response.text);
         peer.verifiedAt = this.now();
+        peer.consecutiveFailures = 0;
+        peer.lastFailureAt = 0;
+        peer.addresses = new Set([address, ...peer.addresses].slice(0, PEER_MAX_ADDRESS_HISTORY));
         return decrypted;
       } catch (error) {
         lastError = error;

@@ -338,6 +338,55 @@ try {
       runtimeSettings
     };
   };
+  let stabilityClock = 1_000;
+  let stabilityPeerEvents = 0;
+  const stabilitySettings = {
+    enabled: true,
+    autoDiscovery: true,
+    checkIntervalSeconds: 1,
+    mode: "bidirectional",
+    syncConfigFolder: false,
+    configDir: ".obsidian",
+    port: 43190,
+    maxFileBytes: 1024 * 1024,
+    manualPeers: []
+  };
+  const stabilityService = new NtfyLanSync({
+    desktop: false,
+    getSettings: () => stabilitySettings,
+    storage: new MemoryStorage(identity, {}),
+    httpRequest,
+    onProgress: () => undefined,
+    onPeersChanged: () => { stabilityPeerEvents += 1; },
+    localStore: memoryLocalStore("STABILITYSTABILITY01"),
+    now: () => stabilityClock
+  });
+  const stabilityPeer = {
+    deviceId: "STABILITYPEER123456",
+    port: 43190,
+    addresses: new Set(["127.0.0.1"]),
+    canHost: true,
+    lastSeenAt: stabilityClock,
+    verifiedAt: stabilityClock,
+    lastProbeAt: 0,
+    lastSyncAt: 0,
+    consecutiveFailures: 1,
+    lastFailureAt: stabilityClock,
+    probing: false,
+    manual: false,
+    policy: { incrementalPush: false, incrementalPull: false, deletePush: false, deletePull: false, syncConfigFolder: false, deleteProtocol: true }
+  };
+  stabilityService.peers.set(stabilityPeer.deviceId, stabilityPeer);
+  stabilityClock = 8_000;
+  assert.equal(stabilityService.listPeers().length, 1, "A short probe failure should not hide an authenticated peer");
+  stabilityService.emitPeersChanged();
+  stabilityPeer.lastSeenAt = stabilityClock + 1_000;
+  stabilityClock += 1_000;
+  stabilityService.emitPeersChanged();
+  assert.equal(stabilityPeerEvents, 1, "Heartbeat timestamps should not rebuild the chat contact list");
+  stabilityPeer.consecutiveFailures = 3;
+  stabilityClock = 31_500;
+  assert.equal(stabilityService.listPeers().length, 0, "A peer should leave the list only after the stable grace window");
   const optionsB = commonOptions(storageB, portB, deviceB, progressB);
   const optionsA = commonOptions(storageA, portA, deviceA, progressA, { autoDiscovery: false, manualPeers: [`127.0.0.1:${portB}`] });
   const messagesB = [];

@@ -118,6 +118,12 @@ async function run() {
   assert.match(styles, /\.obsidian-ntfy-chat\.is-conversation-open \.obsidian-ntfy-chat-conversation/);
   assert.match(source, /notification-hub:conversations-changed/);
   assert.match(source, /class NtfyVaultFileSuggestModal extends SuggestModal/);
+  assert.match(source, /conversationDrafts = new Map\(\)/);
+  assert.match(source, /captureConversationInputState\(\)/);
+  assert.match(source, /installViewportSizing\(\)/);
+  assert.match(styles, /--obsidian-ntfy-viewport-height/);
+  assert.match(styles, /\.obsidian-ntfy-chat-messages[\s\S]*?overflow: auto/);
+  assert.match(styles, /\.obsidian-ntfy-chat-composer[\s\S]*?position: relative/);
   assert.match(source, /channelAction: "ntfy-vault-files"/);
   assert.match(source, /msg_type: "file"/);
   assert.match(styles, /\.obsidian-ntfy-task-time\.is-editable/);

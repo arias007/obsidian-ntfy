@@ -775,6 +775,8 @@ var NtfyLanSyncRuntime = (() => {
   var DISCOVERY_PORT = 43189;
   var ANNOUNCE_INTERVAL_MS = 750;
   var PEER_SWEEP_INTERVAL_MS = 350;
+  var PEER_MIN_STABLE_GRACE_MS = 3e4;
+  var PEER_MAX_ADDRESS_HISTORY = 8;
   var REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 6e4;
   var SYNC_MIN_INTERVAL_MS = 400;
   var HASH_CONCURRENCY = 8;
@@ -1353,7 +1355,7 @@ ${bodyHash}`;
           address,
           port: peer.port,
           linkType: peer.manual && detectedLink === "lan" ? "manual" : detectedLink,
-          verified: now - peer.verifiedAt <= Math.max(4500, this.settings().checkIntervalSeconds * 3e3 + 1e3),
+          verified: this.isPeerActive(peer, now),
           lastSeenAt: Math.max(peer.lastSeenAt, peer.verifiedAt)
         };
       }).filter((peer) => peer.verified).sort((left, right) => left.deviceId.localeCompare(right.deviceId));
@@ -1648,7 +1650,13 @@ ${bodyHash}`;
     }
     emitPeersChanged() {
       const peers = this.listPeers();
-      const fingerprint = JSON.stringify(peers);
+      const fingerprint = JSON.stringify(peers.map((peer) => ({
+        deviceId: peer.deviceId,
+        address: peer.address,
+        port: peer.port,
+        linkType: peer.linkType,
+        verified: peer.verified
+      })));
       if (fingerprint === this.lastPeerFingerprint) return;
       this.lastPeerFingerprint = fingerprint;
       try {
@@ -1808,6 +1816,8 @@ ${bodyHash}`;
           verifiedAt: 0,
           lastProbeAt: 0,
           lastSyncAt: 0,
+          consecutiveFailures: 0,
+          lastFailureAt: 0,
           probing: false,
           manual,
           policy: passivePeerPolicy()
@@ -1818,9 +1828,8 @@ ${bodyHash}`;
       peer.canHost = peer.canHost || canHost;
       peer.manual = peer.manual || manual;
       peer.lastSeenAt = Math.max(peer.lastSeenAt, seenAt);
-      for (const address of addresses.map(normalizeRemoteAddress)) {
-        if (isPrivateLanAddress(address)) peer.addresses.add(address);
-      }
+      const nextAddresses = addresses.map(normalizeRemoteAddress).filter((address) => isPrivateLanAddress(address));
+      peer.addresses = new Set([...nextAddresses, ...peer.addresses].slice(0, PEER_MAX_ADDRESS_HISTORY));
       return peer;
     }
     markInboundPeer(deviceId, address, route) {
@@ -1834,6 +1843,8 @@ ${bodyHash}`;
         false
       );
       peer.verifiedAt = this.now();
+      peer.consecutiveFailures = 0;
+      peer.lastFailureAt = 0;
       this.lastTransferAt = this.now();
       const transfer = route.includes("/file/");
       this.emit({
@@ -1945,11 +1956,15 @@ ${bodyHash}`;
         peer.policy = policyFromRaw(response.policy);
         peer.verifiedAt = this.now();
         peer.lastSeenAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
+        peer.consecutiveFailures = 0;
+        peer.lastFailureAt = 0;
         this.lastErrorValue = "";
         this.emit({ ...defaultProgress("connected"), active: true, peerId: peer.deviceId });
         this.emitPeersChanged();
         this.scheduleSync(20);
       } catch {
+        peer.consecutiveFailures = Math.min(100, peer.consecutiveFailures + 1);
+        peer.lastFailureAt = this.now();
       } finally {
         peer.probing = false;
       }
@@ -1963,8 +1978,13 @@ ${bodyHash}`;
     }
     activePeers() {
       const now = this.now();
-      const activeMs = Math.max(4500, this.settings().checkIntervalSeconds * 3e3 + 1e3);
-      return [...this.peers.values()].filter((peer) => peer.verifiedAt > 0 && now - peer.verifiedAt <= activeMs).sort((left, right) => left.deviceId.localeCompare(right.deviceId));
+      return [...this.peers.values()].filter((peer) => this.isPeerActive(peer, now)).sort((left, right) => left.deviceId.localeCompare(right.deviceId));
+    }
+    isPeerActive(peer, now = this.now()) {
+      if (peer.verifiedAt <= 0) return false;
+      const intervalMs = this.settings().checkIntervalSeconds * 1e3;
+      const stableGraceMs = Math.max(PEER_MIN_STABLE_GRACE_MS, intervalMs * 8);
+      return now - peer.verifiedAt <= stableGraceMs;
     }
     sweepPeers() {
       const active = this.activePeers();
@@ -2122,6 +2142,8 @@ ${bodyHash}`;
       if (failure !== null) throw failure;
       this.saveLedger(peer.deviceId, ledger);
       peer.verifiedAt = this.now();
+      peer.consecutiveFailures = 0;
+      peer.lastFailureAt = 0;
       this.lastErrorValue = "";
       this.emit({
         ...defaultProgress("complete"),
@@ -2344,6 +2366,9 @@ ${bodyHash}`;
           }
           const decrypted = await decryptLanSyncPayload(this.identity.secret, response.text);
           peer.verifiedAt = this.now();
+          peer.consecutiveFailures = 0;
+          peer.lastFailureAt = 0;
+          peer.addresses = new Set([address, ...peer.addresses].slice(0, PEER_MAX_ADDRESS_HISTORY));
           return decrypted;
         } catch (error) {
           lastError = error;
@@ -8236,6 +8261,8 @@ class NtfyManagerView extends ItemView {
     this.activeConversationId = "";
     this.mobileConversationOpen = false;
     this.selectedConversationFiles = [];
+    this.conversationDrafts = new Map();
+    this.viewportCleanup = null;
   }
 
   getViewType() {
@@ -8259,15 +8286,20 @@ class NtfyManagerView extends ItemView {
     const preload = this.plugin.consumeManagerViewPreload();
     if (preload) this.setPreloadedData(preload);
     await this.render();
+    this.installViewportSizing();
+    this.updateViewportSizing();
   }
 
   async onClose() {
+    this.viewportCleanup?.();
+    this.viewportCleanup = null;
     this.viewContentEl().empty();
     this.bodyEl = null;
     this.tabPanels.clear();
     this.tabSignatures.clear();
     this.tabScrollPositions.clear();
     this.tabRefreshes.clear();
+    this.conversationDrafts.clear();
   }
 
   refreshIncomingView() {
@@ -8277,6 +8309,62 @@ class NtfyManagerView extends ItemView {
 
   viewContentEl() {
     return this.contentEl || this.containerEl.children[1] || this.containerEl;
+  }
+
+  installViewportSizing() {
+    if (this.viewportCleanup || typeof window === "undefined") return;
+    const viewport = window.visualViewport;
+    const update = () => this.updateViewportSizing();
+    window.addEventListener("resize", update, { passive: true });
+    window.addEventListener("orientationchange", update, { passive: true });
+    viewport?.addEventListener("resize", update, { passive: true });
+    viewport?.addEventListener("scroll", update, { passive: true });
+    this.viewportCleanup = () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("orientationchange", update);
+      viewport?.removeEventListener("resize", update);
+      viewport?.removeEventListener("scroll", update);
+    };
+  }
+
+  updateViewportSizing() {
+    if (typeof window === "undefined") return;
+    const root = this.viewContentEl();
+    const viewport = window.visualViewport;
+    if (!root || !viewport) return;
+    const rect = root.getBoundingClientRect();
+    const top = Math.max(0, rect.top - Number(viewport.offsetTop || 0));
+    const height = Math.max(240, Math.floor(viewport.height - top));
+    root.style.setProperty("--obsidian-ntfy-viewport-height", `${height}px`);
+  }
+
+  captureConversationInputState() {
+    if (typeof document === "undefined") return null;
+    const activeElement = document.activeElement;
+    if (!activeElement?.classList?.contains("obsidian-ntfy-chat-input")) return null;
+    const conversationId = this.activeConversationId;
+    if (!conversationId) return null;
+    const value = String(activeElement.value || "");
+    this.conversationDrafts.set(conversationId, value);
+    return {
+      conversationId,
+      selectionStart: Number.isFinite(activeElement.selectionStart) ? activeElement.selectionStart : value.length,
+      selectionEnd: Number.isFinite(activeElement.selectionEnd) ? activeElement.selectionEnd : value.length,
+    };
+  }
+
+  restoreConversationInputState(state) {
+    if (!state) return;
+    const restore = () => {
+      if (this.activeTab !== "inbox" || this.activeConversationId !== state.conversationId) return;
+      const input = this.bodyEl?.querySelector(".obsidian-ntfy-chat-input");
+      if (!input) return;
+      input.focus({ preventScroll: true });
+      const length = input.value.length;
+      input.setSelectionRange(Math.min(state.selectionStart, length), Math.min(state.selectionEnd, length));
+    };
+    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(restore);
+    else restore();
   }
 
   setPreloadedData(data) {
@@ -8304,6 +8392,7 @@ class NtfyManagerView extends ItemView {
       this.syncTabPanels(this.managerTabIds());
     }
 
+    this.updateViewportSizing();
     this.refreshTabInBackground(this.activeTab);
   }
 
@@ -8339,6 +8428,7 @@ class NtfyManagerView extends ItemView {
     const panel = this.tabPanels.get(tabId);
     if (!panel) return;
     const scrollTop = this.activeTab === tabId && this.bodyEl ? this.bodyEl.scrollTop : null;
+    const inputState = tabId === "inbox" ? this.captureConversationInputState() : null;
     panel.empty();
     if (tabId === "pending") this.renderNotificationTasks(panel);
     if (tabId === "queue") this.renderQueueWorkspace(panel);
@@ -8348,6 +8438,7 @@ class NtfyManagerView extends ItemView {
     if (tabId === "connections") this.renderConnectionStatus(panel);
     this.tabSignatures.set(tabId, this.tabDataSignature(tabId));
     if (scrollTop !== null && this.bodyEl) this.bodyEl.scrollTop = scrollTop;
+    this.restoreConversationInputState(inputState);
   }
 
   tabDataSignature(tabId) {
@@ -8638,11 +8729,16 @@ class NtfyManagerView extends ItemView {
       cls: "obsidian-ntfy-chat-input",
       attr: { rows: "1", placeholder: this.uiText("输入消息", "Message") },
     });
+    input.value = this.conversationDrafts.get(active.id) || "";
+    input.addEventListener("input", () => {
+      this.conversationDrafts.set(active.id, input.value);
+    });
     const send = this.iconButton(composeRow, "send", this.uiText("发送", "Send"), "primary", async () => {
       const text = input.value.trim();
       const paths = [...this.selectedConversationFiles];
       if (!text && !paths.length) return;
       input.value = "";
+      this.conversationDrafts.delete(active.id);
       this.selectedConversationFiles = [];
       renderSelected();
       send.disabled = true;
