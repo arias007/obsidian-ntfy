@@ -152,7 +152,6 @@ try {
   const {
     NtfyLanSync,
     LanStatusBarTakeover,
-    buildLanConflictPath,
     classifyLanLinkType,
     createLanSyncRequestHeaders,
     decryptLanSyncPayload,
@@ -178,6 +177,8 @@ try {
     identityRoot: ".obsidian/plugins/android-ntfy-notifier/lan-sync"
   };
   assert.equal(normalizeLanSyncPath(".obsidian/hotkeys.json", configPathOptions), ".obsidian/hotkeys.json");
+  assert.equal(normalizeLanSyncPath(".obsidian/plugins/example/data.json", configPathOptions), ".obsidian/plugins/example/data.json");
+  assert.equal(normalizeLanSyncPath("Folder/Note (LAN conflict device hash).md", configPathOptions), null, "Generated conflict copies must never propagate");
   for (const protectedPath of [
     ".obsidian/workspace.json",
     ".obsidian/workspace-mobile.json",
@@ -230,9 +231,8 @@ try {
   assert.equal(planLanSyncReconciliation([local], [remote], { "Note.md": local.hash })[0].kind, "pull");
   assert.equal(planLanSyncReconciliation([local], [remote], { "Note.md": remote.hash })[0].kind, "push");
   assert.deepEqual(planLanSyncReconciliation([local], [], { "Note.md": local.hash }), [], "Deletion was resurrected");
-  const conflict = planLanSyncReconciliation([local], [remote], {});
-  assert.equal(conflict[0].kind, "conflict");
-  assert.equal(conflict[0].winner, "remote");
+  const firstReconciliation = planLanSyncReconciliation([local], [remote], {});
+  assert.equal(firstReconciliation[0].kind, "pull", "The latest first-scan version should replace the original path");
   const largerConflict = planLanSyncReconciliation(
     [{ ...local, size: 5, mtime: 999 }],
     [{ ...remote, size: 8, mtime: 1 }],
@@ -240,12 +240,11 @@ try {
     { incrementalPush: true, incrementalPull: true, deletePush: false, deletePull: false, syncConfigFolder: false, deleteProtocol: true, conflictRule: "larger" },
     { incrementalPush: false, incrementalPull: false, deletePush: false, deletePull: false, syncConfigFolder: false, deleteProtocol: false, conflictRule: "larger" }
   );
-  assert.equal(largerConflict[0].winner, "remote", "Larger-file conflict rule was not applied");
+  assert.equal(largerConflict[0].kind, "pull", "Larger-file rule did not select the remote file for the original path");
   const inboxPath = normalizeLanInboxAttachmentPath(".trash/ntfy-inbox/attachment_12345678/demo.txt");
   assert.equal(inboxPath, ".trash/ntfy-inbox/attachment_12345678/demo.txt");
   assert.equal(isLanInboxAttachmentPath(inboxPath), true);
   assert.equal(normalizeLanInboxAttachmentPath(".trash/ntfy-inbox/attachment_12345678/../bad.txt"), null);
-  assert.equal(buildLanConflictPath("Folder/Note.md", "device-123456", local.hash), "Folder/Note (LAN conflict device-1 aaaaaaaa).md");
 
   const passivePolicy = {
     incrementalPush: false,
@@ -273,7 +272,7 @@ try {
   const metadataBaseline = { local: { size: 5, mtime: 100 }, remote: { size: 5, mtime: 100 } };
   assert.equal(planLanSyncMetadataReconciliation([localMetadata], [remoteMetadata], { "Note.md": metadataBaseline })[0].kind, "pull");
   assert.equal(planLanSyncMetadataReconciliation([{ ...localMetadata, mtime: 300 }], [localMetadata], { "Note.md": metadataBaseline })[0].kind, "push");
-  assert.equal(planLanSyncMetadataReconciliation([localMetadata], [remoteMetadata], {})[0].winner, "remote");
+  assert.equal(planLanSyncMetadataReconciliation([localMetadata], [remoteMetadata], {})[0].kind, "pull");
   assert.deepEqual(planLanSyncMetadataReconciliation([localMetadata], [], { "Note.md": metadataBaseline }), [], "Metadata deletion was resurrected");
   assert.equal(planLanSyncMetadataReconciliation([], [localMetadata], { "Note.md": metadataBaseline }, deletePushPolicy, passivePolicy)[0].kind, "delete-remote");
   assert.equal(planLanSyncMetadataReconciliation([localMetadata], [], { "Note.md": metadataBaseline }, deletePullPolicy, passivePolicy)[0].kind, "delete-local");
@@ -325,6 +324,7 @@ try {
     "Notes/shared.md": { content: "older A", mtime: 200 },
     "Notes/identical.md": { content: "same", mtime: 150 },
     ".obsidian/hotkeys.json": { content: "hotkeys from A", mtime: 500 },
+    ".obsidian/plugins/example/data.json": { content: "other plugin data from A", mtime: 550 },
     ".obsidian/plugins/remotely-save/data.json": { content: "protected fixture", mtime: 600 }
   });
   const storageB = new MemoryStorage(identity, {
@@ -448,11 +448,8 @@ try {
     assert.equal(serviceA.peers.get(deviceB).capabilities.has("metadata-ledger-v1"), true, "Authenticated ping did not negotiate metadata sync");
     serviceA.requestSync();
     await waitFor(() => storageA.text("Notes/from-b.md") === "from B" && storageB.text("Notes/from-a.md") === "from A", "automatic bidirectional LAN transfer");
-    await waitFor(() => storageA.text("Notes/shared.md") === "newer B" && storageB.text("Notes/shared.md") === "newer B", "conflict convergence");
-    const conflictPath = [...storageA.files.keys()].find((path) => path.includes("LAN conflict"));
-    assert.ok(conflictPath, "Conflict copy was not created");
-    assert.equal(storageA.text(conflictPath), "older A");
-    assert.equal(storageB.text(conflictPath), "older A");
+    await waitFor(() => storageA.text("Notes/shared.md") === "newer B" && storageB.text("Notes/shared.md") === "newer B", "original-path convergence");
+    assert.equal([...storageA.files.keys(), ...storageB.files.keys()].some((path) => path.includes("LAN conflict")), false, "LAN sync created a renamed conflict copy");
     assert.equal(storageA.readCount("Notes/identical.md"), 0, "Metadata sync read identical local content on its first scan");
     assert.equal(storageB.readCount("Notes/identical.md"), 0, "Metadata sync read identical remote content on its first scan");
     assert.equal((await storageA.statFile("Notes/from-b.md")).mtime, 300, "Pulled file did not preserve the source mtime");
@@ -467,14 +464,14 @@ try {
       previousScanCompleted = value.completed;
       previousScanTotal = value.total;
     }
-    assert.ok(progressA.some((value) => value.phase === "complete" && value.conflicts === 1));
+    assert.ok(progressA.some((value) => value.phase === "complete" && value.conflicts === 0 && value.uploads > 0 && value.downloads > 0), "Completion progress did not expose upload/download directions");
     assert.ok(progressB.some((value) => value.active), "Receiving peer did not expose LAN status");
     const activityA = serviceA.activity();
     assert.ok(activityA.scan.total > 0, "Full-vault scan snapshot did not expose total files");
     assert.equal(activityA.scan.completed, activityA.scan.total, "Full-vault scan did not finish monotonically");
     assert.ok(activityA.scan.files.some((file) => file.state === "cached" || file.state === "complete"), "Scan file states were not retained");
     assert.ok(activityA.files.some((file) => file.path === "Notes/from-a.md" && file.state === "complete"), "Coordinator did not retain completed file activity");
-    assert.ok(activityA.files.some((file) => file.path === "Notes/shared.md" && file.action === "conflict"), "Conflict activity was not exposed");
+    assert.ok(activityA.files.some((file) => file.path === "Notes/shared.md" && file.action === "pull"), "Latest remote file was not shown as a download");
     const collapsedActivityA = serviceA.activity({ includeScanFiles: false, includeTransferFiles: false });
     assert.equal(collapsedActivityA.scan.total, activityA.scan.total, "Collapsed scan lost its summary");
     assert.deepEqual(collapsedActivityA.scan.files, [], "Collapsed scan still cloned file rows");
@@ -493,9 +490,12 @@ try {
     const negotiatedPeer = serviceA.peers.get(deviceB);
     negotiatedPeer.capabilities.clear();
     requestedRoutes.length = 0;
-    await serviceA.syncPeer(negotiatedPeer);
-    assert.ok(requestedRoutes.includes("/cancip-lan/v1/manifest"), "A peer without metadata capability did not fall back to the hash manifest");
-    assert.equal(requestedRoutes.includes("/cancip-lan/v1/manifest/metadata"), false, "Legacy fallback still called the metadata manifest");
+    const beforeLegacyAttempt = new Map([...storageA.files].map(([path, value]) => [path, { data: new Uint8Array(value.data), mtime: value.mtime }]));
+    await assert.rejects(() => serviceA.syncPeer(negotiatedPeer), /peer_upgrade_required/);
+    assert.deepEqual(requestedRoutes, [], "An outdated peer initiated legacy synchronization requests");
+    assert.deepEqual(storageA.files, beforeLegacyAttempt, "Rejecting an outdated peer changed local files");
+    await assert.rejects(() => serviceA.callPeer(negotiatedPeer, "/manifest", {}), /peer_upgrade_required/);
+    assert.ok(requestedRoutes.includes("/cancip-lan/v1/manifest"), "The server-side legacy route rejection was not exercised");
     negotiatedPeer.capabilities.add("metadata-ledger-v1");
 
     storageA.putText("Notes/identical.md", "changed on A", 700);
@@ -522,8 +522,17 @@ try {
     assert.equal(storageB.text(".obsidian/hotkeys.json"), null, "Config folder synced before both peers enabled it");
     optionsB.runtimeSettings.syncConfigFolder = true;
     serviceA.requestSync();
-    await waitFor(() => storageB.text(".obsidian/hotkeys.json") === "hotkeys from A", "two-sided config-folder synchronization");
+    await waitFor(
+      () => storageB.text(".obsidian/hotkeys.json") === "hotkeys from A"
+        && storageB.text(".obsidian/plugins/example/data.json") === "other plugin data from A",
+      "two-sided full config and plugin-data synchronization"
+    );
     assert.equal(storageB.text(".obsidian/plugins/remotely-save/data.json"), null, "Protected Remotely Save data was transferred");
+    const eligiblePaths = (storage) => [...storage.files.keys()]
+      .filter((path) => normalizeLanSyncPath(path, configPathOptions))
+      .sort();
+    assert.deepEqual(eligiblePaths(storageA), eligiblePaths(storageB), "The two peers did not converge to the same full-vault path set");
+    assert.equal([...storageA.files.keys(), ...storageB.files.keys()].some((path) => path.includes("LAN conflict")), false, "Full-vault sync propagated a renamed conflict copy");
 
     optionsA.runtimeSettings.mode = "delete-push";
     optionsB.runtimeSettings.mode = "bidirectional";
@@ -594,6 +603,7 @@ try {
   }
 
   const source = await readFile(join(root, "main.js"), "utf8");
+  const lanSource = await readFile(join(root, "src", "lanSync.ts"), "utf8");
   const takeoverStart = source.indexOf("remotelySaveStatusBarElement()");
   const takeoverSource = source.slice(takeoverStart, source.indexOf("\n  normalizeChannelHealth(", takeoverStart));
   const statusTextStart = source.indexOf("lanSyncStatusText()");
@@ -607,6 +617,8 @@ try {
   assert.match(source, /class NtfyLanSyncDetailsModal extends Modal/, "LAN sync details modal is missing");
   assert.match(source, /renderScanSection\(body, scan, chinese\)/, "LAN scan section is missing");
   assert.match(source, /renderTransferSection\(body, progress, files, chinese\)/, "LAN transfer section is missing");
+  assert.match(source, /上传/, "LAN transfer details do not label uploads");
+  assert.match(source, /下载/, "LAN transfer details do not label downloads");
   assert.match(source, /this\.sectionState = \{ scan: false, transfer: false \}/, "LAN activity file lists should be collapsed by default");
   assert.match(source, /includeScanFiles: this\.sectionState\.scan/, "Collapsed scans should not materialize hidden file rows");
   assert.match(source, /includeTransferFiles: this\.sectionState\.transfer/, "Collapsed transfers should not materialize hidden file rows");
@@ -623,11 +635,14 @@ try {
   assert.match(source, /lanSyncCheckIntervalSeconds[^\n]*60/, "LAN full-vault scan default should be 60 seconds");
   assert.match(source, /lanSyncSyncConfigFolder[^\n]*true/, "LAN config-folder sync should default to enabled");
   assert.match(source, /lanSyncConflictRule/, "LAN conflict rule setting is missing");
+  assert.doesNotMatch(lanSource, /buildLanConflictPath\s*\(/, "LAN sync still contains a conflict-copy path generator");
+  assert.doesNotMatch(lanSource, /action\.kind === "conflict"/, "LAN sync still contains a conflict-copy executor");
+  assert.match(lanSource, /peer_upgrade_required/, "Outdated LAN peers are not isolated from the original-path protocol");
   assert.match(takeoverSource, /plugins\?\.\["remotely-save"\]\?\.statusBarElement/);
   assert.doesNotMatch(takeoverSource, /isSyncing|currSyncMsg|syncEvent|remotelySave\.settings|candidate\.settings|start-sync/);
   assert.doesNotMatch(takeoverSource, /plugins\/remotely-save|plugins\\remotely-save/);
 
-  console.log("PASS Ntfy encrypted LAN sync, conflict safety, replay defense, migration compatibility, and Remotely Save status isolation checks");
+  console.log("PASS Ntfy encrypted full-vault LAN sync, original-path convergence, direction progress, replay defense, and Remotely Save isolation checks");
 } finally {
   await rm(temp, { recursive: true, force: true });
 }

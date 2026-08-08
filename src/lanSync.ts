@@ -109,10 +109,12 @@ export type LanSyncProgress = {
   bytesTotal: number;
   changed: number;
   conflicts: number;
+  uploads: number;
+  downloads: number;
   error: string;
 };
 
-export type LanSyncFileAction = "push" | "pull" | "delete-local" | "delete-remote" | "conflict";
+export type LanSyncFileAction = "push" | "pull" | "delete-local" | "delete-remote";
 
 export type LanSyncFileActivity = {
   path: string;
@@ -170,7 +172,6 @@ export type LanSyncReconcileAction = {
   path: string;
   local: LanSyncManifestEntry | null;
   remote: LanSyncManifestEntry | null;
-  winner?: "local" | "remote";
 };
 
 export type LanSyncMetadataEntry = {
@@ -199,7 +200,6 @@ export type LanSyncMetadataReconcileAction = {
   path: string;
   local: LanSyncMetadataEntry | null;
   remote: LanSyncMetadataEntry | null;
-  winner?: "local" | "remote";
 };
 
 type LanSyncIdentity = {
@@ -485,6 +485,7 @@ export function normalizeLanSyncPath(value: unknown, options: LanSyncPathOptions
   const segments = path.split("/");
   if (segments.some((segment) => !segment || segment === "." || segment === "..")) return null;
   if (segments.some((segment) => segment.toLocaleLowerCase() === "node_modules" || segment.toLocaleLowerCase() === ".git")) return null;
+  if (segments.some((segment) => / \(lan conflict [^)]+\)(?:\.[^.]+)?$/i.test(segment))) return null;
   const root = segments[0].toLocaleLowerCase();
   const normalized = segments.join("/");
   const configDir = normalizedConfigDir(options.configDir);
@@ -747,7 +748,7 @@ export function planLanSyncReconciliation(
       } else if (baseline && remoteEntry.hash === baseline) {
         if (canPush) actions.push({ kind: "push", path, local: localEntry, remote: remoteEntry });
       } else if (canPush && canPull) {
-        actions.push({ kind: "conflict", path, local: localEntry, remote: remoteEntry, winner: manifestWinner(localEntry, remoteEntry, localPolicy.conflictRule) });
+        actions.push({ kind: manifestWinner(localEntry, remoteEntry, localPolicy.conflictRule) === "local" ? "push" : "pull", path, local: localEntry, remote: remoteEntry });
       } else if (canPush) {
         actions.push({ kind: "push", path, local: localEntry, remote: remoteEntry });
       } else if (canPull) {
@@ -791,10 +792,6 @@ function metadataWinner(local: LanSyncMetadataEntry, remote: LanSyncMetadataEntr
   return "local";
 }
 
-function metadataConflictToken(entry: LanSyncMetadataEntry | LanSyncMetadataSnapshot): string {
-  return `${Math.max(0, Math.trunc(entry.mtime)).toString(36)}-${Math.max(0, Math.trunc(entry.size)).toString(36)}`;
-}
-
 export function planLanSyncMetadataReconciliation(
   localEntries: LanSyncMetadataEntry[],
   remoteEntries: LanSyncMetadataEntry[],
@@ -824,7 +821,7 @@ export function planLanSyncMetadataReconciliation(
       } else if (localChanged && !remoteChanged) {
         if (canPush) actions.push({ kind: "push", path, local: localEntry, remote: remoteEntry });
       } else if (canPush && canPull) {
-        actions.push({ kind: "conflict", path, local: localEntry, remote: remoteEntry, winner: metadataWinner(localEntry, remoteEntry, localPolicy.conflictRule) });
+        actions.push({ kind: metadataWinner(localEntry, remoteEntry, localPolicy.conflictRule) === "local" ? "push" : "pull", path, local: localEntry, remote: remoteEntry });
       } else if (canPush) {
         actions.push({ kind: "push", path, local: localEntry, remote: remoteEntry });
       } else if (canPull) {
@@ -848,20 +845,6 @@ export function planLanSyncMetadataReconciliation(
     else if (remoteEntry && canPull) actions.push({ kind: "pull", path, local: null, remote: remoteEntry });
   }
   return actions;
-}
-
-export function buildLanConflictPath(path: string, losingDeviceId: string, losingHash: string, options: LanSyncPathOptions = {}): string {
-  const normalized = normalizeLanSyncPath(path, options);
-  if (!normalized) throw new LanSyncProtocolError("unsafe_path");
-  const slash = normalized.lastIndexOf("/");
-  const folder = slash >= 0 ? normalized.slice(0, slash + 1) : "";
-  const name = slash >= 0 ? normalized.slice(slash + 1) : normalized;
-  const dot = name.lastIndexOf(".");
-  const stem = dot > 0 ? name.slice(0, dot) : name;
-  const extension = dot > 0 ? name.slice(dot) : "";
-  const device = losingDeviceId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 8) || "peer";
-  const hash = losingHash.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 8) || "changed";
-  return `${folder}${stem} (LAN conflict ${device} ${hash})${extension}`;
 }
 
 export class LanStatusBarTakeover {
@@ -919,6 +902,8 @@ function defaultProgress(phase: LanSyncProgressPhase = "stopped"): LanSyncProgre
     bytesTotal: 0,
     changed: 0,
     conflicts: 0,
+    uploads: 0,
+    downloads: 0,
     error: ""
   };
 }
@@ -1772,6 +1757,8 @@ export class NtfyLanSync {
 
   private emitInboundFileProgress(deviceId: string, phase: LanSyncProgressPhase = "syncing"): void {
     const completed = this.activityFiles.filter((file) => file.state === "complete").length;
+    const uploads = this.activityFiles.filter((file) => file.action === "push").length;
+    const downloads = this.activityFiles.filter((file) => file.action === "pull").length;
     const bytesTransferred = this.activityFiles
       .filter((file) => file.state === "complete")
       .reduce((sum, file) => sum + file.size, 0);
@@ -1784,6 +1771,8 @@ export class NtfyLanSync {
       bytesTransferred,
       bytesTotal: this.activityFiles.reduce((sum, file) => sum + file.size, 0),
       changed: completed,
+      uploads,
+      downloads,
       error: phase === "error" ? "inbound_transfer_failed" : ""
     });
   }
@@ -1971,11 +1960,8 @@ export class NtfyLanSync {
   }
 
   private async syncPeer(peer: LanSyncPeer): Promise<void> {
-    if (peer.capabilities?.has(METADATA_LEDGER_CAPABILITY)) {
-      await this.syncPeerMetadata(peer);
-      return;
-    }
-    await this.syncPeerHashed(peer);
+    if (!peer.capabilities?.has(METADATA_LEDGER_CAPABILITY)) throw new LanSyncProtocolError("peer_upgrade_required", 426);
+    await this.syncPeerMetadata(peer);
   }
 
   private async syncPeerMetadata(peer: LanSyncPeer): Promise<void> {
@@ -2009,6 +1995,8 @@ export class NtfyLanSync {
     }
     const actions = planLanSyncMetadataReconciliation(filteredLocalEntries, remoteEntries, ledger.entries, localPolicy, remotePolicy);
     const bytesTotal = actions.reduce((sum, action) => sum + Math.max(action.local?.size ?? 0, action.remote?.size ?? 0), 0);
+    const uploads = actions.filter((action) => action.kind === "push").length;
+    const downloads = actions.filter((action) => action.kind === "pull").length;
     this.activityFiles = actions.map((action) => ({
       path: action.path,
       action: action.kind,
@@ -2025,7 +2013,9 @@ export class NtfyLanSync {
       active: true,
       peerId: peer.deviceId,
       total: actions.length,
-      bytesTotal
+      bytesTotal,
+      uploads,
+      downloads
     });
     let cursor = 0;
     let failure: unknown = null;
@@ -2046,7 +2036,9 @@ export class NtfyLanSync {
             bytesTransferred,
             bytesTotal,
             changed,
-            conflicts
+            conflicts,
+            uploads,
+            downloads
           });
         }
         try {
@@ -2067,7 +2059,9 @@ export class NtfyLanSync {
             bytesTransferred,
             bytesTotal,
             changed,
-            conflicts
+            conflicts,
+            uploads,
+            downloads
           });
         } catch (error) {
           if (activity) activity.state = "error";
@@ -2092,7 +2086,9 @@ export class NtfyLanSync {
       bytesTransferred,
       bytesTotal,
       changed,
-      conflicts
+      conflicts,
+      uploads,
+      downloads
     });
   }
 
@@ -2239,32 +2235,6 @@ export class NtfyLanSync {
       delete ledger.entries[action.path];
       return { bytes: 0, changed: true, conflict: false };
     }
-    if (action.kind === "conflict" && action.local && action.remote && action.winner) {
-      const [localRead, remoteRead] = await Promise.all([
-        this.readLocalMetadataVerified(action.path, metadataSnapshot(action.local)),
-        this.readRemoteMetadata(peer, action.remote)
-      ]);
-      if (action.winner === "local") {
-        const conflictPath = buildLanConflictPath(action.path, peer.deviceId, metadataConflictToken(remoteRead.metadata), this.pathOptions());
-        const [localConflict, remoteConflict] = await Promise.all([
-          this.writeLocalMetadata(conflictPath, remoteRead.bytes, null, remoteRead.metadata, true),
-          this.writeRemoteMetadata(peer, conflictPath, remoteRead.bytes, null, remoteRead.metadata, true)
-        ]);
-        const remoteWinner = await this.writeRemoteMetadata(peer, action.path, localRead.bytes, remoteRead.metadata, localRead.metadata);
-        ledger.entries[action.path] = { local: localRead.metadata, remote: remoteWinner };
-        ledger.entries[conflictPath] = { local: localConflict, remote: remoteConflict };
-        return { bytes: localRead.bytes.byteLength + remoteRead.bytes.byteLength * 2, changed: true, conflict: true };
-      }
-      const conflictPath = buildLanConflictPath(action.path, this.deviceId, metadataConflictToken(localRead.metadata), this.pathOptions());
-      const [localConflict, remoteConflict] = await Promise.all([
-        this.writeLocalMetadata(conflictPath, localRead.bytes, null, localRead.metadata, true),
-        this.writeRemoteMetadata(peer, conflictPath, localRead.bytes, null, localRead.metadata, true)
-      ]);
-      const localWinner = await this.writeLocalMetadata(action.path, remoteRead.bytes, localRead.metadata, remoteRead.metadata);
-      ledger.entries[action.path] = { local: localWinner, remote: remoteRead.metadata };
-      ledger.entries[conflictPath] = { local: localConflict, remote: remoteConflict };
-      return { bytes: localRead.bytes.byteLength * 2 + remoteRead.bytes.byteLength, changed: true, conflict: true };
-    }
     return { bytes: 0, changed: false, conflict: false };
   }
 
@@ -2290,30 +2260,6 @@ export class NtfyLanSync {
       await this.deleteRemote(peer, action.path, action.remote.hash);
       delete ledger.entries[action.path];
       return { bytes: 0, changed: true, conflict: false };
-    }
-    if (action.kind === "conflict" && action.local && action.remote && action.winner) {
-      if (action.winner === "local") {
-        const [localBytes, remoteBytes] = await Promise.all([
-          this.readLocalVerified(action.path, action.local.hash),
-          this.readRemote(peer, action.remote)
-        ]);
-        const conflictPath = buildLanConflictPath(action.path, peer.deviceId, action.remote.hash, this.pathOptions());
-        await this.writeLocalIfMissingOrSame(conflictPath, remoteBytes, action.remote.hash);
-        await this.writeRemoteIfMissingOrSame(peer, conflictPath, remoteBytes, action.remote.hash);
-        await this.writeRemote(peer, action.path, localBytes, action.remote.hash, action.local.hash);
-        ledger.entries[action.path] = action.local.hash;
-        ledger.entries[conflictPath] = action.remote.hash;
-        return { bytes: localBytes.byteLength + remoteBytes.byteLength * 2, changed: true, conflict: true };
-      }
-      const localBytes = await this.readLocalVerified(action.path, action.local.hash);
-      const remoteBytes = await this.readRemote(peer, action.remote);
-      const conflictPath = buildLanConflictPath(action.path, this.deviceId, action.local.hash, this.pathOptions());
-      await this.writeRemoteIfMissingOrSame(peer, conflictPath, localBytes, action.local.hash);
-      await this.writeLocalIfMissingOrSame(conflictPath, localBytes, action.local.hash);
-      await this.writeLocal(action.path, remoteBytes, action.local.hash, action.remote.hash, true);
-      ledger.entries[action.path] = action.remote.hash;
-      ledger.entries[conflictPath] = action.local.hash;
-      return { bytes: localBytes.byteLength * 2 + remoteBytes.byteLength, changed: true, conflict: true };
     }
     return { bytes: 0, changed: false, conflict: false };
   }
@@ -2939,6 +2885,14 @@ export class NtfyLanSync {
       const remoteAddress = normalizeRemoteAddress(request.socket.remoteAddress ?? "");
       if (!this.allowedByRateLimit(`${remoteAddress}:${deviceId}`)) throw new LanSyncProtocolError("rate_limited", 429);
       const payload = await decryptLanSyncPayload(this.identity.secret, body);
+      if (
+        path === `${API_PREFIX}/manifest`
+        || path === `${API_PREFIX}/file/read`
+        || path === `${API_PREFIX}/file/write`
+        || path === `${API_PREFIX}/file/delete`
+      ) {
+        throw new LanSyncProtocolError("peer_upgrade_required", 426);
+      }
       this.markInboundPeer(deviceId, remoteAddress, path);
       inboundDeviceId = deviceId;
       inboundActivityIndex = this.beginInboundFileActivity(deviceId, path, payload);
@@ -2964,18 +2918,6 @@ export class NtfyLanSync {
         result = await this.handleWriteMetadataFile(payload);
       } else if (path === `${API_PREFIX}/metadata/file/delete`) {
         result = await this.handleDeleteMetadataFile(payload);
-      } else if (path === `${API_PREFIX}/manifest`) {
-        const policy = this.policy();
-        result = {
-          files: await this.buildManifest(policy.syncConfigFolder && payload.syncConfigFolder === true),
-          policy
-        };
-      } else if (path === `${API_PREFIX}/file/read`) {
-        result = await this.handleReadFile(payload);
-      } else if (path === `${API_PREFIX}/file/write`) {
-        result = await this.handleWriteFile(payload);
-      } else if (path === `${API_PREFIX}/file/delete`) {
-        result = await this.handleDeleteFile(payload);
       } else if (path === `${API_PREFIX}/attachment/write`) {
         result = await this.handleWriteAttachment(payload);
       } else if (path === `${API_PREFIX}/message/send`) {
