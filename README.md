@@ -362,7 +362,48 @@ const unregister = hub?.registerIncomingHandler("cancip", async (message, contex
 
 If Cancip loads before Ntfy Notifications, it can listen for the workspace event `notification-hub:ready` and register when the API becomes available. Every accepted message also emits `notification-hub:incoming` for lightweight observers; the configured incoming consumer remains the authoritative model/session handler.
 
-The public API includes `getStatus`, `getCapabilities`, `listChannels`, `send`, `schedule`, `simulate`, `test`, `receive`, `reply`, inbox polling/retry/removal methods, scheduled-delivery listing/cancellation, reminder listing/add/update/removal/send/scan methods, dynamic Channel and incoming-consumer registration, and manager/settings open methods. External desktop agents can use the local `obsidian://notification-hub` URI templates shown by **Copy setup** in the settings. The URI supports `send`, `schedule`, `simulate`, `test`, `receive`, `reply`, and `reminder`; it is protected by a local token and a small request rate limit. The in-plugin API does not need that token.
+The public API keeps the original flat methods and adds stable namespaces: `conversations`, `messages`, `channels`, `notifications`, `reminders`, `lan`, `events`, and `manager`. Other plugins can use either `app.plugins.plugins["android-ntfy-notifier"].api` or `app.plugins.getPlugin?.("android-ntfy-notifier")?.getApi?.()`. Public results are defensive copies, and public Channel descriptors omit credential-bearing configuration. The TypeScript contract is documented in [`api.d.ts`](api.d.ts).
+
+Chat history import accepts an array, one group-chat object, or `{ conversations: [...] }`. A Channel is optional: common fields such as `chatName`/`groupName`, `members`/`participants`, `author`/`sender`, `content`/`text`, and `time`/`timestamp` are normalized automatically. Top-level group information is applied to every message. Imports merge by source, conversation, message ID, and direction and never overwrite an existing message. Use `dryRun` to validate first. Messages without an ID receive a deterministic content-derived ID so repeated imports remain idempotent.
+
+```js
+const hub = app.plugins.getPlugin?.("android-ntfy-notifier")?.getApi?.();
+
+const importRequest = {
+  source: "cancip",
+  mode: "merge",
+  chatName: "Project group",
+  members: ["Alice", "Bob", "Murat"],
+  messages: [
+    {
+      id: "session-message-1",
+      author: "Alice",
+      content: "Imported group message",
+      time: "2026-08-08T01:02:03.000Z"
+    }
+  ]
+};
+
+const preview = await hub.conversations.import({ ...importRequest, dryRun: true });
+
+if (preview.rejected === 0) {
+  await hub.conversations.import(importRequest);
+}
+```
+
+The import result reports `inserted`, `duplicates`, `conflicts`, `rejected`, `errors`, and affected conversation keys. The manager's Messages sidebar also has an import button for a JSON file or pasted JSON. Imported history remains visible without a provider; when its optional provider Channel is active, the same conversation can continue sending through it.
+
+Subscribe without using Obsidian's global workspace event bus when direct plugin integration is preferred:
+
+```js
+const stop = hub.events.on("messages-imported", (result) => {
+  console.log(result.inserted);
+});
+
+// Call stop() when the consumer plugin unloads.
+```
+
+External desktop agents can use the local `obsidian://notification-hub` URI templates shown by **Copy setup** in the settings. The URI supports `send`, `schedule`, `simulate`, `test`, `receive`, `reply`, and `reminder`; it is protected by a local token and a small request rate limit. Large chat imports intentionally stay on the in-process plugin API or the manager's local JSON importer instead of being placed in a URI. The in-plugin API does not need that token.
 
 ### Delivery Controls
 

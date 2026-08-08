@@ -35,6 +35,9 @@ const {
 const PLUGIN_NAME = "Ntfy Notifications";
 const VIEW_TYPE_NTFY_MANAGER = "obsidian-ntfy-manager-view";
 const NOTIFICATION_HUB_API_VERSION = "1";
+const CONVERSATION_MESSAGE_LIMIT = 10000;
+const CONVERSATION_IMPORT_LIMIT = 2000;
+const CONVERSATION_IMPORT_MAX_BYTES = 8 * 1024 * 1024;
 const UI_LANGUAGE_OPTIONS = [
   ["auto", "Follow Obsidian/system"],
   ["en", "English"],
@@ -2699,6 +2702,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     }
     this.externalChannelAdapters = new Map();
     this.incomingMessageHandlers = new Map();
+    this.apiEventListeners = new Map();
     this.agentProtocolRequestTimes = [];
     this.isPollingIncoming = false;
     this.incomingSocketStates = new Map();
@@ -2760,6 +2764,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       id: "open-ntfy-manager",
       name: this.uiText("打开 ntfy 通知管理器", "Open ntfy notification manager"),
       callback: async () => this.openNtfyManager(),
+    });
+
+    this.addCommand({
+      id: "import-ntfy-chat-history",
+      name: this.uiText("导入 ntfy 聊天记录", "Import ntfy chat history"),
+      callback: () => new NtfyConversationImportModal(this.app, this, (result) => {
+        new Notice(this.uiText(`已导入 ${result.inserted} 条聊天记录`, `Imported ${result.inserted} chat messages`));
+      }).open(),
     });
 
     this.addCommand({
@@ -2837,6 +2849,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       if (typeof this.app.workspace.trigger === "function") {
         this.app.workspace.trigger("notification-hub:ready", this.api);
       }
+      this.emitApiEvent("ready", this.api);
     });
   }
 
@@ -2849,6 +2862,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (this.app && this.app.workspace && typeof this.app.workspace.trigger === "function") {
       this.app.workspace.trigger("notification-hub:unavailable");
     }
+    this.emitApiEvent("unavailable");
+    this.apiEventListeners?.clear();
     this.restoreNoticeCapture();
   }
 
@@ -3014,7 +3029,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     settings.conversationMessages = (data && Array.isArray(data.conversationMessages) ? data.conversationMessages : migratedConversationMessages)
       .map((message) => this.normalizeConversationMessage(message))
       .filter(Boolean)
-      .slice(-1000);
+      .slice(-CONVERSATION_MESSAGE_LIMIT);
     settings.conversationPreferences = this.normalizeConversationPreferences(settings.conversationPreferences);
     settings.incomingSeenKeys = data && Array.isArray(data.incomingSeenKeys)
       ? data.incomingSeenKeys.map(String).filter(Boolean).slice(-1000)
@@ -3123,13 +3138,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   lanSyncStatus() {
     const service = this.lanSync?.status();
+    const progress = this.lanSyncProgress || this.emptyLanSyncProgress();
     return {
       running: service?.running === true,
       port: service?.port ?? 0,
-      peerCount: service?.peerCount ?? this.lanSyncProgress.peerCount,
-      error: service?.error ?? this.lanSyncProgress.error,
-      desktop: !Platform.isMobileApp,
-      phase: this.lanSyncProgress.phase,
+      peerCount: service?.peerCount ?? progress.peerCount,
+      error: service?.error ?? progress.error,
+      desktop: Platform ? !Platform.isMobileApp : true,
+      phase: progress.phase,
       peers: this.lanSync?.listPeers?.() || [],
     };
   }
@@ -3242,9 +3258,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         this.lanSyncProgress = progress;
         this.renderLanSyncStatusBar();
         this.lanSyncDetailsModal?.refresh();
+        this.emitApiEvent("lan-progress", this.cloneApiValue(progress));
       },
       onPeersChanged: () => {
-        if (this.app?.workspace?.trigger) this.app.workspace.trigger("notification-hub:peers-changed", this.lanSync?.listPeers?.() || []);
+        const peers = this.cloneApiValue(this.lanSync?.listPeers?.() || []);
+        if (this.app?.workspace?.trigger) this.app.workspace.trigger("notification-hub:peers-changed", peers);
+        this.emitApiEvent("peers-changed", peers);
       },
       onMessage: async (message) => {
         const peer = this.lanSync?.listPeers?.().find((item) => item.deviceId === message.deviceId);
@@ -3457,9 +3476,15 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   }
 
   emitChannelStatus(channelId) {
+    const normalizedId = String(channelId || "").trim().toLowerCase();
     if (this.app && this.app.workspace && typeof this.app.workspace.trigger === "function") {
-      this.app.workspace.trigger("notification-hub:channel-status", String(channelId || "").trim().toLowerCase());
+      this.app.workspace.trigger("notification-hub:channel-status", normalizedId);
     }
+    this.emitApiEvent("channels-changed", { channelId: normalizedId, channels: this.createPublicChannelSnapshot() });
+  }
+
+  createPublicChannelSnapshot() {
+    return this.listNotificationChannels().map((channel) => this.publicChannelDescriptor(channel)).filter(Boolean);
   }
 
   channelCredentialKeys(type) {
@@ -3606,20 +3631,104 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   }
 
   createNotificationHubApi() {
+    const conversations = Object.freeze({
+      list: () => this.cloneApiValue(this.conversationContacts()),
+      get: (conversationKey) => this.cloneApiValue(this.conversationContacts().find((item) => item.id === String(conversationKey || "")) || null),
+      messages: (conversationKey) => this.cloneApiValue((this.settings.conversationMessages || []).filter((message) => !conversationKey || message.conversationKey === conversationKey)),
+      import: (input) => this.importConversationMessages(input || {}),
+      export: (options) => this.exportConversationMessages(options || {}),
+      send: (conversationKey, text, filePaths) => this.sendConversationMessage(conversationKey, text, filePaths),
+      preference: (conversationKey) => this.cloneApiValue(this.conversationPreference(conversationKey)),
+      updatePreference: (conversationKey, patch) => this.updateConversationPreference(conversationKey, patch || {}),
+      markRead: (conversationKey) => this.markConversationRead(conversationKey),
+      clear: (conversationKey) => this.clearConversation(conversationKey),
+      removeMessage: (messageId, direction) => this.removeConversationMessage(messageId, direction),
+    });
+    const channels = Object.freeze({
+      list: () => this.listNotificationChannels().map((channel) => this.publicChannelDescriptor(channel)).filter(Boolean),
+      get: (channelId) => this.publicChannelDescriptor(this.listNotificationChannels().find((channel) => channel.id === String(channelId || "").trim().toLowerCase())),
+      register: (adapter) => this.registerNotificationChannel(adapter),
+      unregister: (channelId) => this.unregisterNotificationChannel(channelId),
+      test: (channelId) => this.sendTestNotification({ channelId: channelId || this.settings.defaultChannelId, simulatedEvent: true }),
+      poll: (options) => this.runIncomingPoll(options || {}),
+    });
+    const messages = Object.freeze({
+      ingest: (input) => this.ingestIncomingMessage(input || {}),
+      incoming: () => this.cloneApiValue(this.settings.incomingMessages || []),
+      status: () => this.cloneApiValue(this.getIncomingStatus()),
+      poll: (options) => this.runIncomingPoll(options || {}),
+      registerHandler: (consumerId, handler) => this.registerIncomingMessageHandler(consumerId, handler),
+      unregisterHandler: (consumerId) => this.unregisterIncomingMessageHandler(consumerId),
+      send: (conversationKey, text, filePaths) => this.sendConversationMessage(conversationKey, text, filePaths),
+      reply: (messageId, replyText, channelId) => this.replyToStoredIncomingMessage(messageId, replyText, channelId),
+      retry: (messageId, channelId) => this.retryIncomingMessage(messageId, channelId),
+      remove: (messageId, channelId) => this.removeIncomingMessage(messageId, channelId),
+      clear: () => this.clearIncomingMessages(),
+    });
+    const notifications = Object.freeze({
+      send: (input) => this.sendNotification(input || {}),
+      schedule: (input) => this.scheduleNotification(input || {}),
+      simulate: (input) => this.simulateNotification(input || {}),
+      test: (channelId) => this.sendTestNotification({ channelId: channelId || this.settings.defaultChannelId, simulatedEvent: true }),
+      scheduled: () => this.cloneApiValue(this.listScheduledNotifications()),
+      cancel: (notificationId, channelId) => this.cancelScheduledNotification(notificationId, channelId),
+    });
+    const reminders = Object.freeze({
+      list: () => this.cloneApiValue(this.settings.queue || []),
+      add: (input) => this.addApiReminder(input || {}),
+      update: (id, patch) => this.rescheduleQueueItem(id, patch || {}),
+      remove: (id) => this.deleteQueueItem(id),
+      sendNow: (id) => this.sendQueueItemNow(id),
+      scan: () => this.scanAndSchedule({ showNotice: false }),
+    });
+    const lan = Object.freeze({
+      status: () => this.cloneApiValue(this.lanSyncStatus()),
+      peers: () => this.cloneApiValue(this.lanSync?.listPeers?.() || []),
+      activity: () => this.cloneApiValue(this.lanSyncActivitySnapshot()),
+      requestSync: () => {
+        this.requestLanSync();
+        return { ok: Boolean(this.lanSync), status: this.lanSync ? "requested" : "unavailable" };
+      },
+      sendMessage: (deviceId, input) => {
+        if (!this.lanSync) throw new Error("LAN sync is unavailable.");
+        return this.lanSync.sendMessage(String(deviceId || ""), input || {});
+      },
+      sendFile: (deviceId, path) => {
+        if (!this.lanSync) throw new Error("LAN sync is unavailable.");
+        return this.lanSync.sendFile(String(deviceId || ""), normalizePath(String(path || "")));
+      },
+    });
+    const events = Object.freeze({
+      names: Object.freeze([
+        "notification-hub:ready",
+        "notification-hub:unavailable",
+        "notification-hub:incoming",
+        "notification-hub:conversations-changed",
+        "notification-hub:messages-imported",
+        "notification-hub:peers-changed",
+        "notification-hub:lan-progress",
+        "notification-hub:channels-changed",
+      ]),
+      on: (event, callback) => this.onApiEvent(event, callback),
+      off: (event, callback) => this.offApiEvent(event, callback),
+    });
     return Object.freeze({
       apiVersion: NOTIFICATION_HUB_API_VERSION,
+      contractVersion: 2,
       getStatus: () => this.getNotificationHubStatus(),
       getCapabilities: () => this.getNotificationHubCapabilities(),
-      listChannels: () => this.listNotificationChannels(),
+      listChannels: () => channels.list(),
       send: (input) => this.sendNotification(input || {}),
       schedule: (input) => this.scheduleNotification(input || {}),
       simulate: (input) => this.simulateNotification(input || {}),
       test: (channelId) => this.sendTestNotification({ channelId: channelId || this.settings.defaultChannelId, simulatedEvent: true }),
       receive: (input) => this.ingestIncomingMessage(input || {}),
       reply: (messageId, replyText, channelId) => this.replyToStoredIncomingMessage(messageId, replyText, channelId),
-      listIncomingMessages: () => [...(this.settings.incomingMessages || [])],
-      listConversations: () => this.conversationContacts(),
-      listConversationMessages: (conversationKey) => (this.settings.conversationMessages || []).filter((message) => !conversationKey || message.conversationKey === conversationKey),
+      listIncomingMessages: () => messages.incoming(),
+      listConversations: () => conversations.list(),
+      listConversationMessages: (conversationKey) => conversations.messages(conversationKey),
+      importConversationMessages: (input) => conversations.import(input),
+      exportConversationMessages: (options) => conversations.export(options),
       sendConversationMessage: (conversationKey, text, filePaths) => this.sendConversationMessage(conversationKey, text, filePaths),
       markConversationRead: (conversationKey) => this.markConversationRead(conversationKey),
       getIncomingStatus: () => this.getIncomingStatus(),
@@ -3627,10 +3736,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       retryIncoming: (messageId, channelId) => this.retryIncomingMessage(messageId, channelId),
       removeIncoming: (messageId, channelId) => this.removeIncomingMessage(messageId, channelId),
       clearIncoming: () => this.clearIncomingMessages(),
-      getConnectionLogs: () => [...(this.settings.connectionLogs || [])],
-      listScheduled: () => this.listScheduledNotifications(),
+      getConnectionLogs: () => this.cloneApiValue(this.settings.connectionLogs || []),
+      listScheduled: () => notifications.scheduled(),
       cancelScheduled: (notificationId, channelId) => this.cancelScheduledNotification(notificationId, channelId),
-      listReminders: () => [...(this.settings.queue || [])],
+      listReminders: () => reminders.list(),
       addReminder: (input) => this.addApiReminder(input || {}),
       updateReminder: (id, patch) => this.rescheduleQueueItem(id, patch || {}),
       removeReminder: (id) => this.deleteQueueItem(id),
@@ -3643,7 +3752,22 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       getAgentConnectionInfo: () => this.getAgentConnectionInfo(),
       openSettings: () => this.openPluginSettings(),
       openManager: () => this.openNtfyManager(),
+      conversations,
+      messages,
+      channels,
+      notifications,
+      reminders,
+      lan,
+      events,
+      manager: Object.freeze({
+        open: () => this.openNtfyManager(),
+        openSettings: () => this.openPluginSettings(),
+      }),
     });
+  }
+
+  getApi() {
+    return this.api;
   }
 
   generateLocalToken() {
@@ -3676,6 +3800,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       incomingPolling: true,
       incomingRetry: true,
       incomingWorkspaceEvents: true,
+      publicApiNamespaces: ["conversations", "messages", "channels", "notifications", "reminders", "lan", "events", "manager"],
+      conversationImport: true,
+      conversationExport: true,
+      conversationMergeDeduplication: true,
+      apiEventSubscriptions: true,
+      publicChannelDescriptors: true,
       ntfyReceive: true,
       obsidianProtocol: true,
       mobileCompatible: true,
@@ -3694,6 +3824,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       scheduledCount: (this.settings.outboundQueue || []).length,
       reminderCount: (this.settings.queue || []).length,
       incoming: this.getIncomingStatus(),
+      lan: this.lanSyncStatus(),
     };
   }
 
@@ -4027,11 +4158,15 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (BUILTIN_CHANNEL_IDS.includes(id)) throw new Error(`Built-in channel '${id}' cannot be replaced.`);
     if (typeof adapter.send !== "function") throw new Error("Channel adapter must provide send(notification, context).");
     this.externalChannelAdapters.set(id, Object.assign({}, adapter, { id }));
+    this.emitApiEvent("channels-changed", { channelId: id, channels: this.createPublicChannelSnapshot() });
     return () => this.unregisterNotificationChannel(id);
   }
 
   unregisterNotificationChannel(channelId) {
-    return Boolean(this.externalChannelAdapters && this.externalChannelAdapters.delete(String(channelId || "").trim().toLowerCase()));
+    const id = String(channelId || "").trim().toLowerCase();
+    const removed = Boolean(this.externalChannelAdapters && this.externalChannelAdapters.delete(id));
+    if (removed) this.emitApiEvent("channels-changed", { channelId: id, channels: this.createPublicChannelSnapshot() });
+    return removed;
   }
 
   registerIncomingMessageHandler(consumerId, handler) {
@@ -4045,6 +4180,315 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   unregisterIncomingMessageHandler(consumerId) {
     return Boolean(this.incomingMessageHandlers && this.incomingMessageHandlers.delete(String(consumerId || "").trim().toLowerCase()));
+  }
+
+  cloneApiValue(value) {
+    if (value === undefined || value === null) return value;
+    if (typeof value !== "object") return value;
+    try {
+      return JSON.parse(JSON.stringify(value));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  normalizeApiEventName(event) {
+    const value = String(event || "").trim();
+    if (!value) return "";
+    return value.startsWith("notification-hub:") ? value : `notification-hub:${value}`;
+  }
+
+  onApiEvent(event, callback) {
+    const name = this.normalizeApiEventName(event);
+    if (!name || typeof callback !== "function") throw new Error("Event name and callback are required.");
+    if (!this.apiEventListeners) this.apiEventListeners = new Map();
+    const listeners = this.apiEventListeners.get(name) || new Set();
+    listeners.add(callback);
+    this.apiEventListeners.set(name, listeners);
+    return () => this.offApiEvent(name, callback);
+  }
+
+  offApiEvent(event, callback) {
+    const name = this.normalizeApiEventName(event);
+    const listeners = this.apiEventListeners?.get(name);
+    if (!listeners) return false;
+    const removed = typeof callback === "function" ? listeners.delete(callback) : listeners.clear() || true;
+    if (!listeners.size) this.apiEventListeners.delete(name);
+    return Boolean(removed);
+  }
+
+  emitApiEvent(event, ...args) {
+    const name = this.normalizeApiEventName(event);
+    const listeners = this.apiEventListeners?.get(name);
+    if (!listeners) return;
+    for (const callback of [...listeners]) {
+      try {
+        callback(...args);
+      } catch (error) {
+        console.warn(`${PLUGIN_NAME}: public API event handler failed`, error);
+      }
+    }
+  }
+
+  publicChannelDescriptor(channel) {
+    if (!channel || typeof channel !== "object") return null;
+    return {
+      id: String(channel.id || ""),
+      type: String(channel.type || ""),
+      accountId: String(channel.accountId || "default"),
+      name: String(channel.name || channel.id || ""),
+      providerName: String(channel.providerName || channel.name || channel.type || ""),
+      enabled: channel.enabled === true,
+      storedEnabled: channel.storedEnabled === true,
+      configured: channel.configured === true,
+      sendConfigured: channel.sendConfigured === true,
+      receiveConfigured: channel.receiveConfigured === true,
+      supportsRemoteSchedule: channel.supportsRemoteSchedule === true,
+      canReceive: channel.canReceive === true,
+      receiveMode: String(channel.receiveMode || ""),
+      connectionStatus: String(channel.connectionStatus || ""),
+      verificationState: String(channel.verificationState || ""),
+      checkedAt: String(channel.checkedAt || ""),
+      lastConnectedAt: String(channel.lastConnectedAt || ""),
+      lastInboundAt: String(channel.lastInboundAt || ""),
+      lastOutboundAt: String(channel.lastOutboundAt || ""),
+      connectionError: this.redactSensitiveText(String(channel.connectionError || ""), true),
+      runtimeTargetAvailable: channel.runtimeTargetAvailable === true,
+      deliveryReady: channel.deliveryReady === true,
+      builtin: channel.builtin === true,
+    };
+  }
+
+  conversationMessageIdentity(message) {
+    return [
+      String(message && message.channelId || "unknown"),
+      String(message && message.conversationId || "default"),
+      String(message && message.id || ""),
+      String(message && message.direction || "incoming"),
+    ].join(":");
+  }
+
+  conversationParticipantKey(value) {
+    if (!Array.isArray(value)) return "";
+    const identities = value.map((participant) => {
+      if (typeof participant === "string" || typeof participant === "number") return String(participant).trim();
+      if (!participant || typeof participant !== "object") return "";
+      return String(participant.id || participant.userId || participant.openId || participant.name || participant.displayName || participant.username || "").trim();
+    }).filter(Boolean).sort((left, right) => left.localeCompare(right));
+    return identities.length ? `participants-${this.hash(JSON.stringify(identities))}` : "";
+  }
+
+  conversationImportDefaults(...sources) {
+    const values = sources.filter((value) => value && typeof value === "object" && !Array.isArray(value));
+    const pick = (...keys) => {
+      for (const value of values) {
+        for (const key of keys) {
+          if (value[key] !== undefined && value[key] !== null && value[key] !== "") return value[key];
+        }
+      }
+      return undefined;
+    };
+    const conversationName = pick("conversationName", "chatName", "groupName");
+    const participants = pick("participants", "members");
+    const conversationId = pick("conversationId", "chatId", "roomId", "threadId", "groupId", "sessionId")
+      || conversationName
+      || this.conversationParticipantKey(participants)
+      || "default";
+    const metadata = {};
+    for (const value of [...values].reverse()) {
+      if (!value.metadata || typeof value.metadata !== "object" || Array.isArray(value.metadata)) continue;
+      for (const [key, item] of Object.entries(value.metadata)) {
+        if (["__proto__", "constructor", "prototype"].includes(key)) continue;
+        metadata[key] = item;
+      }
+    }
+    if (conversationName !== undefined) metadata.conversationName = conversationName;
+    if (participants !== undefined) metadata.participants = participants;
+    return {
+      channelId: pick("channelId", "channel", "provider", "platform") || "imported",
+      conversationId,
+      title: conversationName || undefined,
+      metadata,
+    };
+  }
+
+  applyConversationImportDefaults(raw, defaults) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+    const result = {};
+    for (const [key, value] of Object.entries(defaults || {})) {
+      if (value !== undefined && !["__proto__", "constructor", "prototype"].includes(key)) result[key] = value;
+    }
+    for (const [key, value] of Object.entries(raw)) {
+      if (!["__proto__", "constructor", "prototype"].includes(key)) result[key] = value;
+    }
+    const metadata = {};
+    for (const value of [defaults && defaults.metadata, raw.metadata]) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      for (const [key, item] of Object.entries(value)) {
+        if (!["__proto__", "constructor", "prototype"].includes(key)) metadata[key] = item;
+      }
+    }
+    result.metadata = metadata;
+    return result;
+  }
+
+  normalizeConversationImportPayload(payload) {
+    let value = payload;
+    if (typeof value === "string") {
+      if (value.length > CONVERSATION_IMPORT_MAX_BYTES) throw new Error("Chat import is too large; split it into smaller batches.");
+      try {
+        value = JSON.parse(value);
+      } catch (_) {
+        throw new Error("Chat import JSON is invalid.");
+      }
+    }
+    if (Array.isArray(value)) return { messages: value, source: "external" };
+    if (!value || typeof value !== "object") throw new Error("Chat import must be an array or an object containing messages.");
+    const data = value.data && typeof value.data === "object" && !Array.isArray(value.data) ? value.data : {};
+    const source = String(value.importSource || value.source || data.importSource || data.source || "external").trim().slice(0, 128) || "external";
+    const conversations = Array.isArray(value.conversations)
+      ? value.conversations
+      : Array.isArray(data.conversations) ? data.conversations : null;
+    if (conversations) {
+      const messages = [];
+      for (const conversation of conversations) {
+        if (!conversation || typeof conversation !== "object" || Array.isArray(conversation)) continue;
+        const conversationData = conversation.data && typeof conversation.data === "object" && !Array.isArray(conversation.data) ? conversation.data : {};
+        const rawMessages = Array.isArray(conversation.messages)
+          ? conversation.messages
+          : Array.isArray(conversationData.messages) ? conversationData.messages : [];
+        const defaults = this.conversationImportDefaults(conversation, conversationData, value, data);
+        for (const message of rawMessages) messages.push(this.applyConversationImportDefaults(message, defaults));
+      }
+      if (!messages.length) throw new Error("Chat import payload must contain a messages array.");
+      return { messages, source };
+    }
+    const conversation = value.conversation && typeof value.conversation === "object" && !Array.isArray(value.conversation) ? value.conversation : {};
+    const chat = value.chat && typeof value.chat === "object" && !Array.isArray(value.chat) ? value.chat : {};
+    const group = value.group && typeof value.group === "object" && !Array.isArray(value.group) ? value.group : {};
+    const messages = Array.isArray(value.messages)
+      ? value.messages
+      : Array.isArray(data.messages) ? data.messages
+      : Array.isArray(conversation.messages) ? conversation.messages
+      : Array.isArray(chat.messages) ? chat.messages
+      : Array.isArray(group.messages) ? group.messages : null;
+    if (!messages) throw new Error("Chat import payload must contain a messages array.");
+    const defaults = this.conversationImportDefaults(conversation, chat, group, value, data);
+    return { messages: messages.map((message) => this.applyConversationImportDefaults(message, defaults)), source };
+  }
+
+  normalizeImportedConversationMessage(raw, index, source) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`Message ${index + 1} is not an object.`);
+    const timestampInput = raw.timestamp || raw.sentAt || raw.receivedAt || raw.createdAt || raw.time || raw.date || "";
+    if (timestampInput && Number.isNaN(new Date(timestampInput).getTime())) throw new Error(`Message ${index + 1} has an invalid timestamp.`);
+    const attachmentInputs = Array.isArray(raw.attachments) ? raw.attachments : [];
+    for (const attachment of attachmentInputs) {
+      const attachmentPath = String(attachment && attachment.path || "").replace(/\\/g, "/").trim();
+      if (!attachmentPath) continue;
+      if (attachmentPath.startsWith("/") || /^[A-Za-z]:\//.test(attachmentPath) || attachmentPath.split("/").includes("..")) {
+        throw new Error(`Message ${index + 1} contains an unsafe Vault attachment path.`);
+      }
+    }
+    const message = this.normalizeConversationMessage(raw);
+    if (!message) throw new Error(`Message ${index + 1} could not be normalized.`);
+    if (!message.text && !message.attachments.length) throw new Error(`Message ${index + 1} is empty.`);
+    this.validateIncomingAttachments(message);
+    const metadata = { importSource: source };
+    for (const [key, value] of Object.entries(message.metadata || {})) {
+      if (["__proto__", "constructor", "prototype"].includes(key)) continue;
+      metadata[key] = value;
+    }
+    message.metadata = metadata;
+    return message;
+  }
+
+  async importConversationMessages(input = {}) {
+    const payload = this.normalizeConversationImportPayload(input);
+    const options = Array.isArray(input) || typeof input === "string" ? {} : (input || {});
+    const mode = String(options.mode || "merge").trim().toLowerCase();
+    if (mode !== "merge" && mode !== "append") throw new Error("Chat import only supports merge/append; existing messages are never overwritten.");
+    const dryRun = options.dryRun === true;
+    let serializedMessages = "";
+    try {
+      serializedMessages = JSON.stringify(payload.messages);
+    } catch (_) {
+      throw new Error("Chat import messages must be JSON-serializable.");
+    }
+    if (serializedMessages.length > CONVERSATION_IMPORT_MAX_BYTES) throw new Error("Chat import is too large; split it into smaller batches.");
+    const parsedLimit = Number(options.limit || CONVERSATION_IMPORT_LIMIT);
+    const limit = Number.isFinite(parsedLimit) ? Math.min(CONVERSATION_IMPORT_LIMIT, Math.max(1, Math.floor(parsedLimit))) : CONVERSATION_IMPORT_LIMIT;
+    const source = String(options.source || payload.source || "external").trim().slice(0, 128) || "external";
+    const rawMessages = payload.messages.slice(0, limit);
+    const existing = Array.isArray(this.settings.conversationMessages) ? this.settings.conversationMessages : [];
+    const existingByKey = new Map(existing.map((message) => [this.conversationMessageIdentity(message), message]));
+    const imported = [];
+    const conversations = new Set();
+    const errors = [];
+    let duplicates = 0;
+    let conflicts = 0;
+    for (let index = 0; index < rawMessages.length; index += 1) {
+      try {
+        const message = this.normalizeImportedConversationMessage(rawMessages[index], index, source);
+        const key = this.conversationMessageIdentity(message);
+        const previous = existingByKey.get(key) || imported.find((item) => this.conversationMessageIdentity(item) === key);
+        if (previous) {
+          duplicates += 1;
+          if (JSON.stringify(previous) !== JSON.stringify(message)) conflicts += 1;
+          continue;
+        }
+        if (existing.length + imported.length >= CONVERSATION_MESSAGE_LIMIT) {
+          throw new Error("Chat history capacity is full; existing messages were preserved.");
+        }
+        imported.push(message);
+        conversations.add(message.conversationKey);
+        existingByKey.set(key, message);
+      } catch (error) {
+        errors.push({ index, error: String(error && error.message || error).slice(0, 512) });
+      }
+    }
+    const result = {
+      ok: errors.length === 0,
+      status: errors.length ? imported.length ? "partial" : "rejected" : "accepted",
+      dryRun,
+      mode,
+      source,
+      requested: rawMessages.length,
+      inserted: imported.length,
+      duplicates,
+      conflicts,
+      rejected: errors.length,
+      errors: errors.slice(0, 100),
+      conversations: [...conversations],
+    };
+    if (dryRun || !imported.length) return result;
+    this.settings.conversationMessages = [...existing, ...imported].slice(-CONVERSATION_MESSAGE_LIMIT);
+    await this.saveSettings();
+    const publicResult = this.cloneApiValue(result);
+    this.emitApiEvent("conversations-changed", publicResult);
+    this.emitApiEvent("messages-imported", publicResult);
+    this.app?.workspace?.trigger?.("notification-hub:conversations-changed", publicResult);
+    this.app?.workspace?.trigger?.("notification-hub:messages-imported", publicResult);
+    return result;
+  }
+
+  exportConversationMessages(options = {}) {
+    const value = options && typeof options === "object" ? options : {};
+    let messages = Array.isArray(this.settings.conversationMessages) ? this.settings.conversationMessages : [];
+    const conversationKey = String(value.conversationKey || "").trim();
+    const channelId = String(value.channelId || "").trim().toLowerCase();
+    const conversationId = String(value.conversationId || "").trim();
+    if (conversationKey) messages = messages.filter((message) => message.conversationKey === conversationKey);
+    if (channelId) messages = messages.filter((message) => message.channelId === channelId);
+    if (conversationId) messages = messages.filter((message) => message.conversationId === conversationId);
+    const parsedLimit = Number(value.limit || CONVERSATION_MESSAGE_LIMIT);
+    const limit = Number.isFinite(parsedLimit) ? Math.min(CONVERSATION_MESSAGE_LIMIT, Math.max(1, Math.floor(parsedLimit))) : CONVERSATION_MESSAGE_LIMIT;
+    return {
+      schemaVersion: 1,
+      apiVersion: NOTIFICATION_HUB_API_VERSION,
+      exportedAt: new Date().toISOString(),
+      source: "android-ntfy-notifier",
+      messages: this.cloneApiValue(messages.slice(-limit)),
+    };
   }
 
   conversationKey(channelId, conversationId = "") {
@@ -4069,19 +4513,50 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   normalizeConversationMessage(input = {}) {
     if (!input || typeof input !== "object") return null;
-    const channelId = String(input.channelId || input.channel || "unknown").trim().toLowerCase().slice(0, 64) || "unknown";
-    const conversationId = String(input.conversationId || input.chatId || input.roomId || input.metadata && input.metadata.lanDeviceId || "default").trim().slice(0, 512) || "default";
-    const direction = input.direction === "outgoing" ? "outgoing" : "incoming";
-    const date = new Date(input.timestamp || input.sentAt || input.receivedAt || Date.now());
+    const channelId = String(input.channelId || input.channel || input.provider || input.platform || "imported").trim().toLowerCase().slice(0, 64) || "imported";
+    const conversationName = input.conversationName || input.chatName || input.groupName || input.metadata && input.metadata.conversationName || "";
+    const participants = input.participants || input.members || input.metadata && input.metadata.participants;
+    const conversationId = String(input.conversationId || input.chatId || input.roomId || input.threadId || input.groupId || input.sessionId || input.metadata && input.metadata.lanDeviceId || conversationName || this.conversationParticipantKey(participants) || "default").trim().slice(0, 512) || "default";
+    const rawDirection = String(input.direction || "").trim().toLowerCase();
+    const direction = input.isMine === true || input.isOutgoing === true || ["outgoing", "sent", "me", "assistant"].includes(rawDirection) ? "outgoing" : "incoming";
+    const actor = input.sender ?? input.from ?? input.author ?? input.user ?? input.name ?? input.role;
+    const senderInput = actor && typeof actor === "object"
+      ? actor.name || actor.displayName || actor.username || actor.id || actor.userId || ""
+      : actor;
+    const sender = String(senderInput || (direction === "outgoing" ? "me" : "unknown")).trim().slice(0, 256) || "unknown";
+    const textInput = input.text ?? input.message ?? input.content ?? input.body ?? "";
+    const timestampInput = input.timestamp || input.sentAt || input.receivedAt || input.createdAt || input.time || input.date || "";
+    const date = new Date(timestampInput || Date.now());
+    const attachmentSeed = Array.isArray(input.attachments) ? input.attachments.map((attachment) => ({
+      name: String(attachment && attachment.name || "attachment"),
+      type: String(attachment && attachment.type || ""),
+      size: Number(attachment && attachment.size || 0),
+      path: String(attachment && attachment.path || ""),
+      url: String(attachment && attachment.url || ""),
+    })) : [];
+    const generatedId = this.hash(JSON.stringify({
+      channelId,
+      conversationId,
+      direction,
+      sender,
+      title: String(input.title || conversationName || sender || channelId),
+      text: String(textInput),
+      timestamp: String(timestampInput || ""),
+      attachments: attachmentSeed,
+    }));
+    const normalizedMetadata = this.normalizeIncomingMetadata(input.metadata);
+    const metadata = normalizedMetadata && typeof normalizedMetadata === "object" && !Array.isArray(normalizedMetadata) ? normalizedMetadata : {};
+    if (conversationName) metadata.conversationName = String(conversationName).slice(0, 512);
+    if (participants !== undefined) metadata.participants = this.normalizeIncomingMetadata({ participants }).participants || [];
     return {
-      id: String(input.id || this.hash(`${channelId}:${conversationId}:${direction}:${Date.now()}`)).slice(0, 256),
+      id: String(input.id || generatedId).slice(0, 256),
       channelId,
       conversationId,
       conversationKey: this.conversationKey(channelId, conversationId),
       direction,
-      sender: String(input.sender || (direction === "outgoing" ? "me" : "unknown")).trim().slice(0, 256) || "unknown",
-      title: String(input.title || input.sender || channelId).slice(0, 512),
-      text: String(input.text || input.message || "").slice(0, 100000),
+      sender,
+      title: String(input.title || conversationName || sender || channelId).slice(0, 512),
+      text: String(textInput).slice(0, 100000),
       attachments: Array.isArray(input.attachments) ? input.attachments.slice(0, 32).map((attachment) => ({
         name: String(attachment && attachment.name || "attachment").slice(0, 512),
         type: String(attachment && attachment.type || "").slice(0, 128),
@@ -4093,16 +4568,17 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       timestamp: Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString(),
       status: ["sending", "sent", "failed", "received"].includes(input.status) ? input.status : direction === "outgoing" ? "sent" : "received",
       error: String(input.error || "").slice(0, 512),
-      metadata: this.normalizeIncomingMetadata(input.metadata),
+      metadata,
     };
   }
 
   recordConversationMessage(input) {
     const message = this.normalizeConversationMessage(input);
     if (!message) return null;
-    const key = `${message.channelId}:${message.id}:${message.direction}`;
-    const messages = (this.settings.conversationMessages || []).filter((item) => `${item.channelId}:${item.id}:${item.direction}` !== key);
-    this.settings.conversationMessages = [...messages, message].slice(-1000);
+    const key = this.conversationMessageIdentity(message);
+    const messages = (this.settings.conversationMessages || []).filter((item) => this.conversationMessageIdentity(item) !== key);
+    this.settings.conversationMessages = [...messages, message].slice(-CONVERSATION_MESSAGE_LIMIT);
+    this.emitApiEvent("conversations-changed", this.cloneApiValue(message));
     return message;
   }
 
@@ -4116,6 +4592,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       [key]: Object.assign(this.conversationPreference(key), patch || {}),
     });
     await this.saveSettings();
+    this.emitApiEvent("conversations-changed", { conversationKey: key, preference: this.cloneApiValue(this.conversationPreference(key)) });
     this.app?.workspace?.trigger?.("notification-hub:conversations-changed");
   }
 
@@ -4142,6 +4619,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (contact.kind === "channel") {
       return messages.filter((message) => message.channelId === contact.channelId);
     }
+    if (contact.kind === "history") {
+      return messages.filter((message) => message.conversationKey === contact.id);
+    }
     const peerId = String(contact.deviceId || contact.conversationId || "").trim();
     return messages.filter((message) => {
       if (message.channelId !== "lan") return false;
@@ -4167,6 +4647,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         subtitle: channel.type || channel.id,
         icon: iconByType[channel.type] || "message-circle",
         online: channel.deliveryReady === true || ["connected", "poll"].includes(String(channel.connectionStatus || "").toLowerCase()),
+        available: true,
         metadata: { channelType: channel.type, accountId: channel.accountId || "default" },
       });
     }
@@ -4183,7 +4664,27 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         subtitle: `${peer.linkType} · ${peer.address}:${peer.port}`,
         icon: peer.linkType === "bluetooth-pan" ? "bluetooth" : peer.linkType === "usb" ? "usb" : peer.linkType === "hotspot" ? "radio-tower" : "wifi",
         online: peer.verified === true,
+        available: true,
         metadata: { lanDeviceId: peer.deviceId, lanLinkType: peer.linkType },
+      });
+    }
+    for (const message of messages) {
+      const key = this.conversationKey(message.channelId, message.conversationId);
+      if (contacts.has(key)) continue;
+      const channel = channels.find((item) => item.id === message.channelId);
+      const active = Boolean(channel && this.conversationChannelIsActive(channel));
+      const conversationName = String(message.metadata && message.metadata.conversationName || "").trim();
+      contacts.set(key, {
+        id: key,
+        kind: "history",
+        channelId: message.channelId,
+        conversationId: message.conversationId,
+        name: conversationName || message.title || channel?.name || message.sender || message.channelId,
+        subtitle: channel ? `${channel.type} · history` : `${message.channelId} · imported history`,
+        icon: iconByType[channel?.type] || "message-circle",
+        online: active && (channel.deliveryReady === true || ["connected", "poll"].includes(String(channel.connectionStatus || "").toLowerCase())),
+        available: active,
+        metadata: { imported: true, channelType: channel?.type || message.channelId },
       });
     }
     const now = Date.now();
@@ -4207,16 +4708,22 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   async clearConversation(key) {
     const contact = this.conversationContacts().find((item) => item.id === key);
     const messages = contact ? this.conversationMessagesFor(contact) : (this.settings.conversationMessages || []).filter((message) => message.conversationKey === key);
-    const messageKeys = new Set(messages.map((message) => `${message.channelId}:${message.id}:${message.direction}`));
-    this.settings.conversationMessages = (this.settings.conversationMessages || []).filter((message) => !messageKeys.has(`${message.channelId}:${message.id}:${message.direction}`));
+    const messageKeys = new Set(messages.map((message) => this.conversationMessageIdentity(message)));
+    this.settings.conversationMessages = (this.settings.conversationMessages || []).filter((message) => !messageKeys.has(this.conversationMessageIdentity(message)));
     await this.saveSettings();
+    this.emitApiEvent("conversations-changed", { conversationKey: key, cleared: messageKeys.size });
     this.app?.workspace?.trigger?.("notification-hub:conversations-changed");
   }
 
   async removeConversationMessage(messageId, direction = "") {
     const before = (this.settings.conversationMessages || []).length;
     this.settings.conversationMessages = (this.settings.conversationMessages || []).filter((message) => !(String(message.id) === String(messageId) && (!direction || message.direction === direction)));
-    if (before !== this.settings.conversationMessages.length) await this.saveSettings();
+    if (before !== this.settings.conversationMessages.length) {
+      await this.saveSettings();
+      const payload = { messageId: String(messageId || ""), direction: String(direction || ""), removed: before - this.settings.conversationMessages.length };
+      this.emitApiEvent("conversations-changed", payload);
+      this.app?.workspace?.trigger?.("notification-hub:conversations-changed", payload);
+    }
   }
 
   async sendConversationMessage(contactId, text, filePaths = []) {
@@ -4562,6 +5069,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const quiet = this.isQuietHours() || muted;
     if (!quiet) new Notice(`[${message.channelId}] ${message.sender}: ${message.text || message.title}`);
 
+    this.emitApiEvent("incoming", this.cloneApiValue(message), { quiet });
     if (this.app && this.app.workspace && typeof this.app.workspace.trigger === "function") {
       try {
         this.app.workspace.trigger("notification-hub:incoming", message, { hubApi: this.api, quiet });
@@ -6408,15 +6916,19 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       .replace(/(\/bot)[^/\"\s]+/gi, "$1***");
   }
 
-  getAgentConnectionInfo() {
-    const token = String(this.settings.agentProtocolToken || "");
+  getAgentConnectionInfo(options = {}) {
+    const includeToken = options && options.includeToken === true;
+    const token = includeToken ? String(this.settings.agentProtocolToken || "") : "TOKEN";
     return {
       pluginId: "android-ntfy-notifier",
       apiVersion: NOTIFICATION_HUB_API_VERSION,
       inObsidian: 'app.plugins.plugins["android-ntfy-notifier"].api',
+      getApi: 'app.plugins.getPlugin?.("android-ntfy-notifier")?.getApi?.()',
       sendProtocolTemplate: `obsidian://notification-hub?action=send&token=${encodeURIComponent(token)}&title=TITLE&message=MESSAGE&channel=CHANNEL_ID`,
       receiveProtocolTemplate: `obsidian://notification-hub?action=receive&token=${encodeURIComponent(token)}&sender=SENDER&message=MESSAGE&channel=CHANNEL_ID`,
-      apiMethods: ["getStatus", "getCapabilities", "listChannels", "send", "schedule", "simulate", "test", "receive", "reply", "getIncomingStatus", "listIncomingMessages", "pollIncoming", "retryIncoming", "removeIncoming", "clearIncoming", "listScheduled", "cancelScheduled", "listReminders", "addReminder", "updateReminder", "removeReminder", "sendReminderNow", "scanReminders", "registerChannel", "registerIncomingHandler", "openSettings", "openManager"],
+      apiMethods: ["getApi", "getStatus", "getCapabilities", "listChannels", "send", "schedule", "simulate", "test", "receive", "reply", "getIncomingStatus", "listIncomingMessages", "listConversations", "listConversationMessages", "importConversationMessages", "exportConversationMessages", "sendConversationMessage", "markConversationRead", "listScheduled", "cancelScheduled", "listReminders", "addReminder", "updateReminder", "removeReminder", "sendReminderNow", "scanReminders", "registerChannel", "registerIncomingHandler", "openSettings", "openManager"],
+      apiNamespaces: ["conversations", "messages", "channels", "notifications", "reminders", "lan", "events", "manager"],
+      tokenIncluded: includeToken,
       defaultChannelId: this.settings.defaultChannelId,
       channels: this.listNotificationChannels().map((channel) => ({ id: channel.id, name: channel.name, receiveMode: channel.receiveMode })),
     };
@@ -8216,6 +8728,92 @@ class IncomingMessageReplyModal extends Modal {
   }
 }
 
+class NtfyConversationImportModal extends Modal {
+  constructor(app, plugin, onDone) {
+    super(app);
+    this.plugin = plugin;
+    this.onDone = onDone;
+    this.jsonText = "";
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("obsidian-ntfy-conversation-import-modal");
+    contentEl.createEl("h2", { text: this.plugin.uiText("导入聊天记录", "Import chat history") });
+    contentEl.createEl("p", {
+      cls: "setting-item-description",
+      text: this.plugin.uiText(
+        "支持 JSON 数组、单个群聊或 conversations 多群聊结构；不要求 Channel。默认合并去重，不覆盖已有记录，可先预览。",
+        "Use a JSON array, one group chat, or a conversations collection; Channel is optional. Import merges and deduplicates without overwriting existing messages, and preview is available first."
+      ),
+    });
+    const file = contentEl.createEl("input", { attr: { type: "file", accept: ".json,application/json" } });
+    file.addEventListener("change", async () => {
+      const selected = file.files && file.files[0];
+      if (!selected) return;
+      if (selected.size > CONVERSATION_IMPORT_MAX_BYTES) {
+        new Notice(this.plugin.uiText("导入文件不能超过 8 MB。", "Import files must be 8 MB or smaller."));
+        file.value = "";
+        return;
+      }
+      try {
+        this.jsonText = typeof selected.text === "function" ? await selected.text() : await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || ""));
+          reader.onerror = () => reject(reader.error || new Error("File read failed"));
+          reader.readAsText(selected);
+        });
+        textarea.value = this.jsonText;
+        status.setText(this.plugin.uiText("文件已载入，可以预览或导入。", "File loaded. Preview or import it."));
+      } catch (error) {
+        status.setText(String(error && error.message || error));
+      }
+    });
+    const textarea = contentEl.createEl("textarea", {
+      cls: "obsidian-ntfy-conversation-import-json",
+      attr: { rows: "12", placeholder: '{"chatName":"项目群","members":["Alice","Bob"],"messages":[{"author":"Alice","content":"hello","time":"2026-08-08T00:00:00Z"}]}' },
+    });
+    textarea.value = this.jsonText;
+    const status = contentEl.createDiv({ cls: "obsidian-ntfy-muted" });
+    const controls = contentEl.createDiv({ cls: "obsidian-ntfy-controls" });
+    const run = async (dryRun) => {
+      const raw = textarea.value.trim();
+      if (!raw) return;
+      try {
+        const parsed = JSON.parse(raw);
+        const payload = Array.isArray(parsed)
+          ? { messages: parsed, source: "ui", dryRun }
+          : Object.assign({}, parsed, { source: parsed && parsed.source || "ui", dryRun });
+        const result = await this.plugin.importConversationMessages(payload);
+        status.setText(this.plugin.uiText(
+          `${dryRun ? "预览" : "导入"}：新增 ${result.inserted}，重复 ${result.duplicates}，冲突 ${result.conflicts}，拒绝 ${result.rejected}`,
+          `${dryRun ? "Preview" : "Import"}: ${result.inserted} inserted, ${result.duplicates} duplicates, ${result.conflicts} conflicts, ${result.rejected} rejected`
+        ));
+        if (!dryRun && result.status !== "rejected") {
+          this.onDone?.(result);
+          this.close();
+        }
+      } catch (error) {
+        status.setText(this.plugin.uiText(`导入失败：${error.message || error}`, `Import failed: ${error.message || error}`));
+      }
+    };
+    this.pluginUiButton(controls, this.plugin.uiText("取消", "Cancel"), "secondary", () => this.close());
+    this.pluginUiButton(controls, this.plugin.uiText("预览", "Preview"), "secondary", () => run(true));
+    this.pluginUiButton(controls, this.plugin.uiText("导入", "Import"), "primary", () => run(false));
+  }
+
+  pluginUiButton(parentEl, text, kind, onClick) {
+    const button = parentEl.createEl("button", { text, attr: { type: "button" } });
+    button.addClass(`obsidian-ntfy-button-${kind}`);
+    button.addEventListener("click", onClick);
+    return button;
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 class NtfyVaultFileSuggestModal extends SuggestModal {
   constructor(app, plugin, onChoose) {
     super(app);
@@ -8576,6 +9174,9 @@ class NtfyManagerView extends ItemView {
     const sidebarHead = sidebar.createDiv({ cls: "obsidian-ntfy-chat-sidebar-head" });
     sidebarHead.createEl("h3", { text: this.uiText("消息", "Messages") });
     const sidebarActions = sidebarHead.createDiv({ cls: "obsidian-ntfy-chat-toolbar" });
+    this.iconButton(sidebarActions, "file-input", this.uiText("导入聊天记录", "Import chat history"), "secondary", () => {
+      new NtfyConversationImportModal(this.app, this.plugin, () => this.renderTabPanel("inbox")).open();
+    });
     this.iconButton(sidebarActions, "refresh-cw", this.uiText("立即接收", "Receive now"), "secondary", async () => {
       await this.plugin.runIncomingPoll();
       this.renderTabPanel("inbox");
@@ -8724,7 +9325,7 @@ class NtfyManagerView extends ItemView {
         renderSelected();
       }).open();
     });
-    attach.disabled = !canAttach || active.channelId === "lan" && !active.online;
+    attach.disabled = !active.available || !canAttach || active.channelId === "lan" && !active.online;
     const input = composeRow.createEl("textarea", {
       cls: "obsidian-ntfy-chat-input",
       attr: { rows: "1", placeholder: this.uiText("输入消息", "Message") },
@@ -8757,7 +9358,7 @@ class NtfyManagerView extends ItemView {
         send.click();
       }
     });
-    if (active.channelId === "lan" && !active.online) {
+    if (!active.available || active.channelId === "lan" && !active.online) {
       input.disabled = true;
       send.disabled = true;
     }
@@ -9747,8 +10348,18 @@ class NtfyReminderSuggest extends EditorSuggest {
     el.createEl("div", { cls: "obsidian-ntfy-suggest-note", text: `${suggestion.hint || "到期"} / ${suggestion.note}` });
   }
 
-  selectSuggestion(suggestion) {
+  selectSuggestion(suggestion, event) {
     if (!this.context) return;
+    if (String(event && event.key || "").toLowerCase() === "enter") {
+      const editor = this.context.editor;
+      const cursor = editor.getCursor();
+      const currentLine = editor.getLine(cursor.line);
+      const indent = (currentLine.match(/^\s*/) || [""])[0];
+      editor.replaceRange(`\n${indent}`, cursor, cursor);
+      editor.setCursor({ line: cursor.line + 1, ch: indent.length });
+      this.close();
+      return;
+    }
     const currentLine = this.context.editor.getLine(this.context.start.line);
     const text = suggestion.insertText || this.tasksFields(suggestion.due, currentLine);
     this.context.editor.replaceRange(text, this.context.start, this.context.end);
@@ -10951,7 +11562,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         button.setButtonText(this.uiText("复制连接说明", "Copy setup"));
         if (typeof button.setIcon === "function") button.setIcon("copy");
         button.onClick(async () => {
-          const text = JSON.stringify(this.plugin.getAgentConnectionInfo(), null, 2);
+          const text = JSON.stringify(this.plugin.getAgentConnectionInfo({ includeToken: true }), null, 2);
           if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
             new Notice(this.uiText("当前设备没有可用的剪贴板接口。", "Clipboard API is unavailable on this device."));
             return;
@@ -10962,7 +11573,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       });
     new Setting(apiGroup)
       .setName(this.uiText("公开能力", "Public capabilities"))
-      .setDesc(this.uiText("支持 send、receive、pollIncoming、registerIncomingHandler 和 registerChannel；不在 Ntfy 内管理模型或会话。", "Supports send, receive, pollIncoming, registerIncomingHandler, and registerChannel without managing models or sessions inside Ntfy."));
+      .setDesc(this.uiText("支持聊天导入导出、消息收发、Channel 注册、局域网状态与同步、提醒、通知和事件订阅；返回值不会暴露 Channel 密钥配置。", "Supports chat import/export, messages, Channel registration, LAN status and sync, reminders, notifications, and event subscriptions without exposing Channel credentials."));
 
     const logGroup = this.createSettingsSection(
       containerEl,

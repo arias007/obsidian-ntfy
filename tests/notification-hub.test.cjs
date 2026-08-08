@@ -127,10 +127,12 @@ async function run() {
   assert.match(source, /channelAction: "ntfy-vault-files"/);
   assert.match(source, /msg_type: "file"/);
   assert.match(styles, /\.obsidian-ntfy-task-time\.is-editable/);
-  assert.match(source, /selectSuggestion\(suggestion\)[\s\S]*?replaceRange\([\s\S]*?setCursor\(/);
+  assert.match(source, /selectSuggestion\(suggestion(?:, event)?\)[\s\S]*?replaceRange\([\s\S]*?setCursor\(/);
   assert.match(source, /onChooseSuggestion\(suggestion\)[\s\S]*?replaceRange\([\s\S]*?setCursor\(/);
   assert.match(source, /dateNeedsTimeTrigger = line\.match\(\/\[📅⏰\][\s\S]*?\(\\s\*\)\$\/u\)/);
   assert.match(source, /cursor\.ch - dateNeedsTimeTrigger\[1\]\.length/);
+  assert.match(source, /selectSuggestion\(suggestion, event\)[\s\S]*?event\.key[\s\S]*?replaceRange\(`\\n\$\{indent\}`/);
+  assert.match(source, /Array\.isArray\(parsed\)[\s\S]*?\{ messages: parsed, source: "ui", dryRun \}/, "array preview must retain dryRun");
   assert.match(source, /insertText: ` \$\{plugin\.formatLocalDateTime\(due\)\.slice\(11\)\}`/);
   assert.match(source, /openDateTimePicker\(dueValue, onSave\)/);
   assert.match(source, /typeof input\.showPicker === "function"/);
@@ -151,6 +153,97 @@ async function run() {
   assert.equal(plugin.settings.backgroundReceiveEnabled, true);
   assert.equal(plugin.settings.showObsidianReminderNotices, true);
   assert.deepEqual(plugin.settings.channelHealth, {});
+
+  const conversationImportPlugin = createPlugin({
+    topic: "conversation-import",
+    agentProtocolToken: "agent-secret-must-not-leak",
+    channelAccounts: [{ id: "ntfy", type: "ntfy", accountId: "default", name: "Ntfy", enabled: true, config: { serverUrl: "https://ntfy.sh", topic: "conversation-import", authToken: "must-not-leak" } }],
+  });
+  const conversationApi = conversationImportPlugin.createNotificationHubApi();
+  assert.equal(conversationApi.contractVersion, 2);
+  assert.equal(typeof conversationApi.conversations.import, "function");
+  assert.equal(typeof conversationApi.conversations.export, "function");
+  assert.equal(typeof conversationApi.conversations.preference, "function");
+  assert.equal(typeof conversationApi.conversations.updatePreference, "function");
+  assert.equal(typeof conversationApi.messages.status, "function");
+  assert.equal(typeof conversationApi.messages.poll, "function");
+  assert.equal(typeof conversationApi.messages.registerHandler, "function");
+  assert.equal(typeof conversationApi.messages.unregisterHandler, "function");
+  assert.equal(typeof conversationApi.lan.requestSync, "function");
+  assert.equal(typeof conversationApi.events.on, "function");
+  assert.equal(Object.hasOwn(conversationApi.channels.list()[0], "config"), false, "public channels must not expose credential-bearing config");
+  assert.equal(JSON.stringify(conversationApi.getAgentConnectionInfo()).includes("agent-secret-must-not-leak"), false, "public API setup info must not expose the Agent token");
+  const importPayload = {
+    source: "cancip",
+    messages: [
+      { id: "chat-1", channelId: "cancip", conversationId: "session-1", direction: "incoming", sender: "Cancip", text: "Imported message", timestamp: "2026-08-08T01:02:03.000Z" },
+      { id: "chat-1", channelId: "cancip", conversationId: "session-1", direction: "incoming", sender: "Cancip", text: "Imported message", timestamp: "2026-08-08T01:02:03.000Z" },
+    ],
+  };
+  const importPreview = await conversationApi.conversations.import(Object.assign({}, importPayload, { dryRun: true }));
+  assert.equal(importPreview.inserted, 1);
+  assert.equal(importPreview.duplicates, 1);
+  assert.equal(conversationImportPlugin.settings.conversationMessages.length, 0, "dry-run must not persist messages");
+  let importedEventCount = 0;
+  const stopImportEvents = conversationApi.events.on("messages-imported", () => { importedEventCount += 1; });
+  const imported = await conversationApi.importConversationMessages(importPayload);
+  assert.equal(imported.inserted, 1);
+  assert.equal(imported.duplicates, 1);
+  assert.equal(importedEventCount, 1);
+  stopImportEvents();
+  const repeated = await conversationApi.conversations.import(importPayload);
+  assert.equal(repeated.inserted, 0);
+  assert.equal(repeated.duplicates, 2);
+  const conflicting = await conversationApi.conversations.import({
+    source: "cancip",
+    messages: [{ id: "chat-1", channelId: "cancip", conversationId: "session-1", direction: "incoming", text: "Different body", timestamp: "2026-08-08T01:02:03.000Z" }],
+  });
+  assert.equal(conflicting.inserted, 0);
+  assert.equal(conflicting.conflicts, 1);
+  assert.equal(conversationImportPlugin.settings.conversationMessages[0].text, "Imported message", "conflicts must preserve existing messages");
+  const unsafeImport = await conversationApi.conversations.import({
+    messages: [{ channelId: "cancip", conversationId: "unsafe", text: "Unsafe", timestamp: "2026-08-08T01:02:04.000Z", attachments: [{ name: "outside", path: "../outside.txt", size: 1 }] }],
+  });
+  assert.equal(unsafeImport.rejected, 1);
+  assert.equal(conversationImportPlugin.settings.conversationMessages.length, 1);
+  const exportedConversation = conversationApi.conversations.export({ conversationKey: "cancip::session-1" });
+  assert.equal(exportedConversation.schemaVersion, 1);
+  assert.equal(exportedConversation.messages.length, 1);
+  const exportedCopy = conversationApi.conversations.messages("cancip::session-1");
+  exportedCopy[0].text = "mutated externally";
+  assert.equal(conversationImportPlugin.settings.conversationMessages[0].text, "Imported message", "public message results must be defensive copies");
+  assert.equal(conversationApi.conversations.list().some((contact) => contact.id === "cancip::session-1"), true, "imported inactive conversations must remain visible");
+
+  const groupImportPlugin = createPlugin({ topic: "group-import" });
+  const groupApi = groupImportPlugin.createNotificationHubApi();
+  const groupPayload = {
+    chatName: "项目群",
+    members: ["Alice", "Bob", "Murat"],
+    messages: [
+      { author: "Alice", content: "第一条", time: "2026-08-08T01:00:00Z" },
+      { author: { name: "Bob" }, body: "第二条", createdAt: "2026-08-08T01:01:00Z" },
+    ],
+  };
+  const groupPreview = await groupApi.conversations.import(Object.assign({}, groupPayload, { dryRun: true }));
+  assert.equal(groupPreview.inserted, 2);
+  assert.equal(groupImportPlugin.settings.conversationMessages.length, 0, "group-chat preview must not persist messages");
+  const groupImport = await groupApi.conversations.import(groupPayload);
+  assert.equal(groupImport.inserted, 2);
+  assert.equal(groupImportPlugin.settings.conversationMessages[0].channelId, "imported", "Channel must be optional for group-chat imports");
+  assert.equal(groupImportPlugin.settings.conversationMessages[0].conversationId, "项目群");
+  assert.equal(groupImportPlugin.settings.conversationMessages[0].sender, "Alice");
+  assert.equal(groupImportPlugin.settings.conversationMessages[0].text, "第一条");
+  assert.deepEqual(groupImportPlugin.settings.conversationMessages[0].metadata.participants, ["Alice", "Bob", "Murat"]);
+  assert.equal(groupApi.conversations.list().find((contact) => contact.id === "imported::项目群").name, "项目群");
+  const multiGroupPreview = await groupApi.conversations.import({
+    dryRun: true,
+    conversations: [
+      { groupName: "甲组", members: ["甲", "乙"], messages: [{ name: "甲", message: "你好", date: "2026-08-08T02:00:00Z" }] },
+      { groupName: "乙组", members: ["丙", "丁"], messages: [{ user: "丙", text: "收到", timestamp: "2026-08-08T02:01:00Z" }] },
+    ],
+  });
+  assert.equal(multiGroupPreview.inserted, 2);
+  assert.deepEqual(new Set(multiGroupPreview.conversations), new Set(["imported::甲组", "imported::乙组"]));
 
   const migratedInternalNoticePlugin = createPlugin({
     sent: {

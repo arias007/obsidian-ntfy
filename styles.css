@@ -1245,6 +1245,22 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
   gap: 4px;
 }
 
+.obsidian-ntfy-conversation-import-modal {
+  max-width: min(720px, 92vw);
+}
+
+.obsidian-ntfy-conversation-import-json {
+  box-sizing: border-box;
+  display: block;
+  font-family: var(--font-monospace);
+  margin: 12px 0;
+  max-width: 100%;
+  min-height: 220px;
+  min-width: 100%;
+  resize: vertical;
+  width: 100%;
+}
+
 .obsidian-ntfy-chat-contacts,
 .obsidian-ntfy-chat-messages {
   flex: 1 1 auto;
