@@ -374,6 +374,7 @@ try {
     lastFailureAt: stabilityClock,
     probing: false,
     manual: false,
+    lastRemoteSyncRequestId: "",
     policy: { incrementalPush: false, incrementalPull: false, deletePush: false, deletePull: false, syncConfigFolder: false, deleteProtocol: true }
   };
   stabilityService.peers.set(stabilityPeer.deviceId, stabilityPeer);
@@ -407,6 +408,7 @@ try {
     assert.equal(storageA.text(conflictPath), "older A");
     assert.equal(storageB.text(conflictPath), "older A");
     assert.ok(progressA.some((value) => value.phase === "syncing" && value.active));
+    assert.ok(progressA.some((value) => value.phase === "scanning" && value.total > 0 && value.completed > 0), "LAN scan progress did not expose the full local manifest");
     assert.ok(progressA.some((value) => value.phase === "complete" && value.conflicts === 1));
     assert.ok(progressB.some((value) => value.active), "Receiving peer did not expose LAN status");
     const activityA = serviceA.activity();
@@ -470,17 +472,21 @@ try {
   const desktopProgress = [];
   const mobileProgress = [];
   const desktopService = new NtfyLanSync(commonOptions(desktopStorage, desktopPort, desktopDevice, desktopProgress));
+  const mobileOptions = commonOptions(mobileStorage, 43190, mobileDevice, mobileProgress, { autoDiscovery: false });
   const mobileService = new NtfyLanSync({
-    ...commonOptions(mobileStorage, 43190, mobileDevice, mobileProgress),
+    ...mobileOptions,
     desktop: false
   });
   try {
     await desktopService.start();
     await mobileService.start();
     await waitFor(() => mobileService.status().peerCount === 1, "mobile authenticated desktop endpoint");
-    await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "automatic mobile-initiated LAN synchronization");
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 150));
+    assert.equal(desktopStorage.text("Mobile/client-created.md"), null, "Disabled automatic sync should wait for an explicit request");
+    desktopService.requestSync();
+    await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "desktop-requested mobile LAN synchronization");
     await waitFor(() => mobileProgress.some((value) => value.phase === "complete"), "mobile synchronization completion");
-    assert.ok(mobileProgress.some((value) => value.phase === "complete"), "Mobile client waited for the lower desktop device ID");
+    assert.ok(mobileProgress.some((value) => value.phase === "complete"), "Mobile client did not honor the desktop sync request");
   } finally {
     await Promise.all([mobileService.stop(), desktopService.stop()]);
   }

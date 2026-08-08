@@ -1326,6 +1326,7 @@ ${bodyHash}`;
     syncRunning = false;
     syncQueued = false;
     syncForced = false;
+    syncRequestId = "";
     lastTransferAt = 0;
     progressValue = defaultProgress();
     activityFiles = [];
@@ -1498,6 +1499,7 @@ ${bodyHash}`;
       this.scheduleSync(120);
     }
     requestSync() {
+      this.syncRequestId = randomId(18);
       this.scheduleSync(0, true);
     }
     settings() {
@@ -1823,6 +1825,7 @@ ${bodyHash}`;
           lastFailureAt: 0,
           probing: false,
           manual,
+          lastRemoteSyncRequestId: "",
           policy: passivePeerPolicy()
         };
         this.peers.set(deviceId, peer);
@@ -1957,6 +1960,9 @@ ${bodyHash}`;
           if (oldKey && oldKey !== responseDeviceId) this.peers.delete(oldKey);
         }
         peer.policy = policyFromRaw(response.policy);
+        const remoteSyncRequestId = typeof response.syncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(response.syncRequestId) ? response.syncRequestId : "";
+        const remoteRequestedSync = Boolean(remoteSyncRequestId && remoteSyncRequestId !== peer.lastRemoteSyncRequestId);
+        if (remoteSyncRequestId) peer.lastRemoteSyncRequestId = remoteSyncRequestId;
         peer.verifiedAt = this.now();
         peer.lastSeenAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
         peer.consecutiveFailures = 0;
@@ -1964,7 +1970,7 @@ ${bodyHash}`;
         this.lastErrorValue = "";
         this.emit({ ...defaultProgress("connected"), active: true, peerId: peer.deviceId });
         this.emitPeersChanged();
-        this.scheduleSync(20);
+        this.scheduleSync(remoteRequestedSync ? 0 : 20, remoteRequestedSync);
       } catch {
         peer.consecutiveFailures = Math.min(100, peer.consecutiveFailures + 1);
         peer.lastFailureAt = this.now();
@@ -2052,8 +2058,21 @@ ${bodyHash}`;
       this.activityUpdatedAt = this.now();
       this.emit({ ...defaultProgress("scanning"), active: true, peerId: peer.deviceId });
       const localPolicy = this.policy();
+      let lastScanProgressAt = 0;
+      const reportScanProgress = (completed2, total) => {
+        const now = this.now();
+        if (completed2 !== total && now - lastScanProgressAt < 100) return;
+        lastScanProgressAt = now;
+        this.emit({
+          ...defaultProgress("scanning"),
+          active: true,
+          peerId: peer.deviceId,
+          completed: completed2,
+          total
+        });
+      };
       const [localEntries, remoteResponse, ledger] = await Promise.all([
-        this.buildManifest(localPolicy.syncConfigFolder),
+        this.buildManifest(localPolicy.syncConfigFolder, reportScanProgress),
         this.callPeer(peer, "/manifest", { syncConfigFolder: localPolicy.syncConfigFolder }),
         Promise.resolve(this.loadLedger(peer.deviceId))
       ]);
@@ -2209,9 +2228,11 @@ ${bodyHash}`;
       }
       return { bytes: 0, changed: false, conflict: false };
     }
-    async buildManifest(includeConfigFolder = this.settings().syncConfigFolder) {
+    async buildManifest(includeConfigFolder = this.settings().syncConfigFolder, onProgress) {
       const maxFileBytes = this.settings().maxFileBytes;
       const files = (await this.options.storage.listFiles(includeConfigFolder)).map((file) => ({ ...file, path: this.normalizePath(file.path, includeConfigFolder) })).filter((file) => Boolean(file.path) && file.size >= 0 && file.size <= maxFileBytes).sort((left, right) => left.path.localeCompare(right.path)).slice(0, MAX_MANIFEST_FILES);
+      onProgress?.(0, files.length);
+      let completed = 0;
       return await mapWithConcurrency(files, HASH_CONCURRENCY, async (file) => {
         const signature = `${file.mtime}:${file.size}`;
         let hash = this.hashCache.get(file.path)?.signature === signature ? this.hashCache.get(file.path)?.hash ?? "" : "";
@@ -2219,6 +2240,8 @@ ${bodyHash}`;
           hash = await sha256Bytes(await this.options.storage.readBinary(file.path));
           this.hashCache.set(file.path, { signature, hash });
         }
+        completed += 1;
+        onProgress?.(completed, files.length);
         return { path: file.path, size: file.size, mtime: file.mtime, hash };
       });
     }
@@ -2428,7 +2451,13 @@ ${bodyHash}`;
         inboundActivityIndex = this.beginInboundFileActivity(deviceId, path, payload);
         let result;
         if (path === `${API_PREFIX}/ping`) {
-          result = { ok: true, protocolVersion: PROTOCOL_VERSION, deviceId: this.deviceId, policy: this.policy() };
+          result = {
+            ok: true,
+            protocolVersion: PROTOCOL_VERSION,
+            deviceId: this.deviceId,
+            policy: this.policy(),
+            syncRequestId: this.syncRequestId
+          };
         } else if (path === `${API_PREFIX}/manifest`) {
           const policy = this.policy();
           result = {
@@ -2564,8 +2593,19 @@ class NtfyLanSyncDetailsModal extends Modal {
 
     if (!files.length) {
       const empty = body.createDiv({ cls: "obsidian-ntfy-lan-details-empty" });
-      setIcon(empty.createSpan(), progress.phase === "scanning" ? "scan-search" : "circle-check");
-      empty.createSpan({ text: progress.phase === "scanning" ? (chinese ? "正在比较文件" : "Comparing files") : (chinese ? "暂无文件变更" : "No file changes") });
+      const emptyState = progress.phase === "complete"
+        ? { icon: "circle-check", zh: "本轮扫描无文件变更", en: "No file changes in this scan" }
+        : progress.phase === "scanning" || progress.phase === "syncing"
+          ? { icon: "scan-search", zh: "正在比较文件", en: "Comparing files" }
+          : progress.phase === "connected"
+            ? { icon: "wifi", zh: "设备已连接，等待文件扫描", en: "Device connected; waiting for a file scan" }
+            : progress.phase === "error"
+              ? { icon: "triangle-alert", zh: progress.error ? `同步失败：${progress.error}` : "同步失败", en: progress.error ? `Sync failed: ${progress.error}` : "Sync failed" }
+              : progress.phase === "discovering"
+                ? { icon: "scan-search", zh: "等待同库设备在线", en: "Waiting for a matching vault device" }
+                : { icon: "circle-pause", zh: "同步尚未开始", en: "Synchronization has not started" };
+      setIcon(empty.createSpan(), emptyState.icon);
+      empty.createSpan({ text: chinese ? emptyState.zh : emptyState.en });
       body.scrollTop = scrollTop;
       return;
     }
@@ -3334,7 +3374,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   lanSyncStatusText() {
     const progress = this.lanSyncProgress;
-    if ((progress.phase === "syncing" || progress.phase === "complete") && progress.total > 0) {
+    if ((progress.phase === "scanning" || progress.phase === "syncing" || progress.phase === "complete") && progress.total > 0) {
       return `${progress.completed}/${progress.total}`;
     }
     return "";

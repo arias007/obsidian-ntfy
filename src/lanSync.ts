@@ -169,6 +169,7 @@ type LanSyncPeer = {
   lastFailureAt: number;
   probing: boolean;
   manual: boolean;
+  lastRemoteSyncRequestId: string;
   policy: LanSyncPolicy;
 };
 
@@ -839,6 +840,7 @@ export class NtfyLanSync {
   private syncRunning = false;
   private syncQueued = false;
   private syncForced = false;
+  private syncRequestId = "";
   private lastTransferAt = 0;
   private progressValue = defaultProgress();
   private activityFiles: LanSyncFileActivity[] = [];
@@ -1030,6 +1032,10 @@ export class NtfyLanSync {
   }
 
   requestSync(): void {
+    // A mobile Obsidian client cannot host the HTTP endpoint. Keep a pending
+    // request in the authenticated ping response so its next heartbeat starts
+    // a forced scan instead of silently discarding a desktop-side request.
+    this.syncRequestId = randomId(18);
     this.scheduleSync(0, true);
   }
 
@@ -1390,6 +1396,7 @@ export class NtfyLanSync {
         lastFailureAt: 0,
         probing: false,
         manual,
+        lastRemoteSyncRequestId: "",
         policy: passivePeerPolicy()
       };
       this.peers.set(deviceId, peer);
@@ -1539,6 +1546,11 @@ export class NtfyLanSync {
         if (oldKey && oldKey !== responseDeviceId) this.peers.delete(oldKey);
       }
       peer.policy = policyFromRaw(response.policy);
+      const remoteSyncRequestId = typeof response.syncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(response.syncRequestId)
+        ? response.syncRequestId
+        : "";
+      const remoteRequestedSync = Boolean(remoteSyncRequestId && remoteSyncRequestId !== peer.lastRemoteSyncRequestId);
+      if (remoteSyncRequestId) peer.lastRemoteSyncRequestId = remoteSyncRequestId;
       peer.verifiedAt = this.now();
       peer.lastSeenAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
       peer.consecutiveFailures = 0;
@@ -1546,7 +1558,7 @@ export class NtfyLanSync {
       this.lastErrorValue = "";
       this.emit({ ...defaultProgress("connected"), active: true, peerId: peer.deviceId });
       this.emitPeersChanged();
-      this.scheduleSync(20);
+      this.scheduleSync(remoteRequestedSync ? 0 : 20, remoteRequestedSync);
     } catch {
       peer.consecutiveFailures = Math.min(100, peer.consecutiveFailures + 1);
       peer.lastFailureAt = this.now();
@@ -1647,8 +1659,21 @@ export class NtfyLanSync {
     this.activityUpdatedAt = this.now();
     this.emit({ ...defaultProgress("scanning"), active: true, peerId: peer.deviceId });
     const localPolicy = this.policy();
+    let lastScanProgressAt = 0;
+    const reportScanProgress = (completed: number, total: number): void => {
+      const now = this.now();
+      if (completed !== total && now - lastScanProgressAt < 100) return;
+      lastScanProgressAt = now;
+      this.emit({
+        ...defaultProgress("scanning"),
+        active: true,
+        peerId: peer.deviceId,
+        completed,
+        total
+      });
+    };
     const [localEntries, remoteResponse, ledger] = await Promise.all([
-      this.buildManifest(localPolicy.syncConfigFolder),
+      this.buildManifest(localPolicy.syncConfigFolder, reportScanProgress),
       this.callPeer(peer, "/manifest", { syncConfigFolder: localPolicy.syncConfigFolder }),
       Promise.resolve(this.loadLedger(peer.deviceId))
     ]);
@@ -1808,13 +1833,18 @@ export class NtfyLanSync {
     return { bytes: 0, changed: false, conflict: false };
   }
 
-  private async buildManifest(includeConfigFolder = this.settings().syncConfigFolder): Promise<LanSyncManifestEntry[]> {
+  private async buildManifest(
+    includeConfigFolder = this.settings().syncConfigFolder,
+    onProgress?: (completed: number, total: number) => void
+  ): Promise<LanSyncManifestEntry[]> {
     const maxFileBytes = this.settings().maxFileBytes;
     const files = (await this.options.storage.listFiles(includeConfigFolder))
       .map((file) => ({ ...file, path: this.normalizePath(file.path, includeConfigFolder) }))
       .filter((file): file is Omit<LanSyncFileStat, "path"> & { path: string } => Boolean(file.path) && file.size >= 0 && file.size <= maxFileBytes)
       .sort((left, right) => left.path.localeCompare(right.path))
       .slice(0, MAX_MANIFEST_FILES);
+    onProgress?.(0, files.length);
+    let completed = 0;
     return await mapWithConcurrency(files, HASH_CONCURRENCY, async (file) => {
       const signature = `${file.mtime}:${file.size}`;
       let hash = this.hashCache.get(file.path)?.signature === signature ? this.hashCache.get(file.path)?.hash ?? "" : "";
@@ -1822,6 +1852,8 @@ export class NtfyLanSync {
         hash = await sha256Bytes(await this.options.storage.readBinary(file.path));
         this.hashCache.set(file.path, { signature, hash });
       }
+      completed += 1;
+      onProgress?.(completed, files.length);
       return { path: file.path, size: file.size, mtime: file.mtime, hash };
     });
   }
@@ -2050,7 +2082,13 @@ export class NtfyLanSync {
       inboundActivityIndex = this.beginInboundFileActivity(deviceId, path, payload);
       let result: Record<string, unknown>;
       if (path === `${API_PREFIX}/ping`) {
-        result = { ok: true, protocolVersion: PROTOCOL_VERSION, deviceId: this.deviceId, policy: this.policy() };
+        result = {
+          ok: true,
+          protocolVersion: PROTOCOL_VERSION,
+          deviceId: this.deviceId,
+          policy: this.policy(),
+          syncRequestId: this.syncRequestId
+        };
       } else if (path === `${API_PREFIX}/manifest`) {
         const policy = this.policy();
         result = {
