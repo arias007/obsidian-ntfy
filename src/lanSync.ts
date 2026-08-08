@@ -948,13 +948,15 @@ export class NtfyLanSync {
     return { ...scan };
   }
 
-  activity(): LanSyncActivitySnapshot {
+  activity(options: { includeScanFiles?: boolean; includeTransferFiles?: boolean } = {}): LanSyncActivitySnapshot {
+    const includeScanFiles = options.includeScanFiles !== false;
+    const includeTransferFiles = options.includeTransferFiles !== false;
     return {
       progress: { ...this.progressValue },
-      files: this.activityFiles.map((file) => ({ ...file })),
+      files: includeTransferFiles ? this.activityFiles.map((file) => ({ ...file })) : [],
       scan: {
         ...this.scanValue,
-        files: this.scanValue.files.map((file) => ({ ...file }))
+        files: includeScanFiles ? this.scanValue.files.map((file) => ({ ...file })) : []
       }
     };
   }
@@ -1979,7 +1981,7 @@ export class NtfyLanSync {
     }
     if (action.kind === "pull" && action.remote) {
       const bytes = await this.readRemote(peer, action.remote);
-      await this.writeLocal(action.path, bytes, action.local?.hash ?? null, action.remote.hash);
+      await this.writeLocal(action.path, bytes, action.local?.hash ?? null, action.remote.hash, true);
       ledger.entries[action.path] = action.remote.hash;
       return { bytes: bytes.byteLength, changed: true, conflict: false };
     }
@@ -2012,7 +2014,7 @@ export class NtfyLanSync {
       const conflictPath = buildLanConflictPath(action.path, this.deviceId, action.local.hash, this.pathOptions());
       await this.writeRemoteIfMissingOrSame(peer, conflictPath, localBytes, action.local.hash);
       await this.writeLocalIfMissingOrSame(conflictPath, localBytes, action.local.hash);
-      await this.writeLocal(action.path, remoteBytes, action.local.hash, action.remote.hash);
+      await this.writeLocal(action.path, remoteBytes, action.local.hash, action.remote.hash, true);
       ledger.entries[action.path] = action.remote.hash;
       ledger.entries[conflictPath] = action.local.hash;
       return { bytes: localBytes.byteLength * 2 + remoteBytes.byteLength, changed: true, conflict: true };
@@ -2108,6 +2110,7 @@ export class NtfyLanSync {
           this.scanValue.hashed += 1;
         }
         this.scanValue.completed += 1;
+        if (this.scanValue.completed % 250 === 0) this.queueHashCacheSave();
         report();
         return { path: file.path, size: file.size, mtime: file.mtime, hash };
       });
@@ -2187,40 +2190,72 @@ export class NtfyLanSync {
   private async readLocalVerified(path: string, expectedHash: string): Promise<Uint8Array> {
     const normalized = this.normalizePath(path);
     if (!normalized) throw new LanSyncProtocolError("unsafe_path");
+    const before = await this.options.storage.statFile(normalized);
+    if (!before || before.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("precondition_failed", 409);
     const bytes = new Uint8Array(await this.options.storage.readBinary(normalized));
-    if (bytes.byteLength > this.settings().maxFileBytes || await sha256Bytes(bytes) !== expectedHash) throw new LanSyncProtocolError("precondition_failed", 409);
+    const after = await this.options.storage.statFile(normalized);
+    const beforeSignature = `${before.mtime}:${before.size}`;
+    const afterSignature = after ? `${after.mtime}:${after.size}` : "";
+    if (!after || beforeSignature !== afterSignature || bytes.byteLength !== after.size) throw new LanSyncProtocolError("precondition_failed", 409);
+    const cached = this.hashCache.get(normalized);
+    if (cached?.signature !== afterSignature || cached.hash !== expectedHash) {
+      if (await sha256Bytes(bytes) !== expectedHash) throw new LanSyncProtocolError("precondition_failed", 409);
+      this.hashCache.set(normalized, { signature: afterSignature, hash: expectedHash });
+      this.queueHashCacheSave();
+    }
     return bytes;
   }
 
-  private async writeLocal(path: string, bytes: Uint8Array, expectedHash: string | null, suppliedHash: string): Promise<void> {
+  private async writeLocal(path: string, bytes: Uint8Array, expectedHash: string | null, suppliedHash: string, contentVerified = false): Promise<void> {
     const normalized = this.normalizePath(path);
-    if (!normalized || bytes.byteLength > this.settings().maxFileBytes || await sha256Bytes(bytes) !== suppliedHash) throw new LanSyncProtocolError("unsafe_write", 400);
+    if (!normalized || bytes.byteLength > this.settings().maxFileBytes || !/^[A-Za-z0-9_-]{32,64}$/.test(suppliedHash)) throw new LanSyncProtocolError("unsafe_write", 400);
+    if (!contentVerified && await sha256Bytes(bytes) !== suppliedHash) throw new LanSyncProtocolError("unsafe_write", 400);
     const current = await this.options.storage.statFile(normalized);
     if (expectedHash === null) {
       if (current) throw new LanSyncProtocolError("precondition_failed", 409);
     } else {
-      if (!current || await sha256Bytes(await this.options.storage.readBinary(normalized)) !== expectedHash) throw new LanSyncProtocolError("precondition_failed", 409);
+      if (!current) throw new LanSyncProtocolError("precondition_failed", 409);
+      const signature = `${current.mtime}:${current.size}`;
+      const cached = this.hashCache.get(normalized);
+      const currentHash = cached?.signature === signature
+        ? cached.hash
+        : await sha256Bytes(await this.options.storage.readBinary(normalized));
+      if (currentHash !== expectedHash) throw new LanSyncProtocolError("precondition_failed", 409);
+      if (cached?.signature !== signature) this.hashCache.set(normalized, { signature, hash: currentHash });
     }
     await this.options.storage.writeBinary(normalized, arrayBuffer(bytes));
-    this.hashCache.delete(normalized);
     const written = await this.options.storage.statFile(normalized);
-    if (!written || await sha256Bytes(await this.options.storage.readBinary(normalized)) !== suppliedHash) throw new Error("write_verification_failed");
+    if (!written || written.size !== bytes.byteLength) throw new Error("write_verification_failed");
+    this.hashCache.set(normalized, { signature: `${written.mtime}:${written.size}`, hash: suppliedHash });
+    this.queueHashCacheSave();
   }
 
   private async writeLocalIfMissingOrSame(path: string, bytes: Uint8Array, hash: string): Promise<void> {
     const stat = await this.options.storage.statFile(path);
     if (stat) {
-      if (await sha256Bytes(await this.options.storage.readBinary(path)) === hash) return;
+      const signature = `${stat.mtime}:${stat.size}`;
+      const cached = this.hashCache.get(path);
+      const currentHash = cached?.signature === signature ? cached.hash : await sha256Bytes(await this.options.storage.readBinary(path));
+      if (currentHash === hash) {
+        if (cached?.signature !== signature) {
+          this.hashCache.set(path, { signature, hash });
+          this.queueHashCacheSave();
+        }
+        return;
+      }
       throw new LanSyncProtocolError("conflict_copy_collision", 409);
     }
-    await this.writeLocal(path, bytes, null, hash);
+    await this.writeLocal(path, bytes, null, hash, true);
   }
 
   private async deleteLocal(path: string, expectedHash: string): Promise<void> {
     const normalized = this.normalizePath(path);
     if (!normalized || !/^[A-Za-z0-9_-]{32,64}$/.test(expectedHash)) throw new LanSyncProtocolError("unsafe_delete");
     const current = await this.options.storage.statFile(normalized);
-    if (!current || await sha256Bytes(await this.options.storage.readBinary(normalized)) !== expectedHash) {
+    const signature = current ? `${current.mtime}:${current.size}` : "";
+    const cached = current ? this.hashCache.get(normalized) : null;
+    const currentHash = !current ? "" : cached?.signature === signature ? cached.hash : await sha256Bytes(await this.options.storage.readBinary(normalized));
+    if (!current || currentHash !== expectedHash) {
       throw new LanSyncProtocolError("precondition_failed", 409);
     }
     await this.options.storage.deleteFile(normalized);
@@ -2394,10 +2429,8 @@ export class NtfyLanSync {
     if (!path || !/^[A-Za-z0-9_-]{32,64}$/.test(expectedHash)) throw new LanSyncProtocolError("unsafe_path");
     const stat = await this.options.storage.statFile(path);
     if (!stat || stat.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("file_unavailable", 404);
-    const bytes = new Uint8Array(await this.options.storage.readBinary(path));
-    const hash = await sha256Bytes(bytes);
-    if (hash !== expectedHash) throw new LanSyncProtocolError("precondition_failed", 409);
-    return { path, hash, mtime: stat.mtime, size: bytes.byteLength, data: bytesToBase64Url(bytes) };
+    const bytes = await this.readLocalVerified(path, expectedHash);
+    return { path, hash: expectedHash, mtime: stat.mtime, size: bytes.byteLength, data: bytesToBase64Url(bytes) };
   }
 
   private async handleWriteFile(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -2410,7 +2443,7 @@ export class NtfyLanSync {
     }
     const bytes = base64UrlToBytes(encoded);
     if (bytes.byteLength > this.settings().maxFileBytes || await sha256Bytes(bytes) !== hash) throw new LanSyncProtocolError("invalid_file_content");
-    await this.writeLocal(path, bytes, expectedHash, hash);
+    await this.writeLocal(path, bytes, expectedHash, hash, true);
     return { ok: true, path, hash, size: bytes.byteLength };
   }
 
@@ -2436,7 +2469,7 @@ export class NtfyLanSync {
     await this.options.storage.ensureFolder(path.split("/").slice(0, -1).join("/"));
     await this.options.storage.writeBinary(path, arrayBuffer(bytes));
     const written = await this.options.storage.statFile(path);
-    if (!written || written.size !== bytes.byteLength || await sha256Bytes(await this.options.storage.readBinary(path)) !== hash) throw new Error("write_verification_failed");
+    if (!written || written.size !== bytes.byteLength) throw new Error("write_verification_failed");
     const expiresAt = new Date(this.now() + this.settings().inboxRetentionHours * 60 * 60_000).toISOString();
     return { name, type, path, size: bytes.byteLength, hash, temporary: true, expiresAt };
   }

@@ -39,6 +39,7 @@ class MemoryStorage {
       `${this.identityRoot}/peers`
     ]);
     this.clock = 1000;
+    this.readCounts = new Map();
     this.putText(`${this.identityRoot}/identity.json`, `${JSON.stringify(identity)}\n`, 1);
     for (const [path, value] of Object.entries(files)) this.putText(path, value.content, value.mtime);
   }
@@ -69,7 +70,16 @@ class MemoryStorage {
   async readBinary(path) {
     const entry = this.files.get(path);
     if (!entry) throw new Error("missing_file");
+    this.readCounts.set(path, (this.readCounts.get(path) || 0) + 1);
     return arrayBuffer(entry.data);
+  }
+
+  readCount(path) {
+    return this.readCounts.get(path) || 0;
+  }
+
+  totalReads() {
+    return [...this.readCounts.values()].reduce((sum, count) => sum + count, 0);
   }
 
   async writeBinary(path, data) {
@@ -440,6 +450,19 @@ try {
     assert.ok(activityA.scan.files.some((file) => file.state === "cached" || file.state === "complete"), "Scan file states were not retained");
     assert.ok(activityA.files.some((file) => file.path === "Notes/from-a.md" && file.state === "complete"), "Coordinator did not retain completed file activity");
     assert.ok(activityA.files.some((file) => file.path === "Notes/shared.md" && file.action === "conflict"), "Conflict activity was not exposed");
+    const collapsedActivityA = serviceA.activity({ includeScanFiles: false, includeTransferFiles: false });
+    assert.equal(collapsedActivityA.scan.total, activityA.scan.total, "Collapsed scan lost its summary");
+    assert.deepEqual(collapsedActivityA.scan.files, [], "Collapsed scan still cloned file rows");
+    assert.deepEqual(collapsedActivityA.files, [], "Collapsed transfer section still cloned file rows");
+    assert.equal(storageA.readCount("Notes/from-b.md"), 0, "A verified remote write was read back only to hash it again");
+    const readsBeforeCachedScan = storageA.totalReads();
+    const completedScanId = activityA.scan.id;
+    serviceA.requestSync();
+    await waitFor(() => {
+      const scan = serviceA.activity({ includeScanFiles: false, includeTransferFiles: false }).scan;
+      return scan.id !== completedScanId && scan.phase === "complete";
+    }, "cached follow-up full-vault scan");
+    assert.equal(storageA.totalReads(), readsBeforeCachedScan, "An unchanged follow-up scan reread file contents instead of using metadata/hash cache");
     const activityB = serviceB.activity();
     assert.ok(activityB.files.some((file) => file.path.endsWith(".md")), "Receiving peer did not expose inbound file activity");
     const firstProgress = progressA.find((value) => value.phase === "syncing" && value.total > 0 && value.completed === 0);
@@ -530,7 +553,7 @@ try {
   const takeoverStart = source.indexOf("remotelySaveStatusBarElement()");
   const takeoverSource = source.slice(takeoverStart, source.indexOf("\n  normalizeChannelHealth(", takeoverStart));
   const statusTextStart = source.indexOf("lanSyncStatusText()");
-  const statusTextSource = source.slice(statusTextStart, source.indexOf("\n  lanSyncActivitySnapshot()", statusTextStart));
+  const statusTextSource = source.slice(statusTextStart, source.indexOf("\n  lanSyncActivitySnapshot(", statusTextStart));
   assert.match(statusTextSource, /return `\$\{progress\.completed\}\/\$\{progress\.total\}`;/, "LAN progress should stay compact beside the Wi-Fi icon");
   assert.doesNotMatch(statusTextSource, /progress\.completed.*percent|·.*%/, "LAN progress should not append a percentage or LAN label");
   assert.doesNotMatch(statusTextSource, /LAN (?:connected|scanning|syncing|synced|unavailable)|局域网|已连接|扫描中|同步中|已同步|暂不可用/, "LAN status text should not show visible words");
@@ -540,6 +563,9 @@ try {
   assert.match(source, /class NtfyLanSyncDetailsModal extends Modal/, "LAN sync details modal is missing");
   assert.match(source, /renderScanSection\(body, scan, chinese\)/, "LAN scan section is missing");
   assert.match(source, /renderTransferSection\(body, progress, files, chinese\)/, "LAN transfer section is missing");
+  assert.match(source, /this\.sectionState = \{ scan: false, transfer: false \}/, "LAN activity file lists should be collapsed by default");
+  assert.match(source, /includeScanFiles: this\.sectionState\.scan/, "Collapsed scans should not materialize hidden file rows");
+  assert.match(source, /includeTransferFiles: this\.sectionState\.transfer/, "Collapsed transfers should not materialize hidden file rows");
   assert.match(source, /createEl\("progress"/, "LAN details should expose progress bars");
   assert.match(source, /this\.app\.vault\.on\("create"/, "New Vault files should trigger LAN sync");
   assert.match(source, /attachment\/write/, "LAN attachments should use the temporary inbox route");
