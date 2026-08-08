@@ -3634,7 +3634,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const conversations = Object.freeze({
       list: () => this.cloneApiValue(this.conversationContacts()),
       get: (conversationKey) => this.cloneApiValue(this.conversationContacts().find((item) => item.id === String(conversationKey || "")) || null),
-      messages: (conversationKey) => this.cloneApiValue((this.settings.conversationMessages || []).filter((message) => !conversationKey || message.conversationKey === conversationKey)),
+      messages: (conversationKey) => {
+        const key = String(conversationKey || "");
+        const contact = key ? this.conversationContacts().find((item) => item.id === key) : null;
+        const messages = contact
+          ? this.conversationMessagesFor(contact)
+          : (this.settings.conversationMessages || []).filter((message) => !key || message.conversationKey === key);
+        return this.cloneApiValue(messages);
+      },
       import: (input) => this.importConversationMessages(input || {}),
       export: (options) => this.exportConversationMessages(options || {}),
       send: (conversationKey, text, filePaths) => this.sendConversationMessage(conversationKey, text, filePaths),
@@ -4670,7 +4677,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     }
     for (const message of messages) {
       const key = this.conversationKey(message.channelId, message.conversationId);
-      if (contacts.has(key)) continue;
+      const channelKey = this.conversationKey(message.channelId, "default");
+      if (contacts.has(key) || contacts.has(channelKey)) continue;
       const channel = channels.find((item) => item.id === message.channelId);
       const active = Boolean(channel && this.conversationChannelIsActive(channel));
       const conversationName = String(message.metadata && message.metadata.conversationName || "").trim();

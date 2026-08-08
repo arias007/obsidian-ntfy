@@ -831,6 +831,21 @@ async function run() {
   assert.equal(ntfyConversation.unread, 1);
   await plugin.markConversationRead(ntfyConversation.id);
   assert.equal(plugin.conversationContacts().find((contact) => contact.id === ntfyConversation.id).unread, 0);
+  plugin.recordConversationMessage({
+    id: "codex-task-complete",
+    channelId: "ntfy",
+    conversationId: "murat-win-device",
+    sender: "murat-win-device",
+    title: "Codex任务完成",
+    text: "Codex通知",
+    timestamp: new Date().toISOString(),
+    direction: "incoming",
+  });
+  const activeNtfyContacts = plugin.conversationContacts().filter((contact) => contact.channelId === "ntfy");
+  assert.equal(activeNtfyContacts.length, 1, "active Channel child conversations must remain grouped under one contact");
+  assert.equal(activeNtfyContacts[0].id, "ntfy::default");
+  assert.equal(plugin.conversationMessagesFor(activeNtfyContacts[0]).some((message) => message.id === "codex-task-complete"), true);
+  assert.equal(plugin.createNotificationHubApi().conversations.messages(activeNtfyContacts[0].id).some((message) => message.id === "codex-task-complete"), true, "public Channel history must include child conversations");
   let conversationSend = null;
   const originalConversationSendNotification = plugin.sendNotification.bind(plugin);
   plugin.sendNotification = async (input) => {
