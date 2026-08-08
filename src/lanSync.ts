@@ -74,7 +74,7 @@ export type LanSyncStorage = {
   listFiles(includeConfigFolder: boolean): Promise<LanSyncFileStat[]>;
   statFile(path: string): Promise<LanSyncFileStat | null>;
   readBinary(path: string): Promise<ArrayBuffer>;
-  writeBinary(path: string, data: ArrayBuffer): Promise<void>;
+  writeBinary(path: string, data: ArrayBuffer, mtime?: number): Promise<void>;
   deleteFile(path: string): Promise<void>;
   exists(path: string): Promise<boolean>;
   readText(path: string): Promise<string>;
@@ -173,6 +173,35 @@ export type LanSyncReconcileAction = {
   winner?: "local" | "remote";
 };
 
+export type LanSyncMetadataEntry = {
+  path: string;
+  size: number;
+  mtime: number;
+};
+
+export type LanSyncMetadataSnapshot = {
+  size: number;
+  mtime: number;
+};
+
+export type LanSyncMetadataLedgerEntry = {
+  local: LanSyncMetadataSnapshot;
+  remote: LanSyncMetadataSnapshot;
+};
+
+export type LanSyncMetadataLedger = {
+  schemaVersion: 2;
+  entries: Record<string, LanSyncMetadataLedgerEntry>;
+};
+
+export type LanSyncMetadataReconcileAction = {
+  kind: LanSyncFileAction;
+  path: string;
+  local: LanSyncMetadataEntry | null;
+  remote: LanSyncMetadataEntry | null;
+  winner?: "local" | "remote";
+};
+
 type LanSyncIdentity = {
   schemaVersion: 1;
   vaultId: string;
@@ -205,6 +234,7 @@ type LanSyncPeer = {
   manual: boolean;
   lastRemoteSyncRequestId: string;
   policy: LanSyncPolicy;
+  capabilities: Set<string>;
 };
 
 type LanNetworkInterface = {
@@ -234,6 +264,7 @@ type RequireLike = (name: string) => unknown;
 const PROTOCOL_VERSION = 1;
 const PROTOCOL_NAME = "cancip-lan-sync";
 const API_PREFIX = "/cancip-lan/v1";
+const METADATA_LEDGER_CAPABILITY = "metadata-ledger-v1";
 const MULTICAST_ADDRESS = "239.255.67.19";
 const DISCOVERY_PORT = 43189;
 const ANNOUNCE_INTERVAL_MS = 750;
@@ -251,7 +282,7 @@ const MAX_MANIFEST_FILES = 100_000;
 const MAX_LEDGER_ENTRIES = 50_000;
 const HARD_MAX_REQUEST_BYTES = 960 * 1024 * 1024;
 const RATE_WINDOW_MS = 60_000;
-const RATE_LIMIT = 1200;
+const RATE_LIMIT = 120_000;
 const DEVICE_ID_STORAGE_KEY = "cancip.lan-sync.device-id.v1";
 const HASH_CACHE_STORAGE_PREFIX = "ntfy.lan-sync.hash-cache.v1";
 const LAN_INBOX_ROOT = ".trash/ntfy-inbox";
@@ -742,6 +773,83 @@ export function planLanSyncReconciliation(
   return actions;
 }
 
+function metadataSnapshot(entry: LanSyncMetadataEntry): LanSyncMetadataSnapshot {
+  return { size: entry.size, mtime: entry.mtime };
+}
+
+function metadataMatches(
+  entry: LanSyncMetadataEntry | LanSyncMetadataSnapshot | null | undefined,
+  expected: LanSyncMetadataEntry | LanSyncMetadataSnapshot | null | undefined
+): boolean {
+  return Boolean(entry && expected && entry.size === expected.size && entry.mtime === expected.mtime);
+}
+
+function metadataWinner(local: LanSyncMetadataEntry, remote: LanSyncMetadataEntry, rule: LanSyncConflictRule): "local" | "remote" {
+  if (rule === "larger" && local.size !== remote.size) return local.size > remote.size ? "local" : "remote";
+  if (local.mtime !== remote.mtime) return local.mtime > remote.mtime ? "local" : "remote";
+  if (local.size !== remote.size) return local.size > remote.size ? "local" : "remote";
+  return "local";
+}
+
+function metadataConflictToken(entry: LanSyncMetadataEntry | LanSyncMetadataSnapshot): string {
+  return `${Math.max(0, Math.trunc(entry.mtime)).toString(36)}-${Math.max(0, Math.trunc(entry.size)).toString(36)}`;
+}
+
+export function planLanSyncMetadataReconciliation(
+  localEntries: LanSyncMetadataEntry[],
+  remoteEntries: LanSyncMetadataEntry[],
+  ledger: Record<string, LanSyncMetadataLedgerEntry>,
+  localPolicy: LanSyncPolicy = defaultLocalPolicy(),
+  remotePolicy: LanSyncPolicy = passivePeerPolicy()
+): LanSyncMetadataReconcileAction[] {
+  const local = new Map(localEntries.map((entry) => [entry.path, entry]));
+  const remote = new Map(remoteEntries.map((entry) => [entry.path, entry]));
+  const paths = [...new Set([...local.keys(), ...remote.keys()])].sort((left, right) => left.localeCompare(right));
+  const actions: LanSyncMetadataReconcileAction[] = [];
+  const canPush = localPolicy.incrementalPush || remotePolicy.incrementalPull;
+  const canPull = localPolicy.incrementalPull || remotePolicy.incrementalPush;
+  const canDeleteRemote = remotePolicy.deleteProtocol && (localPolicy.deletePush || remotePolicy.deletePull);
+  const canDeleteLocal = localPolicy.deletePull || remotePolicy.deletePush;
+  for (const path of paths) {
+    const localEntry = local.get(path) ?? null;
+    const remoteEntry = remote.get(path) ?? null;
+    const baseline = ledger[path];
+    if (localEntry && remoteEntry) {
+      if (metadataMatches(localEntry, remoteEntry)) continue;
+      const localChanged = !baseline || !metadataMatches(localEntry, baseline.local);
+      const remoteChanged = !baseline || !metadataMatches(remoteEntry, baseline.remote);
+      if (!localChanged && !remoteChanged) continue;
+      if (!localChanged && remoteChanged) {
+        if (canPull) actions.push({ kind: "pull", path, local: localEntry, remote: remoteEntry });
+      } else if (localChanged && !remoteChanged) {
+        if (canPush) actions.push({ kind: "push", path, local: localEntry, remote: remoteEntry });
+      } else if (canPush && canPull) {
+        actions.push({ kind: "conflict", path, local: localEntry, remote: remoteEntry, winner: metadataWinner(localEntry, remoteEntry, localPolicy.conflictRule) });
+      } else if (canPush) {
+        actions.push({ kind: "push", path, local: localEntry, remote: remoteEntry });
+      } else if (canPull) {
+        actions.push({ kind: "pull", path, local: localEntry, remote: remoteEntry });
+      }
+      continue;
+    }
+    if (baseline) {
+      if (localEntry) {
+        const localChanged = !metadataMatches(localEntry, baseline.local);
+        if (localChanged && canPush) actions.push({ kind: "push", path, local: localEntry, remote: null });
+        else if (!localChanged && canDeleteLocal) actions.push({ kind: "delete-local", path, local: localEntry, remote: null });
+      } else if (remoteEntry) {
+        const remoteChanged = !metadataMatches(remoteEntry, baseline.remote);
+        if (remoteChanged && canPull) actions.push({ kind: "pull", path, local: null, remote: remoteEntry });
+        else if (!remoteChanged && canDeleteRemote) actions.push({ kind: "delete-remote", path, local: null, remote: remoteEntry });
+      }
+      continue;
+    }
+    if (localEntry && canPush) actions.push({ kind: "push", path, local: localEntry, remote: null });
+    else if (remoteEntry && canPull) actions.push({ kind: "pull", path, local: null, remote: remoteEntry });
+  }
+  return actions;
+}
+
 export function buildLanConflictPath(path: string, losingDeviceId: string, losingHash: string, options: LanSyncPathOptions = {}): string {
   const normalized = normalizeLanSyncPath(path, options);
   if (!normalized) throw new LanSyncProtocolError("unsafe_path");
@@ -915,6 +1023,7 @@ export class NtfyLanSync {
   private hashCacheLoaded = false;
   private hashSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private manifestBuild: { includeConfigFolder: boolean; promise: Promise<LanSyncManifestEntry[]> } | null = null;
+  private metadataManifestBuild: { includeConfigFolder: boolean; promise: Promise<LanSyncMetadataEntry[]> } | null = null;
   private intervals: Array<ReturnType<typeof setInterval>> = [];
   private syncTimer: ReturnType<typeof setTimeout> | null = null;
   private syncRunning = false;
@@ -1585,7 +1694,8 @@ export class NtfyLanSync {
         probing: false,
         manual,
         lastRemoteSyncRequestId: "",
-        policy: passivePeerPolicy()
+        policy: passivePeerPolicy(),
+        capabilities: new Set()
       };
       this.peers.set(deviceId, peer);
     }
@@ -1747,6 +1857,10 @@ export class NtfyLanSync {
         if (oldKey && oldKey !== responseDeviceId) this.peers.delete(oldKey);
       }
       peer.policy = policyFromRaw(response.policy);
+      peer.capabilities = new Set(
+        (Array.isArray(response.capabilities) ? response.capabilities : [])
+          .filter((value): value is string => typeof value === "string" && value.length <= 64)
+      );
       const remoteSyncRequestId = typeof response.syncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(response.syncRequestId)
         ? response.syncRequestId
         : "";
@@ -1857,6 +1971,132 @@ export class NtfyLanSync {
   }
 
   private async syncPeer(peer: LanSyncPeer): Promise<void> {
+    if (peer.capabilities?.has(METADATA_LEDGER_CAPABILITY)) {
+      await this.syncPeerMetadata(peer);
+      return;
+    }
+    await this.syncPeerHashed(peer);
+  }
+
+  private async syncPeerMetadata(peer: LanSyncPeer): Promise<void> {
+    this.activityFiles = [];
+    this.activityUpdatedAt = this.now();
+    this.emit({ ...defaultProgress("scanning"), active: true, peerId: peer.deviceId });
+    const localPolicy = this.policy();
+    const [localEntries, remoteResponse, ledger] = await Promise.all([
+      this.buildMetadataManifest(localPolicy.syncConfigFolder),
+      this.callPeer(peer, "/manifest/metadata", { syncConfigFolder: localPolicy.syncConfigFolder }),
+      Promise.resolve(this.loadMetadataLedger(peer.deviceId))
+    ]);
+    const remotePolicy = policyFromRaw(remoteResponse.policy);
+    peer.policy = remotePolicy;
+    const shareConfig = localPolicy.syncConfigFolder && remotePolicy.syncConfigFolder;
+    const filteredLocalEntries = shareConfig
+      ? localEntries
+      : localEntries.filter((entry) => !isConfigPath(entry.path, this.settings().configDir));
+    const remoteEntries = this.parseMetadataManifest(remoteResponse.files, shareConfig);
+    const localMap = new Map(filteredLocalEntries.map((entry) => [entry.path, entry]));
+    const remoteMap = new Map(remoteEntries.map((entry) => [entry.path, entry]));
+    for (const path of Object.keys(ledger.entries)) {
+      if (!localMap.has(path) && !remoteMap.has(path)) delete ledger.entries[path];
+    }
+    for (const path of [...new Set([...localMap.keys(), ...remoteMap.keys()])]) {
+      const local = localMap.get(path);
+      const remote = remoteMap.get(path);
+      if (local && remote && metadataMatches(local, remote)) {
+        ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
+      }
+    }
+    const actions = planLanSyncMetadataReconciliation(filteredLocalEntries, remoteEntries, ledger.entries, localPolicy, remotePolicy);
+    const bytesTotal = actions.reduce((sum, action) => sum + Math.max(action.local?.size ?? 0, action.remote?.size ?? 0), 0);
+    this.activityFiles = actions.map((action) => ({
+      path: action.path,
+      action: action.kind,
+      state: "pending",
+      size: Math.max(action.local?.size ?? 0, action.remote?.size ?? 0)
+    }));
+    this.activityUpdatedAt = this.now();
+    let completed = 0;
+    let bytesTransferred = 0;
+    let changed = 0;
+    let conflicts = 0;
+    this.emit({
+      ...defaultProgress(actions.length ? "syncing" : "complete"),
+      active: true,
+      peerId: peer.deviceId,
+      total: actions.length,
+      bytesTotal
+    });
+    let cursor = 0;
+    let failure: unknown = null;
+    const transferWorker = async (): Promise<void> => {
+      while (this.runningValue && failure === null && cursor < actions.length) {
+        const index = cursor;
+        cursor += 1;
+        const activity = this.activityFiles[index];
+        if (activity) {
+          activity.state = "syncing";
+          this.activityUpdatedAt = this.now();
+          this.emit({
+            ...defaultProgress("syncing"),
+            active: true,
+            peerId: peer.deviceId,
+            completed,
+            total: actions.length,
+            bytesTransferred,
+            bytesTotal,
+            changed,
+            conflicts
+          });
+        }
+        try {
+          const result = await this.executeMetadataAction(peer, actions[index], ledger);
+          if (activity) activity.state = "complete";
+          completed += 1;
+          bytesTransferred += result.bytes;
+          changed += result.changed ? 1 : 0;
+          conflicts += result.conflict ? 1 : 0;
+          this.lastTransferAt = this.now();
+          this.activityUpdatedAt = this.lastTransferAt;
+          this.emit({
+            ...defaultProgress("syncing"),
+            active: true,
+            peerId: peer.deviceId,
+            completed,
+            total: actions.length,
+            bytesTransferred,
+            bytesTotal,
+            changed,
+            conflicts
+          });
+        } catch (error) {
+          if (activity) activity.state = "error";
+          this.activityUpdatedAt = this.now();
+          failure = error;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(TRANSFER_CONCURRENCY, actions.length) }, transferWorker));
+    this.saveMetadataLedger(peer.deviceId, ledger);
+    if (failure !== null) throw failure;
+    peer.verifiedAt = this.now();
+    peer.consecutiveFailures = 0;
+    peer.lastFailureAt = 0;
+    this.lastErrorValue = "";
+    this.emit({
+      ...defaultProgress("complete"),
+      active: true,
+      peerId: peer.deviceId,
+      completed,
+      total: actions.length,
+      bytesTransferred,
+      bytesTotal,
+      changed,
+      conflicts
+    });
+  }
+
+  private async syncPeerHashed(peer: LanSyncPeer): Promise<void> {
     this.activityFiles = [];
     this.activityUpdatedAt = this.now();
     this.emit({ ...defaultProgress("scanning"), active: true, peerId: peer.deviceId });
@@ -1972,6 +2212,62 @@ export class NtfyLanSync {
     });
   }
 
+  private async executeMetadataAction(
+    peer: LanSyncPeer,
+    action: LanSyncMetadataReconcileAction,
+    ledger: LanSyncMetadataLedger
+  ): Promise<{ bytes: number; changed: boolean; conflict: boolean }> {
+    if (action.kind === "push" && action.local) {
+      const local = await this.readLocalMetadataVerified(action.local.path, metadataSnapshot(action.local));
+      const remote = await this.writeRemoteMetadata(peer, action.path, local.bytes, action.remote ? metadataSnapshot(action.remote) : null, local.metadata);
+      ledger.entries[action.path] = { local: local.metadata, remote };
+      return { bytes: local.bytes.byteLength, changed: true, conflict: false };
+    }
+    if (action.kind === "pull" && action.remote) {
+      const remote = await this.readRemoteMetadata(peer, action.remote);
+      const local = await this.writeLocalMetadata(action.path, remote.bytes, action.local ? metadataSnapshot(action.local) : null, remote.metadata);
+      ledger.entries[action.path] = { local, remote: remote.metadata };
+      return { bytes: remote.bytes.byteLength, changed: true, conflict: false };
+    }
+    if (action.kind === "delete-local" && action.local) {
+      await this.deleteLocalMetadata(action.path, metadataSnapshot(action.local));
+      delete ledger.entries[action.path];
+      return { bytes: 0, changed: true, conflict: false };
+    }
+    if (action.kind === "delete-remote" && action.remote) {
+      await this.deleteRemoteMetadata(peer, action.path, metadataSnapshot(action.remote));
+      delete ledger.entries[action.path];
+      return { bytes: 0, changed: true, conflict: false };
+    }
+    if (action.kind === "conflict" && action.local && action.remote && action.winner) {
+      const [localRead, remoteRead] = await Promise.all([
+        this.readLocalMetadataVerified(action.path, metadataSnapshot(action.local)),
+        this.readRemoteMetadata(peer, action.remote)
+      ]);
+      if (action.winner === "local") {
+        const conflictPath = buildLanConflictPath(action.path, peer.deviceId, metadataConflictToken(remoteRead.metadata), this.pathOptions());
+        const [localConflict, remoteConflict] = await Promise.all([
+          this.writeLocalMetadata(conflictPath, remoteRead.bytes, null, remoteRead.metadata, true),
+          this.writeRemoteMetadata(peer, conflictPath, remoteRead.bytes, null, remoteRead.metadata, true)
+        ]);
+        const remoteWinner = await this.writeRemoteMetadata(peer, action.path, localRead.bytes, remoteRead.metadata, localRead.metadata);
+        ledger.entries[action.path] = { local: localRead.metadata, remote: remoteWinner };
+        ledger.entries[conflictPath] = { local: localConflict, remote: remoteConflict };
+        return { bytes: localRead.bytes.byteLength + remoteRead.bytes.byteLength * 2, changed: true, conflict: true };
+      }
+      const conflictPath = buildLanConflictPath(action.path, this.deviceId, metadataConflictToken(localRead.metadata), this.pathOptions());
+      const [localConflict, remoteConflict] = await Promise.all([
+        this.writeLocalMetadata(conflictPath, localRead.bytes, null, localRead.metadata, true),
+        this.writeRemoteMetadata(peer, conflictPath, localRead.bytes, null, localRead.metadata, true)
+      ]);
+      const localWinner = await this.writeLocalMetadata(action.path, remoteRead.bytes, localRead.metadata, remoteRead.metadata);
+      ledger.entries[action.path] = { local: localWinner, remote: remoteRead.metadata };
+      ledger.entries[conflictPath] = { local: localConflict, remote: remoteConflict };
+      return { bytes: localRead.bytes.byteLength * 2 + remoteRead.bytes.byteLength, changed: true, conflict: true };
+    }
+    return { bytes: 0, changed: false, conflict: false };
+  }
+
   private async executeAction(peer: LanSyncPeer, action: LanSyncReconcileAction, ledger: LanSyncLedger): Promise<{ bytes: number; changed: boolean; conflict: boolean }> {
     if (action.kind === "push" && action.local) {
       const bytes = await this.readLocalVerified(action.local.path, action.local.hash);
@@ -2020,6 +2316,266 @@ export class NtfyLanSync {
       return { bytes: localBytes.byteLength * 2 + remoteBytes.byteLength, changed: true, conflict: true };
     }
     return { bytes: 0, changed: false, conflict: false };
+  }
+
+  private async buildMetadataManifest(
+    includeConfigFolder = this.settings().syncConfigFolder,
+    onProgress?: (completed: number, total: number) => void
+  ): Promise<LanSyncMetadataEntry[]> {
+    if (this.metadataManifestBuild?.includeConfigFolder === includeConfigFolder) {
+      const existing = await this.metadataManifestBuild.promise;
+      onProgress?.(this.scanValue.completed, this.scanValue.total);
+      return existing.map((entry) => ({ ...entry }));
+    }
+    const promise = this.buildMetadataManifestOnce(includeConfigFolder, onProgress);
+    this.metadataManifestBuild = { includeConfigFolder, promise };
+    try {
+      return await promise;
+    } finally {
+      if (this.metadataManifestBuild?.promise === promise) this.metadataManifestBuild = null;
+    }
+  }
+
+  private async buildMetadataManifestOnce(
+    includeConfigFolder: boolean,
+    onProgress?: (completed: number, total: number) => void
+  ): Promise<LanSyncMetadataEntry[]> {
+    const maxFileBytes = this.settings().maxFileBytes;
+    const rawFiles = (await this.options.storage.listFiles(includeConfigFolder))
+      .map((file) => ({ ...file, originalPath: String(file.path || ""), path: this.normalizePath(file.path, includeConfigFolder) }))
+      .sort((left, right) => left.originalPath.localeCompare(right.originalPath));
+    const scanFiles: LanSyncScanFileActivity[] = [];
+    const candidates: Array<Omit<LanSyncFileStat, "path"> & { path: string; scanIndex: number }> = [];
+    for (const file of rawFiles) {
+      let reason = "";
+      if (!file.path || !Number.isFinite(file.size) || file.size < 0 || !Number.isFinite(file.mtime) || file.mtime < 0) reason = "unsafe-path";
+      else if (file.size > maxFileBytes) reason = "too-large";
+      else if (candidates.length >= MAX_MANIFEST_FILES) reason = "manifest-limit";
+      const scanIndex = scanFiles.push({
+        path: file.path || file.originalPath,
+        state: reason ? "skipped" : "pending",
+        size: Math.max(0, Number(file.size) || 0),
+        reason
+      }) - 1;
+      if (!reason && file.path) candidates.push({ path: file.path, size: file.size, mtime: file.mtime, scanIndex });
+    }
+    const skipped = scanFiles.filter((file) => file.state === "skipped").length;
+    this.scanValue = {
+      id: randomId(12),
+      phase: "scanning",
+      completed: skipped,
+      total: scanFiles.length,
+      cached: 0,
+      hashed: 0,
+      skipped,
+      error: "",
+      files: scanFiles
+    };
+    let lastReportedAt = 0;
+    const report = (force = false): void => {
+      const now = this.now();
+      if (!force && this.scanValue.completed !== this.scanValue.total && now - lastReportedAt < 40) return;
+      lastReportedAt = now;
+      onProgress?.(this.scanValue.completed, this.scanValue.total);
+      if (this.progressValue.phase !== "syncing") {
+        this.emit({
+          ...defaultProgress("scanning"),
+          active: this.progressValue.active || this.activePeers().length > 0,
+          peerId: this.progressValue.peerId || this.activePeers()[0]?.deviceId || "",
+          completed: this.scanValue.completed,
+          total: this.scanValue.total
+        });
+      }
+    };
+    report(true);
+    try {
+      const entries: LanSyncMetadataEntry[] = [];
+      for (let index = 0; index < candidates.length; index += 1) {
+        const file = candidates[index];
+        const activity = this.scanValue.files[file.scanIndex];
+        activity.state = "cached";
+        activity.reason = "metadata";
+        this.scanValue.cached += 1;
+        this.scanValue.completed += 1;
+        entries.push({ path: file.path, size: file.size, mtime: file.mtime });
+        report();
+        if ((index + 1) % 512 === 0 && index + 1 < candidates.length) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        }
+      }
+      this.scanValue.phase = "complete";
+      this.scanValue.completed = this.scanValue.total;
+      report(true);
+      return entries;
+    } catch (error) {
+      this.scanValue.phase = "error";
+      this.scanValue.error = safeErrorCode(error);
+      report(true);
+      throw error;
+    }
+  }
+
+  private parseMetadataSnapshot(value: unknown): LanSyncMetadataSnapshot | null {
+    if (!isRecord(value)) return null;
+    const size = Number(value.size);
+    const mtime = Number(value.mtime);
+    if (!Number.isFinite(size) || !Number.isInteger(size) || size < 0 || size > this.settings().maxFileBytes || !Number.isFinite(mtime) || mtime < 0) return null;
+    return { size, mtime };
+  }
+
+  private parseMetadataManifest(value: unknown, includeConfigFolder: boolean): LanSyncMetadataEntry[] {
+    if (!Array.isArray(value) || value.length > MAX_MANIFEST_FILES) throw new LanSyncProtocolError("invalid_metadata_manifest");
+    const entries: LanSyncMetadataEntry[] = [];
+    for (const item of value) {
+      if (!isRecord(item)) throw new LanSyncProtocolError("invalid_metadata_manifest");
+      const path = this.normalizePath(item.path, includeConfigFolder);
+      const metadata = this.parseMetadataSnapshot(item);
+      if (!path || !metadata) throw new LanSyncProtocolError("invalid_metadata_manifest");
+      entries.push({ path, ...metadata });
+    }
+    return entries;
+  }
+
+  private metadataLedgerKey(peerId: string): string {
+    return `ntfy.lan-sync.metadata-ledger.v2.${this.identity?.vaultId ?? "unknown"}.${peerId}`;
+  }
+
+  private loadMetadataLedger(peerId: string): LanSyncMetadataLedger {
+    try {
+      const raw = this.localStore()?.getItem(this.metadataLedgerKey(peerId));
+      if (!raw) return { schemaVersion: 2, entries: {} };
+      const parsed = safeJsonObject(raw);
+      if (parsed.schemaVersion !== 2 || !isRecord(parsed.entries)) return { schemaVersion: 2, entries: {} };
+      const entries: Record<string, LanSyncMetadataLedgerEntry> = {};
+      for (const [path, value] of Object.entries(parsed.entries).slice(-MAX_LEDGER_ENTRIES)) {
+        const normalized = this.normalizePath(path, true);
+        if (!normalized || !isRecord(value)) continue;
+        const local = this.parseMetadataSnapshot(value.local);
+        const remote = this.parseMetadataSnapshot(value.remote);
+        if (local && remote) entries[normalized] = { local, remote };
+      }
+      return { schemaVersion: 2, entries };
+    } catch {
+      return { schemaVersion: 2, entries: {} };
+    }
+  }
+
+  private saveMetadataLedger(peerId: string, ledger: LanSyncMetadataLedger): void {
+    const keys = Object.keys(ledger.entries);
+    const trimmed = keys.length <= MAX_LEDGER_ENTRIES
+      ? ledger.entries
+      : Object.fromEntries(keys.slice(-MAX_LEDGER_ENTRIES).map((key) => [key, ledger.entries[key]]));
+    try {
+      this.localStore()?.setItem(this.metadataLedgerKey(peerId), JSON.stringify({ schemaVersion: 2, entries: trimmed }));
+    } catch {
+      try {
+        const smaller = Object.fromEntries(Object.entries(trimmed).slice(-3000));
+        this.localStore()?.setItem(this.metadataLedgerKey(peerId), JSON.stringify({ schemaVersion: 2, entries: smaller }));
+      } catch {
+        // A missing ledger causes a conservative first-run comparison next time.
+      }
+    }
+  }
+
+  private async readLocalMetadataVerified(path: string, expected: LanSyncMetadataSnapshot): Promise<{ bytes: Uint8Array; metadata: LanSyncMetadataSnapshot }> {
+    const normalized = this.normalizePath(path);
+    if (!normalized) throw new LanSyncProtocolError("unsafe_path");
+    const before = await this.options.storage.statFile(normalized);
+    if (!before || !metadataMatches(before, expected) || before.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("precondition_failed", 409);
+    const bytes = new Uint8Array(await this.options.storage.readBinary(normalized));
+    const after = await this.options.storage.statFile(normalized);
+    if (!after || !metadataMatches(after, expected) || bytes.byteLength !== after.size) throw new LanSyncProtocolError("precondition_failed", 409);
+    return { bytes, metadata: metadataSnapshot(after) };
+  }
+
+  private async existingContentMatches(path: string, expected: LanSyncMetadataSnapshot, bytes: Uint8Array): Promise<LanSyncMetadataSnapshot | null> {
+    const before = await this.options.storage.statFile(path);
+    if (!before || before.size !== bytes.byteLength || before.size !== expected.size) return null;
+    const current = new Uint8Array(await this.options.storage.readBinary(path));
+    const after = await this.options.storage.statFile(path);
+    if (!after || !metadataMatches(before, after) || current.byteLength !== bytes.byteLength) return null;
+    for (let index = 0; index < bytes.byteLength; index += 1) {
+      if (current[index] !== bytes[index]) return null;
+    }
+    return metadataSnapshot(after);
+  }
+
+  private async writeLocalMetadata(
+    path: string,
+    bytes: Uint8Array,
+    expected: LanSyncMetadataSnapshot | null,
+    source: LanSyncMetadataSnapshot,
+    allowExistingSame = false
+  ): Promise<LanSyncMetadataSnapshot> {
+    const normalized = this.normalizePath(path);
+    if (!normalized || bytes.byteLength !== source.size || bytes.byteLength > this.settings().maxFileBytes) throw new LanSyncProtocolError("unsafe_write");
+    const current = await this.options.storage.statFile(normalized);
+    if (expected === null) {
+      if (current) {
+        if (allowExistingSame) {
+          const existing = await this.existingContentMatches(normalized, source, bytes);
+          if (existing) return existing;
+        }
+        throw new LanSyncProtocolError("precondition_failed", 409);
+      }
+    } else if (!current || !metadataMatches(current, expected)) {
+      throw new LanSyncProtocolError("precondition_failed", 409);
+    }
+    await this.options.storage.writeBinary(normalized, arrayBuffer(bytes), source.mtime);
+    const written = await this.options.storage.statFile(normalized);
+    if (!written || written.size !== bytes.byteLength) throw new Error("write_verification_failed");
+    this.hashCache.delete(normalized);
+    this.queueHashCacheSave();
+    return metadataSnapshot(written);
+  }
+
+  private async deleteLocalMetadata(path: string, expected: LanSyncMetadataSnapshot): Promise<void> {
+    const normalized = this.normalizePath(path);
+    if (!normalized) throw new LanSyncProtocolError("unsafe_delete");
+    const current = await this.options.storage.statFile(normalized);
+    if (!current || !metadataMatches(current, expected)) throw new LanSyncProtocolError("precondition_failed", 409);
+    await this.options.storage.deleteFile(normalized);
+    this.hashCache.delete(normalized);
+    this.queueHashCacheSave();
+    if (await this.options.storage.statFile(normalized)) throw new Error("delete_verification_failed");
+  }
+
+  private async readRemoteMetadata(peer: LanSyncPeer, entry: LanSyncMetadataEntry): Promise<{ bytes: Uint8Array; metadata: LanSyncMetadataSnapshot }> {
+    const expected = metadataSnapshot(entry);
+    const response = await this.callPeer(peer, "/metadata/file/read", { path: entry.path, expectedMetadata: expected }, fileTransferTimeoutMs(entry.size));
+    const metadata = this.parseMetadataSnapshot(response.metadata);
+    if (response.path !== entry.path || !metadata || !metadataMatches(metadata, expected) || typeof response.data !== "string") throw new LanSyncProtocolError("invalid_file_response");
+    const bytes = base64UrlToBytes(response.data);
+    if (bytes.byteLength !== metadata.size || bytes.byteLength > this.settings().maxFileBytes) throw new LanSyncProtocolError("invalid_file_response");
+    return { bytes, metadata };
+  }
+
+  private async writeRemoteMetadata(
+    peer: LanSyncPeer,
+    path: string,
+    bytes: Uint8Array,
+    expected: LanSyncMetadataSnapshot | null,
+    source: LanSyncMetadataSnapshot,
+    allowExistingSame = false
+  ): Promise<LanSyncMetadataSnapshot> {
+    const response = await this.callPeer(peer, "/metadata/file/write", {
+      path,
+      expectedMetadata: expected,
+      sourceMetadata: source,
+      allowExistingSame,
+      data: bytesToBase64Url(bytes)
+    }, fileTransferTimeoutMs(bytes.byteLength));
+    const metadata = this.parseMetadataSnapshot(response.metadata);
+    if (response.path !== path || !metadata || metadata.size !== bytes.byteLength) throw new Error("remote_write_verification_failed");
+    return metadata;
+  }
+
+  private async deleteRemoteMetadata(peer: LanSyncPeer, path: string, expected: LanSyncMetadataSnapshot): Promise<void> {
+    const response = await this.callPeer(peer, "/metadata/file/delete", { path, expectedMetadata: expected }, 45_000);
+    const deletedMetadata = this.parseMetadataSnapshot(response.deletedMetadata);
+    if (response.path !== path || response.deleted !== true || !deletedMetadata || !metadataMatches(deletedMetadata, expected)) {
+      throw new Error("remote_delete_verification_failed");
+    }
   }
 
   private async buildManifest(
@@ -2393,8 +2949,21 @@ export class NtfyLanSync {
           protocolVersion: PROTOCOL_VERSION,
           deviceId: this.deviceId,
           policy: this.policy(),
+          capabilities: [METADATA_LEDGER_CAPABILITY],
           syncRequestId: this.syncRequestId
         };
+      } else if (path === `${API_PREFIX}/manifest/metadata`) {
+        const policy = this.policy();
+        result = {
+          files: await this.buildMetadataManifest(policy.syncConfigFolder && payload.syncConfigFolder === true),
+          policy
+        };
+      } else if (path === `${API_PREFIX}/metadata/file/read`) {
+        result = await this.handleReadMetadataFile(payload);
+      } else if (path === `${API_PREFIX}/metadata/file/write`) {
+        result = await this.handleWriteMetadataFile(payload);
+      } else if (path === `${API_PREFIX}/metadata/file/delete`) {
+        result = await this.handleDeleteMetadataFile(payload);
       } else if (path === `${API_PREFIX}/manifest`) {
         const policy = this.policy();
         result = {
@@ -2421,6 +2990,35 @@ export class NtfyLanSync {
       const protocol = error instanceof LanSyncProtocolError ? error : new LanSyncProtocolError(safeErrorCode(error), 500);
       sendText(response, protocol.status, JSON.stringify({ ok: false, error: authenticated ? protocol.code : "request_rejected" }));
     }
+  }
+
+  private async handleReadMetadataFile(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const path = this.normalizePath(payload.path);
+    const expected = this.parseMetadataSnapshot(payload.expectedMetadata);
+    if (!path || !expected) throw new LanSyncProtocolError("unsafe_path");
+    const read = await this.readLocalMetadataVerified(path, expected);
+    return { path, metadata: read.metadata, data: bytesToBase64Url(read.bytes) };
+  }
+
+  private async handleWriteMetadataFile(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const path = this.normalizePath(payload.path);
+    const expectsMissing = payload.expectedMetadata === null;
+    const expected = expectsMissing ? null : this.parseMetadataSnapshot(payload.expectedMetadata);
+    const source = this.parseMetadataSnapshot(payload.sourceMetadata);
+    const encoded = typeof payload.data === "string" ? payload.data : "";
+    if (!path || (!expectsMissing && !expected) || !source) throw new LanSyncProtocolError("unsafe_write");
+    const bytes = base64UrlToBytes(encoded);
+    if (bytes.byteLength !== source.size || bytes.byteLength > this.settings().maxFileBytes) throw new LanSyncProtocolError("invalid_file_content");
+    const metadata = await this.writeLocalMetadata(path, bytes, expected, source, payload.allowExistingSame === true);
+    return { ok: true, path, metadata };
+  }
+
+  private async handleDeleteMetadataFile(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const path = this.normalizePath(payload.path);
+    const expected = this.parseMetadataSnapshot(payload.expectedMetadata);
+    if (!path || !expected) throw new LanSyncProtocolError("unsafe_delete");
+    await this.deleteLocalMetadata(path, expected);
+    return { ok: true, deleted: true, path, deletedMetadata: expected };
   }
 
   private async handleReadFile(payload: Record<string, unknown>): Promise<Record<string, unknown>> {

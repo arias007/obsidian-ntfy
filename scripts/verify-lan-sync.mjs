@@ -82,8 +82,8 @@ class MemoryStorage {
     return [...this.readCounts.values()].reduce((sum, count) => sum + count, 0);
   }
 
-  async writeBinary(path, data) {
-    this.files.set(path, { data: new Uint8Array(data), mtime: ++this.clock });
+  async writeBinary(path, data, mtime) {
+    this.files.set(path, { data: new Uint8Array(data), mtime: Number.isFinite(mtime) ? mtime : ++this.clock });
   }
 
   async deleteFile(path) {
@@ -163,6 +163,7 @@ try {
     normalizeLanInboxAttachmentPath,
     isLanInboxAttachmentPath,
     normalizeManualLanPeer,
+    planLanSyncMetadataReconciliation,
     planLanSyncReconciliation,
     verifyLanSyncRequest
   } = require(bundle);
@@ -267,6 +268,21 @@ try {
   const locallyChanged = { ...local, hash: "c".repeat(43), mtime: 300 };
   assert.deepEqual(planLanSyncReconciliation([locallyChanged], [], { "Note.md": local.hash }, deletePullPolicy, passivePolicy), [], "A remote deletion removed a locally changed file");
 
+  const localMetadata = { path: "Note.md", size: 5, mtime: 100 };
+  const remoteMetadata = { path: "Note.md", size: 6, mtime: 200 };
+  const metadataBaseline = { local: { size: 5, mtime: 100 }, remote: { size: 5, mtime: 100 } };
+  assert.equal(planLanSyncMetadataReconciliation([localMetadata], [remoteMetadata], { "Note.md": metadataBaseline })[0].kind, "pull");
+  assert.equal(planLanSyncMetadataReconciliation([{ ...localMetadata, mtime: 300 }], [localMetadata], { "Note.md": metadataBaseline })[0].kind, "push");
+  assert.equal(planLanSyncMetadataReconciliation([localMetadata], [remoteMetadata], {})[0].winner, "remote");
+  assert.deepEqual(planLanSyncMetadataReconciliation([localMetadata], [], { "Note.md": metadataBaseline }), [], "Metadata deletion was resurrected");
+  assert.equal(planLanSyncMetadataReconciliation([], [localMetadata], { "Note.md": metadataBaseline }, deletePushPolicy, passivePolicy)[0].kind, "delete-remote");
+  assert.equal(planLanSyncMetadataReconciliation([localMetadata], [], { "Note.md": metadataBaseline }, deletePullPolicy, passivePolicy)[0].kind, "delete-local");
+  assert.deepEqual(
+    planLanSyncMetadataReconciliation([{ ...localMetadata, mtime: 300 }], [], { "Note.md": metadataBaseline }, deletePullPolicy, passivePolicy),
+    [],
+    "A remote deletion removed a locally changed metadata version"
+  );
+
   class FakeElement {
     constructor() {
       this.hidden = false;
@@ -307,12 +323,14 @@ try {
   const storageA = new MemoryStorage(identity, {
     "Notes/from-a.md": { content: "from A", mtime: 100 },
     "Notes/shared.md": { content: "older A", mtime: 200 },
+    "Notes/identical.md": { content: "same", mtime: 150 },
     ".obsidian/hotkeys.json": { content: "hotkeys from A", mtime: 500 },
     ".obsidian/plugins/remotely-save/data.json": { content: "protected fixture", mtime: 600 }
   });
   const storageB = new MemoryStorage(identity, {
     "Notes/from-b.md": { content: "from B", mtime: 300 },
-    "Notes/shared.md": { content: "newer B", mtime: 400 }
+    "Notes/shared.md": { content: "newer B", mtime: 400 },
+    "Notes/identical.md": { content: "same", mtime: 150 }
   });
   const descriptor = (deviceId, port) => JSON.stringify({
     schemaVersion: 1,
@@ -323,7 +341,9 @@ try {
     addresses: ["127.0.0.1"],
     updatedAt: new Date().toISOString()
   });
+  const requestedRoutes = [];
   const httpRequest = async (request) => {
+    requestedRoutes.push(new URL(request.url).pathname);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), request.timeoutMs);
     try {
@@ -425,6 +445,7 @@ try {
     await waitFor(() => serviceA.status().peerCount === 1, "authenticated same-Vault peer");
     assert.equal(serviceA.listPeers()[0].deviceId, deviceB, "Manual endpoint was not rebound to the authenticated device ID");
     assert.equal(serviceA.listPeers()[0].linkType, "manual");
+    assert.equal(serviceA.peers.get(deviceB).capabilities.has("metadata-ledger-v1"), true, "Authenticated ping did not negotiate metadata sync");
     serviceA.requestSync();
     await waitFor(() => storageA.text("Notes/from-b.md") === "from B" && storageB.text("Notes/from-a.md") === "from A", "automatic bidirectional LAN transfer");
     await waitFor(() => storageA.text("Notes/shared.md") === "newer B" && storageB.text("Notes/shared.md") === "newer B", "conflict convergence");
@@ -432,6 +453,10 @@ try {
     assert.ok(conflictPath, "Conflict copy was not created");
     assert.equal(storageA.text(conflictPath), "older A");
     assert.equal(storageB.text(conflictPath), "older A");
+    assert.equal(storageA.readCount("Notes/identical.md"), 0, "Metadata sync read identical local content on its first scan");
+    assert.equal(storageB.readCount("Notes/identical.md"), 0, "Metadata sync read identical remote content on its first scan");
+    assert.equal((await storageA.statFile("Notes/from-b.md")).mtime, 300, "Pulled file did not preserve the source mtime");
+    assert.equal((await storageB.statFile("Notes/from-a.md")).mtime, 100, "Pushed file did not preserve the source mtime");
     assert.ok(progressA.some((value) => value.phase === "syncing" && value.active));
     assert.ok(progressA.some((value) => value.phase === "scanning" && value.total > 0 && value.completed > 0), "LAN scan progress did not expose the full local manifest");
     let previousScanCompleted = -1;
@@ -463,6 +488,25 @@ try {
       return scan.id !== completedScanId && scan.phase === "complete";
     }, "cached follow-up full-vault scan");
     assert.equal(storageA.totalReads(), readsBeforeCachedScan, "An unchanged follow-up scan reread file contents instead of using metadata/hash cache");
+    assert.ok(requestedRoutes.includes("/cancip-lan/v1/manifest/metadata"), "New peers did not use the metadata manifest route");
+
+    const negotiatedPeer = serviceA.peers.get(deviceB);
+    negotiatedPeer.capabilities.clear();
+    requestedRoutes.length = 0;
+    await serviceA.syncPeer(negotiatedPeer);
+    assert.ok(requestedRoutes.includes("/cancip-lan/v1/manifest"), "A peer without metadata capability did not fall back to the hash manifest");
+    assert.equal(requestedRoutes.includes("/cancip-lan/v1/manifest/metadata"), false, "Legacy fallback still called the metadata manifest");
+    negotiatedPeer.capabilities.add("metadata-ledger-v1");
+
+    storageA.putText("Notes/identical.md", "changed on A", 700);
+    serviceA.notifyVaultChange("Notes/identical.md");
+    serviceA.requestSync();
+    await waitFor(() => storageB.text("Notes/identical.md") === "changed on A", "metadata push after a local edit");
+    assert.equal((await storageB.statFile("Notes/identical.md")).mtime, 700, "Metadata push lost the source mtime");
+    storageB.putText("Notes/identical.md", "changed on B", 710);
+    serviceA.requestSync();
+    await waitFor(() => storageA.text("Notes/identical.md") === "changed on B", "metadata pull after a remote edit");
+    assert.equal((await storageA.statFile("Notes/identical.md")).mtime, 710, "Metadata pull lost the source mtime");
     const activityB = serviceB.activity();
     assert.ok(activityB.files.some((file) => file.path.endsWith(".md")), "Receiving peer did not expose inbound file activity");
     const firstProgress = progressA.find((value) => value.phase === "syncing" && value.total > 0 && value.completed === 0);
