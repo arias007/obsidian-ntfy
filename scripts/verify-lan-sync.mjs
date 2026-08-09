@@ -593,13 +593,19 @@ try {
     assert.equal(serviceA.fullSyncRequestId, periodicRequestId, "A recent completed full scan was immediately scheduled again");
     assert.equal(storageA.readCount("Notes/from-b.md"), 0, "A verified remote write was read back only to hash it again");
     const readsBeforeCachedScan = storageA.totalReads();
-    const completedScanId = activityA.scan.id;
-    serviceA.requestSync();
-    await waitFor(() => {
-      const scan = serviceA.activity({ includeScanFiles: false, includeTransferFiles: false }).scan;
-      return scan.id !== completedScanId && scan.phase === "complete";
-    }, "cached follow-up full-vault scan");
+    const fullEnumerationsBeforeCachedScanA = storageA.listFilesCalls;
+    const fullEnumerationsBeforeCachedScanB = storageB.listFilesCalls;
+    await serviceA.buildMetadataManifest(false);
+    await serviceA.callPeer(
+      serviceA.peers.get(deviceB),
+      "/metadata/v4/manifest",
+      { syncConfigFolder: false }
+    );
     assert.equal(storageA.totalReads(), readsBeforeCachedScan, "An unchanged follow-up scan reread file contents instead of using metadata/hash cache");
+    assert.equal(storageA.listFilesCalls, fullEnumerationsBeforeCachedScanA, "A cached local manifest ignored the persistent metadata index");
+    assert.equal(storageB.listFilesCalls, fullEnumerationsBeforeCachedScanB, "An ordinary remote full-manifest request forced the peer to enumerate its filesystem again");
+    await serviceA.saveMetadataIndex();
+    assert.equal(await storageA.exists(`${storageA.identityRoot}/metadata-index-v1.json`), true, "The full metadata index was not persisted outside the synchronized Vault data plane");
     assert.ok(requestedRoutes.includes("/cancip-lan/v1/metadata/v4/manifest"), "New peers did not use the metadata manifest route");
     assert.ok(serviceB.loadMetadataLedger(deviceA).entries["Notes/identical.md"], "Receiving peer did not persist the reverse metadata ledger");
 
@@ -993,7 +999,7 @@ try {
     assert.match(source, new RegExp(`(?:\\"|^)${mode.replace("-", "\\-")}(?:\\"|$)`), `LAN settings are missing mode ${mode}`);
   }
   assert.match(source, /lanSyncMaxFileMb[^\n]*512/, "LAN settings should allow selecting files larger than 100 MB");
-  assert.match(source, /lanSyncCheckIntervalSeconds[^\n]*60/, "LAN full-vault scan default should be 60 seconds");
+  assert.match(source, /lanSyncCheckIntervalSeconds[^\n]*60/, "LAN durable-journal check default should be 60 seconds");
   assert.match(source, /lanSyncSyncConfigFolder[^\n]*true/, "LAN config-folder sync should default to enabled");
   assert.match(source, /lanSyncConflictRule/, "LAN conflict rule setting is missing");
   assert.doesNotMatch(lanSource, /buildLanConflictPath\s*\(/, "LAN sync still contains a conflict-copy path generator");
@@ -1010,6 +1016,9 @@ try {
   assert.match(lanSource, /ntfy\.lan-sync\.change-journal\.v1\./, "Dirty paths are not stored in a durable journal");
   assert.match(lanSource, /captureChangesSinceCheckpoint\(\)/, "Plugin reload does not catch up from the last successful checkpoint");
   assert.match(lanSource, /this\.recordSyncCheckpoint\(\)/, "Successful synchronization does not record a checkpoint");
+  assert.match(lanSource, /metadata-index-v1\.json/, "The last complete metadata manifest is not persisted");
+  assert.match(lanSource, /buildMetadataManifestFromIndex\(/, "Peer full requests cannot reuse the persistent metadata index");
+  assert.match(lanSource, /this\.replaceMetadataIndex\(entries, includeConfigFolder\)/, "A completed filesystem reconciliation does not refresh the metadata index");
   assert.match(source, /this\.app\.vault\.on\("raw"/, "Hidden configuration changes are not added to the path journal");
   assert.match(source, /listFilesChangedSince: async \(since\)/, "Startup catch-up does not use Obsidian's in-memory file index");
   assert.match(lanSource, /this\.metadataManifestBuild \|\| this\.manifestBuild/, "Periodic calibration can still overlap manifest enumeration");

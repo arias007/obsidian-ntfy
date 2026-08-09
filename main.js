@@ -799,6 +799,7 @@ var NtfyLanSyncRuntime = (() => {
   var CHANGE_JOURNAL_SAVE_DELAY_MS = 100;
   var CHECKPOINT_MTIME_OVERLAP_MS = 2e3;
   var BACKGROUND_FULL_RESCAN_INTERVAL_MS = 24 * 60 * 6e4;
+  var METADATA_INDEX_SAVE_DELAY_MS = 2e3;
   var HASH_CONCURRENCY = 12;
   var LARGE_TRANSFER_CONCURRENCY = 6;
   var MEDIUM_TRANSFER_CONCURRENCY = 8;
@@ -1514,6 +1515,11 @@ ${bodyHash}`;
     hashCacheLoaded = false;
     hashSaveTimer = null;
     changeJournalSaveTimer = null;
+    metadataIndexSaveTimer = null;
+    metadataIndex = /* @__PURE__ */ new Map();
+    metadataIndexReady = false;
+    metadataIndexIncludesConfig = false;
+    metadataIndexMaxFileBytes = 0;
     manifestBuild = null;
     metadataManifestBuild = null;
     intervals = [];
@@ -1524,6 +1530,7 @@ ${bodyHash}`;
     syncRequestId = "";
     fullSyncRequestId = "";
     fullSyncRequested = true;
+    forceFilesystemScanRequested = false;
     lastFullScanAt = 0;
     lastSyncCheckpointAt = 0;
     dirtySequence = 0;
@@ -1717,6 +1724,7 @@ ${bodyHash}`;
       this.lastFullScanAt = this.loadLastFullScanAt();
       this.loadChangeJournal();
       this.loadHashCache();
+      await this.loadMetadataIndex();
       await this.captureChangesSinceCheckpoint();
       if (this.lastFullScanAt > 0 && this.now() - this.lastFullScanAt < this.fullRescanIntervalMs()) {
         this.fullSyncRequested = false;
@@ -1800,6 +1808,11 @@ ${bodyHash}`;
         this.changeJournalSaveTimer = null;
       }
       this.saveChangeJournal();
+      if (this.metadataIndexSaveTimer) {
+        clearTimeout(this.metadataIndexSaveTimer);
+        this.metadataIndexSaveTimer = null;
+      }
+      await this.saveMetadataIndex();
       this.peers.clear();
       this.emitPeersChanged();
       this.replayCache.clear();
@@ -1822,6 +1835,7 @@ ${bodyHash}`;
       this.dirtyPaths.set(normalized, this.dirtySequence);
       if (this.dirtyPaths.size > MAX_DIRTY_PATHS) {
         this.fullSyncRequested = true;
+        this.forceFilesystemScanRequested = true;
         this.fullSyncRequestId = randomId(18);
         const newest = [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS);
         this.dirtyPaths = new Map(newest);
@@ -1835,6 +1849,7 @@ ${bodyHash}`;
         this.fullSyncRequested = true;
         this.fullSyncRequestId = randomId(18);
       }
+      this.forceFilesystemScanRequested = true;
       this.syncRequestId = randomId(18);
       const passivePeer = this.activePeers().find((peer) => !peer.canHost);
       if (passivePeer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing") {
@@ -1859,6 +1874,7 @@ ${bodyHash}`;
       if (this.fullSyncRequested || this.now() - this.lastFullScanAt < this.fullRescanIntervalMs()) return;
       if (!this.isPeriodicInitiator(peers)) return;
       this.fullSyncRequested = true;
+      this.forceFilesystemScanRequested = true;
       this.fullSyncRequestId = randomId(18);
       this.syncRequestId = this.fullSyncRequestId;
       const passivePeer = peers.find((peer) => !peer.canHost);
@@ -1955,6 +1971,70 @@ ${bodyHash}`;
     recordSyncCheckpoint() {
       this.lastSyncCheckpointAt = this.now();
       this.saveChangeJournal();
+    }
+    metadataIndexPath() {
+      return `${this.options.storage.identityRoot.replace(/\/+$/, "")}/metadata-index-v1.json`;
+    }
+    async loadMetadataIndex() {
+      this.metadataIndex.clear();
+      this.metadataIndexReady = false;
+      try {
+        const path = this.metadataIndexPath();
+        if (!await this.options.storage.exists(path)) return;
+        const parsed = safeJsonObject(await this.options.storage.readText(path));
+        if (parsed.schemaVersion !== 1 || parsed.complete !== true || !Array.isArray(parsed.entries)) return;
+        const entries = /* @__PURE__ */ new Map();
+        for (const item of parsed.entries.slice(-MAX_MANIFEST_FILES)) {
+          if (!Array.isArray(item) || item.length !== 3) continue;
+          const normalized = this.normalizePath(item[0], true);
+          const size = Number(item[1]);
+          const mtime = Number(item[2]);
+          if (normalized && Number.isSafeInteger(size) && size >= 0 && size <= 512 * 1024 * 1024 && Number.isFinite(mtime) && mtime >= 0) {
+            entries.set(normalized, { size, mtime });
+          }
+        }
+        this.metadataIndex = entries;
+        this.metadataIndexIncludesConfig = parsed.includeConfigFolder === true;
+        this.metadataIndexMaxFileBytes = Number(parsed.maxFileBytes) || 0;
+        this.metadataIndexReady = true;
+      } catch {
+        this.metadataIndex.clear();
+        this.metadataIndexReady = false;
+        this.lastFullScanAt = 0;
+      }
+    }
+    queueMetadataIndexSave() {
+      if (!this.metadataIndexReady) return;
+      if (this.metadataIndexSaveTimer) clearTimeout(this.metadataIndexSaveTimer);
+      this.metadataIndexSaveTimer = setTimeout(() => {
+        this.metadataIndexSaveTimer = null;
+        void this.saveMetadataIndex();
+      }, METADATA_INDEX_SAVE_DELAY_MS);
+    }
+    async saveMetadataIndex() {
+      if (!this.metadataIndexReady) return;
+      try {
+        await this.options.storage.ensureFolder(this.options.storage.identityRoot);
+        await this.options.storage.writeText(this.metadataIndexPath(), `${JSON.stringify({
+          schemaVersion: 1,
+          complete: true,
+          includeConfigFolder: this.metadataIndexIncludesConfig,
+          maxFileBytes: this.metadataIndexMaxFileBytes,
+          entries: [...this.metadataIndex.entries()].slice(-MAX_MANIFEST_FILES).map(([path, metadata]) => [path, metadata.size, metadata.mtime])
+        })}
+`);
+      } catch {
+      }
+    }
+    replaceMetadataIndex(entries, includeConfigFolder) {
+      this.metadataIndex = new Map(entries.map((entry) => [entry.path, metadataSnapshot(entry)]));
+      this.metadataIndexReady = true;
+      this.metadataIndexIncludesConfig = includeConfigFolder;
+      this.metadataIndexMaxFileBytes = this.settings().maxFileBytes;
+      this.queueMetadataIndexSave();
+    }
+    canUseMetadataIndex(includeConfigFolder) {
+      return this.metadataIndexReady && (!includeConfigFolder || this.metadataIndexIncludesConfig) && this.metadataIndexMaxFileBytes >= this.settings().maxFileBytes;
     }
     isPeriodicInitiator(peers = this.activePeers()) {
       if (!peers.length) return false;
@@ -2403,6 +2483,7 @@ ${bodyHash}`;
           manual,
           lastRemoteSyncRequestId: "",
           remoteFullSyncRequestId: "",
+          remoteForceFilesystemScan: false,
           remoteDirtyPaths: /* @__PURE__ */ new Map(),
           policy: passivePeerPolicy(),
           capabilities: /* @__PURE__ */ new Set(),
@@ -2647,6 +2728,7 @@ ${bodyHash}`;
         capabilities: METADATA_PROTOCOLS.map((protocol) => protocol.capability),
         syncRequestId: this.syncRequestId,
         fullSyncRequestId: this.fullSyncRequested ? this.fullSyncRequestId : "",
+        forceFilesystemScan: this.fullSyncRequested && this.forceFilesystemScanRequested,
         dirtyPaths: this.dirtySnapshot()
       };
     }
@@ -2664,6 +2746,7 @@ ${bodyHash}`;
       const requested = Boolean(requestId && requestId !== peer.lastRemoteSyncRequestId);
       if (requestId) peer.lastRemoteSyncRequestId = requestId;
       peer.remoteFullSyncRequestId = typeof payload.fullSyncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.fullSyncRequestId) ? payload.fullSyncRequestId : "";
+      peer.remoteForceFilesystemScan = Boolean(peer.remoteFullSyncRequestId && payload.forceFilesystemScan === true);
       peer.remoteDirtyPaths = this.parseDirtyPaths(payload.dirtyPaths);
       return requested;
     }
@@ -2790,6 +2873,7 @@ ${bodyHash}`;
       if (!peers.length) return;
       const localDirty = new Map(this.dirtyPaths);
       const localFullSyncRequestId = this.fullSyncRequested ? this.fullSyncRequestId : "";
+      const localForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
       this.syncRunning = true;
       try {
         let settledAcrossPeers = null;
@@ -2798,8 +2882,7 @@ ${bodyHash}`;
         for (const peer of peers) {
           if (!this.runningValue) break;
           if (this.now() - peer.lastSyncAt < SYNC_MIN_INTERVAL_MS && !this.syncQueued && !forced) continue;
-          const result = await this.syncPeer(peer, localDirty, localFullSyncRequestId);
-          if (result.fullSyncComplete) this.recordFullScan();
+          const result = await this.syncPeer(peer, localDirty, localFullSyncRequestId, localForceFilesystemScan);
           settledAcrossPeers = settledAcrossPeers === null ? new Set(result.settledLocalPaths) : new Set([...settledAcrossPeers].filter((path) => result.settledLocalPaths.has(path)));
           if (localFullSyncRequestId) fullSyncCompletedEverywhere = fullSyncCompletedEverywhere && result.fullSyncComplete;
           peer.lastSyncAt = this.now();
@@ -2812,6 +2895,7 @@ ${bodyHash}`;
           }
           if (localFullSyncRequestId && fullSyncCompletedEverywhere && this.fullSyncRequestId === localFullSyncRequestId) {
             this.fullSyncRequested = false;
+            this.forceFilesystemScanRequested = false;
           }
           this.recordSyncCheckpoint();
         }
@@ -2834,7 +2918,7 @@ ${bodyHash}`;
         }
       }
     }
-    async syncPeer(peer, localDirty = new Map(this.dirtyPaths), localFullSyncRequestId = this.fullSyncRequested ? this.fullSyncRequestId : "") {
+    async syncPeer(peer, localDirty = new Map(this.dirtyPaths), localFullSyncRequestId = this.fullSyncRequested ? this.fullSyncRequestId : "", localForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested)) {
       if (!this.metadataProtocol(peer)) throw new LanSyncProtocolError("peer_upgrade_required", 426);
       const remoteDirty = new Map(peer.remoteDirtyPaths ?? []);
       const remoteFullSyncRequestId = peer.remoteFullSyncRequestId ?? "";
@@ -2847,7 +2931,8 @@ ${bodyHash}`;
         localDirty,
         remoteDirty,
         localFullSyncRequestId,
-        remoteFullSyncRequestId
+        remoteFullSyncRequestId,
+        forceFilesystemScan: localForceFilesystemScan || peer.remoteForceFilesystemScan
       });
     }
     async syncPeerMetadata(peer, request) {
@@ -2857,11 +2942,11 @@ ${bodyHash}`;
       const localPolicy = this.policy();
       const requestedPaths = [...request.paths].sort((left, right) => left.localeCompare(right));
       const [localEntries, remoteResponse, ledger] = await Promise.all([
-        request.fullSync ? this.buildMetadataManifest(localPolicy.syncConfigFolder) : this.buildMetadataManifestForPaths(requestedPaths, localPolicy.syncConfigFolder),
+        request.fullSync ? this.buildMetadataManifest(localPolicy.syncConfigFolder, void 0, request.forceFilesystemScan) : this.buildMetadataManifestForPaths(requestedPaths, localPolicy.syncConfigFolder),
         this.callPeer(
           peer,
           this.metadataRoute(peer, request.fullSync ? "/manifest" : "/manifest/paths"),
-          request.fullSync ? { syncConfigFolder: localPolicy.syncConfigFolder } : { syncConfigFolder: localPolicy.syncConfigFolder, paths: requestedPaths }
+          request.fullSync ? { syncConfigFolder: localPolicy.syncConfigFolder, forceFilesystemScan: request.forceFilesystemScan } : { syncConfigFolder: localPolicy.syncConfigFolder, paths: requestedPaths }
         ),
         Promise.resolve(this.loadMetadataLedger(peer.deviceId))
       ]);
@@ -3121,6 +3206,7 @@ ${bodyHash}`;
           if ((peer.remoteDirtyPaths?.get(path) ?? 0) <= generation) peer.remoteDirtyPaths?.delete(path);
         }
         if (request.remoteFullSyncRequestId && peer.remoteFullSyncRequestId === request.remoteFullSyncRequestId) peer.remoteFullSyncRequestId = "";
+        if (!peer.remoteFullSyncRequestId) peer.remoteForceFilesystemScan = false;
         for (const path of retryPaths) this.markDirtyPath(path, QUEUED_SYNC_DELAY_MS);
       }
       if (failure !== null) throw failure;
@@ -3466,6 +3552,7 @@ ${bodyHash}`;
           }
           const stat = await this.options.storage.statFile(path);
           if (!stat) {
+            this.metadataIndex.delete(path);
             activity.path = path;
             activity.state = "complete";
             activity.reason = "missing";
@@ -3476,6 +3563,7 @@ ${bodyHash}`;
           activity.path = path;
           activity.size = stat.size;
           if (!Number.isFinite(stat.size) || stat.size < 0 || stat.size > this.settings().maxFileBytes || !Number.isFinite(stat.mtime) || stat.mtime < 0) {
+            this.metadataIndex.delete(path);
             activity.state = "skipped";
             activity.reason = stat.size > this.settings().maxFileBytes ? "too-large" : "invalid-metadata";
             scan.skipped += 1;
@@ -3485,6 +3573,7 @@ ${bodyHash}`;
           }
           activity.state = "cached";
           activity.reason = "metadata";
+          this.metadataIndex.set(path, { size: stat.size, mtime: stat.mtime });
           scan.cached += 1;
           scan.completed += 1;
           report();
@@ -3493,6 +3582,7 @@ ${bodyHash}`;
         scan.phase = "complete";
         scan.completed = scan.total;
         report();
+        this.queueMetadataIndexSave();
         return results.filter((entry) => entry !== null);
       } catch (error) {
         scan.phase = "error";
@@ -3501,19 +3591,45 @@ ${bodyHash}`;
         throw error;
       }
     }
-    async buildMetadataManifest(includeConfigFolder = this.settings().syncConfigFolder, onProgress) {
-      if (this.metadataManifestBuild?.includeConfigFolder === includeConfigFolder) {
-        const existing = await this.metadataManifestBuild.promise;
-        onProgress?.(this.scanValue.completed, this.scanValue.total);
-        return existing.map((entry) => ({ ...entry }));
+    async buildMetadataManifest(includeConfigFolder = this.settings().syncConfigFolder, onProgress, forceFilesystemScan = false) {
+      if (this.metadataManifestBuild) {
+        const activeBuild = this.metadataManifestBuild;
+        const existing = await activeBuild.promise;
+        if (activeBuild.includeConfigFolder === includeConfigFolder && activeBuild.forceFilesystemScan === forceFilesystemScan) {
+          onProgress?.(this.scanValue.completed, this.scanValue.total);
+          return existing.map((entry) => ({ ...entry }));
+        }
+        if (this.metadataManifestBuild === activeBuild) this.metadataManifestBuild = null;
+        return await this.buildMetadataManifest(includeConfigFolder, onProgress, forceFilesystemScan);
       }
-      const promise = this.buildMetadataManifestOnce(includeConfigFolder, onProgress);
-      this.metadataManifestBuild = { includeConfigFolder, promise };
+      const promise = !forceFilesystemScan && this.canUseMetadataIndex(includeConfigFolder) ? this.buildMetadataManifestFromIndex(includeConfigFolder, onProgress) : this.buildMetadataManifestOnce(includeConfigFolder, onProgress);
+      this.metadataManifestBuild = { includeConfigFolder, forceFilesystemScan, promise };
       try {
         return await promise;
       } finally {
         if (this.metadataManifestBuild?.promise === promise) this.metadataManifestBuild = null;
       }
+    }
+    async buildMetadataManifestFromIndex(includeConfigFolder, onProgress) {
+      const dirty = [...this.dirtyPaths.keys()].filter((path) => this.normalizePath(path, includeConfigFolder) !== null).slice(0, MAX_DIRTY_PATHS);
+      if (dirty.length) {
+        await this.buildMetadataManifestForPaths(dirty, includeConfigFolder);
+      } else {
+        this.scanValue = {
+          id: randomId(12),
+          phase: "complete",
+          completed: 0,
+          total: 0,
+          cached: 0,
+          hashed: 0,
+          skipped: 0,
+          error: "",
+          files: []
+        };
+      }
+      onProgress?.(this.scanValue.completed, this.scanValue.total);
+      const maxFileBytes = this.settings().maxFileBytes;
+      return [...this.metadataIndex.entries()].map(([path, metadata]) => ({ path, ...metadata })).filter((entry) => this.normalizePath(entry.path, includeConfigFolder) !== null && entry.size <= maxFileBytes).sort((left, right) => left.path.localeCompare(right.path));
     }
     async buildMetadataManifestOnce(includeConfigFolder, onProgress) {
       const maxFileBytes = this.settings().maxFileBytes;
@@ -3575,12 +3691,14 @@ ${bodyHash}`;
           entries.push({ path: file.path, size: file.size, mtime: file.mtime });
           report();
           if ((index + 1) % 512 === 0 && index + 1 < candidates.length) {
-            await new Promise((resolve) => setTimeout(resolve, 0));
+            await Promise.resolve();
           }
         }
         scan.phase = "complete";
         scan.completed = scan.total;
         report(true);
+        this.replaceMetadataIndex(entries, includeConfigFolder);
+        this.recordFullScan();
         return entries;
       } catch (error) {
         scan.phase = "error";
@@ -4081,8 +4199,11 @@ ${bodyHash}`;
           };
         } else if (metadataRoute === "/manifest") {
           const policy = this.policy();
-          const files = await this.buildMetadataManifest(policy.syncConfigFolder && payload.syncConfigFolder === true);
-          this.recordFullScan();
+          const files = await this.buildMetadataManifest(
+            policy.syncConfigFolder && payload.syncConfigFolder === true,
+            void 0,
+            payload.forceFilesystemScan === true
+          );
           this.emit({
             ...defaultProgress("scanning"),
             stage: "planning",
@@ -4228,7 +4349,6 @@ ${bodyHash}`;
       const acknowledgedFullSyncRequestId = typeof payload.acknowledgedFullSyncRequestId === "string" ? payload.acknowledgedFullSyncRequestId : "";
       if (acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) {
         this.fullSyncRequested = false;
-        this.recordFullScan();
       }
       const success = payload.success === true;
       if (success) this.recordSyncCheckpoint();
