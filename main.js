@@ -781,8 +781,10 @@ var NtfyLanSyncRuntime = (() => {
   var PROTOCOL_VERSION = 1;
   var PROTOCOL_NAME = "cancip-lan-sync";
   var API_PREFIX = "/cancip-lan/v1";
-  var METADATA_LEDGER_CAPABILITY = "metadata-session-v4";
-  var METADATA_ROUTE_PREFIX = "/metadata/v4";
+  var METADATA_PROTOCOLS = [
+    { capability: "metadata-session-v4", routePrefix: "/metadata/v4" },
+    { capability: "metadata-session-v3", routePrefix: "/metadata/v3" }
+  ];
   var BOOTSTRAP_MTIME_TOLERANCE_MS = 2e3;
   var MULTICAST_ADDRESS = "239.255.67.19";
   var DISCOVERY_PORT = 43189;
@@ -1578,7 +1580,7 @@ ${bodyHash}`;
           verified: this.isPeerActive(peer, now),
           lastSeenAt: Math.max(peer.lastSeenAt, peer.verifiedAt),
           canHost: peer.canHost,
-          compatible: peer.capabilities.has(METADATA_LEDGER_CAPABILITY)
+          compatible: this.metadataProtocol(peer) !== null
         };
       }).filter((peer) => peer.verified).sort((left, right) => left.deviceId.localeCompare(right.deviceId));
     }
@@ -2355,8 +2357,9 @@ ${bodyHash}`;
       peer.verifiedAt = this.now();
       peer.consecutiveFailures = 0;
       peer.lastFailureAt = 0;
-      if (route.startsWith(`${API_PREFIX}${METADATA_ROUTE_PREFIX}/`)) {
-        peer.capabilities.add(METADATA_LEDGER_CAPABILITY);
+      const metadataProtocol = METADATA_PROTOCOLS.find((protocol) => route.startsWith(`${API_PREFIX}${protocol.routePrefix}/`));
+      if (metadataProtocol) {
+        peer.capabilities.add(metadataProtocol.capability);
         peer.compatibilityPendingSince = 0;
         if (this.lastErrorValue === "peer_upgrade_required") this.lastErrorValue = "";
       }
@@ -2366,7 +2369,7 @@ ${bodyHash}`;
       if (!transfer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
         this.emit({
           ...defaultProgress("connected"),
-          stage: peer.capabilities.has(METADATA_LEDGER_CAPABILITY) ? "waiting-peer-scan" : "checking-peer",
+          stage: this.metadataProtocol(peer) ? "waiting-peer-scan" : "checking-peer",
           active: true,
           peerId: deviceId
         });
@@ -2556,9 +2559,17 @@ ${bodyHash}`;
       }
       return paths;
     }
+    metadataProtocol(peer) {
+      return METADATA_PROTOCOLS.find((protocol) => peer.capabilities.has(protocol.capability)) ?? null;
+    }
+    metadataRoute(peer, suffix) {
+      const protocol = this.metadataProtocol(peer);
+      if (!protocol) throw new LanSyncProtocolError("peer_upgrade_required", 426);
+      return `${protocol.routePrefix}${suffix}`;
+    }
     syncSignalPayload() {
       return {
-        capabilities: [METADATA_LEDGER_CAPABILITY],
+        capabilities: METADATA_PROTOCOLS.map((protocol) => protocol.capability),
         syncRequestId: this.syncRequestId,
         fullSyncRequestId: this.fullSyncRequested ? this.fullSyncRequestId : "",
         dirtyPaths: this.dirtySnapshot()
@@ -2566,11 +2577,12 @@ ${bodyHash}`;
     }
     applyRemoteSyncSignal(peer, payload) {
       const capabilities = (Array.isArray(payload.capabilities) ? payload.capabilities : []).filter((value) => typeof value === "string" && value.length <= 64);
-      if (capabilities.includes(METADATA_LEDGER_CAPABILITY)) {
-        peer.capabilities.add(METADATA_LEDGER_CAPABILITY);
+      const compatibleCapabilities = METADATA_PROTOCOLS.map((protocol) => protocol.capability).filter((capability) => capabilities.includes(capability));
+      if (compatibleCapabilities.length) {
+        for (const capability of compatibleCapabilities) peer.capabilities.add(capability);
         peer.compatibilityPendingSince = 0;
         if (this.lastErrorValue === "peer_upgrade_required") this.lastErrorValue = "";
-      } else if (!peer.capabilities.has(METADATA_LEDGER_CAPABILITY) && peer.compatibilityPendingSince <= 0) {
+      } else if (!this.metadataProtocol(peer) && peer.compatibilityPendingSince <= 0) {
         peer.compatibilityPendingSince = this.now();
       }
       const requestId = typeof payload.syncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.syncRequestId) ? payload.syncRequestId : "";
@@ -2584,7 +2596,7 @@ ${bodyHash}`;
       if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing" || this.inboundSession) return;
       const hasPendingWork = this.fullSyncRequested || Boolean(peer.remoteFullSyncRequestId) || (peer.remoteDirtyPaths?.size ?? 0) > 0;
       if (this.progressValue.phase === "complete" && !hasPendingWork) return;
-      const compatible = peer.capabilities.has(METADATA_LEDGER_CAPABILITY);
+      const compatible = this.metadataProtocol(peer) !== null;
       const compatibilityExpired = !compatible && peer.compatibilityPendingSince > 0 && this.now() - peer.compatibilityPendingSince >= 2e3;
       const stage = compatibilityExpired ? "peer-upgrade-required" : !compatible ? "checking-peer" : this.fullSyncRequested ? "requesting-peer-scan" : "waiting-peer-scan";
       const error = compatibilityExpired ? "peer_upgrade_required" : "";
@@ -2747,7 +2759,7 @@ ${bodyHash}`;
       }
     }
     async syncPeer(peer, localDirty = new Map(this.dirtyPaths), localFullSyncRequestId = this.fullSyncRequested ? this.fullSyncRequestId : "") {
-      if (!peer.capabilities?.has(METADATA_LEDGER_CAPABILITY)) throw new LanSyncProtocolError("peer_upgrade_required", 426);
+      if (!this.metadataProtocol(peer)) throw new LanSyncProtocolError("peer_upgrade_required", 426);
       const remoteDirty = new Map(peer.remoteDirtyPaths ?? []);
       const remoteFullSyncRequestId = peer.remoteFullSyncRequestId ?? "";
       const fullSync = Boolean(localFullSyncRequestId || remoteFullSyncRequestId);
@@ -2772,7 +2784,7 @@ ${bodyHash}`;
         request.fullSync ? this.buildMetadataManifest(localPolicy.syncConfigFolder) : this.buildMetadataManifestForPaths(requestedPaths, localPolicy.syncConfigFolder),
         this.callPeer(
           peer,
-          request.fullSync ? `${METADATA_ROUTE_PREFIX}/manifest` : `${METADATA_ROUTE_PREFIX}/manifest/paths`,
+          this.metadataRoute(peer, request.fullSync ? "/manifest" : "/manifest/paths"),
           request.fullSync ? { syncConfigFolder: localPolicy.syncConfigFolder } : { syncConfigFolder: localPolicy.syncConfigFolder, paths: requestedPaths }
         ),
         Promise.resolve(this.loadMetadataLedger(peer.deviceId))
@@ -2851,7 +2863,7 @@ ${bodyHash}`;
             });
           }
         );
-        const remoteHashesPromise = this.callPeer(peer, `${METADATA_ROUTE_PREFIX}/bootstrap/hashes`, {
+        const remoteHashesPromise = this.callPeer(peer, this.metadataRoute(peer, "/bootstrap/hashes"), {
           syncConfigFolder: localPolicy.syncConfigFolder,
           files: bootstrapCandidates.map((item) => item.remote)
         }, 10 * 6e4);
@@ -2902,7 +2914,7 @@ ${bodyHash}`;
       }));
       this.activityUpdatedAt = this.now();
       const sessionId = randomId(18);
-      await this.callPeer(peer, `${METADATA_ROUTE_PREFIX}/session/start`, {
+      await this.callPeer(peer, this.metadataRoute(peer, "/session/start"), {
         sessionId,
         total: actions.length,
         bytesTotal,
@@ -3017,7 +3029,7 @@ ${bodyHash}`;
       const acknowledgedRemoteDirty = [...request.remoteDirty.entries()].filter(([path]) => settledPaths.has(path)).map(([path, generation]) => ({ path, generation }));
       let finishFailure = null;
       try {
-        await this.callPeer(peer, `${METADATA_ROUTE_PREFIX}/session/finish`, {
+        await this.callPeer(peer, this.metadataRoute(peer, "/session/finish"), {
           sessionId,
           success,
           commits,
@@ -3593,7 +3605,7 @@ ${bodyHash}`;
       }
       await this.options.storage.writeBinary(normalized, arrayBuffer(bytes), source.mtime);
       const written = await this.options.storage.statFile(normalized);
-      if (!written || written.size !== bytes.byteLength) throw new Error("write_verification_failed");
+      if (!written || written.size !== bytes.byteLength) throw new LanSyncProtocolError("precondition_failed", 409);
       this.hashCache.delete(normalized);
       this.queueHashCacheSave();
       return metadataSnapshot(written);
@@ -3606,11 +3618,11 @@ ${bodyHash}`;
       await this.options.storage.deleteFile(normalized);
       this.hashCache.delete(normalized);
       this.queueHashCacheSave();
-      if (await this.options.storage.statFile(normalized)) throw new Error("delete_verification_failed");
+      if (await this.options.storage.statFile(normalized)) throw new LanSyncProtocolError("precondition_failed", 409);
     }
     async readRemoteMetadata(peer, entry, sessionId = "") {
       const expected = metadataSnapshot(entry);
-      const response = await this.callPeer(peer, `${METADATA_ROUTE_PREFIX}/file/read`, { path: entry.path, expectedMetadata: expected, sessionId }, fileTransferTimeoutMs(entry.size));
+      const response = await this.callPeer(peer, this.metadataRoute(peer, "/file/read"), { path: entry.path, expectedMetadata: expected, sessionId }, fileTransferTimeoutMs(entry.size));
       const metadata = this.parseMetadataSnapshot(response.metadata);
       if (response.path !== entry.path || !metadata || !metadataMatches(metadata, expected) || typeof response.data !== "string") throw new LanSyncProtocolError("invalid_file_response");
       const bytes = base64UrlToBytes(response.data);
@@ -3618,7 +3630,7 @@ ${bodyHash}`;
       return { bytes, metadata };
     }
     async writeRemoteMetadata(peer, path, bytes, expected, source, allowExistingSame = false, sessionId = "") {
-      const response = await this.callPeer(peer, `${METADATA_ROUTE_PREFIX}/file/write`, {
+      const response = await this.callPeer(peer, this.metadataRoute(peer, "/file/write"), {
         path,
         expectedMetadata: expected,
         sourceMetadata: source,
@@ -3631,7 +3643,7 @@ ${bodyHash}`;
       return metadata;
     }
     async deleteRemoteMetadata(peer, path, expected, sessionId = "") {
-      const response = await this.callPeer(peer, `${METADATA_ROUTE_PREFIX}/file/delete`, { path, expectedMetadata: expected, sessionId }, 45e3);
+      const response = await this.callPeer(peer, this.metadataRoute(peer, "/file/delete"), { path, expectedMetadata: expected, sessionId }, 45e3);
       const deletedMetadata = this.parseMetadataSnapshot(response.deletedMetadata);
       if (response.path !== path || response.deleted !== true || !deletedMetadata || !metadataMatches(deletedMetadata, expected)) {
         throw new Error("remote_delete_verification_failed");
@@ -3968,7 +3980,9 @@ ${bodyHash}`;
         const remoteAddress = normalizeRemoteAddress(request.socket.remoteAddress ?? "");
         if (!this.allowedByRateLimit(`${remoteAddress}:${deviceId}`)) throw new LanSyncProtocolError("rate_limited", 429);
         const payload = await decryptLanSyncPayload(this.identity.secret, body);
-        if (path === `${API_PREFIX}/manifest` || path === `${API_PREFIX}/file/read` || path === `${API_PREFIX}/file/write` || path === `${API_PREFIX}/file/delete` || path === `${API_PREFIX}/manifest/metadata` || path === `${API_PREFIX}/manifest/metadata/paths` || path === `${API_PREFIX}/metadata/session/start` || path === `${API_PREFIX}/metadata/session/finish` || path === `${API_PREFIX}/metadata/file/read` || path === `${API_PREFIX}/metadata/file/write` || path === `${API_PREFIX}/metadata/file/delete` || path.startsWith(`${API_PREFIX}/metadata/v2/`) || path.startsWith(`${API_PREFIX}/metadata/v3/`)) {
+        const metadataProtocol = METADATA_PROTOCOLS.find((protocol) => path.startsWith(`${API_PREFIX}${protocol.routePrefix}/`));
+        const metadataRoute = metadataProtocol ? path.slice(`${API_PREFIX}${metadataProtocol.routePrefix}`.length) : "";
+        if (path === `${API_PREFIX}/manifest` || path === `${API_PREFIX}/file/read` || path === `${API_PREFIX}/file/write` || path === `${API_PREFIX}/file/delete` || path === `${API_PREFIX}/manifest/metadata` || path === `${API_PREFIX}/manifest/metadata/paths` || path === `${API_PREFIX}/metadata/session/start` || path === `${API_PREFIX}/metadata/session/finish` || path === `${API_PREFIX}/metadata/file/read` || path === `${API_PREFIX}/metadata/file/write` || path === `${API_PREFIX}/metadata/file/delete` || path.startsWith(`${API_PREFIX}/metadata/v2/`)) {
           throw new LanSyncProtocolError("peer_upgrade_required", 426);
         }
         this.markInboundPeer(deviceId, remoteAddress, path);
@@ -3989,7 +4003,7 @@ ${bodyHash}`;
             messages: this.pendingMessagesFor(deviceId),
             ...this.syncSignalPayload()
           };
-        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/manifest`) {
+        } else if (metadataRoute === "/manifest") {
           const policy = this.policy();
           const files = await this.buildMetadataManifest(policy.syncConfigFolder && payload.syncConfigFolder === true);
           this.recordFullScan();
@@ -4005,7 +4019,7 @@ ${bodyHash}`;
             files,
             policy
           };
-        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/manifest/paths`) {
+        } else if (metadataRoute === "/manifest/paths") {
           const policy = this.policy();
           const paths = Array.isArray(payload.paths) ? payload.paths.filter((value) => typeof value === "string") : [];
           if (paths.length > MAX_DIRTY_PATHS) throw new LanSyncProtocolError("too_many_dirty_paths", 413);
@@ -4022,20 +4036,20 @@ ${bodyHash}`;
             files,
             policy
           };
-        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/bootstrap/hashes`) {
+        } else if (metadataRoute === "/bootstrap/hashes") {
           const policy = this.policy();
           const includeConfigFolder = policy.syncConfigFolder && payload.syncConfigFolder === true;
           const expected = this.parseMetadataManifest(payload.files, includeConfigFolder);
           result = { files: await this.buildInboundMetadataHashManifest(expected, includeConfigFolder, deviceId) };
-        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/session/start`) {
+        } else if (metadataRoute === "/session/start") {
           result = await this.handleMetadataSessionStart(deviceId, payload);
-        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/session/finish`) {
+        } else if (metadataRoute === "/session/finish") {
           result = await this.handleMetadataSessionFinish(deviceId, payload);
-        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/file/read`) {
+        } else if (metadataRoute === "/file/read") {
           result = await this.handleReadMetadataFile(payload);
-        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/file/write`) {
+        } else if (metadataRoute === "/file/write") {
           result = await this.handleWriteMetadataFile(payload);
-        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/file/delete`) {
+        } else if (metadataRoute === "/file/delete") {
           result = await this.handleDeleteMetadataFile(payload);
         } else if (path === `${API_PREFIX}/attachment/read`) {
           result = await this.handleReadQueuedAttachment(deviceId, payload);

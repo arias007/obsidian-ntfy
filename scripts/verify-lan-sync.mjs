@@ -42,6 +42,7 @@ class MemoryStorage {
     this.readCounts = new Map();
     this.writeCounts = new Map();
     this.beforeRead = null;
+    this.afterWrite = null;
     this.mtimeTransform = typeof options.mtimeTransform === "function" ? options.mtimeTransform : (mtime) => mtime;
     this.putText(`${this.identityRoot}/identity.json`, `${JSON.stringify(identity)}\n`, 1);
     for (const [path, value] of Object.entries(files)) this.putText(path, value.content, value.mtime);
@@ -94,6 +95,7 @@ class MemoryStorage {
     const requestedMtime = Number.isFinite(mtime) ? mtime : ++this.clock;
     this.files.set(path, { data: new Uint8Array(data), mtime: this.mtimeTransform(requestedMtime, path) });
     this.writeCounts.set(path, (this.writeCounts.get(path) || 0) + 1);
+    if (typeof this.afterWrite === "function") await this.afterWrite(path, this);
   }
 
   async deleteFile(path) {
@@ -464,7 +466,7 @@ try {
   stabilityClock += 3_000;
   stabilityService.emitPeerConnectionStage(stabilityPeer);
   assert.equal(stabilityService.progress().stage, "peer-upgrade-required", "An incompatible passive mobile peer stayed at an unexplained 0/0 state");
-  stabilityService.applyRemoteSyncSignal(stabilityPeer, { capabilities: ["metadata-session-v4"] });
+  stabilityService.applyRemoteSyncSignal(stabilityPeer, { capabilities: ["metadata-session-v3"] });
   stabilityService.emitPeerConnectionStage(stabilityPeer);
   assert.equal(stabilityService.progress().stage, "requesting-peer-scan", "A compatible peer did not resume the locally initiated session stage");
   assert.ok(stabilityProgress.some((value) => value.stage === "checking-peer" || value.stage === "peer-upgrade-required"), "Peer compatibility stages were not emitted");
@@ -484,6 +486,7 @@ try {
     assert.equal(serviceA.listPeers()[0].deviceId, deviceB, "Manual endpoint was not rebound to the authenticated device ID");
     assert.equal(serviceA.listPeers()[0].linkType, "manual");
     assert.equal(serviceA.peers.get(deviceB).capabilities.has("metadata-session-v4"), true, "Authenticated ping did not negotiate metadata sync");
+    assert.equal(serviceA.peers.get(deviceB).capabilities.has("metadata-session-v3"), true, "Authenticated ping did not advertise rolling-upgrade compatibility");
     serviceA.requestSync();
     await waitFor(() => storageA.text("Notes/from-b.md") === "from B" && storageB.text("Notes/from-a.md") === "from A", "automatic bidirectional LAN transfer");
     await waitFor(() => storageA.text("Notes/shared.md") === "newer B" && storageB.text("Notes/shared.md") === "newer B", "original-path convergence");
@@ -549,6 +552,16 @@ try {
     assert.ok(serviceB.loadMetadataLedger(deviceA).entries["Notes/identical.md"], "Receiving peer did not persist the reverse metadata ledger");
 
     const negotiatedPeer = serviceA.peers.get(deviceB);
+    negotiatedPeer.capabilities = new Set(["metadata-session-v3"]);
+    requestedRoutes.length = 0;
+    storageA.putText("Notes/v3-compatible.md", "rolling upgrade", 650);
+    serviceA.notifyVaultChange("Notes/v3-compatible.md");
+    await waitFor(() => storageB.text("Notes/v3-compatible.md") === "rolling upgrade", "v3 rolling-upgrade synchronization");
+    await waitFor(() => !serviceA.syncRunning && serviceA.dirtyPaths.size === 0, "v3 rolling-upgrade session settlement");
+    assert.equal(serviceA.listPeers()[0].compatible, true, "A v3 peer was treated as a blocking version conflict");
+    assert.ok(requestedRoutes.includes("/cancip-lan/v1/metadata/v3/manifest/paths"), "A v3 peer did not use the negotiated compatibility route");
+    assert.equal(requestedRoutes.some((route) => route.includes("/metadata/v4/")), false, "The v3 compatibility pass mixed protocol routes");
+
     negotiatedPeer.capabilities = new Set(["metadata-session-v2"]);
     requestedRoutes.length = 0;
     const beforeLegacyAttempt = new Map([...storageA.files].map(([path, value]) => [path, { data: new Uint8Array(value.data), mtime: value.mtime }]));
@@ -601,6 +614,23 @@ try {
     assert.equal(requestedRoutes.slice(volatileRouteStart).includes("/cancip-lan/v1/metadata/v4/manifest"), false, "A volatile file retry restarted a full-vault scan");
     assert.ok(progressA.some((value) => value.phase === "complete" && value.total >= 1), "Deferred retry never returned to a completed session");
     assert.ok(serviceA.loadMetadataLedger(deviceB).entries["Notes/identical.md"], "An unrelated incremental pass erased an existing metadata baseline");
+
+    storageA.putText("Notes/steady-during-write-race.md", "steady write", 820);
+    storageA.putText("Notes/receiver-write-race.md", "incoming value", 821);
+    let receiverWriteRace = false;
+    storageB.afterWrite = async (path, storage) => {
+      if (path !== "Notes/receiver-write-race.md" || receiverWriteRace) return;
+      receiverWriteRace = true;
+      storage.putText(path, "receiver changed after write", 900);
+    };
+    const receiverRaceRouteStart = requestedRoutes.length;
+    serviceA.notifyVaultChange("Notes/steady-during-write-race.md");
+    serviceA.notifyVaultChange("Notes/receiver-write-race.md");
+    await waitFor(() => storageB.text("Notes/steady-during-write-race.md") === "steady write", "unrelated transfer continued after receiver write race");
+    await waitFor(() => storageA.text("Notes/receiver-write-race.md") === "receiver changed after write", "receiver write-race path-only retry", 30_000);
+    storageB.afterWrite = null;
+    assert.equal(receiverWriteRace, true, "Receiver write-race regression did not execute");
+    assert.equal(requestedRoutes.slice(receiverRaceRouteStart).includes("/cancip-lan/v1/metadata/v4/manifest"), false, "A receiver write race restarted a full-vault scan");
     assert.equal(mirroredPushA.bytesTotal, mirroredPushB.bytesTotal, "The two peers did not share the same byte total");
     assert.equal(mirroredPushA.bytesTransferred, mirroredPushB.bytesTransferred, "The two peers did not finish the same transferred bytes");
     storageB.putText("Notes/identical.md", "changed on B", 710);
@@ -820,12 +850,19 @@ try {
     ...mobileOptions,
     desktop: false
   });
+  const mobileSyncSignalPayload = mobileService.syncSignalPayload.bind(mobileService);
+  mobileService.syncSignalPayload = () => ({ ...mobileSyncSignalPayload(), capabilities: ["metadata-session-v3"] });
+  mobileService.metadataProtocol = (peer) => peer.capabilities.has("metadata-session-v3")
+    ? { capability: "metadata-session-v3", routePrefix: "/metadata/v3" }
+    : null;
   try {
     await desktopService.start();
     await mobileService.start();
     await waitFor(() => mobileService.status().peerCount === 1, "mobile authenticated desktop endpoint");
     await waitFor(() => desktopService.status().peerCount === 1, "desktop observed authenticated mobile client");
     assert.equal(desktopService.listPeers()[0].compatible, true, "Desktop did not learn the passive mobile peer capability from its inbound ping");
+    assert.equal(desktopService.peers.get(mobileDevice).capabilities.has("metadata-session-v3"), true, "Desktop did not accept the mobile v3 compatibility capability");
+    assert.equal(desktopService.peers.get(mobileDevice).capabilities.has("metadata-session-v4"), false, "The old-mobile fixture unexpectedly advertised v4");
     await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "automatic full-vault sync");
     assert.ok(desktopProgress.some((value) => value.stage === "enumerating"), "Passive desktop did not report metadata enumeration");
     assert.ok(desktopProgress.some((value) => value.stage === "planning"), "Passive desktop did not report transfer planning");
@@ -833,9 +870,9 @@ try {
     desktopService.notifyVaultChange("Desktop/desktop-initiated.md");
     const beforeDesktopInitiatedProgress = desktopProgress.length;
     desktopService.requestSync();
-    assert.equal(desktopService.progress().stage, "requesting-peer-scan", "Desktop could not actively initiate a LAN synchronization session");
+    assert.ok(["requesting-peer-scan", "enumerating", "planning", "transferring"].includes(desktopService.progress().stage), "Desktop could not actively initiate a LAN synchronization session");
     await waitFor(() => mobileStorage.text("Desktop/desktop-initiated.md") === "started on desktop", "desktop-initiated LAN synchronization");
-    assert.ok(desktopProgress.slice(beforeDesktopInitiatedProgress).some((value) => value.stage === "requesting-peer-scan" || value.stage === "enumerating"), "Desktop initiation exposed no active progress");
+    assert.ok(desktopProgress.slice(beforeDesktopInitiatedProgress).some((value) => ["requesting-peer-scan", "enumerating", "planning", "transferring"].includes(value.stage)), "Desktop initiation exposed no active progress");
     mobileStorage.putText("Mobile/mobile-initiated.md", "started on mobile", 1400);
     mobileService.notifyVaultChange("Mobile/mobile-initiated.md");
     const beforeMobileInitiatedProgress = mobileProgress.length;
@@ -910,12 +947,17 @@ try {
   assert.doesNotMatch(lanSource, /buildLanConflictPath\s*\(/, "LAN sync still contains a conflict-copy path generator");
   assert.doesNotMatch(lanSource, /action\.kind === "conflict"/, "LAN sync still contains a conflict-copy executor");
   assert.match(lanSource, /peer_upgrade_required/, "Outdated LAN peers are not isolated from the original-path protocol");
+  assert.match(lanSource, /capability: "metadata-session-v4", routePrefix: "\/metadata\/v4"/, "The preferred metadata protocol is missing");
+  assert.match(lanSource, /capability: "metadata-session-v3", routePrefix: "\/metadata\/v3"/, "Rolling-upgrade metadata compatibility is missing");
+  assert.match(lanSource, /capabilities: METADATA_PROTOCOLS\.map/, "Peers do not advertise all safe metadata protocols");
+  assert.doesNotMatch(lanSource, /path\.startsWith\(`\$\{API_PREFIX\}\/metadata\/v3\/`\)/, "The server still blocks the v3 rolling-upgrade route");
   assert.match(lanSource, /const SMALL_TRANSFER_CONCURRENCY = 12/, "Small-file LAN transfers are not using the fast bounded worker pool");
   assert.match(lanSource, /if \(!this\.runningValue \|\| this\.syncRunning \|\| this\.inboundSession \|\| this\.metadataManifestBuild \|\| this\.manifestBuild\) return;/, "Periodic full scans can still interrupt an active transfer or manifest enumeration");
   assert.match(lanSource, /private isPeriodicInitiator\(peers = this\.activePeers\(\)\)/, "Periodic synchronization is still permanently assigned to one device role");
   assert.match(lanSource, /MIN_FULL_RESCAN_INTERVAL_MS = 10 \* 60_000/, "Large Vaults can still run a full scan every minute");
   assert.match(lanSource, /this\.metadataManifestBuild \|\| this\.manifestBuild/, "Periodic calibration can still overlap manifest enumeration");
   assert.match(lanSource, /safeErrorCode\(error\) === "precondition_failed"/, "One changing file can still abort the entire transfer batch");
+  assert.match(lanSource, /written\.size !== bytes\.byteLength\) throw new LanSyncProtocolError\("precondition_failed", 409\)/, "A receiver-side write race can still abort the entire batch");
   assert.match(lanSource, /retryPaths: \[\.\.\.retryPaths\]/, "Deferred paths are not mirrored to the peer retry queue");
   assert.match(takeoverSource, /plugins\?\.\["remotely-save"\]\?\.statusBarElement/);
   assert.doesNotMatch(takeoverSource, /isSyncing|currSyncMsg|syncEvent|remotelySave\.settings|candidate\.settings|start-sync/);
