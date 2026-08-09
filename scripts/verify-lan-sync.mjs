@@ -169,6 +169,7 @@ try {
     normalizeLanSyncPath,
     normalizeLanInboxAttachmentPath,
     isLanInboxAttachmentPath,
+    lanSyncTopLevelGroup,
     normalizeManualLanPeer,
     planLanSyncMetadataReconciliation,
     planLanSyncReconciliation,
@@ -186,6 +187,9 @@ try {
   };
   assert.equal(normalizeLanSyncPath(".obsidian/hotkeys.json", configPathOptions), ".obsidian/hotkeys.json");
   assert.equal(normalizeLanSyncPath(".obsidian/plugins/example/data.json", configPathOptions), ".obsidian/plugins/example/data.json");
+  assert.equal(lanSyncTopLevelGroup("Notes/Daily/Today.md"), "Notes");
+  assert.equal(lanSyncTopLevelGroup("README.md"), "");
+  assert.equal(lanSyncTopLevelGroup(".obsidian/hotkeys.json"), ".obsidian");
   assert.equal(normalizeLanSyncPath("Folder/Note (LAN conflict device hash).md", configPathOptions), null, "Generated conflict copies must never propagate");
   for (const protectedPath of [
     ".obsidian/workspace.json",
@@ -481,18 +485,37 @@ try {
       previousScanTotal = value.total;
     }
     await waitFor(() => progressA.some((value) => value.phase === "complete" && value.uploads > 0 && value.downloads > 0), "bidirectional completion progress");
-    assert.ok(progressA.some((value) => value.phase === "complete" && value.conflicts === 0 && value.uploads > 0 && value.downloads > 0), "Completion progress did not expose upload/download directions");
+    assert.ok(progressA.some((value) => value.phase === "complete"
+      && value.conflicts === 0
+      && value.uploadCompleted === value.uploads
+      && value.downloadCompleted === value.downloads
+      && value.uploads > 0
+      && value.downloads > 0), "Completion progress did not expose separate upload/download completion counts");
     assert.ok(progressB.some((value) => value.active), "Receiving peer did not expose LAN status");
+    const firstInboundTransfer = progressB.findIndex((value) => value.phase === "syncing" && value.total > 0);
+    assert.ok(firstInboundTransfer >= 0, "Receiving peer did not start a counted transfer session");
+    assert.equal(progressB.slice(firstInboundTransfer).some((value) => value.phase === "syncing" && value.total === 0), false, "Receiving progress reset to zero during file requests");
     const activityA = serviceA.activity();
     assert.ok(activityA.scan.total > 0, "Full-vault scan snapshot did not expose total files");
     assert.equal(activityA.scan.completed, activityA.scan.total, "Full-vault scan did not finish monotonically");
     assert.ok(activityA.scan.files.some((file) => file.state === "cached" || file.state === "complete"), "Scan file states were not retained");
     assert.ok(activityA.files.some((file) => file.path === "Notes/from-a.md" && file.state === "complete"), "Coordinator did not retain completed file activity");
     assert.ok(activityA.files.some((file) => file.path === "Notes/shared.md" && file.action === "pull"), "Latest remote file was not shown as a download");
+    assert.ok(activityA.scanGroups.some((group) => group.key === "Notes" && group.completed === group.total), "Scan activity was not grouped by top-level folder");
+    assert.ok(activityA.transferGroups.some((group) => group.key === "Notes" && group.completed === group.total), "Transfer activity was not grouped by top-level folder");
     const collapsedActivityA = serviceA.activity({ includeScanFiles: false, includeTransferFiles: false });
     assert.equal(collapsedActivityA.scan.total, activityA.scan.total, "Collapsed scan lost its summary");
     assert.deepEqual(collapsedActivityA.scan.files, [], "Collapsed scan still cloned file rows");
     assert.deepEqual(collapsedActivityA.files, [], "Collapsed transfer section still cloned file rows");
+    const notesOnlyActivity = serviceA.activity({ scanGroups: ["Notes"], transferGroups: ["Notes"] });
+    assert.ok(notesOnlyActivity.scan.files.length > 0 && notesOnlyActivity.scan.files.every((file) => lanSyncTopLevelGroup(file.path) === "Notes"), "Expanded scan group materialized another folder");
+    assert.ok(notesOnlyActivity.files.length > 0 && notesOnlyActivity.files.every((file) => lanSyncTopLevelGroup(file.path) === "Notes"), "Expanded transfer group materialized another folder");
+    const periodicRequestId = serviceA.fullSyncRequestId;
+    serviceA.syncRunning = true;
+    serviceA.requestPeriodicSync();
+    assert.equal(serviceA.fullSyncRequestId, periodicRequestId, "Periodic calibration replaced the active synchronization request");
+    assert.equal(serviceA.syncQueued, false, "Periodic calibration queued a redundant scan during active synchronization");
+    serviceA.syncRunning = false;
     assert.equal(storageA.readCount("Notes/from-b.md"), 0, "A verified remote write was read back only to hash it again");
     const readsBeforeCachedScan = storageA.totalReads();
     const completedScanId = activityA.scan.id;
@@ -535,6 +558,8 @@ try {
     assert.ok(mirroredPushA && mirroredPushB, "Both peers did not finish the same incremental session");
     assert.equal(mirroredPushA.uploads, mirroredPushB.downloads, "Coordinator uploads did not mirror peer downloads");
     assert.equal(mirroredPushA.downloads, mirroredPushB.uploads, "Coordinator downloads did not mirror peer uploads");
+    assert.equal(mirroredPushA.uploadCompleted, mirroredPushB.downloadCompleted, "Coordinator completed uploads did not mirror peer completed downloads");
+    assert.equal(mirroredPushA.downloadCompleted, mirroredPushB.uploadCompleted, "Coordinator completed downloads did not mirror peer completed uploads");
     assert.equal(mirroredPushA.bytesTotal, mirroredPushB.bytesTotal, "The two peers did not share the same byte total");
     assert.equal(mirroredPushA.bytesTransferred, mirroredPushB.bytesTransferred, "The two peers did not finish the same transferred bytes");
     storageB.putText("Notes/identical.md", "changed on B", 710);
@@ -714,13 +739,19 @@ try {
   assert.match(source, /setIcon\(icon, "wifi"\)/, "Connected LAN status should keep the Wi-Fi icon");
   assert.match(source, /registerDomEvent\(item, "click", \(\) => this\.openLanSyncDetails\(\)\)/, "LAN status item should open live details on click");
   assert.match(source, /class NtfyLanSyncDetailsModal extends Modal/, "LAN sync details modal is missing");
-  assert.match(source, /renderScanSection\(body, scan, chinese\)/, "LAN scan section is missing");
-  assert.match(source, /renderTransferSection\(body, progress, files, chinese\)/, "LAN transfer section is missing");
+  assert.match(source, /renderScanSection\(body, scan, scanGroups, chinese\)/, "LAN scan section is missing");
+  assert.match(source, /renderTransferSection\(body, progress, files, transferGroups, chinese\)/, "LAN transfer section is missing");
   assert.match(source, /上传/, "LAN transfer details do not label uploads");
   assert.match(source, /下载/, "LAN transfer details do not label downloads");
+  assert.match(source, /progress\.uploadCompleted[^\n]*progress\.uploads/, "LAN details do not show completed/total uploads");
+  assert.match(source, /progress\.downloadCompleted[^\n]*progress\.downloads/, "LAN details do not show completed/total downloads");
+  assert.match(source, /title: chinese \? "立即扫描同步" : "Scan and sync now"/, "LAN details are missing the manual sync button");
+  assert.match(source, /this\.requestSync\(\)/, "LAN details manual sync button is not wired");
   assert.match(source, /this\.sectionState = \{ scan: false, transfer: false \}/, "LAN activity file lists should be collapsed by default");
-  assert.match(source, /includeScanFiles: this\.sectionState\.scan/, "Collapsed scans should not materialize hidden file rows");
-  assert.match(source, /includeTransferFiles: this\.sectionState\.transfer/, "Collapsed transfers should not materialize hidden file rows");
+  assert.match(source, /includeScanFiles: this\.sectionState\.scan && expandedScanGroups\.length > 0/, "Collapsed scan groups should not materialize hidden file rows");
+  assert.match(source, /includeTransferFiles: this\.sectionState\.transfer && expandedTransferGroups\.length > 0/, "Collapsed transfer groups should not materialize hidden file rows");
+  assert.match(source, /renderActivityGroups\(panel, groups, scanFiles, "scan", chinese\)/, "Scan files are not grouped by top-level folder");
+  assert.match(source, /renderActivityGroups\(panel, groups, Array\.isArray\(files\) \? files : \[\], "transfer", chinese\)/, "Transfer files are not grouped by top-level folder");
   assert.match(source, /createEl\("progress"/, "LAN details should expose progress bars");
   assert.match(source, /this\.app\.vault\.on\("create"/, "New Vault files should trigger LAN sync");
   assert.match(source, /attachment\/write/, "LAN attachments should use the temporary inbox route");
@@ -737,6 +768,8 @@ try {
   assert.doesNotMatch(lanSource, /buildLanConflictPath\s*\(/, "LAN sync still contains a conflict-copy path generator");
   assert.doesNotMatch(lanSource, /action\.kind === "conflict"/, "LAN sync still contains a conflict-copy executor");
   assert.match(lanSource, /peer_upgrade_required/, "Outdated LAN peers are not isolated from the original-path protocol");
+  assert.match(lanSource, /const SMALL_TRANSFER_CONCURRENCY = 12/, "Small-file LAN transfers are not using the fast bounded worker pool");
+  assert.match(lanSource, /if \(!this\.runningValue \|\| this\.syncRunning \|\| this\.inboundSession \|\| !this\.isCoordinator\(\)\) return;/, "Periodic full scans can still interrupt an active transfer");
   assert.match(takeoverSource, /plugins\?\.\["remotely-save"\]\?\.statusBarElement/);
   assert.doesNotMatch(takeoverSource, /isSyncing|currSyncMsg|syncEvent|remotelySave\.settings|candidate\.settings|start-sync/);
   assert.doesNotMatch(takeoverSource, /plugins\/remotely-save|plugins\\remotely-save/);

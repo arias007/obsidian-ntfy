@@ -770,6 +770,7 @@ var NtfyLanSyncRuntime = (() => {
     isLanInboxAttachmentPath: () => isLanInboxAttachmentPath,
     isLanSyncPathEligible: () => isLanSyncPathEligible,
     isPrivateLanAddress: () => isPrivateLanAddress,
+    lanSyncTopLevelGroup: () => lanSyncTopLevelGroup,
     normalizeLanInboxAttachmentPath: () => normalizeLanInboxAttachmentPath,
     normalizeLanSyncPath: () => normalizeLanSyncPath,
     normalizeManualLanPeer: () => normalizeManualLanPeer,
@@ -791,7 +792,11 @@ var NtfyLanSyncRuntime = (() => {
   var REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 6e4;
   var SYNC_MIN_INTERVAL_MS = 400;
   var HASH_CONCURRENCY = 12;
-  var TRANSFER_CONCURRENCY = 6;
+  var LARGE_TRANSFER_CONCURRENCY = 6;
+  var MEDIUM_TRANSFER_CONCURRENCY = 8;
+  var SMALL_TRANSFER_CONCURRENCY = 12;
+  var SMALL_TRANSFER_BYTES = 512 * 1024;
+  var MEDIUM_TRANSFER_BYTES = 2 * 1024 * 1024;
   var MAX_CLOCK_SKEW_MS = 12e4;
   var REPLAY_TTL_MS = 18e4;
   var MAX_MANIFEST_FILES = 1e5;
@@ -1321,9 +1326,83 @@ ${bodyHash}`;
       changed: 0,
       conflicts: 0,
       uploads: 0,
+      uploadCompleted: 0,
       downloads: 0,
+      downloadCompleted: 0,
       error: ""
     };
+  }
+  function lanSyncTopLevelGroup(path) {
+    const normalized = String(path || "").replace(/\\/g, "/").replace(/^\/+/, "");
+    const separator = normalized.indexOf("/");
+    return separator < 0 ? "" : normalized.slice(0, separator);
+  }
+  function adaptiveTransferConcurrency(actions) {
+    const largest = actions.reduce((maximum, action) => Math.max(maximum, Math.max(0, Number(action.size) || 0)), 0);
+    if (largest <= SMALL_TRANSFER_BYTES) return Math.min(SMALL_TRANSFER_CONCURRENCY, Math.max(1, actions.length));
+    if (largest <= MEDIUM_TRANSFER_BYTES) return Math.min(MEDIUM_TRANSFER_CONCURRENCY, Math.max(1, actions.length));
+    return Math.min(LARGE_TRANSFER_CONCURRENCY, Math.max(1, actions.length));
+  }
+  function emptyActivityGroup(key) {
+    return {
+      key,
+      total: 0,
+      completed: 0,
+      active: 0,
+      errors: 0,
+      bytesTotal: 0,
+      bytesTransferred: 0,
+      uploads: 0,
+      uploadCompleted: 0,
+      downloads: 0,
+      downloadCompleted: 0
+    };
+  }
+  function sortedActivityGroups(groups) {
+    return [...groups.values()].sort((left, right) => {
+      if (!left.key) return -1;
+      if (!right.key) return 1;
+      return left.key.localeCompare(right.key);
+    });
+  }
+  function summarizeTransferGroups(files) {
+    const groups = /* @__PURE__ */ new Map();
+    for (const file of files) {
+      const key = lanSyncTopLevelGroup(file.path);
+      const group = groups.get(key) ?? emptyActivityGroup(key);
+      groups.set(key, group);
+      group.total += 1;
+      group.bytesTotal += file.size;
+      if (file.state === "complete") {
+        group.completed += 1;
+        group.bytesTransferred += file.size;
+      } else if (file.state === "syncing") group.active += 1;
+      else if (file.state === "error") group.errors += 1;
+      if (file.action === "push") {
+        group.uploads += 1;
+        if (file.state === "complete") group.uploadCompleted += 1;
+      } else if (file.action === "pull") {
+        group.downloads += 1;
+        if (file.state === "complete") group.downloadCompleted += 1;
+      }
+    }
+    return sortedActivityGroups(groups);
+  }
+  function summarizeScanGroups(files) {
+    const groups = /* @__PURE__ */ new Map();
+    for (const file of files) {
+      const key = lanSyncTopLevelGroup(file.path);
+      const group = groups.get(key) ?? emptyActivityGroup(key);
+      groups.set(key, group);
+      group.total += 1;
+      group.bytesTotal += file.size;
+      if (file.state === "cached" || file.state === "complete" || file.state === "skipped") {
+        group.completed += 1;
+        group.bytesTransferred += file.size;
+      } else if (file.state === "hashing") group.active += 1;
+      else if (file.state === "error") group.errors += 1;
+    }
+    return sortedActivityGroups(groups);
   }
   function identityFromRaw(value) {
     if (!isRecord(value) || value.schemaVersion !== 1) return null;
@@ -1456,13 +1535,19 @@ ${bodyHash}`;
     activity(options = {}) {
       const includeScanFiles = options.includeScanFiles !== false;
       const includeTransferFiles = options.includeTransferFiles !== false;
+      const scanGroups = Array.isArray(options.scanGroups) ? new Set(options.scanGroups.map(String)) : null;
+      const transferGroups = Array.isArray(options.transferGroups) ? new Set(options.transferGroups.map(String)) : null;
+      const scanFiles = scanGroups ? this.scanValue.files.filter((file) => scanGroups.has(lanSyncTopLevelGroup(file.path))) : this.scanValue.files;
+      const transferFiles = transferGroups ? this.activityFiles.filter((file) => transferGroups.has(lanSyncTopLevelGroup(file.path))) : this.activityFiles;
       return {
         progress: { ...this.progressValue },
-        files: includeTransferFiles ? this.activityFiles.map((file) => ({ ...file })) : [],
+        files: includeTransferFiles ? transferFiles.map((file) => ({ ...file })) : [],
         scan: {
           ...this.scanValue,
-          files: includeScanFiles ? this.scanValue.files.map((file) => ({ ...file })) : []
-        }
+          files: includeScanFiles ? scanFiles.map((file) => ({ ...file })) : []
+        },
+        transferGroups: summarizeTransferGroups(this.activityFiles),
+        scanGroups: summarizeScanGroups(this.scanValue.files)
       };
     }
     listPeers() {
@@ -1542,7 +1627,15 @@ ${bodyHash}`;
       }
       this.activityFiles = [{ path: `${LAN_INBOX_ROOT}/${attachmentId}/${name}`, action: "push", state: "syncing", size: bytes.byteLength }];
       this.activityUpdatedAt = this.now();
-      this.emit({ ...defaultProgress("syncing"), active: true, peerId: peer.deviceId, total: 1, bytesTotal: bytes.byteLength });
+      this.emit({
+        ...defaultProgress("syncing"),
+        active: true,
+        peerId: peer.deviceId,
+        total: 1,
+        bytesTotal: bytes.byteLength,
+        uploads: 1,
+        uploadCompleted: 0
+      });
       try {
         const response = await this.callPeer(peer, "/attachment/write", {
           attachmentId,
@@ -1554,11 +1647,31 @@ ${bodyHash}`;
         const attachment = this.parseAttachment(response);
         this.activityFiles[0].path = attachment.path;
         this.activityFiles[0].state = "complete";
-        this.emit({ ...defaultProgress("complete"), active: true, peerId: peer.deviceId, completed: 1, total: 1, bytesTransferred: bytes.byteLength, bytesTotal: bytes.byteLength, changed: 1 });
+        this.emit({
+          ...defaultProgress("complete"),
+          active: true,
+          peerId: peer.deviceId,
+          completed: 1,
+          total: 1,
+          bytesTransferred: bytes.byteLength,
+          bytesTotal: bytes.byteLength,
+          changed: 1,
+          uploads: 1,
+          uploadCompleted: 1
+        });
         return attachment;
       } catch (error) {
         this.activityFiles[0].state = "error";
-        this.emit({ ...defaultProgress("error"), active: true, peerId: peer.deviceId, total: 1, bytesTotal: bytes.byteLength, error: safeErrorCode(error) });
+        this.emit({
+          ...defaultProgress("error"),
+          active: true,
+          peerId: peer.deviceId,
+          total: 1,
+          bytesTotal: bytes.byteLength,
+          uploads: 1,
+          uploadCompleted: 0,
+          error: safeErrorCode(error)
+        });
         throw error;
       }
     }
@@ -1605,7 +1718,7 @@ ${bodyHash}`;
         this.intervals.push(setInterval(() => this.announce(), ANNOUNCE_INTERVAL_MS));
         this.intervals.push(setInterval(() => void this.probePeers(), PEER_PROBE_INTERVAL_MS));
         this.intervals.push(setInterval(() => {
-          if (this.settings().autoDiscovery) this.requestSync();
+          if (this.settings().autoDiscovery) this.requestPeriodicSync();
         }, settings.checkIntervalSeconds * 1e3));
         this.intervals.push(setInterval(() => this.sweepPeers(), PEER_SWEEP_INTERVAL_MS));
         this.announce();
@@ -1685,6 +1798,14 @@ ${bodyHash}`;
       this.fullSyncRequestId = randomId(18);
       this.syncRequestId = this.fullSyncRequestId;
       this.scheduleSync(0, true);
+    }
+    requestPeriodicSync() {
+      if (!this.runningValue || this.syncRunning || this.inboundSession || !this.isCoordinator()) return;
+      if (!this.syncTargets().length) return;
+      this.fullSyncRequested = true;
+      this.fullSyncRequestId = randomId(18);
+      this.syncRequestId = this.fullSyncRequestId;
+      this.scheduleSync(0, false);
     }
     settings() {
       const raw = this.options.getSettings();
@@ -2156,9 +2277,9 @@ ${bodyHash}`;
       if (firstVerifiedConnection && route.endsWith("/ping")) this.syncRequestId = randomId(18);
       const transfer = route.includes("/file/") || route.includes("/attachment/");
       if (transfer) this.lastTransferAt = this.now();
-      if (transfer || this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing") {
+      if (!transfer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
         this.emit({
-          ...defaultProgress(transfer ? "syncing" : "connected"),
+          ...defaultProgress("connected"),
           active: true,
           peerId: deviceId
         });
@@ -2202,7 +2323,9 @@ ${bodyHash}`;
     emitInboundFileProgress(deviceId, phase = "syncing") {
       const completed = this.activityFiles.filter((file) => file.state === "complete").length;
       const uploads = this.activityFiles.filter((file) => file.action === "push").length;
+      const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
       const downloads = this.activityFiles.filter((file) => file.action === "pull").length;
+      const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
       const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
       this.emit({
         ...defaultProgress(phase),
@@ -2214,7 +2337,9 @@ ${bodyHash}`;
         bytesTotal: this.activityFiles.reduce((sum, file) => sum + file.size, 0),
         changed: completed,
         uploads,
+        uploadCompleted,
         downloads,
+        downloadCompleted,
         error: phase === "error" ? "inbound_transfer_failed" : ""
       });
     }
@@ -2395,7 +2520,7 @@ ${bodyHash}`;
         peer.consecutiveFailures = 0;
         peer.lastFailureAt = 0;
         this.lastErrorValue = "";
-        if (this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing") {
+        if (this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
           this.emit({ ...defaultProgress("connected"), active: true, peerId: peer.deviceId });
         }
         this.emitPeersChanged();
@@ -2431,7 +2556,8 @@ ${bodyHash}`;
         this.emitPeersChanged();
         return;
       }
-      if (this.progressValue.phase === "syncing" && !this.syncRunning && this.now() - this.lastTransferAt > 500) {
+      const hasActiveTransfer = this.activityFiles.some((file) => file.state === "syncing");
+      if (this.progressValue.phase === "syncing" && !this.syncRunning && !this.inboundSession && !hasActiveTransfer && this.now() - this.lastTransferAt > 500) {
         this.emit({ ...defaultProgress("connected"), active: true, peerId: active[0].deviceId });
       }
     }
@@ -2585,6 +2711,8 @@ ${bodyHash}`;
         files: this.activityFiles.map((file) => ({ path: file.path, action: file.action, size: file.size }))
       });
       let completed = 0;
+      let uploadCompleted = 0;
+      let downloadCompleted = 0;
       let bytesTransferred = 0;
       let changed = 0;
       let conflicts = 0;
@@ -2595,7 +2723,9 @@ ${bodyHash}`;
         total: actions.length,
         bytesTotal,
         uploads,
-        downloads
+        uploadCompleted,
+        downloads,
+        downloadCompleted
       });
       let cursor = 0;
       let failure = null;
@@ -2618,7 +2748,9 @@ ${bodyHash}`;
               changed,
               conflicts,
               uploads,
-              downloads
+              uploadCompleted,
+              downloads,
+              downloadCompleted
             });
           }
           try {
@@ -2627,6 +2759,8 @@ ${bodyHash}`;
             settledPaths.add(actions[index].path);
             if (result.commit) commits.push(result.commit);
             completed += 1;
+            if (actions[index].kind === "push") uploadCompleted += 1;
+            else if (actions[index].kind === "pull") downloadCompleted += 1;
             bytesTransferred += result.bytes;
             changed += result.changed ? 1 : 0;
             conflicts += result.conflict ? 1 : 0;
@@ -2643,7 +2777,9 @@ ${bodyHash}`;
               changed,
               conflicts,
               uploads,
-              downloads
+              uploadCompleted,
+              downloads,
+              downloadCompleted
             });
           } catch (error) {
             if (activity) activity.state = "error";
@@ -2652,7 +2788,7 @@ ${bodyHash}`;
           }
         }
       };
-      await Promise.all(Array.from({ length: Math.min(TRANSFER_CONCURRENCY, actions.length) }, transferWorker));
+      await Promise.all(Array.from({ length: adaptiveTransferConcurrency(this.activityFiles) }, transferWorker));
       this.saveMetadataLedger(peer.deviceId, ledger);
       const success = failure === null && completed === actions.length;
       const acknowledgedRemoteDirty = [...request.remoteDirty.entries()].filter(([path]) => settledPaths.has(path)).map(([path, generation]) => ({ path, generation }));
@@ -2691,7 +2827,9 @@ ${bodyHash}`;
         changed,
         conflicts,
         uploads,
-        downloads
+        uploadCompleted,
+        downloads,
+        downloadCompleted
       });
       return {
         settledLocalPaths: new Set([...request.localDirty.keys()].filter((path) => settledPaths.has(path))),
@@ -2732,7 +2870,11 @@ ${bodyHash}`;
         size: Math.max(action.local?.size ?? 0, action.remote?.size ?? 0)
       }));
       this.activityUpdatedAt = this.now();
+      const uploads = actions.filter((action) => action.kind === "push").length;
+      const downloads = actions.filter((action) => action.kind === "pull").length;
       let completed = 0;
+      let uploadCompleted = 0;
+      let downloadCompleted = 0;
       let bytesTransferred = 0;
       let changed = 0;
       let conflicts = 0;
@@ -2741,7 +2883,11 @@ ${bodyHash}`;
         active: true,
         peerId: peer.deviceId,
         total: actions.length,
-        bytesTotal
+        bytesTotal,
+        uploads,
+        uploadCompleted,
+        downloads,
+        downloadCompleted
       });
       let cursor = 0;
       let failure = null;
@@ -2762,13 +2908,19 @@ ${bodyHash}`;
               bytesTransferred,
               bytesTotal,
               changed,
-              conflicts
+              conflicts,
+              uploads,
+              uploadCompleted,
+              downloads,
+              downloadCompleted
             });
           }
           try {
             const result = await this.executeAction(peer, actions[index], ledger);
             if (activity) activity.state = "complete";
             completed += 1;
+            if (actions[index].kind === "push") uploadCompleted += 1;
+            else if (actions[index].kind === "pull") downloadCompleted += 1;
             bytesTransferred += result.bytes;
             changed += result.changed ? 1 : 0;
             conflicts += result.conflict ? 1 : 0;
@@ -2783,7 +2935,11 @@ ${bodyHash}`;
               bytesTransferred,
               bytesTotal,
               changed,
-              conflicts
+              conflicts,
+              uploads,
+              uploadCompleted,
+              downloads,
+              downloadCompleted
             });
           } catch (error) {
             if (activity) activity.state = "error";
@@ -2792,7 +2948,7 @@ ${bodyHash}`;
           }
         }
       };
-      await Promise.all(Array.from({ length: Math.min(TRANSFER_CONCURRENCY, actions.length) }, transferWorker));
+      await Promise.all(Array.from({ length: adaptiveTransferConcurrency(this.activityFiles) }, transferWorker));
       if (failure !== null) throw failure;
       this.saveLedger(peer.deviceId, ledger);
       peer.verifiedAt = this.now();
@@ -2808,7 +2964,11 @@ ${bodyHash}`;
         bytesTransferred,
         bytesTotal,
         changed,
-        conflicts
+        conflicts,
+        uploads,
+        uploadCompleted,
+        downloads,
+        downloadCompleted
       });
     }
     async executeMetadataAction(peer, action, ledger, sessionId) {
@@ -3593,7 +3753,9 @@ ${bodyHash}`;
         total: files.length,
         bytesTotal,
         uploads: coordinatorDownloads,
-        downloads: coordinatorUploads
+        uploadCompleted: 0,
+        downloads: coordinatorUploads,
+        downloadCompleted: 0
       });
       return { ok: true, sessionId };
     }
@@ -3634,6 +3796,8 @@ ${bodyHash}`;
         for (const file of this.activityFiles) if (file.state === "pending" || file.state === "syncing") file.state = "error";
       }
       const completed = this.activityFiles.filter((file) => file.state === "complete").length;
+      const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
+      const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
       const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
       this.emit({
         ...defaultProgress(success ? "complete" : "error"),
@@ -3645,7 +3809,9 @@ ${bodyHash}`;
         bytesTotal: session.bytesTotal,
         changed: completed,
         uploads: session.uploads,
+        uploadCompleted,
         downloads: session.downloads,
+        downloadCompleted,
         error: success ? "" : "inbound_transfer_failed"
       });
       this.activityUpdatedAt = this.now();
@@ -3732,14 +3898,16 @@ ${bodyHash}`;
 const { NtfyLanSync, LanStatusBarTakeover, hashLanSyncBytes, isLanInboxAttachmentPath, isLanSyncPathEligible } = NtfyLanSyncRuntime;
 
 class NtfyLanSyncDetailsModal extends Modal {
-  constructor(app, getSnapshot, isChinese, onClosed) {
+  constructor(app, getSnapshot, isChinese, requestSync, onClosed) {
     super(app);
     this.getSnapshot = getSnapshot;
     this.isChinese = isChinese;
+    this.requestSync = requestSync;
     this.onClosed = onClosed;
     this.bodyEl = null;
     this.refreshTimer = null;
     this.sectionState = { scan: false, transfer: false };
+    this.groupState = { scan: new Set(), transfer: new Set() };
   }
 
   onOpen() {
@@ -3770,9 +3938,19 @@ class NtfyLanSyncDetailsModal extends Modal {
     if (!body) return;
     const scrollTop = body.scrollTop;
     const chinese = this.isChinese();
-    const { progress, files, scan = { phase: "idle", completed: 0, total: 0, cached: 0, hashed: 0, skipped: 0, error: "", files: [] } } = this.getSnapshot({
-      includeScanFiles: this.sectionState.scan,
-      includeTransferFiles: this.sectionState.transfer,
+    const expandedScanGroups = [...this.groupState.scan];
+    const expandedTransferGroups = [...this.groupState.transfer];
+    const {
+      progress,
+      files,
+      scan = { phase: "idle", completed: 0, total: 0, cached: 0, hashed: 0, skipped: 0, error: "", files: [] },
+      scanGroups = [],
+      transferGroups = [],
+    } = this.getSnapshot({
+      includeScanFiles: this.sectionState.scan && expandedScanGroups.length > 0,
+      includeTransferFiles: this.sectionState.transfer && expandedTransferGroups.length > 0,
+      scanGroups: expandedScanGroups,
+      transferGroups: expandedTransferGroups,
     });
     body.empty();
 
@@ -3805,19 +3983,33 @@ class NtfyLanSyncDetailsModal extends Modal {
     if (progress.total > 0) progressParts.push(`${chinese ? "同步" : "Sync"} ${progress.completed}/${progress.total}`);
     if (progress.uploads > 0 || progress.downloads > 0) {
       progressParts.push(chinese
-        ? `上传 ${progress.uploads || 0} · 下载 ${progress.downloads || 0}`
-        : `Upload ${progress.uploads || 0} · Download ${progress.downloads || 0}`);
+        ? `上传 ${progress.uploadCompleted || 0}/${progress.uploads || 0} · 下载 ${progress.downloadCompleted || 0}/${progress.downloads || 0}`
+        : `Upload ${progress.uploadCompleted || 0}/${progress.uploads || 0} · Download ${progress.downloadCompleted || 0}/${progress.downloads || 0}`);
     }
     if (progress.bytesTotal > 0) progressParts.push(`${formatLanFileSize(progress.bytesTransferred)} / ${formatLanFileSize(progress.bytesTotal)}`);
     if (progress.peerCount > 0) progressParts.push(chinese ? `${progress.peerCount} 台设备` : `${progress.peerCount} device${progress.peerCount === 1 ? "" : "s"}`);
     if (progressParts.length) summaryText.createDiv({ cls: "obsidian-ntfy-lan-details-meta", text: progressParts.join(" · ") });
 
-    this.renderScanSection(body, scan, chinese);
-    this.renderTransferSection(body, progress, files, chinese);
+    const syncButton = summary.createEl("button", {
+      cls: "clickable-icon obsidian-ntfy-lan-sync-now",
+      attr: {
+        type: "button",
+        title: chinese ? "立即扫描同步" : "Scan and sync now",
+        "aria-label": chinese ? "立即扫描同步" : "Scan and sync now",
+      },
+    });
+    setIcon(syncButton, progress.phase === "scanning" || progress.phase === "syncing" ? "loader-circle" : "refresh-cw");
+    syncButton.addEventListener("click", () => {
+      this.requestSync();
+      this.refresh();
+    });
+
+    this.renderScanSection(body, scan, scanGroups, chinese);
+    this.renderTransferSection(body, progress, files, transferGroups, chinese);
     body.scrollTop = scrollTop;
   }
 
-  renderScanSection(body, scan, chinese) {
+  renderScanSection(body, scan, groups, chinese) {
     const details = body.createEl("details", { cls: "obsidian-ntfy-lan-details-section" });
     details.open = this.sectionState.scan;
     details.addEventListener("toggle", () => {
@@ -3836,14 +4028,11 @@ class NtfyLanSyncDetailsModal extends Modal {
     const progress = panel.createEl("progress", { cls: "obsidian-ntfy-lan-details-progress", attr: { max: String(Math.max(1, scan.total || 0)), value: String(Math.min(scan.completed || 0, Math.max(1, scan.total || 0))) } });
     progress.setAttribute("aria-label", label);
     const scanFiles = Array.isArray(scan.files) ? scan.files : [];
-    if (!scanFiles.length) panel.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: chinese ? "连接后自动开始全库扫描" : "A full-vault scan starts automatically after connection" });
-    const visible = this.visibleFiles(scanFiles, 500);
-    const list = panel.createDiv({ cls: "obsidian-ntfy-lan-details-list is-scan" });
-    for (const file of visible) this.renderScanFile(list, file, chinese);
-    if (visible.length < scanFiles.length) panel.createDiv({ cls: "obsidian-ntfy-lan-details-limit", text: chinese ? `显示 ${visible.length}/${scanFiles.length}` : `Showing ${visible.length}/${scanFiles.length}` });
+    if (!groups.length) panel.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: chinese ? "连接后自动开始全库扫描" : "A full-vault scan starts automatically after connection" });
+    this.renderActivityGroups(panel, groups, scanFiles, "scan", chinese);
   }
 
-  renderTransferSection(body, progress, files, chinese) {
+  renderTransferSection(body, progress, files, groups, chinese) {
     const details = body.createEl("details", { cls: "obsidian-ntfy-lan-details-section" });
     details.open = this.sectionState.transfer;
     details.addEventListener("toggle", () => {
@@ -3855,8 +4044,8 @@ class NtfyLanSyncDetailsModal extends Modal {
     const label = `${chinese ? "同步" : "Sync"} ${progress.completed || 0}/${progress.total || 0}`;
     summary.createSpan({ text: label });
     const directionSummary = chinese
-      ? `上传 ${progress.uploads || 0} · 下载 ${progress.downloads || 0}`
-      : `Upload ${progress.uploads || 0} · Download ${progress.downloads || 0}`;
+      ? `上传 ${progress.uploadCompleted || 0}/${progress.uploads || 0} · 下载 ${progress.downloadCompleted || 0}/${progress.downloads || 0}`
+      : `Upload ${progress.uploadCompleted || 0}/${progress.uploads || 0} · Download ${progress.downloadCompleted || 0}/${progress.downloads || 0}`;
     summary.createSpan({ cls: "obsidian-ntfy-lan-details-section-meta", text: progress.bytesTotal > 0
       ? `${directionSummary} · ${formatLanFileSize(progress.bytesTransferred)} / ${formatLanFileSize(progress.bytesTotal)}`
       : directionSummary });
@@ -3864,11 +4053,48 @@ class NtfyLanSyncDetailsModal extends Modal {
     const panel = details.createDiv({ cls: "obsidian-ntfy-lan-details-section-body" });
     const bar = panel.createEl("progress", { cls: "obsidian-ntfy-lan-details-progress", attr: { max: String(Math.max(1, progress.bytesTotal || progress.total || 0)), value: String(Math.min(progress.bytesTotal ? progress.bytesTransferred : progress.completed || 0, Math.max(1, progress.bytesTotal || progress.total || 0))) } });
     bar.setAttribute("aria-label", label);
-    if (!files.length) panel.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: progress.phase === "complete" ? (chinese ? "本轮没有需要传输的文件" : "No files needed transfer in this scan") : (chinese ? "尚无传输任务" : "No transfer jobs yet") });
-    const visible = this.visibleFiles(files, 500);
-    const list = panel.createDiv({ cls: "obsidian-ntfy-lan-details-list" });
-    for (const file of visible) this.renderFile(list, file, chinese);
-    if (visible.length < files.length) panel.createDiv({ cls: "obsidian-ntfy-lan-details-limit", text: chinese ? `显示 ${visible.length}/${files.length}` : `Showing ${visible.length}/${files.length}` });
+    if (!groups.length) panel.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: progress.phase === "complete" ? (chinese ? "本轮没有需要传输的文件" : "No files needed transfer in this scan") : (chinese ? "尚无传输任务" : "No transfer jobs yet") });
+    this.renderActivityGroups(panel, groups, Array.isArray(files) ? files : [], "transfer", chinese);
+  }
+
+  fileGroupKey(path) {
+    const normalized = String(path || "").replace(/\\/g, "/").replace(/^\/+/, "");
+    const separator = normalized.indexOf("/");
+    return separator < 0 ? "" : normalized.slice(0, separator);
+  }
+
+  groupLabel(key, chinese) {
+    return key || (chinese ? "根目录" : "Vault root");
+  }
+
+  renderActivityGroups(parent, groups, files, kind, chinese) {
+    const openGroups = this.groupState[kind];
+    for (const group of groups) {
+      const details = parent.createEl("details", { cls: "obsidian-ntfy-lan-details-group" });
+      details.open = openGroups.has(group.key);
+      details.addEventListener("toggle", () => {
+        if (details.open) openGroups.add(group.key);
+        else openGroups.delete(group.key);
+        this.refresh();
+      });
+      const summary = details.createEl("summary");
+      summary.createSpan({ cls: "obsidian-ntfy-lan-details-group-name", text: this.groupLabel(group.key, chinese) });
+      const meta = kind === "transfer"
+        ? (chinese
+          ? `${group.completed}/${group.total} · 上传 ${group.uploadCompleted}/${group.uploads} · 下载 ${group.downloadCompleted}/${group.downloads}`
+          : `${group.completed}/${group.total} · Upload ${group.uploadCompleted}/${group.uploads} · Download ${group.downloadCompleted}/${group.downloads}`)
+        : `${group.completed}/${group.total}`;
+      summary.createSpan({ cls: "obsidian-ntfy-lan-details-group-meta", text: meta });
+      if (!details.open) continue;
+      const groupFiles = files.filter((file) => this.fileGroupKey(file.path) === group.key);
+      const visible = this.visibleFiles(groupFiles, 250);
+      const list = details.createDiv({ cls: `obsidian-ntfy-lan-details-list${kind === "scan" ? " is-scan" : ""}` });
+      for (const file of visible) {
+        if (kind === "scan") this.renderScanFile(list, file, chinese);
+        else this.renderFile(list, file, chinese);
+      }
+      if (visible.length < group.total) details.createDiv({ cls: "obsidian-ntfy-lan-details-limit", text: chinese ? `显示 ${visible.length}/${group.total}` : `Showing ${visible.length}/${group.total}` });
+    }
   }
 
   renderScanFile(parent, file, chinese) {
@@ -4445,7 +4671,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       changed: 0,
       conflicts: 0,
       uploads: 0,
+      uploadCompleted: 0,
       downloads: 0,
+      downloadCompleted: 0,
       error: "",
     };
   }
@@ -4693,6 +4921,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       progress: Object.assign({}, this.lanSyncProgress),
       files: [],
       scan: { id: "", phase: "idle", completed: 0, total: 0, cached: 0, hashed: 0, skipped: 0, error: "", files: [] },
+      transferGroups: [],
+      scanGroups: [],
     };
   }
 
@@ -4706,6 +4936,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       this.app,
       (options) => this.lanSyncActivitySnapshot(options),
       () => this.currentUiLanguage() === "zh",
+      () => this.requestLanSync(),
       () => {
         if (this.lanSyncDetailsModal === modal) this.lanSyncDetailsModal = null;
       }

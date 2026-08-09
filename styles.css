@@ -68,7 +68,7 @@
 
 .obsidian-ntfy-lan-details-summary {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr);
+  grid-template-columns: 24px minmax(0, 1fr) 32px;
   align-items: center;
   gap: 8px;
   min-height: 44px;
@@ -93,6 +93,21 @@
 .obsidian-ntfy-lan-details-summary-text {
   min-width: 0;
   font-size: var(--font-ui-small);
+}
+
+.obsidian-ntfy-lan-sync-now {
+  align-self: center;
+  width: 30px;
+  height: 30px;
+}
+
+.obsidian-ntfy-lan-sync-now svg {
+  width: 16px;
+  height: 16px;
+}
+
+.obsidian-ntfy-lan-details-summary:has(.obsidian-ntfy-lan-sync-now svg.lucide-loader-circle) .obsidian-ntfy-lan-sync-now svg {
+  animation: obsidian-ntfy-lan-spin 0.9s linear infinite;
 }
 
 .obsidian-ntfy-lan-details-meta {
@@ -149,6 +164,44 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
+}
+
+.obsidian-ntfy-lan-details-group {
+  border-top: 1px solid var(--background-modifier-border-hover);
+}
+
+.obsidian-ntfy-lan-details-group > summary {
+  display: grid;
+  grid-template-columns: minmax(96px, 1fr) minmax(0, auto);
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 3px 2px;
+  cursor: pointer;
+  font-size: var(--font-ui-smaller);
+}
+
+.obsidian-ntfy-lan-details-group-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-normal);
+  font-weight: 600;
+}
+
+.obsidian-ntfy-lan-details-group-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+
+.obsidian-ntfy-lan-details-group > .obsidian-ntfy-lan-details-list {
+  padding-left: 12px;
 }
 
 .obsidian-ntfy-lan-details-file {
@@ -263,6 +316,10 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
 
   .obsidian-ntfy-lan-details-section > summary {
     grid-template-columns: minmax(72px, auto) minmax(0, 1fr);
+  }
+
+  .obsidian-ntfy-lan-details-group > summary {
+    grid-template-columns: minmax(72px, 1fr) minmax(0, auto);
   }
 }
 

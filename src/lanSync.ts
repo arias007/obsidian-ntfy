@@ -110,7 +110,9 @@ export type LanSyncProgress = {
   changed: number;
   conflicts: number;
   uploads: number;
+  uploadCompleted: number;
   downloads: number;
+  downloadCompleted: number;
   error: string;
 };
 
@@ -142,10 +144,26 @@ export type LanSyncScanActivity = {
   files: LanSyncScanFileActivity[];
 };
 
+export type LanSyncActivityGroup = {
+  key: string;
+  total: number;
+  completed: number;
+  active: number;
+  errors: number;
+  bytesTotal: number;
+  bytesTransferred: number;
+  uploads: number;
+  uploadCompleted: number;
+  downloads: number;
+  downloadCompleted: number;
+};
+
 export type LanSyncActivitySnapshot = {
   progress: LanSyncProgress;
   files: LanSyncFileActivity[];
   scan: LanSyncScanActivity;
+  transferGroups: LanSyncActivityGroup[];
+  scanGroups: LanSyncActivityGroup[];
 };
 
 export type LanSyncServiceOptions = {
@@ -308,7 +326,11 @@ const PEER_MAX_ADDRESS_HISTORY = 8;
 const REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 const SYNC_MIN_INTERVAL_MS = 400;
 const HASH_CONCURRENCY = 12;
-const TRANSFER_CONCURRENCY = 6;
+const LARGE_TRANSFER_CONCURRENCY = 6;
+const MEDIUM_TRANSFER_CONCURRENCY = 8;
+const SMALL_TRANSFER_CONCURRENCY = 12;
+const SMALL_TRANSFER_BYTES = 512 * 1024;
+const MEDIUM_TRANSFER_BYTES = 2 * 1024 * 1024;
 const MAX_CLOCK_SKEW_MS = 120_000;
 const REPLAY_TTL_MS = 180_000;
 const MAX_MANIFEST_FILES = 100_000;
@@ -941,9 +963,89 @@ function defaultProgress(phase: LanSyncProgressPhase = "stopped"): LanSyncProgre
     changed: 0,
     conflicts: 0,
     uploads: 0,
+    uploadCompleted: 0,
     downloads: 0,
+    downloadCompleted: 0,
     error: ""
   };
+}
+
+export function lanSyncTopLevelGroup(path: string): string {
+  const normalized = String(path || "").replace(/\\/g, "/").replace(/^\/+/, "");
+  const separator = normalized.indexOf("/");
+  return separator < 0 ? "" : normalized.slice(0, separator);
+}
+
+function adaptiveTransferConcurrency(actions: Array<{ size: number }>): number {
+  const largest = actions.reduce((maximum, action) => Math.max(maximum, Math.max(0, Number(action.size) || 0)), 0);
+  if (largest <= SMALL_TRANSFER_BYTES) return Math.min(SMALL_TRANSFER_CONCURRENCY, Math.max(1, actions.length));
+  if (largest <= MEDIUM_TRANSFER_BYTES) return Math.min(MEDIUM_TRANSFER_CONCURRENCY, Math.max(1, actions.length));
+  return Math.min(LARGE_TRANSFER_CONCURRENCY, Math.max(1, actions.length));
+}
+
+function emptyActivityGroup(key: string): LanSyncActivityGroup {
+  return {
+    key,
+    total: 0,
+    completed: 0,
+    active: 0,
+    errors: 0,
+    bytesTotal: 0,
+    bytesTransferred: 0,
+    uploads: 0,
+    uploadCompleted: 0,
+    downloads: 0,
+    downloadCompleted: 0
+  };
+}
+
+function sortedActivityGroups(groups: Map<string, LanSyncActivityGroup>): LanSyncActivityGroup[] {
+  return [...groups.values()].sort((left, right) => {
+    if (!left.key) return -1;
+    if (!right.key) return 1;
+    return left.key.localeCompare(right.key);
+  });
+}
+
+function summarizeTransferGroups(files: LanSyncFileActivity[]): LanSyncActivityGroup[] {
+  const groups = new Map<string, LanSyncActivityGroup>();
+  for (const file of files) {
+    const key = lanSyncTopLevelGroup(file.path);
+    const group = groups.get(key) ?? emptyActivityGroup(key);
+    groups.set(key, group);
+    group.total += 1;
+    group.bytesTotal += file.size;
+    if (file.state === "complete") {
+      group.completed += 1;
+      group.bytesTransferred += file.size;
+    } else if (file.state === "syncing") group.active += 1;
+    else if (file.state === "error") group.errors += 1;
+    if (file.action === "push") {
+      group.uploads += 1;
+      if (file.state === "complete") group.uploadCompleted += 1;
+    } else if (file.action === "pull") {
+      group.downloads += 1;
+      if (file.state === "complete") group.downloadCompleted += 1;
+    }
+  }
+  return sortedActivityGroups(groups);
+}
+
+function summarizeScanGroups(files: LanSyncScanFileActivity[]): LanSyncActivityGroup[] {
+  const groups = new Map<string, LanSyncActivityGroup>();
+  for (const file of files) {
+    const key = lanSyncTopLevelGroup(file.path);
+    const group = groups.get(key) ?? emptyActivityGroup(key);
+    groups.set(key, group);
+    group.total += 1;
+    group.bytesTotal += file.size;
+    if (file.state === "cached" || file.state === "complete" || file.state === "skipped") {
+      group.completed += 1;
+      group.bytesTransferred += file.size;
+    } else if (file.state === "hashing") group.active += 1;
+    else if (file.state === "error") group.errors += 1;
+  }
+  return sortedActivityGroups(groups);
 }
 
 function identityFromRaw(value: unknown): LanSyncIdentity | null {
@@ -1087,16 +1189,31 @@ export class NtfyLanSync {
     return { ...scan };
   }
 
-  activity(options: { includeScanFiles?: boolean; includeTransferFiles?: boolean } = {}): LanSyncActivitySnapshot {
+  activity(options: {
+    includeScanFiles?: boolean;
+    includeTransferFiles?: boolean;
+    scanGroups?: string[];
+    transferGroups?: string[];
+  } = {}): LanSyncActivitySnapshot {
     const includeScanFiles = options.includeScanFiles !== false;
     const includeTransferFiles = options.includeTransferFiles !== false;
+    const scanGroups = Array.isArray(options.scanGroups) ? new Set(options.scanGroups.map(String)) : null;
+    const transferGroups = Array.isArray(options.transferGroups) ? new Set(options.transferGroups.map(String)) : null;
+    const scanFiles = scanGroups
+      ? this.scanValue.files.filter((file) => scanGroups.has(lanSyncTopLevelGroup(file.path)))
+      : this.scanValue.files;
+    const transferFiles = transferGroups
+      ? this.activityFiles.filter((file) => transferGroups.has(lanSyncTopLevelGroup(file.path)))
+      : this.activityFiles;
     return {
       progress: { ...this.progressValue },
-      files: includeTransferFiles ? this.activityFiles.map((file) => ({ ...file })) : [],
+      files: includeTransferFiles ? transferFiles.map((file) => ({ ...file })) : [],
       scan: {
         ...this.scanValue,
-        files: includeScanFiles ? this.scanValue.files.map((file) => ({ ...file })) : []
-      }
+        files: includeScanFiles ? scanFiles.map((file) => ({ ...file })) : []
+      },
+      transferGroups: summarizeTransferGroups(this.activityFiles),
+      scanGroups: summarizeScanGroups(this.scanValue.files)
     };
   }
 
@@ -1184,7 +1301,15 @@ export class NtfyLanSync {
     }
     this.activityFiles = [{ path: `${LAN_INBOX_ROOT}/${attachmentId}/${name}`, action: "push", state: "syncing", size: bytes.byteLength }];
     this.activityUpdatedAt = this.now();
-    this.emit({ ...defaultProgress("syncing"), active: true, peerId: peer.deviceId, total: 1, bytesTotal: bytes.byteLength });
+    this.emit({
+      ...defaultProgress("syncing"),
+      active: true,
+      peerId: peer.deviceId,
+      total: 1,
+      bytesTotal: bytes.byteLength,
+      uploads: 1,
+      uploadCompleted: 0
+    });
     try {
       const response = await this.callPeer(peer, "/attachment/write", {
         attachmentId,
@@ -1196,11 +1321,31 @@ export class NtfyLanSync {
       const attachment = this.parseAttachment(response);
       this.activityFiles[0].path = attachment.path;
       this.activityFiles[0].state = "complete";
-      this.emit({ ...defaultProgress("complete"), active: true, peerId: peer.deviceId, completed: 1, total: 1, bytesTransferred: bytes.byteLength, bytesTotal: bytes.byteLength, changed: 1 });
+      this.emit({
+        ...defaultProgress("complete"),
+        active: true,
+        peerId: peer.deviceId,
+        completed: 1,
+        total: 1,
+        bytesTransferred: bytes.byteLength,
+        bytesTotal: bytes.byteLength,
+        changed: 1,
+        uploads: 1,
+        uploadCompleted: 1
+      });
       return attachment;
     } catch (error) {
       this.activityFiles[0].state = "error";
-      this.emit({ ...defaultProgress("error"), active: true, peerId: peer.deviceId, total: 1, bytesTotal: bytes.byteLength, error: safeErrorCode(error) });
+      this.emit({
+        ...defaultProgress("error"),
+        active: true,
+        peerId: peer.deviceId,
+        total: 1,
+        bytesTotal: bytes.byteLength,
+        uploads: 1,
+        uploadCompleted: 0,
+        error: safeErrorCode(error)
+      });
       throw error;
     }
   }
@@ -1249,7 +1394,7 @@ export class NtfyLanSync {
       this.intervals.push(setInterval(() => this.announce(), ANNOUNCE_INTERVAL_MS));
       this.intervals.push(setInterval(() => void this.probePeers(), PEER_PROBE_INTERVAL_MS));
       this.intervals.push(setInterval(() => {
-        if (this.settings().autoDiscovery) this.requestSync();
+        if (this.settings().autoDiscovery) this.requestPeriodicSync();
       }, settings.checkIntervalSeconds * 1000));
       this.intervals.push(setInterval(() => this.sweepPeers(), PEER_SWEEP_INTERVAL_MS));
       this.announce();
@@ -1336,6 +1481,15 @@ export class NtfyLanSync {
     this.fullSyncRequestId = randomId(18);
     this.syncRequestId = this.fullSyncRequestId;
     this.scheduleSync(0, true);
+  }
+
+  private requestPeriodicSync(): void {
+    if (!this.runningValue || this.syncRunning || this.inboundSession || !this.isCoordinator()) return;
+    if (!this.syncTargets().length) return;
+    this.fullSyncRequested = true;
+    this.fullSyncRequestId = randomId(18);
+    this.syncRequestId = this.fullSyncRequestId;
+    this.scheduleSync(0, false);
   }
 
   private settings(): LanSyncRuntimeSettings {
@@ -1861,9 +2015,9 @@ export class NtfyLanSync {
     if (firstVerifiedConnection && route.endsWith("/ping")) this.syncRequestId = randomId(18);
     const transfer = route.includes("/file/") || route.includes("/attachment/");
     if (transfer) this.lastTransferAt = this.now();
-    if (transfer || (this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing")) {
+    if (!transfer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
       this.emit({
-        ...defaultProgress(transfer ? "syncing" : "connected"),
+        ...defaultProgress("connected"),
         active: true,
         peerId: deviceId
       });
@@ -1916,7 +2070,9 @@ export class NtfyLanSync {
   private emitInboundFileProgress(deviceId: string, phase: LanSyncProgressPhase = "syncing"): void {
     const completed = this.activityFiles.filter((file) => file.state === "complete").length;
     const uploads = this.activityFiles.filter((file) => file.action === "push").length;
+    const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
     const downloads = this.activityFiles.filter((file) => file.action === "pull").length;
+    const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
     const bytesTransferred = this.activityFiles
       .filter((file) => file.state === "complete")
       .reduce((sum, file) => sum + file.size, 0);
@@ -1930,7 +2086,9 @@ export class NtfyLanSync {
       bytesTotal: this.activityFiles.reduce((sum, file) => sum + file.size, 0),
       changed: completed,
       uploads,
+      uploadCompleted,
       downloads,
+      downloadCompleted,
       error: phase === "error" ? "inbound_transfer_failed" : ""
     });
   }
@@ -2130,7 +2288,7 @@ export class NtfyLanSync {
       peer.consecutiveFailures = 0;
       peer.lastFailureAt = 0;
       this.lastErrorValue = "";
-      if (this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing") {
+      if (this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
         this.emit({ ...defaultProgress("connected"), active: true, peerId: peer.deviceId });
       }
       this.emitPeersChanged();
@@ -2174,7 +2332,8 @@ export class NtfyLanSync {
       this.emitPeersChanged();
       return;
     }
-    if (this.progressValue.phase === "syncing" && !this.syncRunning && this.now() - this.lastTransferAt > 500) {
+    const hasActiveTransfer = this.activityFiles.some((file) => file.state === "syncing");
+    if (this.progressValue.phase === "syncing" && !this.syncRunning && !this.inboundSession && !hasActiveTransfer && this.now() - this.lastTransferAt > 500) {
       this.emit({ ...defaultProgress("connected"), active: true, peerId: active[0].deviceId });
     }
   }
@@ -2360,6 +2519,8 @@ export class NtfyLanSync {
       files: this.activityFiles.map((file) => ({ path: file.path, action: file.action, size: file.size }))
     });
     let completed = 0;
+    let uploadCompleted = 0;
+    let downloadCompleted = 0;
     let bytesTransferred = 0;
     let changed = 0;
     let conflicts = 0;
@@ -2370,7 +2531,9 @@ export class NtfyLanSync {
       total: actions.length,
       bytesTotal,
       uploads,
-      downloads
+      uploadCompleted,
+      downloads,
+      downloadCompleted
     });
     let cursor = 0;
     let failure: unknown = null;
@@ -2393,7 +2556,9 @@ export class NtfyLanSync {
             changed,
             conflicts,
             uploads,
-            downloads
+            uploadCompleted,
+            downloads,
+            downloadCompleted
           });
         }
         try {
@@ -2402,6 +2567,8 @@ export class NtfyLanSync {
           settledPaths.add(actions[index].path);
           if (result.commit) commits.push(result.commit);
           completed += 1;
+          if (actions[index].kind === "push") uploadCompleted += 1;
+          else if (actions[index].kind === "pull") downloadCompleted += 1;
           bytesTransferred += result.bytes;
           changed += result.changed ? 1 : 0;
           conflicts += result.conflict ? 1 : 0;
@@ -2418,7 +2585,9 @@ export class NtfyLanSync {
             changed,
             conflicts,
             uploads,
-            downloads
+            uploadCompleted,
+            downloads,
+            downloadCompleted
           });
         } catch (error) {
           if (activity) activity.state = "error";
@@ -2427,7 +2596,7 @@ export class NtfyLanSync {
         }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(TRANSFER_CONCURRENCY, actions.length) }, transferWorker));
+    await Promise.all(Array.from({ length: adaptiveTransferConcurrency(this.activityFiles) }, transferWorker));
     this.saveMetadataLedger(peer.deviceId, ledger);
     const success = failure === null && completed === actions.length;
     const acknowledgedRemoteDirty = [...request.remoteDirty.entries()]
@@ -2468,7 +2637,9 @@ export class NtfyLanSync {
       changed,
       conflicts,
       uploads,
-      downloads
+      uploadCompleted,
+      downloads,
+      downloadCompleted
     });
     return {
       settledLocalPaths: new Set([...request.localDirty.keys()].filter((path) => settledPaths.has(path))),
@@ -2512,7 +2683,11 @@ export class NtfyLanSync {
       size: Math.max(action.local?.size ?? 0, action.remote?.size ?? 0)
     }));
     this.activityUpdatedAt = this.now();
+    const uploads = actions.filter((action) => action.kind === "push").length;
+    const downloads = actions.filter((action) => action.kind === "pull").length;
     let completed = 0;
+    let uploadCompleted = 0;
+    let downloadCompleted = 0;
     let bytesTransferred = 0;
     let changed = 0;
     let conflicts = 0;
@@ -2521,7 +2696,11 @@ export class NtfyLanSync {
       active: true,
       peerId: peer.deviceId,
       total: actions.length,
-      bytesTotal
+      bytesTotal,
+      uploads,
+      uploadCompleted,
+      downloads,
+      downloadCompleted
     });
     let cursor = 0;
     let failure: unknown = null;
@@ -2542,13 +2721,19 @@ export class NtfyLanSync {
             bytesTransferred,
             bytesTotal,
             changed,
-            conflicts
+            conflicts,
+            uploads,
+            uploadCompleted,
+            downloads,
+            downloadCompleted
           });
         }
         try {
           const result = await this.executeAction(peer, actions[index], ledger);
           if (activity) activity.state = "complete";
           completed += 1;
+          if (actions[index].kind === "push") uploadCompleted += 1;
+          else if (actions[index].kind === "pull") downloadCompleted += 1;
           bytesTransferred += result.bytes;
           changed += result.changed ? 1 : 0;
           conflicts += result.conflict ? 1 : 0;
@@ -2563,7 +2748,11 @@ export class NtfyLanSync {
             bytesTransferred,
             bytesTotal,
             changed,
-            conflicts
+            conflicts,
+            uploads,
+            uploadCompleted,
+            downloads,
+            downloadCompleted
           });
         } catch (error) {
           if (activity) activity.state = "error";
@@ -2572,7 +2761,7 @@ export class NtfyLanSync {
         }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(TRANSFER_CONCURRENCY, actions.length) }, transferWorker));
+    await Promise.all(Array.from({ length: adaptiveTransferConcurrency(this.activityFiles) }, transferWorker));
     if (failure !== null) throw failure;
     this.saveLedger(peer.deviceId, ledger);
     peer.verifiedAt = this.now();
@@ -2588,7 +2777,11 @@ export class NtfyLanSync {
       bytesTransferred,
       bytesTotal,
       changed,
-      conflicts
+      conflicts,
+      uploads,
+      uploadCompleted,
+      downloads,
+      downloadCompleted
     });
   }
 
@@ -3463,7 +3656,9 @@ export class NtfyLanSync {
       total: files.length,
       bytesTotal,
       uploads: coordinatorDownloads,
-      downloads: coordinatorUploads
+      uploadCompleted: 0,
+      downloads: coordinatorUploads,
+      downloadCompleted: 0
     });
     return { ok: true, sessionId };
   }
@@ -3505,6 +3700,8 @@ export class NtfyLanSync {
       for (const file of this.activityFiles) if (file.state === "pending" || file.state === "syncing") file.state = "error";
     }
     const completed = this.activityFiles.filter((file) => file.state === "complete").length;
+    const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
+    const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
     const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
     this.emit({
       ...defaultProgress(success ? "complete" : "error"),
@@ -3516,7 +3713,9 @@ export class NtfyLanSync {
       bytesTotal: session.bytesTotal,
       changed: completed,
       uploads: session.uploads,
+      uploadCompleted,
       downloads: session.downloads,
+      downloadCompleted,
       error: success ? "" : "inbound_transfer_failed"
     });
     this.activityUpdatedAt = this.now();
