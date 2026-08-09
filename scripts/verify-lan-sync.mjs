@@ -41,6 +41,7 @@ class MemoryStorage {
     this.clock = 1000;
     this.readCounts = new Map();
     this.writeCounts = new Map();
+    this.beforeRead = null;
     this.mtimeTransform = typeof options.mtimeTransform === "function" ? options.mtimeTransform : (mtime) => mtime;
     this.putText(`${this.identityRoot}/identity.json`, `${JSON.stringify(identity)}\n`, 1);
     for (const [path, value] of Object.entries(files)) this.putText(path, value.content, value.mtime);
@@ -70,6 +71,7 @@ class MemoryStorage {
   }
 
   async readBinary(path) {
+    if (typeof this.beforeRead === "function") await this.beforeRead(path, this);
     const entry = this.files.get(path);
     if (!entry) throw new Error("missing_file");
     this.readCounts.set(path, (this.readCounts.get(path) || 0) + 1);
@@ -462,7 +464,7 @@ try {
   stabilityClock += 3_000;
   stabilityService.emitPeerConnectionStage(stabilityPeer);
   assert.equal(stabilityService.progress().stage, "peer-upgrade-required", "An incompatible passive mobile peer stayed at an unexplained 0/0 state");
-  stabilityService.applyRemoteSyncSignal(stabilityPeer, { capabilities: ["metadata-session-v3"] });
+  stabilityService.applyRemoteSyncSignal(stabilityPeer, { capabilities: ["metadata-session-v4"] });
   stabilityService.emitPeerConnectionStage(stabilityPeer);
   assert.equal(stabilityService.progress().stage, "requesting-peer-scan", "A compatible peer did not resume the locally initiated session stage");
   assert.ok(stabilityProgress.some((value) => value.stage === "checking-peer" || value.stage === "peer-upgrade-required"), "Peer compatibility stages were not emitted");
@@ -481,7 +483,7 @@ try {
     await waitFor(() => serviceA.status().peerCount === 1, "authenticated same-Vault peer");
     assert.equal(serviceA.listPeers()[0].deviceId, deviceB, "Manual endpoint was not rebound to the authenticated device ID");
     assert.equal(serviceA.listPeers()[0].linkType, "manual");
-    assert.equal(serviceA.peers.get(deviceB).capabilities.has("metadata-session-v3"), true, "Authenticated ping did not negotiate metadata sync");
+    assert.equal(serviceA.peers.get(deviceB).capabilities.has("metadata-session-v4"), true, "Authenticated ping did not negotiate metadata sync");
     serviceA.requestSync();
     await waitFor(() => storageA.text("Notes/from-b.md") === "from B" && storageB.text("Notes/from-a.md") === "from A", "automatic bidirectional LAN transfer");
     await waitFor(() => storageA.text("Notes/shared.md") === "newer B" && storageB.text("Notes/shared.md") === "newer B", "original-path convergence");
@@ -532,6 +534,8 @@ try {
     assert.equal(serviceA.fullSyncRequestId, periodicRequestId, "Periodic calibration replaced the active synchronization request");
     assert.equal(serviceA.syncQueued, false, "Periodic calibration queued a redundant scan during active synchronization");
     serviceA.syncRunning = false;
+    serviceA.requestPeriodicSync();
+    assert.equal(serviceA.fullSyncRequestId, periodicRequestId, "A recent completed full scan was immediately scheduled again");
     assert.equal(storageA.readCount("Notes/from-b.md"), 0, "A verified remote write was read back only to hash it again");
     const readsBeforeCachedScan = storageA.totalReads();
     const completedScanId = activityA.scan.id;
@@ -541,7 +545,7 @@ try {
       return scan.id !== completedScanId && scan.phase === "complete";
     }, "cached follow-up full-vault scan");
     assert.equal(storageA.totalReads(), readsBeforeCachedScan, "An unchanged follow-up scan reread file contents instead of using metadata/hash cache");
-    assert.ok(requestedRoutes.includes("/cancip-lan/v1/metadata/v3/manifest"), "New peers did not use the metadata manifest route");
+    assert.ok(requestedRoutes.includes("/cancip-lan/v1/metadata/v4/manifest"), "New peers did not use the metadata manifest route");
     assert.ok(serviceB.loadMetadataLedger(deviceA).entries["Notes/identical.md"], "Receiving peer did not persist the reverse metadata ledger");
 
     const negotiatedPeer = serviceA.peers.get(deviceB);
@@ -555,7 +559,7 @@ try {
     assert.ok(requestedRoutes.includes("/cancip-lan/v1/manifest"), "The server-side legacy route rejection was not exercised");
     await assert.rejects(() => serviceA.callPeer(negotiatedPeer, "/manifest/metadata", {}), /peer_upgrade_required/);
     assert.ok(requestedRoutes.includes("/cancip-lan/v1/manifest/metadata"), "The server-side v2 metadata route rejection was not exercised");
-    negotiatedPeer.capabilities = new Set(["metadata-session-v3"]);
+    negotiatedPeer.capabilities = new Set(["metadata-session-v4"]);
 
     storageA.putText("Notes/identical.md", "changed on A", 700);
     const incrementalRouteStart = requestedRoutes.length;
@@ -564,7 +568,7 @@ try {
     serviceA.notifyVaultChange("Notes/identical.md");
     await waitFor(() => storageB.text("Notes/identical.md") === "changed on A", "metadata push after a local edit");
     assert.equal((await storageB.statFile("Notes/identical.md")).mtime, 700, "Metadata push lost the source mtime");
-    assert.ok(requestedRoutes.slice(incrementalRouteStart).includes("/cancip-lan/v1/metadata/v3/manifest/paths"), "A file event still requested a full-vault manifest");
+    assert.ok(requestedRoutes.slice(incrementalRouteStart).includes("/cancip-lan/v1/metadata/v4/manifest/paths"), "A file event still requested a full-vault manifest");
     assert.ok(serviceA.activity().scan.total <= 1, "A single file event scanned more than its dirty path");
     await waitFor(
       () => progressA.slice(incrementalProgressA).some((value) => value.phase === "complete" && value.total === 1)
@@ -578,6 +582,25 @@ try {
     assert.equal(mirroredPushA.downloads, mirroredPushB.uploads, "Coordinator downloads did not mirror peer uploads");
     assert.equal(mirroredPushA.uploadCompleted, mirroredPushB.downloadCompleted, "Coordinator completed uploads did not mirror peer completed downloads");
     assert.equal(mirroredPushA.downloadCompleted, mirroredPushB.uploadCompleted, "Coordinator completed downloads did not mirror peer completed uploads");
+
+    storageA.putText("Notes/steady-during-volatile.md", "steady", 810);
+    storageA.putText("Notes/volatile.md", "volatile-v1", 811);
+    let mutatedVolatileRead = false;
+    storageA.beforeRead = async (path, storage) => {
+      if (path !== "Notes/volatile.md" || mutatedVolatileRead) return;
+      mutatedVolatileRead = true;
+      storage.putText(path, "volatile-v2", 812);
+    };
+    const volatileRouteStart = requestedRoutes.length;
+    serviceA.notifyVaultChange("Notes/steady-during-volatile.md");
+    serviceA.notifyVaultChange("Notes/volatile.md");
+    await waitFor(() => storageB.text("Notes/steady-during-volatile.md") === "steady", "unrelated transfer continued after a volatile-file precondition change");
+    await waitFor(() => storageB.text("Notes/volatile.md") === "volatile-v2", "volatile file path-only retry", 30_000);
+    storageA.beforeRead = null;
+    assert.equal(mutatedVolatileRead, true, "Volatile-file precondition regression did not execute");
+    assert.equal(requestedRoutes.slice(volatileRouteStart).includes("/cancip-lan/v1/metadata/v4/manifest"), false, "A volatile file retry restarted a full-vault scan");
+    assert.ok(progressA.some((value) => value.phase === "complete" && value.total >= 1), "Deferred retry never returned to a completed session");
+    assert.ok(serviceA.loadMetadataLedger(deviceB).entries["Notes/identical.md"], "An unrelated incremental pass erased an existing metadata baseline");
     assert.equal(mirroredPushA.bytesTotal, mirroredPushB.bytesTotal, "The two peers did not share the same byte total");
     assert.equal(mirroredPushA.bytesTransferred, mirroredPushB.bytesTransferred, "The two peers did not finish the same transferred bytes");
     storageB.putText("Notes/identical.md", "changed on B", 710);
@@ -747,7 +770,7 @@ try {
     assert.equal(baselineStorageA.text("Only-B/new.md"), "from B", "A unique remote file was not downloaded");
     assert.equal(baselineStorageA.readCount("Bulk/rounded.bin"), 0, "Small filesystem mtime rounding triggered a content read");
     assert.equal(baselineStorageB.readCount("Bulk/rounded.bin"), 0, "Remote small mtime rounding triggered a content read");
-    assert.ok(requestedRoutes.includes("/cancip-lan/v1/metadata/v3/bootstrap/hashes"), "Ambiguous first-baseline metadata was not fingerprinted");
+    assert.ok(requestedRoutes.includes("/cancip-lan/v1/metadata/v4/bootstrap/hashes"), "Ambiguous first-baseline metadata was not fingerprinted");
     assert.equal(baselineServiceA.activity().files.length, 3, "The transfer list exposed baseline-only files");
 
     const beforeIncrementalProgress = baselineProgressA.length;
@@ -888,8 +911,12 @@ try {
   assert.doesNotMatch(lanSource, /action\.kind === "conflict"/, "LAN sync still contains a conflict-copy executor");
   assert.match(lanSource, /peer_upgrade_required/, "Outdated LAN peers are not isolated from the original-path protocol");
   assert.match(lanSource, /const SMALL_TRANSFER_CONCURRENCY = 12/, "Small-file LAN transfers are not using the fast bounded worker pool");
-  assert.match(lanSource, /if \(!this\.runningValue \|\| this\.syncRunning \|\| this\.inboundSession\) return;/, "Periodic full scans can still interrupt an active transfer");
+  assert.match(lanSource, /if \(!this\.runningValue \|\| this\.syncRunning \|\| this\.inboundSession \|\| this\.metadataManifestBuild \|\| this\.manifestBuild\) return;/, "Periodic full scans can still interrupt an active transfer or manifest enumeration");
   assert.match(lanSource, /private isPeriodicInitiator\(peers = this\.activePeers\(\)\)/, "Periodic synchronization is still permanently assigned to one device role");
+  assert.match(lanSource, /MIN_FULL_RESCAN_INTERVAL_MS = 10 \* 60_000/, "Large Vaults can still run a full scan every minute");
+  assert.match(lanSource, /this\.metadataManifestBuild \|\| this\.manifestBuild/, "Periodic calibration can still overlap manifest enumeration");
+  assert.match(lanSource, /safeErrorCode\(error\) === "precondition_failed"/, "One changing file can still abort the entire transfer batch");
+  assert.match(lanSource, /retryPaths: \[\.\.\.retryPaths\]/, "Deferred paths are not mirrored to the peer retry queue");
   assert.match(takeoverSource, /plugins\?\.\["remotely-save"\]\?\.statusBarElement/);
   assert.doesNotMatch(takeoverSource, /isSyncing|currSyncMsg|syncEvent|remotelySave\.settings|candidate\.settings|start-sync/);
   assert.doesNotMatch(takeoverSource, /plugins\/remotely-save|plugins\\remotely-save/);

@@ -251,6 +251,10 @@
   color: var(--color-green, #15803d);
 }
 
+.obsidian-ntfy-lan-details-file.is-deferred .obsidian-ntfy-lan-details-file-state svg {
+  color: var(--color-orange, var(--text-muted));
+}
+
 .obsidian-ntfy-lan-details-file.is-error .obsidian-ntfy-lan-details-file-state svg {
   color: var(--color-red, #b91c1c);
 }

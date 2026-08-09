@@ -138,7 +138,7 @@ export type LanSyncFileAction = "push" | "pull" | "delete-local" | "delete-remot
 export type LanSyncFileActivity = {
   path: string;
   action: LanSyncFileAction;
-  state: "pending" | "syncing" | "complete" | "error";
+  state: "pending" | "syncing" | "complete" | "deferred" | "error";
   size: number;
 };
 
@@ -333,8 +333,8 @@ type RequireLike = (name: string) => unknown;
 const PROTOCOL_VERSION = 1;
 const PROTOCOL_NAME = "cancip-lan-sync";
 const API_PREFIX = "/cancip-lan/v1";
-const METADATA_LEDGER_CAPABILITY = "metadata-session-v3";
-const METADATA_ROUTE_PREFIX = "/metadata/v3";
+const METADATA_LEDGER_CAPABILITY = "metadata-session-v4";
+const METADATA_ROUTE_PREFIX = "/metadata/v4";
 const BOOTSTRAP_MTIME_TOLERANCE_MS = 2_000;
 const MULTICAST_ADDRESS = "239.255.67.19";
 const DISCOVERY_PORT = 43189;
@@ -345,6 +345,9 @@ const PEER_MIN_STABLE_GRACE_MS = 30_000;
 const PEER_MAX_ADDRESS_HISTORY = 8;
 const REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 const SYNC_MIN_INTERVAL_MS = 400;
+const QUEUED_SYNC_DELAY_MS = 750;
+const MIN_FULL_RESCAN_INTERVAL_MS = 10 * 60_000;
+const MAX_FULL_RESCAN_INTERVAL_MS = 60 * 60_000;
 const HASH_CONCURRENCY = 12;
 const LARGE_TRANSFER_CONCURRENCY = 6;
 const MEDIUM_TRANSFER_CONCURRENCY = 8;
@@ -1056,6 +1059,9 @@ function summarizeTransferGroups(files: LanSyncFileActivity[]): LanSyncActivityG
     if (file.state === "complete") {
       group.completed += 1;
       group.bytesTransferred += file.size;
+    } else if (file.state === "deferred") {
+      group.completed += 1;
+      group.errors += 1;
     } else if (file.state === "syncing") group.active += 1;
     else if (file.state === "error") group.errors += 1;
     if (file.action === "push") {
@@ -1195,6 +1201,7 @@ export class NtfyLanSync {
   private syncRequestId = "";
   private fullSyncRequestId = "";
   private fullSyncRequested = true;
+  private lastFullScanAt = 0;
   private dirtySequence = 0;
   private dirtyPaths = new Map<string, number>();
   private inboundSession: LanSyncInboundSession | null = null;
@@ -1409,10 +1416,15 @@ export class NtfyLanSync {
     }
     this.identity = await this.loadOrCreateIdentity();
     this.deviceId = this.loadOrCreateDeviceId();
+    this.lastFullScanAt = this.loadLastFullScanAt();
+    if (this.lastFullScanAt > 0 && this.now() - this.lastFullScanAt < this.fullRescanIntervalMs()) {
+      this.fullSyncRequested = false;
+    }
     if (!this.fullSyncRequestId) {
       this.fullSyncRequestId = randomId(18);
       this.syncRequestId = this.fullSyncRequestId;
     }
+    if (!this.syncRequestId) this.syncRequestId = randomId(18);
     this.loadPendingMessages();
     this.loadHashCache();
     this.runningValue = true;
@@ -1497,6 +1509,10 @@ export class NtfyLanSync {
   }
 
   notifyVaultChange(path: string): void {
+    this.markDirtyPath(path, 30);
+  }
+
+  private markDirtyPath(path: string, delay = QUEUED_SYNC_DELAY_MS): void {
     const normalized = this.normalizePath(path);
     if (!normalized) return;
     this.hashCache.delete(normalized);
@@ -1510,15 +1526,17 @@ export class NtfyLanSync {
       this.dirtyPaths = new Map(newest);
     }
     this.syncRequestId = randomId(18);
-    this.scheduleSync(30, true);
+    this.scheduleSync(delay, true);
   }
 
   requestSync(): void {
     // Either device may initiate. A non-listening peer receives the request
     // through the authenticated heartbeat and joins the same forced session.
-    this.fullSyncRequested = true;
-    this.fullSyncRequestId = randomId(18);
-    this.syncRequestId = this.fullSyncRequestId;
+    if (!this.fullSyncRequested) {
+      this.fullSyncRequested = true;
+      this.fullSyncRequestId = randomId(18);
+    }
+    this.syncRequestId = randomId(18);
     const passivePeer = this.activePeers().find((peer) => !peer.canHost);
     if (passivePeer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing") {
       this.emit({
@@ -1532,9 +1550,16 @@ export class NtfyLanSync {
   }
 
   private requestPeriodicSync(): void {
-    if (!this.runningValue || this.syncRunning || this.inboundSession) return;
+    if (!this.runningValue || this.syncRunning || this.inboundSession || this.metadataManifestBuild || this.manifestBuild) return;
+    if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing" || this.scanValue.phase === "scanning") return;
     const peers = this.activePeers();
-    if (!peers.length || !this.isPeriodicInitiator(peers)) return;
+    if (!peers.length) return;
+    if (this.dirtyPaths.size || peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0)) {
+      this.scheduleSync(0, false);
+      return;
+    }
+    if (this.fullSyncRequested || this.now() - this.lastFullScanAt < this.fullRescanIntervalMs()) return;
+    if (!this.isPeriodicInitiator(peers)) return;
     this.fullSyncRequested = true;
     this.fullSyncRequestId = randomId(18);
     this.syncRequestId = this.fullSyncRequestId;
@@ -1548,6 +1573,31 @@ export class NtfyLanSync {
       });
     }
     this.scheduleSync(0, false);
+  }
+
+  private fullRescanIntervalMs(): number {
+    return Math.min(
+      MAX_FULL_RESCAN_INTERVAL_MS,
+      Math.max(MIN_FULL_RESCAN_INTERVAL_MS, this.settings().checkIntervalSeconds * 10_000)
+    );
+  }
+
+  private lastFullScanStorageKey(): string {
+    return `ntfy.lan-sync.last-full-scan.v1.${this.identity?.vaultId ?? "unknown"}`;
+  }
+
+  private loadLastFullScanAt(): number {
+    const parsed = Number(this.localStore()?.getItem(this.lastFullScanStorageKey()) ?? 0);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
+  private recordFullScan(): void {
+    this.lastFullScanAt = this.now();
+    try {
+      this.localStore()?.setItem(this.lastFullScanStorageKey(), String(this.lastFullScanAt));
+    } catch {
+      // The next launch may conservatively run a full scan again.
+    }
   }
 
   private isPeriodicInitiator(peers = this.activePeers()): boolean {
@@ -2477,7 +2527,7 @@ export class NtfyLanSync {
   private async syncActivePeers(): Promise<void> {
     const forced = this.syncForced;
     this.syncForced = false;
-    if (!this.runningValue || this.syncRunning || (!forced && !this.isCoordinator())) return;
+    if (!this.runningValue || this.syncRunning || !this.isCoordinator()) return;
     const peers = this.syncTargets();
     if (!peers.length) return;
     const localDirty = new Map(this.dirtyPaths);
@@ -2491,6 +2541,7 @@ export class NtfyLanSync {
         if (!this.runningValue) break;
         if (this.now() - peer.lastSyncAt < SYNC_MIN_INTERVAL_MS && !this.syncQueued && !forced) continue;
         const result = await this.syncPeer(peer, localDirty, localFullSyncRequestId);
+        if (result.fullSyncComplete) this.recordFullScan();
         settledAcrossPeers = settledAcrossPeers === null
           ? new Set(result.settledLocalPaths)
           : new Set([...settledAcrossPeers].filter((path) => result.settledLocalPaths.has(path)));
@@ -2509,6 +2560,7 @@ export class NtfyLanSync {
       }
     } catch (error) {
       this.lastErrorValue = safeErrorCode(error);
+      this.syncQueued = true;
       const peer = peers[0];
       this.emit({
         ...defaultProgress("error"),
@@ -2521,7 +2573,7 @@ export class NtfyLanSync {
       this.syncRunning = false;
       if (this.syncQueued) {
         this.syncQueued = false;
-        this.scheduleSync(120, true);
+        this.scheduleSync(QUEUED_SYNC_DELAY_MS, true);
       }
     }
   }
@@ -2588,8 +2640,10 @@ export class NtfyLanSync {
         : requestedPaths)
         .filter((path) => shareConfig || !isConfigPath(path, this.settings().configDir))
     );
-    for (const path of Object.keys(ledger.entries)) {
-      if (!localMap.has(path) && !remoteMap.has(path)) delete ledger.entries[path];
+    if (request.fullSync) {
+      for (const path of Object.keys(ledger.entries)) {
+        if (!localMap.has(path) && !remoteMap.has(path)) delete ledger.entries[path];
+      }
     }
     for (const path of [...new Set([...localMap.keys(), ...remoteMap.keys()])]) {
       const local = localMap.get(path);
@@ -2737,6 +2791,7 @@ export class NtfyLanSync {
     });
     let cursor = 0;
     let failure: unknown = null;
+    const retryPaths = new Set<string>();
     const transferWorker = async (): Promise<void> => {
       while (this.runningValue && failure === null && cursor < actions.length) {
         const index = cursor;
@@ -2790,6 +2845,28 @@ export class NtfyLanSync {
             downloadCompleted
           });
         } catch (error) {
+          if (safeErrorCode(error) === "precondition_failed") {
+            if (activity) activity.state = "deferred";
+            retryPaths.add(actions[index].path);
+            completed += 1;
+            this.activityUpdatedAt = this.now();
+            this.emit({
+              ...defaultProgress("syncing"),
+              active: true,
+              peerId: peer.deviceId,
+              completed,
+              total: actions.length,
+              bytesTransferred,
+              bytesTotal,
+              changed,
+              conflicts,
+              uploads,
+              uploadCompleted,
+              downloads,
+              downloadCompleted
+            });
+            continue;
+          }
           if (activity) activity.state = "error";
           this.activityUpdatedAt = this.now();
           failure = error;
@@ -2798,7 +2875,7 @@ export class NtfyLanSync {
     };
     await Promise.all(Array.from({ length: adaptiveTransferConcurrency(this.activityFiles) }, transferWorker));
     this.saveMetadataLedger(peer.deviceId, ledger);
-    const success = failure === null && completed === actions.length;
+    const success = failure === null;
     const acknowledgedRemoteDirty = [...request.remoteDirty.entries()]
       .filter(([path]) => settledPaths.has(path))
       .map(([path, generation]) => ({ path, generation }));
@@ -2808,6 +2885,7 @@ export class NtfyLanSync {
         sessionId,
         success,
         commits,
+        retryPaths: [...retryPaths],
         acknowledgedDirtyPaths: acknowledgedRemoteDirty,
         acknowledgedFullSyncRequestId: success ? request.remoteFullSyncRequestId : ""
       });
@@ -2819,6 +2897,7 @@ export class NtfyLanSync {
         if ((peer.remoteDirtyPaths?.get(path) ?? 0) <= generation) peer.remoteDirtyPaths?.delete(path);
       }
       if (request.remoteFullSyncRequestId && peer.remoteFullSyncRequestId === request.remoteFullSyncRequestId) peer.remoteFullSyncRequestId = "";
+      for (const path of retryPaths) this.markDirtyPath(path, QUEUED_SYNC_DELAY_MS);
     }
     if (failure !== null) throw failure;
     if (finishFailure !== null) throw finishFailure;
@@ -2843,7 +2922,7 @@ export class NtfyLanSync {
     });
     return {
       settledLocalPaths: new Set([...request.localDirty.keys()].filter((path) => settledPaths.has(path))),
-      fullSyncComplete: Boolean(request.localFullSyncRequestId && request.fullSync && success)
+      fullSyncComplete: Boolean(request.fullSync && success)
     };
   }
 
@@ -3859,6 +3938,8 @@ export class NtfyLanSync {
         || path === `${API_PREFIX}/metadata/file/read`
         || path === `${API_PREFIX}/metadata/file/write`
         || path === `${API_PREFIX}/metadata/file/delete`
+        || path.startsWith(`${API_PREFIX}/metadata/v2/`)
+        || path.startsWith(`${API_PREFIX}/metadata/v3/`)
       ) {
         throw new LanSyncProtocolError("peer_upgrade_required", 426);
       }
@@ -3883,6 +3964,7 @@ export class NtfyLanSync {
       } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/manifest`) {
         const policy = this.policy();
         const files = await this.buildMetadataManifest(policy.syncConfigFolder && payload.syncConfigFolder === true);
+        this.recordFullScan();
         this.emit({
           ...defaultProgress("scanning"),
           stage: "planning",
@@ -4022,19 +4104,31 @@ export class NtfyLanSync {
       }
     }
     this.saveMetadataLedger(deviceId, ledger);
+    const retryPaths = new Set(
+      (Array.isArray(payload.retryPaths) ? payload.retryPaths : [])
+        .map((path) => this.normalizePath(path, true))
+        .filter((path): path is string => Boolean(path))
+        .slice(0, MAX_DIRTY_PATHS)
+    );
     const acknowledgedDirtyPaths = this.parseDirtyPaths(payload.acknowledgedDirtyPaths);
     for (const [path, generation] of acknowledgedDirtyPaths) {
       if ((this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
     }
     const acknowledgedFullSyncRequestId = typeof payload.acknowledgedFullSyncRequestId === "string" ? payload.acknowledgedFullSyncRequestId : "";
-    if (acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) this.fullSyncRequested = false;
+    if (acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) {
+      this.fullSyncRequested = false;
+      this.recordFullScan();
+    }
     const success = payload.success === true;
     if (success) {
-      for (const file of this.activityFiles) if (file.state !== "error") file.state = "complete";
+      for (const file of this.activityFiles) {
+        if (retryPaths.has(file.path)) file.state = "deferred";
+        else if (file.state !== "error") file.state = "complete";
+      }
     } else {
       for (const file of this.activityFiles) if (file.state === "pending" || file.state === "syncing") file.state = "error";
     }
-    const completed = this.activityFiles.filter((file) => file.state === "complete").length;
+    const completed = this.activityFiles.filter((file) => file.state === "complete" || file.state === "deferred").length;
     const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
     const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
     const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
