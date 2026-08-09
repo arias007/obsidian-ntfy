@@ -781,7 +781,9 @@ var NtfyLanSyncRuntime = (() => {
   var PROTOCOL_VERSION = 1;
   var PROTOCOL_NAME = "cancip-lan-sync";
   var API_PREFIX = "/cancip-lan/v1";
-  var METADATA_LEDGER_CAPABILITY = "metadata-session-v2";
+  var METADATA_LEDGER_CAPABILITY = "metadata-session-v3";
+  var METADATA_ROUTE_PREFIX = "/metadata/v3";
+  var BOOTSTRAP_MTIME_TOLERANCE_MS = 2e3;
   var MULTICAST_ADDRESS = "239.255.67.19";
   var DISCOVERY_PORT = 43189;
   var ANNOUNCE_INTERVAL_MS = 750;
@@ -1224,6 +1226,9 @@ ${bodyHash}`;
   }
   function metadataMatches(entry, expected) {
     return Boolean(entry && expected && entry.size === expected.size && entry.mtime === expected.mtime);
+  }
+  function metadataBootstrapEquivalent(local, remote) {
+    return local.size === remote.size && Math.abs(local.mtime - remote.mtime) <= BOOTSTRAP_MTIME_TOLERANCE_MS;
   }
   function metadataWinner(local, remote, rule) {
     if (rule === "larger" && local.size !== remote.size) return local.size > remote.size ? "local" : "remote";
@@ -2651,7 +2656,7 @@ ${bodyHash}`;
         request.fullSync ? this.buildMetadataManifest(localPolicy.syncConfigFolder) : this.buildMetadataManifestForPaths(requestedPaths, localPolicy.syncConfigFolder),
         this.callPeer(
           peer,
-          request.fullSync ? "/manifest/metadata" : "/manifest/metadata/paths",
+          request.fullSync ? `${METADATA_ROUTE_PREFIX}/manifest` : `${METADATA_ROUTE_PREFIX}/manifest/paths`,
           request.fullSync ? { syncConfigFolder: localPolicy.syncConfigFolder } : { syncConfigFolder: localPolicy.syncConfigFolder, paths: requestedPaths }
         ),
         Promise.resolve(this.loadMetadataLedger(peer.deviceId))
@@ -2672,9 +2677,76 @@ ${bodyHash}`;
       for (const path of [.../* @__PURE__ */ new Set([...localMap.keys(), ...remoteMap.keys()])]) {
         const local = localMap.get(path);
         const remote = remoteMap.get(path);
-        if (local && remote && metadataMatches(local, remote)) {
+        if (local && remote && (metadataMatches(local, remote) || !ledger.entries[path] && metadataBootstrapEquivalent(local, remote))) {
           ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
         }
+      }
+      const bootstrapCandidates = [...localMap.keys()].map((path) => ({ path, local: localMap.get(path), remote: remoteMap.get(path) })).filter((item) => Boolean(
+        !ledger.entries[item.path] && item.local && item.remote && item.local.size === item.remote.size
+      ));
+      if (bootstrapCandidates.length) {
+        const scan = this.scanValue;
+        const scanFiles = new Map(scan.files.map((file) => [file.path, file]));
+        const completedBeforeHashes = scan.completed;
+        scan.phase = "scanning";
+        scan.total += bootstrapCandidates.length;
+        this.emit({
+          ...defaultProgress("scanning"),
+          active: true,
+          peerId: peer.deviceId,
+          completed: scan.completed,
+          total: scan.total
+        });
+        let verified = 0;
+        let lastBootstrapProgressAt = 0;
+        const localHashesPromise = this.buildMetadataHashManifest(
+          bootstrapCandidates.map((item) => item.local),
+          shareConfig,
+          (path, cached) => {
+            verified += 1;
+            scan.completed = completedBeforeHashes + verified;
+            if (cached) scan.cached += 1;
+            else scan.hashed += 1;
+            const activity = scanFiles.get(path);
+            if (activity) {
+              activity.state = cached ? "cached" : "complete";
+              activity.reason = cached ? "fingerprint-cache" : "fingerprint";
+            }
+            const now = this.now();
+            if (verified < bootstrapCandidates.length && now - lastBootstrapProgressAt < 40) return;
+            lastBootstrapProgressAt = now;
+            this.emit({
+              ...defaultProgress("scanning"),
+              active: true,
+              peerId: peer.deviceId,
+              completed: scan.completed,
+              total: scan.total
+            });
+          }
+        );
+        const remoteHashesPromise = this.callPeer(peer, `${METADATA_ROUTE_PREFIX}/bootstrap/hashes`, {
+          syncConfigFolder: localPolicy.syncConfigFolder,
+          files: bootstrapCandidates.map((item) => item.remote)
+        }, 10 * 6e4);
+        const [localHashes, remoteHashesResponse] = await Promise.all([localHashesPromise, remoteHashesPromise]);
+        const localHashMap = new Map(localHashes.map((entry) => [entry.path, entry]));
+        const remoteHashMap = new Map(this.parseManifest(remoteHashesResponse.files, shareConfig).map((entry) => [entry.path, entry]));
+        for (const item of bootstrapCandidates) {
+          const localHash = localHashMap.get(item.path);
+          const remoteHash = remoteHashMap.get(item.path);
+          if (!localHash || !remoteHash || localHash.hash !== remoteHash.hash) continue;
+          if (!metadataMatches(localHash, item.local) || !metadataMatches(remoteHash, item.remote)) continue;
+          ledger.entries[item.path] = { local: metadataSnapshot(item.local), remote: metadataSnapshot(item.remote) };
+        }
+        scan.phase = "complete";
+        scan.completed = scan.total;
+        this.emit({
+          ...defaultProgress("scanning"),
+          active: true,
+          peerId: peer.deviceId,
+          completed: scan.completed,
+          total: scan.total
+        });
       }
       const actions = planLanSyncMetadataReconciliation(filteredLocalEntries, remoteEntries, ledger.entries, localPolicy, remotePolicy);
       const actionPaths = new Set(actions.map((action) => action.path));
@@ -2702,7 +2774,7 @@ ${bodyHash}`;
       }));
       this.activityUpdatedAt = this.now();
       const sessionId = randomId(18);
-      await this.callPeer(peer, "/metadata/session/start", {
+      await this.callPeer(peer, `${METADATA_ROUTE_PREFIX}/session/start`, {
         sessionId,
         total: actions.length,
         bytesTotal,
@@ -2794,7 +2866,7 @@ ${bodyHash}`;
       const acknowledgedRemoteDirty = [...request.remoteDirty.entries()].filter(([path]) => settledPaths.has(path)).map(([path, generation]) => ({ path, generation }));
       let finishFailure = null;
       try {
-        await this.callPeer(peer, "/metadata/session/finish", {
+        await this.callPeer(peer, `${METADATA_ROUTE_PREFIX}/session/finish`, {
           sessionId,
           success,
           commits,
@@ -3021,6 +3093,42 @@ ${bodyHash}`;
       }
       return { bytes: 0, changed: false, conflict: false };
     }
+    async buildMetadataHashManifest(expectedEntries, includeConfigFolder, onProgress) {
+      const entries = await mapWithConcurrency(expectedEntries.slice(0, MAX_MANIFEST_FILES), HASH_CONCURRENCY, async (expected) => {
+        if (!this.runningValue) {
+          onProgress?.(expected.path, false);
+          return null;
+        }
+        const path = this.normalizePath(expected.path, includeConfigFolder);
+        if (!path) {
+          onProgress?.(expected.path, false);
+          return null;
+        }
+        const before = await this.options.storage.statFile(path);
+        if (!before || !metadataMatches(before, expected) || before.size > this.settings().maxFileBytes) {
+          onProgress?.(path, false);
+          return null;
+        }
+        const signature = `${before.mtime}:${before.size}`;
+        const cachedHash = this.hashCache.get(path);
+        if (cachedHash?.signature === signature) {
+          onProgress?.(path, true);
+          return { path, size: before.size, mtime: before.mtime, hash: cachedHash.hash };
+        }
+        const bytes = new Uint8Array(await this.options.storage.readBinary(path));
+        const after = await this.options.storage.statFile(path);
+        if (!after || !metadataMatches(after, expected) || bytes.byteLength !== after.size) {
+          onProgress?.(path, false);
+          return null;
+        }
+        const hash = await sha256Bytes(bytes);
+        this.hashCache.set(path, { signature, hash });
+        onProgress?.(path, false);
+        return { path, size: after.size, mtime: after.mtime, hash };
+      });
+      this.queueHashCacheSave();
+      return entries.filter((entry) => entry !== null);
+    }
     async buildMetadataManifestForPaths(paths, includeConfigFolder = this.settings().syncConfigFolder) {
       const unique = [...new Set(paths)].slice(0, MAX_DIRTY_PATHS);
       const scan = {
@@ -3203,14 +3311,14 @@ ${bodyHash}`;
       return entries;
     }
     metadataLedgerKey(peerId) {
-      return `ntfy.lan-sync.metadata-ledger.v2.${this.identity?.vaultId ?? "unknown"}.${peerId}`;
+      return `ntfy.lan-sync.metadata-ledger.v3.${this.identity?.vaultId ?? "unknown"}.${peerId}`;
     }
     loadMetadataLedger(peerId) {
       try {
         const raw = this.localStore()?.getItem(this.metadataLedgerKey(peerId));
-        if (!raw) return { schemaVersion: 2, entries: {} };
+        if (!raw) return { schemaVersion: 3, entries: {} };
         const parsed = safeJsonObject(raw);
-        if (parsed.schemaVersion !== 2 || !isRecord(parsed.entries)) return { schemaVersion: 2, entries: {} };
+        if (parsed.schemaVersion !== 3 || !isRecord(parsed.entries)) return { schemaVersion: 3, entries: {} };
         const entries = {};
         for (const [path, value] of Object.entries(parsed.entries).slice(-MAX_LEDGER_ENTRIES)) {
           const normalized = this.normalizePath(path, true);
@@ -3219,20 +3327,20 @@ ${bodyHash}`;
           const remote = this.parseMetadataSnapshot(value.remote);
           if (local && remote) entries[normalized] = { local, remote };
         }
-        return { schemaVersion: 2, entries };
+        return { schemaVersion: 3, entries };
       } catch {
-        return { schemaVersion: 2, entries: {} };
+        return { schemaVersion: 3, entries: {} };
       }
     }
     saveMetadataLedger(peerId, ledger) {
       const keys = Object.keys(ledger.entries);
       const trimmed = keys.length <= MAX_LEDGER_ENTRIES ? ledger.entries : Object.fromEntries(keys.slice(-MAX_LEDGER_ENTRIES).map((key) => [key, ledger.entries[key]]));
       try {
-        this.localStore()?.setItem(this.metadataLedgerKey(peerId), JSON.stringify({ schemaVersion: 2, entries: trimmed }));
+        this.localStore()?.setItem(this.metadataLedgerKey(peerId), JSON.stringify({ schemaVersion: 3, entries: trimmed }));
       } catch {
         try {
           const smaller = Object.fromEntries(Object.entries(trimmed).slice(-3e3));
-          this.localStore()?.setItem(this.metadataLedgerKey(peerId), JSON.stringify({ schemaVersion: 2, entries: smaller }));
+          this.localStore()?.setItem(this.metadataLedgerKey(peerId), JSON.stringify({ schemaVersion: 3, entries: smaller }));
         } catch {
         }
       }
@@ -3292,7 +3400,7 @@ ${bodyHash}`;
     }
     async readRemoteMetadata(peer, entry, sessionId = "") {
       const expected = metadataSnapshot(entry);
-      const response = await this.callPeer(peer, "/metadata/file/read", { path: entry.path, expectedMetadata: expected, sessionId }, fileTransferTimeoutMs(entry.size));
+      const response = await this.callPeer(peer, `${METADATA_ROUTE_PREFIX}/file/read`, { path: entry.path, expectedMetadata: expected, sessionId }, fileTransferTimeoutMs(entry.size));
       const metadata = this.parseMetadataSnapshot(response.metadata);
       if (response.path !== entry.path || !metadata || !metadataMatches(metadata, expected) || typeof response.data !== "string") throw new LanSyncProtocolError("invalid_file_response");
       const bytes = base64UrlToBytes(response.data);
@@ -3300,7 +3408,7 @@ ${bodyHash}`;
       return { bytes, metadata };
     }
     async writeRemoteMetadata(peer, path, bytes, expected, source, allowExistingSame = false, sessionId = "") {
-      const response = await this.callPeer(peer, "/metadata/file/write", {
+      const response = await this.callPeer(peer, `${METADATA_ROUTE_PREFIX}/file/write`, {
         path,
         expectedMetadata: expected,
         sourceMetadata: source,
@@ -3313,7 +3421,7 @@ ${bodyHash}`;
       return metadata;
     }
     async deleteRemoteMetadata(peer, path, expected, sessionId = "") {
-      const response = await this.callPeer(peer, "/metadata/file/delete", { path, expectedMetadata: expected, sessionId }, 45e3);
+      const response = await this.callPeer(peer, `${METADATA_ROUTE_PREFIX}/file/delete`, { path, expectedMetadata: expected, sessionId }, 45e3);
       const deletedMetadata = this.parseMetadataSnapshot(response.deletedMetadata);
       if (response.path !== path || response.deleted !== true || !deletedMetadata || !metadataMatches(deletedMetadata, expected)) {
         throw new Error("remote_delete_verification_failed");
@@ -3650,7 +3758,7 @@ ${bodyHash}`;
         const remoteAddress = normalizeRemoteAddress(request.socket.remoteAddress ?? "");
         if (!this.allowedByRateLimit(`${remoteAddress}:${deviceId}`)) throw new LanSyncProtocolError("rate_limited", 429);
         const payload = await decryptLanSyncPayload(this.identity.secret, body);
-        if (path === `${API_PREFIX}/manifest` || path === `${API_PREFIX}/file/read` || path === `${API_PREFIX}/file/write` || path === `${API_PREFIX}/file/delete`) {
+        if (path === `${API_PREFIX}/manifest` || path === `${API_PREFIX}/file/read` || path === `${API_PREFIX}/file/write` || path === `${API_PREFIX}/file/delete` || path === `${API_PREFIX}/manifest/metadata` || path === `${API_PREFIX}/manifest/metadata/paths` || path === `${API_PREFIX}/metadata/session/start` || path === `${API_PREFIX}/metadata/session/finish` || path === `${API_PREFIX}/metadata/file/read` || path === `${API_PREFIX}/metadata/file/write` || path === `${API_PREFIX}/metadata/file/delete`) {
           throw new LanSyncProtocolError("peer_upgrade_required", 426);
         }
         this.markInboundPeer(deviceId, remoteAddress, path);
@@ -3669,13 +3777,13 @@ ${bodyHash}`;
             messages: this.pendingMessagesFor(deviceId),
             ...this.syncSignalPayload()
           };
-        } else if (path === `${API_PREFIX}/manifest/metadata`) {
+        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/manifest`) {
           const policy = this.policy();
           result = {
             files: await this.buildMetadataManifest(policy.syncConfigFolder && payload.syncConfigFolder === true),
             policy
           };
-        } else if (path === `${API_PREFIX}/manifest/metadata/paths`) {
+        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/manifest/paths`) {
           const policy = this.policy();
           const paths = Array.isArray(payload.paths) ? payload.paths.filter((value) => typeof value === "string") : [];
           if (paths.length > MAX_DIRTY_PATHS) throw new LanSyncProtocolError("too_many_dirty_paths", 413);
@@ -3683,15 +3791,20 @@ ${bodyHash}`;
             files: await this.buildMetadataManifestForPaths(paths, policy.syncConfigFolder && payload.syncConfigFolder === true),
             policy
           };
-        } else if (path === `${API_PREFIX}/metadata/session/start`) {
+        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/bootstrap/hashes`) {
+          const policy = this.policy();
+          const includeConfigFolder = policy.syncConfigFolder && payload.syncConfigFolder === true;
+          const expected = this.parseMetadataManifest(payload.files, includeConfigFolder);
+          result = { files: await this.buildMetadataHashManifest(expected, includeConfigFolder) };
+        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/session/start`) {
           result = await this.handleMetadataSessionStart(deviceId, payload);
-        } else if (path === `${API_PREFIX}/metadata/session/finish`) {
+        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/session/finish`) {
           result = await this.handleMetadataSessionFinish(deviceId, payload);
-        } else if (path === `${API_PREFIX}/metadata/file/read`) {
+        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/file/read`) {
           result = await this.handleReadMetadataFile(payload);
-        } else if (path === `${API_PREFIX}/metadata/file/write`) {
+        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/file/write`) {
           result = await this.handleWriteMetadataFile(payload);
-        } else if (path === `${API_PREFIX}/metadata/file/delete`) {
+        } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/file/delete`) {
           result = await this.handleDeleteMetadataFile(payload);
         } else if (path === `${API_PREFIX}/attachment/read`) {
           result = await this.handleReadQueuedAttachment(deviceId, payload);

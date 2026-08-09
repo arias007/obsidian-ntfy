@@ -341,7 +341,7 @@ try {
   assert.notEqual(portA, portB);
   const storageA = new MemoryStorage(identity, {
     "Notes/from-a.md": { content: "from A", mtime: 100 },
-    "Notes/shared.md": { content: "older A", mtime: 200 },
+    "Notes/shared.md": { content: "older A", mtime: 200_000 },
     "Notes/identical.md": { content: "same", mtime: 150 },
     ".obsidian/hotkeys.json": { content: "hotkeys from A", mtime: 500 },
     ".obsidian/plugins/example/data.json": { content: "other plugin data from A", mtime: 550 },
@@ -349,7 +349,7 @@ try {
   });
   const storageB = new MemoryStorage(identity, {
     "Notes/from-b.md": { content: "from B", mtime: 300 },
-    "Notes/shared.md": { content: "newer B", mtime: 400 },
+    "Notes/shared.md": { content: "newer B", mtime: 400_000 },
     "Notes/identical.md": { content: "same", mtime: 150 }
   });
   const descriptor = (deviceId, port) => JSON.stringify({
@@ -465,7 +465,7 @@ try {
     await waitFor(() => serviceA.status().peerCount === 1, "authenticated same-Vault peer");
     assert.equal(serviceA.listPeers()[0].deviceId, deviceB, "Manual endpoint was not rebound to the authenticated device ID");
     assert.equal(serviceA.listPeers()[0].linkType, "manual");
-    assert.equal(serviceA.peers.get(deviceB).capabilities.has("metadata-session-v2"), true, "Authenticated ping did not negotiate metadata sync");
+    assert.equal(serviceA.peers.get(deviceB).capabilities.has("metadata-session-v3"), true, "Authenticated ping did not negotiate metadata sync");
     serviceA.requestSync();
     await waitFor(() => storageA.text("Notes/from-b.md") === "from B" && storageB.text("Notes/from-a.md") === "from A", "automatic bidirectional LAN transfer");
     await waitFor(() => storageA.text("Notes/shared.md") === "newer B" && storageB.text("Notes/shared.md") === "newer B", "original-path convergence");
@@ -525,11 +525,11 @@ try {
       return scan.id !== completedScanId && scan.phase === "complete";
     }, "cached follow-up full-vault scan");
     assert.equal(storageA.totalReads(), readsBeforeCachedScan, "An unchanged follow-up scan reread file contents instead of using metadata/hash cache");
-    assert.ok(requestedRoutes.includes("/cancip-lan/v1/manifest/metadata"), "New peers did not use the metadata manifest route");
+    assert.ok(requestedRoutes.includes("/cancip-lan/v1/metadata/v3/manifest"), "New peers did not use the metadata manifest route");
     assert.ok(serviceB.loadMetadataLedger(deviceA).entries["Notes/identical.md"], "Receiving peer did not persist the reverse metadata ledger");
 
     const negotiatedPeer = serviceA.peers.get(deviceB);
-    negotiatedPeer.capabilities.clear();
+    negotiatedPeer.capabilities = new Set(["metadata-session-v2"]);
     requestedRoutes.length = 0;
     const beforeLegacyAttempt = new Map([...storageA.files].map(([path, value]) => [path, { data: new Uint8Array(value.data), mtime: value.mtime }]));
     await assert.rejects(() => serviceA.syncPeer(negotiatedPeer), /peer_upgrade_required/);
@@ -537,7 +537,9 @@ try {
     assert.deepEqual(storageA.files, beforeLegacyAttempt, "Rejecting an outdated peer changed local files");
     await assert.rejects(() => serviceA.callPeer(negotiatedPeer, "/manifest", {}), /peer_upgrade_required/);
     assert.ok(requestedRoutes.includes("/cancip-lan/v1/manifest"), "The server-side legacy route rejection was not exercised");
-    negotiatedPeer.capabilities.add("metadata-session-v2");
+    await assert.rejects(() => serviceA.callPeer(negotiatedPeer, "/manifest/metadata", {}), /peer_upgrade_required/);
+    assert.ok(requestedRoutes.includes("/cancip-lan/v1/manifest/metadata"), "The server-side v2 metadata route rejection was not exercised");
+    negotiatedPeer.capabilities = new Set(["metadata-session-v3"]);
 
     storageA.putText("Notes/identical.md", "changed on A", 700);
     const incrementalRouteStart = requestedRoutes.length;
@@ -546,7 +548,7 @@ try {
     serviceA.notifyVaultChange("Notes/identical.md");
     await waitFor(() => storageB.text("Notes/identical.md") === "changed on A", "metadata push after a local edit");
     assert.equal((await storageB.statFile("Notes/identical.md")).mtime, 700, "Metadata push lost the source mtime");
-    assert.ok(requestedRoutes.slice(incrementalRouteStart).includes("/cancip-lan/v1/manifest/metadata/paths"), "A file event still requested a full-vault manifest");
+    assert.ok(requestedRoutes.slice(incrementalRouteStart).includes("/cancip-lan/v1/metadata/v3/manifest/paths"), "A file event still requested a full-vault manifest");
     assert.ok(serviceA.activity().scan.total <= 1, "A single file event scanned more than its dirty path");
     await waitFor(
       () => progressA.slice(incrementalProgressA).some((value) => value.phase === "complete" && value.total === 1)
@@ -676,6 +678,84 @@ try {
     assert.equal(exactStorage.totalReads() + roundedStorage.totalReads(), readsBeforeSteadyScan, "Steady-state calibration reread unchanged file content");
   } finally {
     await Promise.all([exactService.stop(), roundedService.stop()]);
+  }
+
+  const [baselinePortA, baselinePortB] = await Promise.all([freePort(), freePort()]);
+  const baselineDeviceA = "FFFFFFFFFFFFFFFFFFFFFFFF";
+  const baselineDeviceB = "GGGGGGGGGGGGGGGGGGGGGGGG";
+  const baselineFilesA = {};
+  const baselineFilesB = {};
+  for (let index = 0; index < 3000; index += 1) {
+    const path = `Bulk/f-${String(index).padStart(4, "0")}.bin`;
+    const content = `same-${String(index).padStart(4, "0")}`;
+    baselineFilesA[path] = { content, mtime: 10_000 + index };
+    baselineFilesB[path] = { content, mtime: 90_000_000 + index };
+  }
+  baselineFilesA["Bulk/rounded.bin"] = { content: "rounded", mtime: 123_000 };
+  baselineFilesB["Bulk/rounded.bin"] = { content: "rounded", mtime: 124_500 };
+  baselineFilesA["Bulk/changed.bin"] = { content: "local-xx", mtime: 200_000 };
+  baselineFilesB["Bulk/changed.bin"] = { content: "remote-x", mtime: 300_000 };
+  baselineFilesA["Only-A/new.md"] = { content: "from A", mtime: 400_000 };
+  baselineFilesB["Only-B/new.md"] = { content: "from B", mtime: 500_000 };
+  const baselineStorageA = new MemoryStorage(identity, baselineFilesA);
+  const baselineStorageB = new MemoryStorage(identity, baselineFilesB);
+  const baselineProgressA = [];
+  const baselineProgressB = [];
+  const baselineOptionsB = commonOptions(baselineStorageB, baselinePortB, baselineDeviceB, baselineProgressB, { checkIntervalSeconds: 60 });
+  const baselineOptionsA = commonOptions(baselineStorageA, baselinePortA, baselineDeviceA, baselineProgressA, {
+    autoDiscovery: false,
+    manualPeers: [`127.0.0.1:${baselinePortB}`],
+    checkIntervalSeconds: 60
+  });
+  const baselineServiceB = new NtfyLanSync(baselineOptionsB);
+  const baselineServiceA = new NtfyLanSync(baselineOptionsA);
+  try {
+    await baselineServiceB.start();
+    await baselineServiceA.start();
+    await waitFor(() => baselineServiceA.status().peerCount === 1, "large baseline peer");
+    const firstBaselineProgress = baselineProgressA.length;
+    baselineServiceA.requestSync();
+    await waitFor(
+      () => baselineProgressA.slice(firstBaselineProgress).some((value) => value.phase === "complete" && value.total === 3),
+      "large Remotely Save baseline",
+      30_000
+    );
+    const firstBaseline = baselineProgressA.slice(firstBaselineProgress).filter((value) => value.phase === "complete").at(-1);
+    assert.equal(firstBaseline.total, 3, "Thousands of metadata-only mtime differences entered the transfer plan");
+    assert.equal(firstBaseline.uploads, 1, "Large baseline upload count included metadata-equivalent files");
+    assert.equal(firstBaseline.downloads, 2, "Large baseline download count included metadata-equivalent files");
+    assert.equal(baselineStorageA.text("Bulk/changed.bin"), "remote-x", "A real same-size content change was not reconciled");
+    assert.equal(baselineStorageB.text("Only-A/new.md"), "from A", "A unique local file was not uploaded");
+    assert.equal(baselineStorageA.text("Only-B/new.md"), "from B", "A unique remote file was not downloaded");
+    assert.equal(baselineStorageA.readCount("Bulk/rounded.bin"), 0, "Small filesystem mtime rounding triggered a content read");
+    assert.equal(baselineStorageB.readCount("Bulk/rounded.bin"), 0, "Remote small mtime rounding triggered a content read");
+    assert.ok(requestedRoutes.includes("/cancip-lan/v1/metadata/v3/bootstrap/hashes"), "Ambiguous first-baseline metadata was not fingerprinted");
+    assert.equal(baselineServiceA.activity().files.length, 3, "The transfer list exposed baseline-only files");
+
+    const beforeIncrementalProgress = baselineProgressA.length;
+    baselineOptionsA.runtimeSettings.mode = "delete-push";
+    baselineStorageA.putText("Bulk/f-0001.bin", "edit-0001", 100_000_000);
+    baselineStorageA.files.delete("Bulk/f-0002.bin");
+    baselineStorageA.putText("Only-A/second.md", "second A", 100_000_001);
+    baselineStorageB.putText("Only-B/second.md", "second B", 100_000_002);
+    baselineServiceA.requestSync();
+    await waitFor(
+      () => baselineProgressA.slice(beforeIncrementalProgress).some((value) => value.phase === "complete" && value.total === 4),
+      "post-baseline real changes",
+      30_000
+    ).catch((error) => {
+      const completed = baselineProgressA.slice(beforeIncrementalProgress).filter((value) => value.phase === "complete");
+      throw new Error(`${error.message}; completions=${JSON.stringify(completed)}`);
+    });
+    const incrementalBaseline = baselineProgressA.slice(beforeIncrementalProgress).filter((value) => value.phase === "complete").at(-1);
+    assert.equal(incrementalBaseline.total, 4, "Post-baseline scan scheduled unchanged files");
+    assert.equal(baselineStorageB.text("Bulk/f-0001.bin"), "edit-0001", "A later same-size edit was not detected");
+    assert.equal(baselineStorageB.text("Bulk/f-0002.bin"), null, "A later deletion was not propagated");
+    assert.equal(baselineStorageB.text("Only-A/second.md"), "second A", "A later local file was not uploaded");
+    assert.equal(baselineStorageA.text("Only-B/second.md"), "second B", "A later remote file was not downloaded");
+    assert.equal([...baselineStorageA.files.keys(), ...baselineStorageB.files.keys()].some((path) => path.includes("LAN conflict")), false, "Baseline reconciliation created a renamed conflict copy");
+  } finally {
+    await Promise.all([baselineServiceA.stop(), baselineServiceB.stop()]);
   }
 
   const [desktopPort] = await Promise.all([freePort()]);
