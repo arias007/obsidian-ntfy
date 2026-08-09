@@ -405,6 +405,7 @@ try {
   };
   let stabilityClock = 1_000;
   let stabilityPeerEvents = 0;
+  const stabilityProgress = [];
   const stabilitySettings = {
     enabled: true,
     autoDiscovery: true,
@@ -421,7 +422,7 @@ try {
     getSettings: () => stabilitySettings,
     storage: new MemoryStorage(identity, {}),
     httpRequest,
-    onProgress: () => undefined,
+    onProgress: (value) => stabilityProgress.push(value),
     onPeersChanged: () => { stabilityPeerEvents += 1; },
     localStore: memoryLocalStore("STABILITYSTABILITY01"),
     now: () => stabilityClock
@@ -440,7 +441,11 @@ try {
     probing: false,
     manual: false,
     lastRemoteSyncRequestId: "",
-    policy: { incrementalPush: false, incrementalPull: false, deletePush: false, deletePull: false, syncConfigFolder: false, deleteProtocol: true }
+    remoteFullSyncRequestId: "",
+    remoteDirtyPaths: new Map(),
+    policy: { incrementalPush: false, incrementalPull: false, deletePush: false, deletePull: false, syncConfigFolder: false, deleteProtocol: true },
+    capabilities: new Set(),
+    compatibilityPendingSince: 0
   };
   stabilityService.peers.set(stabilityPeer.deviceId, stabilityPeer);
   stabilityClock = 8_000;
@@ -450,6 +455,17 @@ try {
   stabilityClock += 1_000;
   stabilityService.emitPeersChanged();
   assert.equal(stabilityPeerEvents, 1, "Heartbeat timestamps should not rebuild the chat contact list");
+  stabilityPeer.canHost = false;
+  stabilityService.requestSync();
+  assert.equal(stabilityService.progress().stage, "requesting-peer-scan", "A desktop request did not explain that it was waiting for the mobile coordinator");
+  stabilityService.applyRemoteSyncSignal(stabilityPeer, {});
+  stabilityClock += 3_000;
+  stabilityService.emitPeerConnectionStage(stabilityPeer);
+  assert.equal(stabilityService.progress().stage, "peer-upgrade-required", "An incompatible passive mobile peer stayed at an unexplained 0/0 state");
+  stabilityService.applyRemoteSyncSignal(stabilityPeer, { capabilities: ["metadata-session-v3"] });
+  stabilityService.emitPeerConnectionStage(stabilityPeer);
+  assert.equal(stabilityService.progress().stage, "requesting-peer-scan", "A compatible mobile peer did not resume the pending scan request stage");
+  assert.ok(stabilityProgress.some((value) => value.stage === "checking-peer" || value.stage === "peer-upgrade-required"), "Peer compatibility stages were not emitted");
   stabilityPeer.consecutiveFailures = 3;
   stabilityClock = 31_500;
   assert.equal(stabilityService.listPeers().length, 0, "A peer should leave the list only after the stable grace window");
@@ -724,6 +740,8 @@ try {
     assert.equal(firstBaseline.total, 3, "Thousands of metadata-only mtime differences entered the transfer plan");
     assert.equal(firstBaseline.uploads, 1, "Large baseline upload count included metadata-equivalent files");
     assert.equal(firstBaseline.downloads, 2, "Large baseline download count included metadata-equivalent files");
+    assert.ok(baselineProgressA.some((value) => value.stage === "fingerprinting" && value.total > 0), "Ambiguous baseline hashing did not expose fingerprint progress");
+    assert.ok(baselineProgressA.some((value) => value.stage === "planning"), "Baseline comparison did not expose the planning stage");
     assert.equal(baselineStorageA.text("Bulk/changed.bin"), "remote-x", "A real same-size content change was not reconciled");
     assert.equal(baselineStorageB.text("Only-A/new.md"), "from A", "A unique local file was not uploaded");
     assert.equal(baselineStorageA.text("Only-B/new.md"), "from B", "A unique remote file was not downloaded");
@@ -784,7 +802,10 @@ try {
     await mobileService.start();
     await waitFor(() => mobileService.status().peerCount === 1, "mobile authenticated desktop endpoint");
     await waitFor(() => desktopService.status().peerCount === 1, "desktop observed authenticated mobile client");
+    assert.equal(desktopService.listPeers()[0].compatible, true, "Desktop did not learn the passive mobile peer capability from its inbound ping");
     await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "automatic full-vault sync");
+    assert.ok(desktopProgress.some((value) => value.stage === "enumerating"), "Passive desktop did not report metadata enumeration");
+    assert.ok(desktopProgress.some((value) => value.stage === "planning"), "Passive desktop did not report transfer planning");
     desktopService.requestSync();
     await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "desktop-requested mobile LAN synchronization");
     await waitFor(() => mobileProgress.some((value) => value.phase === "complete"), "mobile synchronization completion");
@@ -819,8 +840,14 @@ try {
   assert.match(source, /setIcon\(icon, "wifi"\)/, "Connected LAN status should keep the Wi-Fi icon");
   assert.match(source, /registerDomEvent\(item, "click", \(\) => this\.openLanSyncDetails\(\)\)/, "LAN status item should open live details on click");
   assert.match(source, /class NtfyLanSyncDetailsModal extends Modal/, "LAN sync details modal is missing");
-  assert.match(source, /renderScanSection\(body, scan, scanGroups, chinese\)/, "LAN scan section is missing");
-  assert.match(source, /renderTransferSection\(body, progress, files, transferGroups, chinese\)/, "LAN transfer section is missing");
+  assert.match(source, /renderScanSection\(body, scan, scanGroups, chinese, progress, effectiveStage, stageDescriptions\)/, "LAN scan section is missing stage context");
+  assert.match(source, /renderTransferSection\(body, progress, files, transferGroups, chinese, effectiveStage, stageDescriptions\)/, "LAN transfer section is missing stage context");
+  assert.match(source, /"waiting-peer-scan": "等待手机发起扫描"/, "LAN details do not explain the passive mobile wait stage");
+  assert.match(source, /"peer-upgrade-required": "手机插件需要升级"/, "LAN details do not explain an incompatible mobile peer");
+  assert.match(source, /正在核对内容指纹/, "LAN details do not expose first-baseline fingerprinting");
+  assert.match(source, /const idleLabel = chinese/, "An idle scan does not derive a meaningful stage label");
+  assert.match(source, /同步：等待扫描结果/, "An idle transfer section does not explain what it is waiting for");
+  assert.doesNotMatch(source, /const label = `\$\{chinese \? "扫描" : "Scan"\} \$\{scan\.completed \|\| 0\}\/\$\{scan\.total \|\| 0\}`/, "LAN details still render an unexplained scan 0/0");
   assert.match(source, /上传/, "LAN transfer details do not label uploads");
   assert.match(source, /下载/, "LAN transfer details do not label downloads");
   assert.match(source, /progress\.uploadCompleted[^\n]*progress\.uploads/, "LAN details do not show completed/total uploads");
@@ -832,6 +859,7 @@ try {
   assert.match(source, /includeTransferFiles: this\.sectionState\.transfer && expandedTransferGroups\.length > 0/, "Collapsed transfer groups should not materialize hidden file rows");
   assert.match(source, /renderActivityGroups\(panel, groups, scanFiles, "scan", chinese\)/, "Scan files are not grouped by top-level folder");
   assert.match(source, /renderActivityGroups\(panel, groups, Array\.isArray\(files\) \? files : \[\], "transfer", chinese\)/, "Transfer files are not grouped by top-level folder");
+  assert.match(source, /obsidian-ntfy-lan-stage-progress/, "LAN details should expose stage progress before file totals exist");
   assert.match(source, /createEl\("progress"/, "LAN details should expose progress bars");
   assert.match(source, /this\.app\.vault\.on\("create"/, "New Vault files should trigger LAN sync");
   assert.match(source, /attachment\/write/, "LAN attachments should use the temporary inbox route");

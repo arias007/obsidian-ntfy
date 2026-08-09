@@ -90,6 +90,10 @@
   color: var(--color-green, #15803d);
 }
 
+.obsidian-ntfy-lan-details-summary-icon svg.lucide-loader-circle {
+  animation: obsidian-ntfy-lan-spin 0.9s linear infinite;
+}
+
 .obsidian-ntfy-lan-details-summary-text {
   min-width: 0;
   font-size: var(--font-ui-small);
@@ -114,6 +118,21 @@
   margin-top: 2px;
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
+}
+
+.obsidian-ntfy-lan-details-stage-description {
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.obsidian-ntfy-lan-stage-progress {
+  display: block;
+  height: 4px;
+  margin-top: 6px;
+  width: 100%;
 }
 
 .obsidian-ntfy-lan-details-section {

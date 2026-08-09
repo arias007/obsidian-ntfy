@@ -24,6 +24,8 @@ export type LanSyncPeerInfo = {
   linkType: LanLinkType;
   verified: boolean;
   lastSeenAt: number;
+  canHost: boolean;
+  compatible: boolean;
 };
 
 export type LanSyncIncomingMessage = {
@@ -98,8 +100,23 @@ export type LanSyncHttpResponse = {
 
 export type LanSyncProgressPhase = "stopped" | "discovering" | "connected" | "scanning" | "syncing" | "complete" | "error";
 
+export type LanSyncProgressStage =
+  | "stopped"
+  | "discovering"
+  | "checking-peer"
+  | "requesting-peer-scan"
+  | "waiting-peer-scan"
+  | "enumerating"
+  | "fingerprinting"
+  | "planning"
+  | "transferring"
+  | "complete"
+  | "peer-upgrade-required"
+  | "error";
+
 export type LanSyncProgress = {
   phase: LanSyncProgressPhase;
+  stage: LanSyncProgressStage;
   active: boolean;
   peerId: string;
   peerCount: number;
@@ -255,6 +272,7 @@ type LanSyncPeer = {
   remoteDirtyPaths: Map<string, number>;
   policy: LanSyncPolicy;
   capabilities: Set<string>;
+  compatibilityPendingSince: number;
 };
 
 type LanSyncDirtyPath = {
@@ -957,8 +975,22 @@ export class LanStatusBarTakeover {
 }
 
 function defaultProgress(phase: LanSyncProgressPhase = "stopped"): LanSyncProgress {
+  const stage: LanSyncProgressStage = phase === "discovering"
+    ? "discovering"
+    : phase === "connected"
+      ? "waiting-peer-scan"
+      : phase === "scanning"
+        ? "enumerating"
+        : phase === "syncing"
+          ? "transferring"
+          : phase === "complete"
+            ? "complete"
+            : phase === "error"
+              ? "error"
+              : "stopped";
   return {
     phase,
+    stage,
     active: false,
     peerId: "",
     peerCount: 0,
@@ -1237,7 +1269,9 @@ export class NtfyLanSync {
           port: peer.port,
           linkType: peer.manual && detectedLink === "lan" ? "manual" : detectedLink,
           verified: this.isPeerActive(peer, now),
-          lastSeenAt: Math.max(peer.lastSeenAt, peer.verifiedAt)
+          lastSeenAt: Math.max(peer.lastSeenAt, peer.verifiedAt),
+          canHost: peer.canHost,
+          compatible: peer.capabilities.has(METADATA_LEDGER_CAPABILITY)
         };
       })
       .filter((peer) => peer.verified)
@@ -1486,6 +1520,15 @@ export class NtfyLanSync {
     this.fullSyncRequested = true;
     this.fullSyncRequestId = randomId(18);
     this.syncRequestId = this.fullSyncRequestId;
+    const passivePeer = this.activePeers().find((peer) => !peer.canHost);
+    if (passivePeer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing") {
+      this.emit({
+        ...defaultProgress("connected"),
+        stage: "requesting-peer-scan",
+        active: true,
+        peerId: passivePeer.deviceId
+      });
+    }
     this.scheduleSync(0, true);
   }
 
@@ -1989,7 +2032,8 @@ export class NtfyLanSync {
         remoteFullSyncRequestId: "",
         remoteDirtyPaths: new Map(),
         policy: passivePeerPolicy(),
-        capabilities: new Set()
+        capabilities: new Set(),
+        compatibilityPendingSince: 0
       };
       this.peers.set(deviceId, peer);
     }
@@ -2018,12 +2062,18 @@ export class NtfyLanSync {
     peer.verifiedAt = this.now();
     peer.consecutiveFailures = 0;
     peer.lastFailureAt = 0;
+    if (route.startsWith(`${API_PREFIX}${METADATA_ROUTE_PREFIX}/`)) {
+      peer.capabilities.add(METADATA_LEDGER_CAPABILITY);
+      peer.compatibilityPendingSince = 0;
+      if (this.lastErrorValue === "peer_upgrade_required") this.lastErrorValue = "";
+    }
     if (firstVerifiedConnection && route.endsWith("/ping")) this.syncRequestId = randomId(18);
     const transfer = route.includes("/file/") || route.includes("/attachment/");
     if (transfer) this.lastTransferAt = this.now();
     if (!transfer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
       this.emit({
         ...defaultProgress("connected"),
+        stage: peer.capabilities.has(METADATA_LEDGER_CAPABILITY) ? "waiting-peer-scan" : "checking-peer",
         active: true,
         peerId: deviceId
       });
@@ -2238,6 +2288,7 @@ export class NtfyLanSync {
 
   private syncSignalPayload(): Record<string, unknown> {
     return {
+      capabilities: [METADATA_LEDGER_CAPABILITY],
       syncRequestId: this.syncRequestId,
       fullSyncRequestId: this.fullSyncRequested ? this.fullSyncRequestId : "",
       dirtyPaths: this.dirtySnapshot()
@@ -2245,6 +2296,15 @@ export class NtfyLanSync {
   }
 
   private applyRemoteSyncSignal(peer: LanSyncPeer, payload: Record<string, unknown>): boolean {
+    const capabilities = (Array.isArray(payload.capabilities) ? payload.capabilities : [])
+      .filter((value): value is string => typeof value === "string" && value.length <= 64);
+    if (capabilities.includes(METADATA_LEDGER_CAPABILITY)) {
+      peer.capabilities.add(METADATA_LEDGER_CAPABILITY);
+      peer.compatibilityPendingSince = 0;
+      if (this.lastErrorValue === "peer_upgrade_required") this.lastErrorValue = "";
+    } else if (!peer.capabilities.has(METADATA_LEDGER_CAPABILITY) && peer.compatibilityPendingSince <= 0) {
+      peer.compatibilityPendingSince = this.now();
+    }
     const requestId = typeof payload.syncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.syncRequestId)
       ? payload.syncRequestId
       : "";
@@ -2255,6 +2315,32 @@ export class NtfyLanSync {
       : "";
     peer.remoteDirtyPaths = this.parseDirtyPaths(payload.dirtyPaths);
     return requested;
+  }
+
+  private emitPeerConnectionStage(peer: LanSyncPeer): void {
+    if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing" || this.inboundSession) return;
+    const hasPendingWork = this.fullSyncRequested || Boolean(peer.remoteFullSyncRequestId) || (peer.remoteDirtyPaths?.size ?? 0) > 0;
+    if (this.progressValue.phase === "complete" && !hasPendingWork) return;
+    const compatible = peer.capabilities.has(METADATA_LEDGER_CAPABILITY);
+    const compatibilityExpired = !compatible
+      && peer.compatibilityPendingSince > 0
+      && this.now() - peer.compatibilityPendingSince >= 2_000;
+    const stage: LanSyncProgressStage = compatibilityExpired
+      ? "peer-upgrade-required"
+      : !compatible
+        ? "checking-peer"
+        : this.fullSyncRequested
+          ? "requesting-peer-scan"
+          : "waiting-peer-scan";
+    const error = compatibilityExpired ? "peer_upgrade_required" : "";
+    if (error) this.lastErrorValue = error;
+    this.emit({
+      ...defaultProgress("connected"),
+      stage,
+      active: true,
+      peerId: peer.deviceId,
+      error
+    });
   }
 
   private async verifyPeer(peer: LanSyncPeer): Promise<void> {
@@ -2295,7 +2381,7 @@ export class NtfyLanSync {
       peer.lastFailureAt = 0;
       this.lastErrorValue = "";
       if (this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
-        this.emit({ ...defaultProgress("connected"), active: true, peerId: peer.deviceId });
+        this.emit({ ...defaultProgress("connected"), stage: "waiting-peer-scan", active: true, peerId: peer.deviceId });
       }
       this.emitPeersChanged();
       await this.receiveQueuedMessages(peer, response.messages);
@@ -2404,7 +2490,13 @@ export class NtfyLanSync {
     } catch (error) {
       this.lastErrorValue = safeErrorCode(error);
       const peer = peers[0];
-      this.emit({ ...defaultProgress("error"), active: Boolean(peer), peerId: peer?.deviceId ?? "", error: this.lastErrorValue });
+      this.emit({
+        ...defaultProgress("error"),
+        stage: this.lastErrorValue === "peer_upgrade_required" ? "peer-upgrade-required" : "error",
+        active: Boolean(peer),
+        peerId: peer?.deviceId ?? "",
+        error: this.lastErrorValue
+      });
     } finally {
       this.syncRunning = false;
       if (this.syncQueued) {
@@ -2500,8 +2592,16 @@ export class NtfyLanSync {
       const completedBeforeHashes = scan.completed;
       scan.phase = "scanning";
       scan.total += bootstrapCandidates.length;
+      for (const candidate of bootstrapCandidates) {
+        const activity = scanFiles.get(candidate.path);
+        if (activity) {
+          activity.state = "hashing";
+          activity.reason = "fingerprint";
+        }
+      }
       this.emit({
         ...defaultProgress("scanning"),
+        stage: "fingerprinting",
         active: true,
         peerId: peer.deviceId,
         completed: scan.completed,
@@ -2527,6 +2627,7 @@ export class NtfyLanSync {
           lastBootstrapProgressAt = now;
           this.emit({
             ...defaultProgress("scanning"),
+            stage: "fingerprinting",
             active: true,
             peerId: peer.deviceId,
             completed: scan.completed,
@@ -2550,14 +2651,15 @@ export class NtfyLanSync {
       }
       scan.phase = "complete";
       scan.completed = scan.total;
-      this.emit({
-        ...defaultProgress("scanning"),
-        active: true,
-        peerId: peer.deviceId,
-        completed: scan.completed,
-        total: scan.total
-      });
     }
+    this.emit({
+      ...defaultProgress("scanning"),
+      stage: "planning",
+      active: true,
+      peerId: peer.deviceId,
+      completed: this.scanValue.completed,
+      total: this.scanValue.total
+    });
     const actions = planLanSyncMetadataReconciliation(filteredLocalEntries, remoteEntries, ledger.entries, localPolicy, remotePolicy);
     const actionPaths = new Set(actions.map((action) => action.path));
     const settledPaths = new Set([...selectedPaths].filter((path) => !actionPaths.has(path)));
@@ -2959,6 +3061,68 @@ export class NtfyLanSync {
     });
     this.queueHashCacheSave();
     return entries.filter((entry): entry is LanSyncManifestEntry => entry !== null);
+  }
+
+  private async buildInboundMetadataHashManifest(
+    expectedEntries: LanSyncMetadataEntry[],
+    includeConfigFolder: boolean,
+    peerId: string
+  ): Promise<LanSyncManifestEntry[]> {
+    const scan = this.scanValue;
+    const scanFiles = new Map(scan.files.map((file) => [file.path, file]));
+    const completedBeforeHashes = scan.completed;
+    scan.phase = "scanning";
+    scan.total += expectedEntries.length;
+    for (const expected of expectedEntries) {
+      const activity = scanFiles.get(expected.path);
+      if (activity) {
+        activity.state = "hashing";
+        activity.reason = "fingerprint";
+      }
+    }
+    this.emit({
+      ...defaultProgress("scanning"),
+      stage: "fingerprinting",
+      active: true,
+      peerId,
+      completed: scan.completed,
+      total: scan.total
+    });
+    let verified = 0;
+    let lastReportedAt = 0;
+    const entries = await this.buildMetadataHashManifest(expectedEntries, includeConfigFolder, (path, cached) => {
+      verified += 1;
+      scan.completed = completedBeforeHashes + verified;
+      if (cached) scan.cached += 1;
+      else scan.hashed += 1;
+      const activity = scanFiles.get(path);
+      if (activity) {
+        activity.state = cached ? "cached" : "complete";
+        activity.reason = cached ? "fingerprint-cache" : "fingerprint";
+      }
+      const now = this.now();
+      if (verified < expectedEntries.length && now - lastReportedAt < 40) return;
+      lastReportedAt = now;
+      this.emit({
+        ...defaultProgress("scanning"),
+        stage: "fingerprinting",
+        active: true,
+        peerId,
+        completed: scan.completed,
+        total: scan.total
+      });
+    });
+    scan.phase = "complete";
+    scan.completed = scan.total;
+    this.emit({
+      ...defaultProgress("scanning"),
+      stage: "planning",
+      active: true,
+      peerId,
+      completed: scan.completed,
+      total: scan.total
+    });
+    return entries;
   }
 
   private async buildMetadataManifestForPaths(
@@ -3684,35 +3848,55 @@ export class NtfyLanSync {
       let result: Record<string, unknown>;
       if (path === `${API_PREFIX}/ping`) {
         const peer = this.peers.get(deviceId);
-        if (peer) this.applyRemoteSyncSignal(peer, payload);
+        if (peer) {
+          this.applyRemoteSyncSignal(peer, payload);
+          this.emitPeerConnectionStage(peer);
+        }
         result = {
           ok: true,
           protocolVersion: PROTOCOL_VERSION,
           deviceId: this.deviceId,
           policy: this.policy(),
-          capabilities: [METADATA_LEDGER_CAPABILITY],
           messages: this.pendingMessagesFor(deviceId),
           ...this.syncSignalPayload()
         };
       } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/manifest`) {
         const policy = this.policy();
+        const files = await this.buildMetadataManifest(policy.syncConfigFolder && payload.syncConfigFolder === true);
+        this.emit({
+          ...defaultProgress("scanning"),
+          stage: "planning",
+          active: true,
+          peerId: deviceId,
+          completed: this.scanValue.completed,
+          total: this.scanValue.total
+        });
         result = {
-          files: await this.buildMetadataManifest(policy.syncConfigFolder && payload.syncConfigFolder === true),
+          files,
           policy
         };
       } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/manifest/paths`) {
         const policy = this.policy();
         const paths = Array.isArray(payload.paths) ? payload.paths.filter((value): value is string => typeof value === "string") : [];
         if (paths.length > MAX_DIRTY_PATHS) throw new LanSyncProtocolError("too_many_dirty_paths", 413);
+        const files = await this.buildMetadataManifestForPaths(paths, policy.syncConfigFolder && payload.syncConfigFolder === true);
+        this.emit({
+          ...defaultProgress("scanning"),
+          stage: "planning",
+          active: true,
+          peerId: deviceId,
+          completed: this.scanValue.completed,
+          total: this.scanValue.total
+        });
         result = {
-          files: await this.buildMetadataManifestForPaths(paths, policy.syncConfigFolder && payload.syncConfigFolder === true),
+          files,
           policy
         };
       } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/bootstrap/hashes`) {
         const policy = this.policy();
         const includeConfigFolder = policy.syncConfigFolder && payload.syncConfigFolder === true;
         const expected = this.parseMetadataManifest(payload.files, includeConfigFolder);
-        result = { files: await this.buildMetadataHashManifest(expected, includeConfigFolder) };
+        result = { files: await this.buildInboundMetadataHashManifest(expected, includeConfigFolder, deviceId) };
       } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/session/start`) {
         result = await this.handleMetadataSessionStart(deviceId, payload);
       } else if (path === `${API_PREFIX}${METADATA_ROUTE_PREFIX}/session/finish`) {
