@@ -28,7 +28,7 @@ function arrayBuffer(value) {
 }
 
 class MemoryStorage {
-  constructor(identity, files = {}) {
+  constructor(identity, files = {}, options = {}) {
     this.identityRoot = ".obsidian/plugins/android-ntfy-notifier/lan-sync";
     this.files = new Map();
     this.folders = new Set([
@@ -40,6 +40,8 @@ class MemoryStorage {
     ]);
     this.clock = 1000;
     this.readCounts = new Map();
+    this.writeCounts = new Map();
+    this.mtimeTransform = typeof options.mtimeTransform === "function" ? options.mtimeTransform : (mtime) => mtime;
     this.putText(`${this.identityRoot}/identity.json`, `${JSON.stringify(identity)}\n`, 1);
     for (const [path, value] of Object.entries(files)) this.putText(path, value.content, value.mtime);
   }
@@ -82,8 +84,14 @@ class MemoryStorage {
     return [...this.readCounts.values()].reduce((sum, count) => sum + count, 0);
   }
 
+  totalWrites() {
+    return [...this.writeCounts.values()].reduce((sum, count) => sum + count, 0);
+  }
+
   async writeBinary(path, data, mtime) {
-    this.files.set(path, { data: new Uint8Array(data), mtime: Number.isFinite(mtime) ? mtime : ++this.clock });
+    const requestedMtime = Number.isFinite(mtime) ? mtime : ++this.clock;
+    this.files.set(path, { data: new Uint8Array(data), mtime: this.mtimeTransform(requestedMtime, path) });
+    this.writeCounts.set(path, (this.writeCounts.get(path) || 0) + 1);
   }
 
   async deleteFile(path) {
@@ -183,10 +191,18 @@ try {
     ".obsidian/workspace.json",
     ".obsidian/workspace-mobile.json",
     ".obsidian/plugins/remotely-save/data.json",
+    ".obsidian/plugins/android-ntfy-notifier/data.json",
     ".obsidian/plugins/android-ntfy-notifier/lan-sync/identity.json",
     ".obsidian/plugins/example/node_modules/cache.bin"
   ]) {
     assert.equal(normalizeLanSyncPath(protectedPath, configPathOptions), null, `Protected config path accepted: ${protectedPath}`);
+  }
+  for (const sharedPluginPath of [
+    ".obsidian/plugins/android-ntfy-notifier/main.js",
+    ".obsidian/plugins/android-ntfy-notifier/manifest.json",
+    ".obsidian/plugins/android-ntfy-notifier/styles.css"
+  ]) {
+    assert.equal(normalizeLanSyncPath(sharedPluginPath, configPathOptions), sharedPluginPath, `Plugin release file was excluded: ${sharedPluginPath}`);
   }
   assert.equal(normalizeLanSyncPath(".obsidian/hotkeys.json"), null, "Config path was enabled without the setting");
   for (const address of ["127.0.0.1", "10.0.0.2", "172.20.1.2", "192.168.1.8", "169.254.2.3"]) assert.equal(isPrivateLanAddress(address), true);
@@ -445,7 +461,7 @@ try {
     await waitFor(() => serviceA.status().peerCount === 1, "authenticated same-Vault peer");
     assert.equal(serviceA.listPeers()[0].deviceId, deviceB, "Manual endpoint was not rebound to the authenticated device ID");
     assert.equal(serviceA.listPeers()[0].linkType, "manual");
-    assert.equal(serviceA.peers.get(deviceB).capabilities.has("metadata-ledger-v1"), true, "Authenticated ping did not negotiate metadata sync");
+    assert.equal(serviceA.peers.get(deviceB).capabilities.has("metadata-session-v2"), true, "Authenticated ping did not negotiate metadata sync");
     serviceA.requestSync();
     await waitFor(() => storageA.text("Notes/from-b.md") === "from B" && storageB.text("Notes/from-a.md") === "from A", "automatic bidirectional LAN transfer");
     await waitFor(() => storageA.text("Notes/shared.md") === "newer B" && storageB.text("Notes/shared.md") === "newer B", "original-path convergence");
@@ -464,6 +480,7 @@ try {
       previousScanCompleted = value.completed;
       previousScanTotal = value.total;
     }
+    await waitFor(() => progressA.some((value) => value.phase === "complete" && value.uploads > 0 && value.downloads > 0), "bidirectional completion progress");
     assert.ok(progressA.some((value) => value.phase === "complete" && value.conflicts === 0 && value.uploads > 0 && value.downloads > 0), "Completion progress did not expose upload/download directions");
     assert.ok(progressB.some((value) => value.active), "Receiving peer did not expose LAN status");
     const activityA = serviceA.activity();
@@ -486,6 +503,7 @@ try {
     }, "cached follow-up full-vault scan");
     assert.equal(storageA.totalReads(), readsBeforeCachedScan, "An unchanged follow-up scan reread file contents instead of using metadata/hash cache");
     assert.ok(requestedRoutes.includes("/cancip-lan/v1/manifest/metadata"), "New peers did not use the metadata manifest route");
+    assert.ok(serviceB.loadMetadataLedger(deviceA).entries["Notes/identical.md"], "Receiving peer did not persist the reverse metadata ledger");
 
     const negotiatedPeer = serviceA.peers.get(deviceB);
     negotiatedPeer.capabilities.clear();
@@ -496,15 +514,31 @@ try {
     assert.deepEqual(storageA.files, beforeLegacyAttempt, "Rejecting an outdated peer changed local files");
     await assert.rejects(() => serviceA.callPeer(negotiatedPeer, "/manifest", {}), /peer_upgrade_required/);
     assert.ok(requestedRoutes.includes("/cancip-lan/v1/manifest"), "The server-side legacy route rejection was not exercised");
-    negotiatedPeer.capabilities.add("metadata-ledger-v1");
+    negotiatedPeer.capabilities.add("metadata-session-v2");
 
     storageA.putText("Notes/identical.md", "changed on A", 700);
+    const incrementalRouteStart = requestedRoutes.length;
+    const incrementalProgressA = progressA.length;
+    const incrementalProgressB = progressB.length;
     serviceA.notifyVaultChange("Notes/identical.md");
-    serviceA.requestSync();
     await waitFor(() => storageB.text("Notes/identical.md") === "changed on A", "metadata push after a local edit");
     assert.equal((await storageB.statFile("Notes/identical.md")).mtime, 700, "Metadata push lost the source mtime");
+    assert.ok(requestedRoutes.slice(incrementalRouteStart).includes("/cancip-lan/v1/manifest/metadata/paths"), "A file event still requested a full-vault manifest");
+    assert.ok(serviceA.activity().scan.total <= 1, "A single file event scanned more than its dirty path");
+    await waitFor(
+      () => progressA.slice(incrementalProgressA).some((value) => value.phase === "complete" && value.total === 1)
+        && progressB.slice(incrementalProgressB).some((value) => value.phase === "complete" && value.total === 1),
+      "mirrored incremental completion"
+    );
+    const mirroredPushA = progressA.slice(incrementalProgressA).filter((value) => value.phase === "complete" && value.total === 1).at(-1);
+    const mirroredPushB = progressB.slice(incrementalProgressB).filter((value) => value.phase === "complete" && value.total === 1).at(-1);
+    assert.ok(mirroredPushA && mirroredPushB, "Both peers did not finish the same incremental session");
+    assert.equal(mirroredPushA.uploads, mirroredPushB.downloads, "Coordinator uploads did not mirror peer downloads");
+    assert.equal(mirroredPushA.downloads, mirroredPushB.uploads, "Coordinator downloads did not mirror peer uploads");
+    assert.equal(mirroredPushA.bytesTotal, mirroredPushB.bytesTotal, "The two peers did not share the same byte total");
+    assert.equal(mirroredPushA.bytesTransferred, mirroredPushB.bytesTransferred, "The two peers did not finish the same transferred bytes");
     storageB.putText("Notes/identical.md", "changed on B", 710);
-    serviceA.requestSync();
+    serviceB.notifyVaultChange("Notes/identical.md");
     await waitFor(() => storageA.text("Notes/identical.md") === "changed on B", "metadata pull after a remote edit");
     assert.equal((await storageA.statFile("Notes/identical.md")).mtime, 710, "Metadata pull lost the source mtime");
     const activityB = serviceB.activity();
@@ -573,6 +607,52 @@ try {
     await Promise.all([serviceA.stop(), serviceB.stop()]);
   }
 
+  const [exactPort, roundedPort] = await Promise.all([freePort(), freePort()]);
+  const exactDevice = "DDDDDDDDDDDDDDDDDDDDDDDD";
+  const roundedDevice = "EEEEEEEEEEEEEEEEEEEEEEEE";
+  const exactStorage = new MemoryStorage(identity, {
+    "Notes/android-mtime.md": { content: "stable content", mtime: 123456 }
+  });
+  const roundedStorage = new MemoryStorage(identity, {}, {
+    mtimeTransform: (mtime) => Math.floor(mtime / 1000) * 1000 + 37
+  });
+  const exactProgress = [];
+  const roundedProgress = [];
+  const roundedService = new NtfyLanSync(commonOptions(roundedStorage, roundedPort, roundedDevice, roundedProgress));
+  const exactService = new NtfyLanSync(commonOptions(exactStorage, exactPort, exactDevice, exactProgress, {
+    autoDiscovery: false,
+    manualPeers: [`127.0.0.1:${roundedPort}`]
+  }));
+  try {
+    await roundedService.start();
+    await exactService.start();
+    await waitFor(() => roundedStorage.text("Notes/android-mtime.md") === "stable content", "Android-like initial transfer");
+    await waitFor(() => exactProgress.some((value) => value.phase === "complete" && value.total === 1), "Android-like initial session completion");
+    const exactMetadata = await exactStorage.statFile("Notes/android-mtime.md");
+    const roundedMetadata = await roundedStorage.statFile("Notes/android-mtime.md");
+    assert.notEqual(exactMetadata.mtime, roundedMetadata.mtime, "Android-like storage unexpectedly preserved the source mtime exactly");
+    assert.deepEqual(exactService.loadMetadataLedger(roundedDevice).entries["Notes/android-mtime.md"], {
+      local: { size: exactMetadata.size, mtime: exactMetadata.mtime },
+      remote: { size: roundedMetadata.size, mtime: roundedMetadata.mtime }
+    }, "Coordinator ledger did not retain both real mtimes");
+    assert.deepEqual(roundedService.loadMetadataLedger(exactDevice).entries["Notes/android-mtime.md"], {
+      local: { size: roundedMetadata.size, mtime: roundedMetadata.mtime },
+      remote: { size: exactMetadata.size, mtime: exactMetadata.mtime }
+    }, "Receiving peer ledger was not the coordinator ledger inverse");
+    const writesBeforeSteadyScan = roundedStorage.totalWrites();
+    const readsBeforeSteadyScan = exactStorage.totalReads() + roundedStorage.totalReads();
+    const progressBeforeSteadyScan = exactProgress.length;
+    exactService.requestSync();
+    await waitFor(() => exactProgress.slice(progressBeforeSteadyScan).some((value) => value.phase === "complete"), "steady-state full-vault calibration");
+    const steady = exactProgress.slice(progressBeforeSteadyScan).filter((value) => value.phase === "complete").at(-1);
+    assert.equal(steady.total, 0, "A just-synchronized Android-like Vault scheduled files again");
+    assert.equal(steady.bytesTotal, 0, "A just-synchronized Android-like Vault scheduled bytes again");
+    assert.equal(roundedStorage.totalWrites(), writesBeforeSteadyScan, "Steady-state calibration rewrote an unchanged file");
+    assert.equal(exactStorage.totalReads() + roundedStorage.totalReads(), readsBeforeSteadyScan, "Steady-state calibration reread unchanged file content");
+  } finally {
+    await Promise.all([exactService.stop(), roundedService.stop()]);
+  }
+
   const [desktopPort] = await Promise.all([freePort()]);
   const desktopDevice = "CCCCCCCCCCCCCCCCCCCCCCCC";
   const mobileDevice = "ZZZZZZZZZZZZZZZZZZZZZZZZ";
@@ -583,8 +663,13 @@ try {
   mobileStorage.putText(`${mobileStorage.identityRoot}/peers/${desktopDevice}.json`, descriptor(desktopDevice, desktopPort));
   const desktopProgress = [];
   const mobileProgress = [];
-  const desktopService = new NtfyLanSync(commonOptions(desktopStorage, desktopPort, desktopDevice, desktopProgress));
+  const desktopMessages = [];
+  const mobileMessages = [];
+  const desktopOptions = commonOptions(desktopStorage, desktopPort, desktopDevice, desktopProgress);
+  desktopOptions.onMessage = (message) => desktopMessages.push(message);
+  const desktopService = new NtfyLanSync(desktopOptions);
   const mobileOptions = commonOptions(mobileStorage, 43190, mobileDevice, mobileProgress, { autoDiscovery: false });
+  mobileOptions.onMessage = (message) => mobileMessages.push(message);
   const mobileService = new NtfyLanSync({
     ...mobileOptions,
     desktop: false
@@ -593,11 +678,25 @@ try {
     await desktopService.start();
     await mobileService.start();
     await waitFor(() => mobileService.status().peerCount === 1, "mobile authenticated desktop endpoint");
+    await waitFor(() => desktopService.status().peerCount === 1, "desktop observed authenticated mobile client");
     await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "automatic full-vault sync");
     desktopService.requestSync();
     await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "desktop-requested mobile LAN synchronization");
     await waitFor(() => mobileProgress.some((value) => value.phase === "complete"), "mobile synchronization completion");
     assert.ok(mobileProgress.some((value) => value.phase === "complete"), "Mobile client did not honor the desktop sync request");
+    const mobileToDesktop = await mobileService.sendMessage(desktopDevice, { text: "mobile to desktop" });
+    await waitFor(() => desktopMessages.some((message) => message.id === mobileToDesktop.id), "mobile-to-desktop LAN message");
+    const desktopToMobile = await desktopService.sendMessage(mobileDevice, { text: "desktop to mobile" });
+    await waitFor(() => mobileMessages.some((message) => message.id === desktopToMobile.id), "desktop-to-mobile queued LAN message");
+    const desktopAttachment = await desktopService.sendDeviceFile(mobileDevice, {
+      name: "desktop-file.txt",
+      type: "text/plain",
+      data: arrayBuffer(bytes("desktop attachment"))
+    });
+    const desktopFileMessage = await desktopService.sendMessage(mobileDevice, { text: "desktop file", attachments: [desktopAttachment] });
+    await waitFor(() => mobileMessages.some((message) => message.id === desktopFileMessage.id), "desktop-to-mobile queued LAN file message");
+    assert.equal(mobileStorage.text(desktopAttachment.path), "desktop attachment", "Mobile did not pull the queued desktop attachment");
+    await waitFor(() => (desktopService.pendingMessages.get(mobileDevice) || []).length === 0, "mobile message acknowledgement");
   } finally {
     await Promise.all([mobileService.stop(), desktopService.stop()]);
   }

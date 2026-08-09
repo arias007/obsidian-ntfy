@@ -780,7 +780,7 @@ var NtfyLanSyncRuntime = (() => {
   var PROTOCOL_VERSION = 1;
   var PROTOCOL_NAME = "cancip-lan-sync";
   var API_PREFIX = "/cancip-lan/v1";
-  var METADATA_LEDGER_CAPABILITY = "metadata-ledger-v1";
+  var METADATA_LEDGER_CAPABILITY = "metadata-session-v2";
   var MULTICAST_ADDRESS = "239.255.67.19";
   var DISCOVERY_PORT = 43189;
   var ANNOUNCE_INTERVAL_MS = 750;
@@ -804,6 +804,10 @@ var NtfyLanSyncRuntime = (() => {
   var LAN_INBOX_ROOT = ".trash/ntfy-inbox";
   var MAX_MESSAGE_TEXT_LENGTH = 32e3;
   var MAX_MESSAGE_ATTACHMENTS = 12;
+  var MAX_DIRTY_PATHS = 4096;
+  var MAX_QUEUED_MESSAGES_PER_PEER = 100;
+  var MAX_PING_MESSAGES = 20;
+  var OUTBOUND_MESSAGE_STORAGE_PREFIX = "ntfy.lan-message-outbox.v1";
   var LanSyncProtocolError = class extends Error {
     constructor(code, status = 400) {
       super(code);
@@ -979,6 +983,7 @@ var NtfyLanSyncRuntime = (() => {
     if (lower === `${configRoot}/workspace.json` || lower === `${configRoot}/workspace-mobile.json`) return null;
     if (lower.startsWith(`${configRoot}/cache/`) || lower.startsWith(`${configRoot}/.cache/`)) return null;
     if (lower === `${configRoot}/plugins/remotely-save` || lower.startsWith(`${configRoot}/plugins/remotely-save/`)) return null;
+    if (lower === `${configRoot}/plugins/android-ntfy-notifier/data.json`) return null;
     return normalized;
   }
   function classifyLanLinkType(name, address = "") {
@@ -1421,6 +1426,13 @@ ${bodyHash}`;
     syncQueued = false;
     syncForced = false;
     syncRequestId = "";
+    fullSyncRequestId = "";
+    fullSyncRequested = true;
+    dirtySequence = 0;
+    dirtyPaths = /* @__PURE__ */ new Map();
+    inboundSession = null;
+    pendingMessages = /* @__PURE__ */ new Map();
+    receivedMessageIds = /* @__PURE__ */ new Set();
     lastTransferAt = 0;
     progressValue = defaultProgress();
     activityFiles = [];
@@ -1473,6 +1485,19 @@ ${bodyHash}`;
       const peer = this.activePeers().find((candidate) => candidate.deviceId === deviceId);
       if (!peer) throw new Error("peer_unavailable");
       const message = this.normalizeMessagePayload(input, this.deviceId);
+      if (!peer.canHost) {
+        for (const attachment of message.attachments) {
+          const sourcePath = this.outboundAttachmentPath(deviceId, attachment.path);
+          const stat = sourcePath ? await this.options.storage.statFile(sourcePath) : null;
+          if (!sourcePath || !stat || stat.size !== attachment.size) throw new LanSyncProtocolError("message_attachment_unavailable", 409);
+        }
+        const queue = this.pendingMessages.get(deviceId) ?? [];
+        const next = [...queue.filter((item) => item.id !== message.id), message].slice(-MAX_QUEUED_MESSAGES_PER_PEER);
+        this.pendingMessages.set(deviceId, next);
+        this.savePendingMessages();
+        this.syncRequestId = randomId(18);
+        return { id: message.id };
+      }
       const response = await this.callPeer(peer, "/message/send", message);
       if (response.ok !== true || response.id !== message.id) throw new Error("message_delivery_failed");
       return { id: message.id };
@@ -1497,6 +1522,24 @@ ${bodyHash}`;
       const type = String(input.type || "application/octet-stream").slice(0, 128);
       const hash = await sha256Bytes(bytes);
       const attachmentId = randomId(18);
+      if (!peer.canHost) {
+        const path = normalizeLanInboxAttachmentPath(`${LAN_INBOX_ROOT}/${attachmentId}/${name}`);
+        const sourcePath = path ? this.outboundAttachmentPath(deviceId, path) : null;
+        if (!path || !sourcePath) throw new LanSyncProtocolError("unsafe_attachment");
+        await this.options.storage.ensureFolder(sourcePath.split("/").slice(0, -1).join("/"));
+        await this.options.storage.writeBinary(sourcePath, arrayBuffer(bytes));
+        const written = await this.options.storage.statFile(sourcePath);
+        if (!written || written.size !== bytes.byteLength) throw new Error("write_verification_failed");
+        return {
+          name,
+          type,
+          path,
+          size: bytes.byteLength,
+          hash,
+          temporary: true,
+          expiresAt: new Date(this.now() + this.settings().inboxRetentionHours * 60 * 6e4).toISOString()
+        };
+      }
       this.activityFiles = [{ path: `${LAN_INBOX_ROOT}/${attachmentId}/${name}`, action: "push", state: "syncing", size: bytes.byteLength }];
       this.activityUpdatedAt = this.now();
       this.emit({ ...defaultProgress("syncing"), active: true, peerId: peer.deviceId, total: 1, bytesTotal: bytes.byteLength });
@@ -1537,6 +1580,11 @@ ${bodyHash}`;
       }
       this.identity = await this.loadOrCreateIdentity();
       this.deviceId = this.loadOrCreateDeviceId();
+      if (!this.fullSyncRequestId) {
+        this.fullSyncRequestId = randomId(18);
+        this.syncRequestId = this.fullSyncRequestId;
+      }
+      this.loadPendingMessages();
       this.loadHashCache();
       this.runningValue = true;
       this.lastErrorValue = "";
@@ -1610,6 +1658,7 @@ ${bodyHash}`;
       this.emitPeersChanged();
       this.replayCache.clear();
       this.rateByClient.clear();
+      this.inboundSession = null;
       this.activityFiles = [];
       this.scanValue = this.emptyScanActivity();
       this.activityUpdatedAt = this.now();
@@ -1620,12 +1669,21 @@ ${bodyHash}`;
       if (!normalized) return;
       this.hashCache.delete(normalized);
       this.queueHashCacheSave();
-      if (!this.settings().autoDiscovery) return;
+      this.dirtySequence += 1;
+      this.dirtyPaths.set(normalized, this.dirtySequence);
+      if (this.dirtyPaths.size > MAX_DIRTY_PATHS) {
+        this.fullSyncRequested = true;
+        this.fullSyncRequestId = randomId(18);
+        const newest = [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS);
+        this.dirtyPaths = new Map(newest);
+      }
       this.syncRequestId = randomId(18);
-      this.scheduleSync(45, true);
+      this.scheduleSync(30, true);
     }
     requestSync() {
-      this.syncRequestId = randomId(18);
+      this.fullSyncRequested = true;
+      this.fullSyncRequestId = randomId(18);
+      this.syncRequestId = this.fullSyncRequestId;
       this.scheduleSync(0, true);
     }
     settings() {
@@ -1740,6 +1798,53 @@ ${bodyHash}`;
       } catch {
         return null;
       }
+    }
+    outboundMessageStorageKey() {
+      return `${OUTBOUND_MESSAGE_STORAGE_PREFIX}.${this.identity?.vaultId ?? "unknown"}`;
+    }
+    loadPendingMessages() {
+      this.pendingMessages.clear();
+      try {
+        const raw = this.localStore()?.getItem(this.outboundMessageStorageKey());
+        if (!raw) return;
+        const parsed = safeJsonObject(raw);
+        if (parsed.schemaVersion !== 1 || !isRecord(parsed.peers)) return;
+        for (const [deviceId, value] of Object.entries(parsed.peers)) {
+          if (!/^[A-Za-z0-9_-]{16,64}$/.test(deviceId) || !Array.isArray(value)) continue;
+          const messages = [];
+          for (const item of value.slice(-MAX_QUEUED_MESSAGES_PER_PEER)) {
+            try {
+              messages.push(this.normalizeMessagePayload(item, this.deviceId));
+            } catch {
+            }
+          }
+          if (messages.length) this.pendingMessages.set(deviceId, messages);
+        }
+      } catch {
+        this.pendingMessages.clear();
+      }
+    }
+    savePendingMessages() {
+      try {
+        const peers = Object.fromEntries(
+          [...this.pendingMessages.entries()].filter(([, messages]) => messages.length).map(([deviceId, messages]) => [deviceId, messages.slice(-MAX_QUEUED_MESSAGES_PER_PEER)])
+        );
+        this.localStore()?.setItem(this.outboundMessageStorageKey(), JSON.stringify({ schemaVersion: 1, peers }));
+      } catch {
+      }
+    }
+    outboundAttachmentPath(deviceId, attachmentPath) {
+      if (!/^[A-Za-z0-9_-]{16,64}$/.test(deviceId)) return null;
+      const remotePath = normalizeLanInboxAttachmentPath(attachmentPath);
+      if (!remotePath) return null;
+      const relative = remotePath.slice(`${LAN_INBOX_ROOT}/`.length);
+      return `${this.options.storage.identityRoot.replace(/\/+$/, "")}/outbox/${deviceId}/${relative}`;
+    }
+    pendingMessagesFor(deviceId) {
+      return (this.pendingMessages.get(deviceId) ?? []).slice(0, MAX_PING_MESSAGES).map((message) => ({
+        ...message,
+        attachments: message.attachments.map((attachment) => ({ ...attachment }))
+      }));
     }
     emit(progress) {
       this.progressValue = { ...progress, peerCount: this.activePeers().length };
@@ -2019,6 +2124,8 @@ ${bodyHash}`;
           probing: false,
           manual,
           lastRemoteSyncRequestId: "",
+          remoteFullSyncRequestId: "",
+          remoteDirtyPaths: /* @__PURE__ */ new Map(),
           policy: passivePeerPolicy(),
           capabilities: /* @__PURE__ */ new Set()
         };
@@ -2064,6 +2171,15 @@ ${bodyHash}`;
       const path = attachmentPath || this.normalizePath(payload.path);
       if (!path) return null;
       const now = this.now();
+      const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : "";
+      if (sessionId && this.inboundSession?.id === sessionId && this.inboundSession.deviceId === deviceId) {
+        const index2 = this.activityFiles.findIndex((file) => file.path === path && (file.state === "pending" || file.state === "syncing"));
+        if (index2 < 0) return null;
+        this.activityFiles[index2].state = "syncing";
+        this.activityUpdatedAt = now;
+        this.emitInboundFileProgress(deviceId);
+        return index2;
+      }
       if (this.progressValue.peerId !== deviceId || now - this.activityUpdatedAt > 1500) this.activityFiles = [];
       const action = route.endsWith("/read") ? "push" : route.endsWith("/delete") ? "delete-local" : "pull";
       const encodedLength = typeof payload.data === "string" ? payload.data.length : 0;
@@ -2142,6 +2258,107 @@ ${bodyHash}`;
       await this.options.onMessage?.(message);
       return { ok: true, id: message.id };
     }
+    async receiveQueuedMessages(peer, value) {
+      if (!Array.isArray(value) || value.length > MAX_PING_MESSAGES) return;
+      for (const item of value) {
+        try {
+          const message = this.normalizeMessagePayload(item, peer.deviceId);
+          for (const attachment of message.attachments) {
+            const existing = await this.options.storage.statFile(attachment.path);
+            if (existing) {
+              if (existing.size !== attachment.size) throw new LanSyncProtocolError("attachment_exists", 409);
+              const existingHash = await sha256Bytes(await this.options.storage.readBinary(attachment.path));
+              if (existingHash !== attachment.hash) throw new LanSyncProtocolError("attachment_exists", 409);
+              continue;
+            }
+            const response = await this.callPeer(peer, "/attachment/read", {
+              messageId: message.id,
+              path: attachment.path,
+              expectedHash: attachment.hash
+            }, fileTransferTimeoutMs(attachment.size));
+            const received = this.parseAttachment(response.attachment);
+            const encoded = typeof response.data === "string" ? response.data : "";
+            const bytes = base64UrlToBytes(encoded);
+            if (received.path !== attachment.path || received.hash !== attachment.hash || bytes.byteLength !== attachment.size || await sha256Bytes(bytes) !== attachment.hash) {
+              throw new LanSyncProtocolError("invalid_file_response");
+            }
+            await this.options.storage.ensureFolder(attachment.path.split("/").slice(0, -1).join("/"));
+            await this.options.storage.writeBinary(attachment.path, arrayBuffer(bytes));
+            const written = await this.options.storage.statFile(attachment.path);
+            if (!written || written.size !== bytes.byteLength) throw new Error("write_verification_failed");
+          }
+          if (!this.receivedMessageIds.has(message.id)) {
+            await this.options.onMessage?.(message);
+            this.receivedMessageIds.add(message.id);
+            if (this.receivedMessageIds.size > 5e3) this.receivedMessageIds.delete(this.receivedMessageIds.values().next().value ?? "");
+          }
+          await this.callPeer(peer, "/message/ack", { ids: [message.id] });
+        } catch (error) {
+          this.lastErrorValue = safeErrorCode(error);
+        }
+      }
+    }
+    async handleReadQueuedAttachment(deviceId, payload) {
+      const messageId = typeof payload.messageId === "string" ? payload.messageId : "";
+      const path = normalizeLanInboxAttachmentPath(payload.path);
+      const expectedHash = typeof payload.expectedHash === "string" ? payload.expectedHash : "";
+      const message = (this.pendingMessages.get(deviceId) ?? []).find((item) => item.id === messageId);
+      const attachment = message?.attachments.find((item) => item.path === path && item.hash === expectedHash);
+      const sourcePath = attachment && path ? this.outboundAttachmentPath(deviceId, path) : null;
+      if (!message || !attachment || !sourcePath) throw new LanSyncProtocolError("file_unavailable", 404);
+      const stat = await this.options.storage.statFile(sourcePath);
+      if (!stat || stat.size !== attachment.size) throw new LanSyncProtocolError("file_unavailable", 404);
+      const bytes = new Uint8Array(await this.options.storage.readBinary(sourcePath));
+      if (bytes.byteLength !== attachment.size || await sha256Bytes(bytes) !== attachment.hash) throw new LanSyncProtocolError("precondition_failed", 409);
+      return { attachment, data: bytesToBase64Url(bytes) };
+    }
+    async handleMessageAcknowledgement(deviceId, payload) {
+      const ids = Array.isArray(payload.ids) ? payload.ids.filter((value) => typeof value === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(value)).slice(0, MAX_PING_MESSAGES) : [];
+      const idSet = new Set(ids);
+      const queue = this.pendingMessages.get(deviceId) ?? [];
+      const removed = queue.filter((message) => idSet.has(message.id));
+      const remaining = queue.filter((message) => !idSet.has(message.id));
+      if (remaining.length) this.pendingMessages.set(deviceId, remaining);
+      else this.pendingMessages.delete(deviceId);
+      this.savePendingMessages();
+      for (const message of removed) {
+        for (const attachment of message.attachments) {
+          const sourcePath = this.outboundAttachmentPath(deviceId, attachment.path);
+          if (sourcePath && await this.options.storage.exists(sourcePath)) await this.options.storage.deleteFile(sourcePath).catch(() => void 0);
+        }
+      }
+      return { ok: true, acked: removed.map((message) => message.id) };
+    }
+    dirtySnapshot() {
+      return [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS).map(([path, generation]) => ({ path, generation }));
+    }
+    parseDirtyPaths(value) {
+      const paths = /* @__PURE__ */ new Map();
+      if (!Array.isArray(value) || value.length > MAX_DIRTY_PATHS) return paths;
+      for (const item of value) {
+        if (!isRecord(item)) continue;
+        const path = this.normalizePath(item.path, true);
+        const generation = Number(item.generation);
+        if (!path || !Number.isSafeInteger(generation) || generation <= 0) continue;
+        paths.set(path, generation);
+      }
+      return paths;
+    }
+    syncSignalPayload() {
+      return {
+        syncRequestId: this.syncRequestId,
+        fullSyncRequestId: this.fullSyncRequested ? this.fullSyncRequestId : "",
+        dirtyPaths: this.dirtySnapshot()
+      };
+    }
+    applyRemoteSyncSignal(peer, payload) {
+      const requestId = typeof payload.syncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.syncRequestId) ? payload.syncRequestId : "";
+      const requested = Boolean(requestId && requestId !== peer.lastRemoteSyncRequestId);
+      if (requestId) peer.lastRemoteSyncRequestId = requestId;
+      peer.remoteFullSyncRequestId = typeof payload.fullSyncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.fullSyncRequestId) ? payload.fullSyncRequestId : "";
+      peer.remoteDirtyPaths = this.parseDirtyPaths(payload.dirtyPaths);
+      return requested;
+    }
     async verifyPeer(peer) {
       const now = this.now();
       const minimumProbeInterval = Math.max(300, PEER_PROBE_INTERVAL_MS - 100);
@@ -2150,7 +2367,7 @@ ${bodyHash}`;
       peer.lastProbeAt = now;
       const firstVerifiedConnection = peer.verifiedAt <= 0;
       try {
-        const response = await this.callPeer(peer, "/ping", {});
+        const response = await this.callPeer(peer, "/ping", this.syncSignalPayload());
         const responseDeviceId = typeof response.deviceId === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(response.deviceId) ? response.deviceId : "";
         if (response.protocolVersion !== PROTOCOL_VERSION || !responseDeviceId) throw new Error("peer_identity_mismatch");
         if (responseDeviceId !== peer.deviceId) {
@@ -2172,9 +2389,7 @@ ${bodyHash}`;
         peer.capabilities = new Set(
           (Array.isArray(response.capabilities) ? response.capabilities : []).filter((value) => typeof value === "string" && value.length <= 64)
         );
-        const remoteSyncRequestId = typeof response.syncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(response.syncRequestId) ? response.syncRequestId : "";
-        const remoteRequestedSync = Boolean(remoteSyncRequestId && remoteSyncRequestId !== peer.lastRemoteSyncRequestId);
-        if (remoteSyncRequestId) peer.lastRemoteSyncRequestId = remoteSyncRequestId;
+        const remoteRequestedSync = this.applyRemoteSyncSignal(peer, response);
         peer.verifiedAt = this.now();
         peer.lastSeenAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
         peer.consecutiveFailures = 0;
@@ -2184,6 +2399,7 @@ ${bodyHash}`;
           this.emit({ ...defaultProgress("connected"), active: true, peerId: peer.deviceId });
         }
         this.emitPeersChanged();
+        await this.receiveQueuedMessages(peer, response.messages);
         if (firstVerifiedConnection || remoteRequestedSync) this.scheduleSync(remoteRequestedSync ? 0 : 20, true);
       } catch {
         peer.consecutiveFailures = Math.min(100, peer.consecutiveFailures + 1);
@@ -2246,13 +2462,30 @@ ${bodyHash}`;
       if (!this.runningValue || this.syncRunning || !forced && !this.isCoordinator()) return;
       const peers = this.syncTargets();
       if (!peers.length) return;
+      const localDirty = new Map(this.dirtyPaths);
+      const localFullSyncRequestId = this.fullSyncRequested ? this.fullSyncRequestId : "";
       this.syncRunning = true;
       try {
+        let settledAcrossPeers = null;
+        let fullSyncCompletedEverywhere = Boolean(localFullSyncRequestId);
+        let synchronizedPeers = 0;
         for (const peer of peers) {
           if (!this.runningValue) break;
           if (this.now() - peer.lastSyncAt < SYNC_MIN_INTERVAL_MS && !this.syncQueued && !forced) continue;
-          await this.syncPeer(peer);
+          const result = await this.syncPeer(peer, localDirty, localFullSyncRequestId);
+          settledAcrossPeers = settledAcrossPeers === null ? new Set(result.settledLocalPaths) : new Set([...settledAcrossPeers].filter((path) => result.settledLocalPaths.has(path)));
+          if (localFullSyncRequestId) fullSyncCompletedEverywhere = fullSyncCompletedEverywhere && result.fullSyncComplete;
           peer.lastSyncAt = this.now();
+          synchronizedPeers += 1;
+        }
+        if (synchronizedPeers === peers.length) {
+          for (const path of settledAcrossPeers ?? []) {
+            const generation = localDirty.get(path);
+            if (generation !== void 0 && (this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
+          }
+          if (localFullSyncRequestId && fullSyncCompletedEverywhere && this.fullSyncRequestId === localFullSyncRequestId) {
+            this.fullSyncRequested = false;
+          }
         }
       } catch (error) {
         this.lastErrorValue = safeErrorCode(error);
@@ -2266,18 +2499,35 @@ ${bodyHash}`;
         }
       }
     }
-    async syncPeer(peer) {
+    async syncPeer(peer, localDirty = new Map(this.dirtyPaths), localFullSyncRequestId = this.fullSyncRequested ? this.fullSyncRequestId : "") {
       if (!peer.capabilities?.has(METADATA_LEDGER_CAPABILITY)) throw new LanSyncProtocolError("peer_upgrade_required", 426);
-      await this.syncPeerMetadata(peer);
+      const remoteDirty = new Map(peer.remoteDirtyPaths ?? []);
+      const remoteFullSyncRequestId = peer.remoteFullSyncRequestId ?? "";
+      const fullSync = Boolean(localFullSyncRequestId || remoteFullSyncRequestId);
+      const paths = /* @__PURE__ */ new Set([...localDirty.keys(), ...remoteDirty.keys()]);
+      if (!fullSync && !paths.size) return { settledLocalPaths: /* @__PURE__ */ new Set(), fullSyncComplete: false };
+      return await this.syncPeerMetadata(peer, {
+        fullSync,
+        paths,
+        localDirty,
+        remoteDirty,
+        localFullSyncRequestId,
+        remoteFullSyncRequestId
+      });
     }
-    async syncPeerMetadata(peer) {
+    async syncPeerMetadata(peer, request) {
       this.activityFiles = [];
       this.activityUpdatedAt = this.now();
       this.emit({ ...defaultProgress("scanning"), active: true, peerId: peer.deviceId });
       const localPolicy = this.policy();
+      const requestedPaths = [...request.paths].sort((left, right) => left.localeCompare(right));
       const [localEntries, remoteResponse, ledger] = await Promise.all([
-        this.buildMetadataManifest(localPolicy.syncConfigFolder),
-        this.callPeer(peer, "/manifest/metadata", { syncConfigFolder: localPolicy.syncConfigFolder }),
+        request.fullSync ? this.buildMetadataManifest(localPolicy.syncConfigFolder) : this.buildMetadataManifestForPaths(requestedPaths, localPolicy.syncConfigFolder),
+        this.callPeer(
+          peer,
+          request.fullSync ? "/manifest/metadata" : "/manifest/metadata/paths",
+          request.fullSync ? { syncConfigFolder: localPolicy.syncConfigFolder } : { syncConfigFolder: localPolicy.syncConfigFolder, paths: requestedPaths }
+        ),
         Promise.resolve(this.loadMetadataLedger(peer.deviceId))
       ]);
       const remotePolicy = policyFromRaw(remoteResponse.policy);
@@ -2287,6 +2537,9 @@ ${bodyHash}`;
       const remoteEntries = this.parseMetadataManifest(remoteResponse.files, shareConfig);
       const localMap = new Map(filteredLocalEntries.map((entry) => [entry.path, entry]));
       const remoteMap = new Map(remoteEntries.map((entry) => [entry.path, entry]));
+      const selectedPaths = new Set(
+        (request.fullSync ? [...localMap.keys(), ...remoteMap.keys(), ...request.paths] : requestedPaths).filter((path) => shareConfig || !isConfigPath(path, this.settings().configDir))
+      );
       for (const path of Object.keys(ledger.entries)) {
         if (!localMap.has(path) && !remoteMap.has(path)) delete ledger.entries[path];
       }
@@ -2298,16 +2551,39 @@ ${bodyHash}`;
         }
       }
       const actions = planLanSyncMetadataReconciliation(filteredLocalEntries, remoteEntries, ledger.entries, localPolicy, remotePolicy);
-      const bytesTotal = actions.reduce((sum, action) => sum + Math.max(action.local?.size ?? 0, action.remote?.size ?? 0), 0);
+      const actionPaths = new Set(actions.map((action) => action.path));
+      const settledPaths = new Set([...selectedPaths].filter((path) => !actionPaths.has(path)));
+      const commits = [];
+      for (const path of settledPaths) {
+        const local = localMap.get(path);
+        const remote = remoteMap.get(path);
+        const baseline = ledger.entries[path];
+        if (local && remote && (metadataMatches(local, remote) || baseline && metadataMatches(local, baseline.local) && metadataMatches(remote, baseline.remote))) {
+          commits.push({ path, coordinator: metadataSnapshot(local), peer: metadataSnapshot(remote) });
+        } else if (!local && !remote) {
+          commits.push({ path, coordinator: null, peer: null });
+        }
+      }
+      const transferSize = (action) => action.kind === "push" ? action.local?.size ?? 0 : action.kind === "pull" ? action.remote?.size ?? 0 : 0;
+      const bytesTotal = actions.reduce((sum, action) => sum + transferSize(action), 0);
       const uploads = actions.filter((action) => action.kind === "push").length;
       const downloads = actions.filter((action) => action.kind === "pull").length;
       this.activityFiles = actions.map((action) => ({
         path: action.path,
         action: action.kind,
         state: "pending",
-        size: Math.max(action.local?.size ?? 0, action.remote?.size ?? 0)
+        size: transferSize(action)
       }));
       this.activityUpdatedAt = this.now();
+      const sessionId = randomId(18);
+      await this.callPeer(peer, "/metadata/session/start", {
+        sessionId,
+        total: actions.length,
+        bytesTotal,
+        uploads,
+        downloads,
+        files: this.activityFiles.map((file) => ({ path: file.path, action: file.action, size: file.size }))
+      });
       let completed = 0;
       let bytesTransferred = 0;
       let changed = 0;
@@ -2346,8 +2622,10 @@ ${bodyHash}`;
             });
           }
           try {
-            const result = await this.executeMetadataAction(peer, actions[index], ledger);
+            const result = await this.executeMetadataAction(peer, actions[index], ledger, sessionId);
             if (activity) activity.state = "complete";
+            settledPaths.add(actions[index].path);
+            if (result.commit) commits.push(result.commit);
             completed += 1;
             bytesTransferred += result.bytes;
             changed += result.changed ? 1 : 0;
@@ -2376,7 +2654,28 @@ ${bodyHash}`;
       };
       await Promise.all(Array.from({ length: Math.min(TRANSFER_CONCURRENCY, actions.length) }, transferWorker));
       this.saveMetadataLedger(peer.deviceId, ledger);
+      const success = failure === null && completed === actions.length;
+      const acknowledgedRemoteDirty = [...request.remoteDirty.entries()].filter(([path]) => settledPaths.has(path)).map(([path, generation]) => ({ path, generation }));
+      let finishFailure = null;
+      try {
+        await this.callPeer(peer, "/metadata/session/finish", {
+          sessionId,
+          success,
+          commits,
+          acknowledgedDirtyPaths: acknowledgedRemoteDirty,
+          acknowledgedFullSyncRequestId: success ? request.remoteFullSyncRequestId : ""
+        });
+      } catch (error) {
+        finishFailure = error;
+      }
+      if (success && finishFailure === null) {
+        for (const { path, generation } of acknowledgedRemoteDirty) {
+          if ((peer.remoteDirtyPaths?.get(path) ?? 0) <= generation) peer.remoteDirtyPaths?.delete(path);
+        }
+        if (request.remoteFullSyncRequestId && peer.remoteFullSyncRequestId === request.remoteFullSyncRequestId) peer.remoteFullSyncRequestId = "";
+      }
       if (failure !== null) throw failure;
+      if (finishFailure !== null) throw finishFailure;
       peer.verifiedAt = this.now();
       peer.consecutiveFailures = 0;
       peer.lastFailureAt = 0;
@@ -2394,6 +2693,10 @@ ${bodyHash}`;
         uploads,
         downloads
       });
+      return {
+        settledLocalPaths: new Set([...request.localDirty.keys()].filter((path) => settledPaths.has(path))),
+        fullSyncComplete: Boolean(request.localFullSyncRequestId && request.fullSync && success)
+      };
     }
     async syncPeerHashed(peer) {
       this.activityFiles = [];
@@ -2508,30 +2811,30 @@ ${bodyHash}`;
         conflicts
       });
     }
-    async executeMetadataAction(peer, action, ledger) {
+    async executeMetadataAction(peer, action, ledger, sessionId) {
       if (action.kind === "push" && action.local) {
         const local = await this.readLocalMetadataVerified(action.local.path, metadataSnapshot(action.local));
-        const remote = await this.writeRemoteMetadata(peer, action.path, local.bytes, action.remote ? metadataSnapshot(action.remote) : null, local.metadata);
+        const remote = await this.writeRemoteMetadata(peer, action.path, local.bytes, action.remote ? metadataSnapshot(action.remote) : null, local.metadata, false, sessionId);
         ledger.entries[action.path] = { local: local.metadata, remote };
-        return { bytes: local.bytes.byteLength, changed: true, conflict: false };
+        return { bytes: local.bytes.byteLength, changed: true, conflict: false, commit: { path: action.path, coordinator: local.metadata, peer: remote } };
       }
       if (action.kind === "pull" && action.remote) {
-        const remote = await this.readRemoteMetadata(peer, action.remote);
+        const remote = await this.readRemoteMetadata(peer, action.remote, sessionId);
         const local = await this.writeLocalMetadata(action.path, remote.bytes, action.local ? metadataSnapshot(action.local) : null, remote.metadata);
         ledger.entries[action.path] = { local, remote: remote.metadata };
-        return { bytes: remote.bytes.byteLength, changed: true, conflict: false };
+        return { bytes: remote.bytes.byteLength, changed: true, conflict: false, commit: { path: action.path, coordinator: local, peer: remote.metadata } };
       }
       if (action.kind === "delete-local" && action.local) {
         await this.deleteLocalMetadata(action.path, metadataSnapshot(action.local));
         delete ledger.entries[action.path];
-        return { bytes: 0, changed: true, conflict: false };
+        return { bytes: 0, changed: true, conflict: false, commit: { path: action.path, coordinator: null, peer: null } };
       }
       if (action.kind === "delete-remote" && action.remote) {
-        await this.deleteRemoteMetadata(peer, action.path, metadataSnapshot(action.remote));
+        await this.deleteRemoteMetadata(peer, action.path, metadataSnapshot(action.remote), sessionId);
         delete ledger.entries[action.path];
-        return { bytes: 0, changed: true, conflict: false };
+        return { bytes: 0, changed: true, conflict: false, commit: { path: action.path, coordinator: null, peer: null } };
       }
-      return { bytes: 0, changed: false, conflict: false };
+      return { bytes: 0, changed: false, conflict: false, commit: null };
     }
     async executeAction(peer, action, ledger) {
       if (action.kind === "push" && action.local) {
@@ -2557,6 +2860,80 @@ ${bodyHash}`;
         return { bytes: 0, changed: true, conflict: false };
       }
       return { bytes: 0, changed: false, conflict: false };
+    }
+    async buildMetadataManifestForPaths(paths, includeConfigFolder = this.settings().syncConfigFolder) {
+      const unique = [...new Set(paths)].slice(0, MAX_DIRTY_PATHS);
+      const scan = {
+        id: randomId(12),
+        phase: "scanning",
+        completed: 0,
+        total: unique.length,
+        cached: 0,
+        hashed: 0,
+        skipped: 0,
+        error: "",
+        files: unique.map((path) => ({ path, state: "pending", size: 0, reason: "" }))
+      };
+      this.scanValue = scan;
+      const report = () => {
+        if (this.scanValue !== scan || this.progressValue.phase === "syncing") return;
+        this.emit({
+          ...defaultProgress("scanning"),
+          active: this.progressValue.active || this.activePeers().length > 0,
+          peerId: this.progressValue.peerId || this.activePeers()[0]?.deviceId || "",
+          completed: scan.completed,
+          total: scan.total
+        });
+      };
+      report();
+      try {
+        const results = await mapWithConcurrency(unique.map((path, index) => ({ path, index })), HASH_CONCURRENCY, async ({ path: rawPath, index }) => {
+          const activity = scan.files[index];
+          const path = this.normalizePath(rawPath, includeConfigFolder);
+          if (!path) {
+            activity.state = "skipped";
+            activity.reason = "unsafe-path";
+            scan.skipped += 1;
+            scan.completed += 1;
+            report();
+            return null;
+          }
+          const stat = await this.options.storage.statFile(path);
+          if (!stat) {
+            activity.path = path;
+            activity.state = "complete";
+            activity.reason = "missing";
+            scan.completed += 1;
+            report();
+            return null;
+          }
+          activity.path = path;
+          activity.size = stat.size;
+          if (!Number.isFinite(stat.size) || stat.size < 0 || stat.size > this.settings().maxFileBytes || !Number.isFinite(stat.mtime) || stat.mtime < 0) {
+            activity.state = "skipped";
+            activity.reason = stat.size > this.settings().maxFileBytes ? "too-large" : "invalid-metadata";
+            scan.skipped += 1;
+            scan.completed += 1;
+            report();
+            return null;
+          }
+          activity.state = "cached";
+          activity.reason = "metadata";
+          scan.cached += 1;
+          scan.completed += 1;
+          report();
+          return { path, size: stat.size, mtime: stat.mtime };
+        });
+        scan.phase = "complete";
+        scan.completed = scan.total;
+        report();
+        return results.filter((entry) => entry !== null);
+      } catch (error) {
+        scan.phase = "error";
+        scan.error = safeErrorCode(error);
+        report();
+        throw error;
+      }
     }
     async buildMetadataManifest(includeConfigFolder = this.settings().syncConfigFolder, onProgress) {
       if (this.metadataManifestBuild?.includeConfigFolder === includeConfigFolder) {
@@ -2591,7 +2968,7 @@ ${bodyHash}`;
         if (!reason && file.path) candidates.push({ path: file.path, size: file.size, mtime: file.mtime, scanIndex });
       }
       const skipped = scanFiles.filter((file) => file.state === "skipped").length;
-      this.scanValue = {
+      const scan = {
         id: randomId(12),
         phase: "scanning",
         completed: skipped,
@@ -2602,19 +2979,20 @@ ${bodyHash}`;
         error: "",
         files: scanFiles
       };
+      this.scanValue = scan;
       let lastReportedAt = 0;
       const report = (force = false) => {
         const now = this.now();
-        if (!force && this.scanValue.completed !== this.scanValue.total && now - lastReportedAt < 40) return;
+        if (!force && scan.completed !== scan.total && now - lastReportedAt < 40) return;
         lastReportedAt = now;
-        onProgress?.(this.scanValue.completed, this.scanValue.total);
-        if (this.progressValue.phase !== "syncing") {
+        onProgress?.(scan.completed, scan.total);
+        if (this.scanValue === scan && this.progressValue.phase !== "syncing") {
           this.emit({
             ...defaultProgress("scanning"),
             active: this.progressValue.active || this.activePeers().length > 0,
             peerId: this.progressValue.peerId || this.activePeers()[0]?.deviceId || "",
-            completed: this.scanValue.completed,
-            total: this.scanValue.total
+            completed: scan.completed,
+            total: scan.total
           });
         }
       };
@@ -2623,24 +3001,24 @@ ${bodyHash}`;
         const entries = [];
         for (let index = 0; index < candidates.length; index += 1) {
           const file = candidates[index];
-          const activity = this.scanValue.files[file.scanIndex];
+          const activity = scan.files[file.scanIndex];
           activity.state = "cached";
           activity.reason = "metadata";
-          this.scanValue.cached += 1;
-          this.scanValue.completed += 1;
+          scan.cached += 1;
+          scan.completed += 1;
           entries.push({ path: file.path, size: file.size, mtime: file.mtime });
           report();
           if ((index + 1) % 512 === 0 && index + 1 < candidates.length) {
             await new Promise((resolve) => setTimeout(resolve, 0));
           }
         }
-        this.scanValue.phase = "complete";
-        this.scanValue.completed = this.scanValue.total;
+        scan.phase = "complete";
+        scan.completed = scan.total;
         report(true);
         return entries;
       } catch (error) {
-        this.scanValue.phase = "error";
-        this.scanValue.error = safeErrorCode(error);
+        scan.phase = "error";
+        scan.error = safeErrorCode(error);
         report(true);
         throw error;
       }
@@ -2752,29 +3130,30 @@ ${bodyHash}`;
       this.queueHashCacheSave();
       if (await this.options.storage.statFile(normalized)) throw new Error("delete_verification_failed");
     }
-    async readRemoteMetadata(peer, entry) {
+    async readRemoteMetadata(peer, entry, sessionId = "") {
       const expected = metadataSnapshot(entry);
-      const response = await this.callPeer(peer, "/metadata/file/read", { path: entry.path, expectedMetadata: expected }, fileTransferTimeoutMs(entry.size));
+      const response = await this.callPeer(peer, "/metadata/file/read", { path: entry.path, expectedMetadata: expected, sessionId }, fileTransferTimeoutMs(entry.size));
       const metadata = this.parseMetadataSnapshot(response.metadata);
       if (response.path !== entry.path || !metadata || !metadataMatches(metadata, expected) || typeof response.data !== "string") throw new LanSyncProtocolError("invalid_file_response");
       const bytes = base64UrlToBytes(response.data);
       if (bytes.byteLength !== metadata.size || bytes.byteLength > this.settings().maxFileBytes) throw new LanSyncProtocolError("invalid_file_response");
       return { bytes, metadata };
     }
-    async writeRemoteMetadata(peer, path, bytes, expected, source, allowExistingSame = false) {
+    async writeRemoteMetadata(peer, path, bytes, expected, source, allowExistingSame = false, sessionId = "") {
       const response = await this.callPeer(peer, "/metadata/file/write", {
         path,
         expectedMetadata: expected,
         sourceMetadata: source,
         allowExistingSame,
+        sessionId,
         data: bytesToBase64Url(bytes)
       }, fileTransferTimeoutMs(bytes.byteLength));
       const metadata = this.parseMetadataSnapshot(response.metadata);
       if (response.path !== path || !metadata || metadata.size !== bytes.byteLength) throw new Error("remote_write_verification_failed");
       return metadata;
     }
-    async deleteRemoteMetadata(peer, path, expected) {
-      const response = await this.callPeer(peer, "/metadata/file/delete", { path, expectedMetadata: expected }, 45e3);
+    async deleteRemoteMetadata(peer, path, expected, sessionId = "") {
+      const response = await this.callPeer(peer, "/metadata/file/delete", { path, expectedMetadata: expected, sessionId }, 45e3);
       const deletedMetadata = this.parseMetadataSnapshot(response.deletedMetadata);
       if (response.path !== path || response.deleted !== true || !deletedMetadata || !metadataMatches(deletedMetadata, expected)) {
         throw new Error("remote_delete_verification_failed");
@@ -3119,13 +3498,16 @@ ${bodyHash}`;
         inboundActivityIndex = this.beginInboundFileActivity(deviceId, path, payload);
         let result;
         if (path === `${API_PREFIX}/ping`) {
+          const peer = this.peers.get(deviceId);
+          if (peer) this.applyRemoteSyncSignal(peer, payload);
           result = {
             ok: true,
             protocolVersion: PROTOCOL_VERSION,
             deviceId: this.deviceId,
             policy: this.policy(),
             capabilities: [METADATA_LEDGER_CAPABILITY],
-            syncRequestId: this.syncRequestId
+            messages: this.pendingMessagesFor(deviceId),
+            ...this.syncSignalPayload()
           };
         } else if (path === `${API_PREFIX}/manifest/metadata`) {
           const policy = this.policy();
@@ -3133,16 +3515,32 @@ ${bodyHash}`;
             files: await this.buildMetadataManifest(policy.syncConfigFolder && payload.syncConfigFolder === true),
             policy
           };
+        } else if (path === `${API_PREFIX}/manifest/metadata/paths`) {
+          const policy = this.policy();
+          const paths = Array.isArray(payload.paths) ? payload.paths.filter((value) => typeof value === "string") : [];
+          if (paths.length > MAX_DIRTY_PATHS) throw new LanSyncProtocolError("too_many_dirty_paths", 413);
+          result = {
+            files: await this.buildMetadataManifestForPaths(paths, policy.syncConfigFolder && payload.syncConfigFolder === true),
+            policy
+          };
+        } else if (path === `${API_PREFIX}/metadata/session/start`) {
+          result = await this.handleMetadataSessionStart(deviceId, payload);
+        } else if (path === `${API_PREFIX}/metadata/session/finish`) {
+          result = await this.handleMetadataSessionFinish(deviceId, payload);
         } else if (path === `${API_PREFIX}/metadata/file/read`) {
           result = await this.handleReadMetadataFile(payload);
         } else if (path === `${API_PREFIX}/metadata/file/write`) {
           result = await this.handleWriteMetadataFile(payload);
         } else if (path === `${API_PREFIX}/metadata/file/delete`) {
           result = await this.handleDeleteMetadataFile(payload);
+        } else if (path === `${API_PREFIX}/attachment/read`) {
+          result = await this.handleReadQueuedAttachment(deviceId, payload);
         } else if (path === `${API_PREFIX}/attachment/write`) {
           result = await this.handleWriteAttachment(payload);
         } else if (path === `${API_PREFIX}/message/send`) {
           result = await this.handleIncomingMessage(deviceId, payload);
+        } else if (path === `${API_PREFIX}/message/ack`) {
+          result = await this.handleMessageAcknowledgement(deviceId, payload);
         } else {
           throw new LanSyncProtocolError("not_found", 404);
         }
@@ -3153,6 +3551,106 @@ ${bodyHash}`;
         const protocol = error instanceof LanSyncProtocolError ? error : new LanSyncProtocolError(safeErrorCode(error), 500);
         sendText(response, protocol.status, JSON.stringify({ ok: false, error: authenticated ? protocol.code : "request_rejected" }));
       }
+    }
+    async handleMetadataSessionStart(deviceId, payload) {
+      const sessionId = typeof payload.sessionId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.sessionId) ? payload.sessionId : "";
+      const rawFiles = Array.isArray(payload.files) ? payload.files : [];
+      const total = Number(payload.total);
+      const bytesTotal = Number(payload.bytesTotal);
+      const coordinatorUploads = Number(payload.uploads);
+      const coordinatorDownloads = Number(payload.downloads);
+      if (!sessionId || !Number.isSafeInteger(total) || total < 0 || total !== rawFiles.length || total > MAX_MANIFEST_FILES || !Number.isSafeInteger(bytesTotal) || bytesTotal < 0 || !Number.isSafeInteger(coordinatorUploads) || coordinatorUploads < 0 || !Number.isSafeInteger(coordinatorDownloads) || coordinatorDownloads < 0) {
+        throw new LanSyncProtocolError("invalid_sync_session");
+      }
+      const mirrorAction = (action) => {
+        if (action === "push") return "pull";
+        if (action === "pull") return "push";
+        if (action === "delete-local") return "delete-remote";
+        if (action === "delete-remote") return "delete-local";
+        return null;
+      };
+      const files = rawFiles.map((item) => {
+        if (!isRecord(item)) throw new LanSyncProtocolError("invalid_sync_session");
+        const path = this.normalizePath(item.path, true);
+        const action = mirrorAction(item.action);
+        const size = Number(item.size);
+        if (!path || !action || !Number.isSafeInteger(size) || size < 0 || size > this.settings().maxFileBytes) throw new LanSyncProtocolError("invalid_sync_session");
+        return { path, action, state: "pending", size };
+      });
+      this.inboundSession = {
+        id: sessionId,
+        deviceId,
+        bytesTotal,
+        uploads: coordinatorDownloads,
+        downloads: coordinatorUploads
+      };
+      this.activityFiles = files;
+      this.activityUpdatedAt = this.now();
+      this.emit({
+        ...defaultProgress(files.length ? "syncing" : "complete"),
+        active: true,
+        peerId: deviceId,
+        total: files.length,
+        bytesTotal,
+        uploads: coordinatorDownloads,
+        downloads: coordinatorUploads
+      });
+      return { ok: true, sessionId };
+    }
+    async handleMetadataSessionFinish(deviceId, payload) {
+      const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : "";
+      const session = this.inboundSession;
+      if (!session || session.id !== sessionId || session.deviceId !== deviceId) throw new LanSyncProtocolError("invalid_sync_session", 409);
+      const commits = Array.isArray(payload.commits) ? payload.commits : [];
+      if (commits.length > MAX_MANIFEST_FILES) throw new LanSyncProtocolError("invalid_sync_session");
+      const ledger = this.loadMetadataLedger(deviceId);
+      for (const item of commits) {
+        if (!isRecord(item)) continue;
+        const path = this.normalizePath(item.path, true);
+        if (!path) continue;
+        const coordinator = item.coordinator === null ? null : this.parseMetadataSnapshot(item.coordinator);
+        const peer = item.peer === null ? null : this.parseMetadataSnapshot(item.peer);
+        if (item.coordinator !== null && !coordinator || item.peer !== null && !peer) continue;
+        const current = await this.options.storage.statFile(path);
+        if (coordinator === null && peer === null) {
+          if (!current) delete ledger.entries[path];
+          continue;
+        }
+        if (coordinator && peer && current && metadataMatches(current, peer)) {
+          ledger.entries[path] = { local: peer, remote: coordinator };
+        }
+      }
+      this.saveMetadataLedger(deviceId, ledger);
+      const acknowledgedDirtyPaths = this.parseDirtyPaths(payload.acknowledgedDirtyPaths);
+      for (const [path, generation] of acknowledgedDirtyPaths) {
+        if ((this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
+      }
+      const acknowledgedFullSyncRequestId = typeof payload.acknowledgedFullSyncRequestId === "string" ? payload.acknowledgedFullSyncRequestId : "";
+      if (acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) this.fullSyncRequested = false;
+      const success = payload.success === true;
+      if (success) {
+        for (const file of this.activityFiles) if (file.state !== "error") file.state = "complete";
+      } else {
+        for (const file of this.activityFiles) if (file.state === "pending" || file.state === "syncing") file.state = "error";
+      }
+      const completed = this.activityFiles.filter((file) => file.state === "complete").length;
+      const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
+      this.emit({
+        ...defaultProgress(success ? "complete" : "error"),
+        active: true,
+        peerId: deviceId,
+        completed,
+        total: this.activityFiles.length,
+        bytesTransferred,
+        bytesTotal: session.bytesTotal,
+        changed: completed,
+        uploads: session.uploads,
+        downloads: session.downloads,
+        error: success ? "" : "inbound_transfer_failed"
+      });
+      this.activityUpdatedAt = this.now();
+      this.inboundSession = null;
+      return { ok: true, sessionId, committed: commits.length };
     }
     async handleReadMetadataFile(payload) {
       const path = this.normalizePath(payload.path);
