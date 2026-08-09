@@ -1514,9 +1514,8 @@ export class NtfyLanSync {
   }
 
   requestSync(): void {
-    // A mobile Obsidian client cannot host the HTTP endpoint. Keep a pending
-    // request in the authenticated ping response so its next heartbeat starts
-    // a forced scan instead of silently discarding a desktop-side request.
+    // Either device may initiate. A non-listening peer receives the request
+    // through the authenticated heartbeat and joins the same forced session.
     this.fullSyncRequested = true;
     this.fullSyncRequestId = randomId(18);
     this.syncRequestId = this.fullSyncRequestId;
@@ -1533,12 +1532,33 @@ export class NtfyLanSync {
   }
 
   private requestPeriodicSync(): void {
-    if (!this.runningValue || this.syncRunning || this.inboundSession || !this.isCoordinator()) return;
-    if (!this.syncTargets().length) return;
+    if (!this.runningValue || this.syncRunning || this.inboundSession) return;
+    const peers = this.activePeers();
+    if (!peers.length || !this.isPeriodicInitiator(peers)) return;
     this.fullSyncRequested = true;
     this.fullSyncRequestId = randomId(18);
     this.syncRequestId = this.fullSyncRequestId;
+    const passivePeer = peers.find((peer) => !peer.canHost);
+    if (passivePeer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing") {
+      this.emit({
+        ...defaultProgress("connected"),
+        stage: "requesting-peer-scan",
+        active: true,
+        peerId: passivePeer.deviceId
+      });
+    }
     this.scheduleSync(0, false);
+  }
+
+  private isPeriodicInitiator(peers = this.activePeers()): boolean {
+    if (!peers.length) return false;
+    const participants = [...new Set([this.deviceId, ...peers.map((peer) => peer.deviceId)])]
+      .filter(Boolean)
+      .sort((left, right) => left.localeCompare(right));
+    if (!participants.length) return false;
+    const intervalMs = Math.max(1_000, this.settings().checkIntervalSeconds * 1000);
+    const slot = Math.floor(this.now() / intervalMs) % participants.length;
+    return participants[slot] === this.deviceId;
   }
 
   private settings(): LanSyncRuntimeSettings {

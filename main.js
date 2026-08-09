@@ -1818,12 +1818,30 @@ ${bodyHash}`;
       this.scheduleSync(0, true);
     }
     requestPeriodicSync() {
-      if (!this.runningValue || this.syncRunning || this.inboundSession || !this.isCoordinator()) return;
-      if (!this.syncTargets().length) return;
+      if (!this.runningValue || this.syncRunning || this.inboundSession) return;
+      const peers = this.activePeers();
+      if (!peers.length || !this.isPeriodicInitiator(peers)) return;
       this.fullSyncRequested = true;
       this.fullSyncRequestId = randomId(18);
       this.syncRequestId = this.fullSyncRequestId;
+      const passivePeer = peers.find((peer) => !peer.canHost);
+      if (passivePeer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing") {
+        this.emit({
+          ...defaultProgress("connected"),
+          stage: "requesting-peer-scan",
+          active: true,
+          peerId: passivePeer.deviceId
+        });
+      }
       this.scheduleSync(0, false);
+    }
+    isPeriodicInitiator(peers = this.activePeers()) {
+      if (!peers.length) return false;
+      const participants = [.../* @__PURE__ */ new Set([this.deviceId, ...peers.map((peer) => peer.deviceId)])].filter(Boolean).sort((left, right) => left.localeCompare(right));
+      if (!participants.length) return false;
+      const intervalMs = Math.max(1e3, this.settings().checkIntervalSeconds * 1e3);
+      const slot = Math.floor(this.now() / intervalMs) % participants.length;
+      return participants[slot] === this.deviceId;
     }
     settings() {
       const raw = this.options.getSettings();
@@ -4230,55 +4248,55 @@ class NtfyLanSyncDetailsModal extends Modal {
           stopped: "已停止",
           discovering: "正在检测设备",
           "checking-peer": "正在检查手机版本",
-          "requesting-peer-scan": "已请求手机扫描",
-          "waiting-peer-scan": "等待手机发起扫描",
+          "requesting-peer-scan": "本机已发起同步",
+          "waiting-peer-scan": "等待对端交换清单",
           enumerating: "正在枚举全库文件",
           fingerprinting: "正在核对内容指纹",
           planning: "正在计算同步清单",
           transferring: "正在传输文件",
           complete: "同步完成",
-          "peer-upgrade-required": "手机插件需要升级",
+          "peer-upgrade-required": "对端插件需要升级",
           error: "同步出错",
         }
       : {
           stopped: "Stopped",
           discovering: "Finding devices",
           "checking-peer": "Checking mobile version",
-          "requesting-peer-scan": "Mobile scan requested",
-          "waiting-peer-scan": "Waiting for mobile scan",
+          "requesting-peer-scan": "Sync initiated locally",
+          "waiting-peer-scan": "Waiting for peer manifest",
           enumerating: "Enumerating vault files",
           fingerprinting: "Verifying content fingerprints",
           planning: "Planning transfers",
           transferring: "Transferring files",
           complete: "Sync complete",
-          "peer-upgrade-required": "Mobile plugin update required",
+          "peer-upgrade-required": "Peer plugin update required",
           error: "Sync error",
         };
     const stageDescriptions = chinese
       ? {
           discovering: "正在寻找同一 Vault 的局域网设备",
           "checking-peer": "已连接，正在确认手机是否支持当前同步协议",
-          "requesting-peer-scan": "电脑已把立即同步请求发给手机，等待手机下一次心跳启动比较",
-          "waiting-peer-scan": "Android 端负责发起比较，电脑保持连接并等待请求",
+          "requesting-peer-scan": "本机已主动发起本轮同步；对端会通过已认证链路加入同一轮比较",
+          "waiting-peer-scan": "电脑和手机都可主动发起；当前已连接，正在等待对端交换文件清单",
           enumerating: "正在列出路径、大小和修改时间，不传输文件内容",
           fingerprinting: "只核对同大小模糊文件的 SHA-256，内容相同不会进入传输清单",
           planning: "元数据已经收集完成，正在确定真实的上传、下载和删除项目",
           transferring: "正在按清单传输，下面可查看上传和下载进度",
           complete: "本轮扫描和传输已经完成",
-          "peer-upgrade-required": "电脑与手机协议不一致，请把手机 ntfy 插件升级到当前版本",
+          "peer-upgrade-required": "两端同步协议不一致，请把版本较旧一端的 ntfy 插件升级到当前版本",
           error: progress.error ? `错误：${progress.error}` : "同步遇到错误",
         }
       : {
           discovering: "Looking for another device with the same Vault identity",
           "checking-peer": "Connected and checking whether the mobile peer supports this sync protocol",
-          "requesting-peer-scan": "The desktop requested an immediate scan and is waiting for the next mobile heartbeat",
-          "waiting-peer-scan": "Android initiates comparison; the desktop is connected and waiting for its request",
+          "requesting-peer-scan": "This device initiated the session; the peer will join it over the authenticated link",
+          "waiting-peer-scan": "Both devices may initiate; the connection is ready and waiting for the peer manifest",
           enumerating: "Listing paths, sizes, and mtimes without transferring file content",
           fingerprinting: "Hashing only ambiguous same-size files; matching content will not enter the transfer list",
           planning: "Metadata is ready and the real upload, download, and deletion plan is being calculated",
           transferring: "Transferring the planned files; upload and download progress is shown below",
           complete: "This scan and transfer session is complete",
-          "peer-upgrade-required": "Desktop and mobile protocols differ; update the mobile ntfy plugin",
+          "peer-upgrade-required": "The peer protocols differ; update the older ntfy plugin",
           error: progress.error ? `Error: ${progress.error}` : "Synchronization failed",
         };
     const effectiveStage = progress.stage || (progress.phase === "scanning" ? "enumerating" : progress.phase === "syncing" ? "transferring" : progress.phase);
@@ -4349,8 +4367,8 @@ class NtfyLanSyncDetailsModal extends Modal {
     const summary = details.createEl("summary");
     const hasScanWork = (scan.total || 0) > 0;
     const idleLabel = chinese
-      ? (stage === "peer-upgrade-required" ? "等待升级" : stage === "checking-peer" ? "检查版本" : stage === "requesting-peer-scan" ? "已发出请求" : stage === "waiting-peer-scan" ? "等待手机" : stage === "complete" ? "已完成" : "尚未开始")
-      : (stage === "peer-upgrade-required" ? "Update required" : stage === "checking-peer" ? "Checking version" : stage === "requesting-peer-scan" ? "Requested" : stage === "waiting-peer-scan" ? "Waiting for mobile" : stage === "complete" ? "Complete" : "Not started");
+      ? (stage === "peer-upgrade-required" ? "等待升级" : stage === "checking-peer" ? "检查版本" : stage === "requesting-peer-scan" ? "本机已发起" : stage === "waiting-peer-scan" ? "等待对端" : stage === "complete" ? "已完成" : "尚未开始")
+      : (stage === "peer-upgrade-required" ? "Update required" : stage === "checking-peer" ? "Checking version" : stage === "requesting-peer-scan" ? "Initiated here" : stage === "waiting-peer-scan" ? "Waiting for peer" : stage === "complete" ? "Complete" : "Not started");
     const label = hasScanWork
       ? `${chinese ? "扫描" : "Scan"} ${scan.completed || 0}/${scan.total}`
       : `${chinese ? "扫描" : "Scan"}：${idleLabel}`;
