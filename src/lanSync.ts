@@ -1203,6 +1203,9 @@ export class NtfyLanSync {
   private metadataIndexReady = false;
   private metadataIndexIncludesConfig = false;
   private metadataIndexMaxFileBytes = 0;
+  private metadataIndexGeneration = 0;
+  private backgroundReconciliation: Promise<void> | null = null;
+  private reconciliationDirtyPaths = new Set<string>();
   private manifestBuild: { includeConfigFolder: boolean; promise: Promise<LanSyncManifestEntry[]> } | null = null;
   private metadataManifestBuild: {
     includeConfigFolder: boolean;
@@ -1218,6 +1221,7 @@ export class NtfyLanSync {
   private fullSyncRequestId = "";
   private fullSyncRequested = true;
   private forceFilesystemScanRequested = false;
+  private localFilesystemScanCompletedRequestId = "";
   private lastFullScanAt = 0;
   private lastSyncCheckpointAt = 0;
   private dirtySequence = 0;
@@ -1513,6 +1517,10 @@ export class NtfyLanSync {
         }, 250))
       ]);
     }
+    if (this.backgroundReconciliation) {
+      await this.backgroundReconciliation.catch(() => undefined);
+      this.backgroundReconciliation = null;
+    }
     if (this.hashSaveTimer) {
       clearTimeout(this.hashSaveTimer);
       this.hashSaveTimer = null;
@@ -1550,12 +1558,14 @@ export class NtfyLanSync {
     this.queueHashCacheSave();
     this.dirtySequence += 1;
     this.dirtyPaths.set(normalized, this.dirtySequence);
+    if (this.backgroundReconciliation) this.reconciliationDirtyPaths.add(normalized);
     if (this.dirtyPaths.size > MAX_DIRTY_PATHS) {
       this.fullSyncRequested = true;
       this.forceFilesystemScanRequested = true;
       this.fullSyncRequestId = randomId(18);
       const newest = [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS);
       this.dirtyPaths = new Map(newest);
+      this.startBackgroundFilesystemReconciliation();
     }
     this.queueChangeJournalSave();
     this.syncRequestId = randomId(18);
@@ -1570,6 +1580,7 @@ export class NtfyLanSync {
       this.fullSyncRequestId = randomId(18);
     }
     this.forceFilesystemScanRequested = true;
+    this.startBackgroundFilesystemReconciliation();
     this.syncRequestId = randomId(18);
     const passivePeer = this.activePeers().find((peer) => !peer.canHost);
     if (passivePeer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing") {
@@ -1580,7 +1591,7 @@ export class NtfyLanSync {
         peerId: passivePeer.deviceId
       });
     }
-    this.scheduleSync(0, true);
+    if (this.dirtyPaths.size) this.scheduleSync(0, true);
   }
 
   private requestPeriodicSync(): void {
@@ -1607,7 +1618,30 @@ export class NtfyLanSync {
         peerId: passivePeer.deviceId
       });
     }
-    this.scheduleSync(0, false);
+    this.startBackgroundFilesystemReconciliation();
+  }
+
+  private startBackgroundFilesystemReconciliation(): void {
+    if (!this.runningValue || this.backgroundReconciliation || this.metadataManifestBuild) return;
+    const includeConfigFolder = this.settings().syncConfigFolder;
+    this.reconciliationDirtyPaths.clear();
+    const promise = (async (): Promise<void> => {
+      await this.buildMetadataManifest(includeConfigFolder, undefined, true);
+      while (this.reconciliationDirtyPaths.size) {
+        const changed = [...this.reconciliationDirtyPaths].slice(0, MAX_DIRTY_PATHS);
+        for (const path of changed) this.reconciliationDirtyPaths.delete(path);
+        await this.buildMetadataManifestForPaths(changed, includeConfigFolder);
+      }
+      this.metadataIndexGeneration = this.dirtySequence;
+      if (this.fullSyncRequested) this.localFilesystemScanCompletedRequestId = this.fullSyncRequestId;
+    })();
+    this.backgroundReconciliation = promise;
+    void promise.catch((error) => {
+      this.lastErrorValue = safeErrorCode(error);
+    }).finally(() => {
+      if (this.backgroundReconciliation === promise) this.backgroundReconciliation = null;
+      if (this.runningValue) this.scheduleSync(0, true);
+    });
   }
 
   private fullRescanIntervalMs(): number {
@@ -2727,8 +2761,13 @@ export class NtfyLanSync {
     const peers = this.syncTargets();
     if (!peers.length) return;
     const localDirty = new Map(this.dirtyPaths);
-    const localFullSyncRequestId = this.fullSyncRequested ? this.fullSyncRequestId : "";
-    const localForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
+    const localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation ? this.fullSyncRequestId : "";
+    const localForceFilesystemScan = Boolean(
+      localFullSyncRequestId
+      && this.forceFilesystemScanRequested
+      && this.localFilesystemScanCompletedRequestId !== localFullSyncRequestId
+    );
+    const remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
     this.syncRunning = true;
     try {
       let settledAcrossPeers: Set<string> | null = null;
@@ -2737,7 +2776,7 @@ export class NtfyLanSync {
       for (const peer of peers) {
         if (!this.runningValue) break;
         if (this.now() - peer.lastSyncAt < SYNC_MIN_INTERVAL_MS && !this.syncQueued && !forced) continue;
-        const result = await this.syncPeer(peer, localDirty, localFullSyncRequestId, localForceFilesystemScan);
+        const result = await this.syncPeer(peer, localDirty, localFullSyncRequestId, localForceFilesystemScan, remoteForceFilesystemScan);
         settledAcrossPeers = settledAcrossPeers === null
           ? new Set(result.settledLocalPaths)
           : new Set([...settledAcrossPeers].filter((path) => result.settledLocalPaths.has(path)));
@@ -2753,6 +2792,7 @@ export class NtfyLanSync {
         if (localFullSyncRequestId && fullSyncCompletedEverywhere && this.fullSyncRequestId === localFullSyncRequestId) {
           this.fullSyncRequested = false;
           this.forceFilesystemScanRequested = false;
+          this.localFilesystemScanCompletedRequestId = "";
         }
         this.recordSyncCheckpoint();
       }
@@ -2780,11 +2820,12 @@ export class NtfyLanSync {
     peer: LanSyncPeer,
     localDirty = new Map(this.dirtyPaths),
     localFullSyncRequestId = this.fullSyncRequested ? this.fullSyncRequestId : "",
-    localForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested)
+    localForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested),
+    remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested)
   ): Promise<LanSyncPeerResult> {
     if (!this.metadataProtocol(peer)) throw new LanSyncProtocolError("peer_upgrade_required", 426);
     const remoteDirty = new Map(peer.remoteDirtyPaths ?? []);
-    const remoteFullSyncRequestId = peer.remoteFullSyncRequestId ?? "";
+    const remoteFullSyncRequestId = this.backgroundReconciliation ? "" : peer.remoteFullSyncRequestId ?? "";
     const fullSync = Boolean(localFullSyncRequestId || remoteFullSyncRequestId);
     const paths = new Set([...localDirty.keys(), ...remoteDirty.keys()]);
     if (!fullSync && !paths.size) return { settledLocalPaths: new Set(), fullSyncComplete: false };
@@ -2795,7 +2836,8 @@ export class NtfyLanSync {
       remoteDirty,
       localFullSyncRequestId,
       remoteFullSyncRequestId,
-      forceFilesystemScan: localForceFilesystemScan || peer.remoteForceFilesystemScan
+      forceLocalFilesystemScan: localForceFilesystemScan || peer.remoteForceFilesystemScan,
+      forceRemoteFilesystemScan: remoteForceFilesystemScan || peer.remoteForceFilesystemScan
     });
   }
 
@@ -2806,7 +2848,8 @@ export class NtfyLanSync {
     remoteDirty: Map<string, number>;
     localFullSyncRequestId: string;
     remoteFullSyncRequestId: string;
-    forceFilesystemScan: boolean;
+    forceLocalFilesystemScan: boolean;
+    forceRemoteFilesystemScan: boolean;
   }): Promise<LanSyncPeerResult> {
     this.activityFiles = [];
     this.activityUpdatedAt = this.now();
@@ -2815,13 +2858,13 @@ export class NtfyLanSync {
     const requestedPaths = [...request.paths].sort((left, right) => left.localeCompare(right));
     const [localEntries, remoteResponse, ledger] = await Promise.all([
       request.fullSync
-        ? this.buildMetadataManifest(localPolicy.syncConfigFolder, undefined, request.forceFilesystemScan)
+        ? this.buildMetadataManifest(localPolicy.syncConfigFolder, undefined, request.forceLocalFilesystemScan)
         : this.buildMetadataManifestForPaths(requestedPaths, localPolicy.syncConfigFolder),
       this.callPeer(
         peer,
         this.metadataRoute(peer, request.fullSync ? "/manifest" : "/manifest/paths"),
         request.fullSync
-          ? { syncConfigFolder: localPolicy.syncConfigFolder, forceFilesystemScan: request.forceFilesystemScan }
+          ? { syncConfigFolder: localPolicy.syncConfigFolder, forceFilesystemScan: request.forceRemoteFilesystemScan }
           : { syncConfigFolder: localPolicy.syncConfigFolder, paths: requestedPaths }
       ),
       Promise.resolve(this.loadMetadataLedger(peer.deviceId))
@@ -3442,9 +3485,10 @@ export class NtfyLanSync {
       error: "",
       files: unique.map((path) => ({ path, state: "pending", size: 0, reason: "" }))
     };
-    this.scanValue = scan;
+    const exposeScanProgress = !this.backgroundReconciliation;
+    if (exposeScanProgress) this.scanValue = scan;
     const report = (): void => {
-      if (this.scanValue !== scan || this.progressValue.phase === "syncing") return;
+      if (!exposeScanProgress || this.scanValue !== scan || this.progressValue.phase === "syncing") return;
       this.emit({
         ...defaultProgress("scanning"),
         active: this.progressValue.active || this.activePeers().length > 0,
@@ -3541,25 +3585,17 @@ export class NtfyLanSync {
     includeConfigFolder: boolean,
     onProgress?: (completed: number, total: number) => void
   ): Promise<LanSyncMetadataEntry[]> {
-    const dirty = [...this.dirtyPaths.keys()]
-      .filter((path) => this.normalizePath(path, includeConfigFolder) !== null)
+    const dirtyEntries = [...this.dirtyPaths.entries()]
+      .filter(([path, generation]) => generation > this.metadataIndexGeneration && this.normalizePath(path, includeConfigFolder) !== null)
       .slice(0, MAX_DIRTY_PATHS);
+    const dirty = dirtyEntries.map(([path]) => path);
     if (dirty.length) {
       await this.buildMetadataManifestForPaths(dirty, includeConfigFolder);
+      this.metadataIndexGeneration = Math.max(this.metadataIndexGeneration, ...dirtyEntries.map(([, generation]) => generation));
     } else {
-      this.scanValue = {
-        id: randomId(12),
-        phase: "complete",
-        completed: 0,
-        total: 0,
-        cached: 0,
-        hashed: 0,
-        skipped: 0,
-        error: "",
-        files: []
-      };
+      onProgress?.(0, 0);
     }
-    onProgress?.(this.scanValue.completed, this.scanValue.total);
+    if (dirty.length) onProgress?.(this.scanValue.completed, this.scanValue.total);
     const maxFileBytes = this.settings().maxFileBytes;
     return [...this.metadataIndex.entries()]
       .map(([path, metadata]) => ({ path, ...metadata }))
@@ -4373,6 +4409,8 @@ export class NtfyLanSync {
     const acknowledgedFullSyncRequestId = typeof payload.acknowledgedFullSyncRequestId === "string" ? payload.acknowledgedFullSyncRequestId : "";
     if (acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) {
       this.fullSyncRequested = false;
+      this.forceFilesystemScanRequested = false;
+      this.localFilesystemScanCompletedRequestId = "";
     }
     const success = payload.success === true;
     if (success) this.recordSyncCheckpoint();

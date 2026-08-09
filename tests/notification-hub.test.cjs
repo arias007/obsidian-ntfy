@@ -28,8 +28,10 @@ const obsidianStub = {
   Plugin,
   PluginSettingTab: EmptyClass,
   Setting: EmptyClass,
+  normalizePath(value) { return String(value || "").replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/^\/+|\/+$/g, ""); },
   requestUrl: null,
   SuggestModal: EmptyClass,
+  TFile: EmptyClass,
   setIcon() {},
 };
 
@@ -54,6 +56,68 @@ function createPlugin(settings = {}) {
   plugin.saveSettings = async () => {};
   plugin.app = {};
   return plugin;
+}
+
+function attachMemoryVault(plugin) {
+  const files = new Map();
+  const folders = new Set([".trash", ".trash/ntfy-inbox", "附件"]);
+  const normalize = (value) => String(value || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const adapter = {
+    async exists(value) {
+      const path = normalize(value);
+      return files.has(path) || folders.has(path);
+    },
+    async stat(value) {
+      const path = normalize(value);
+      if (files.has(path)) return { type: "file", size: files.get(path).byteLength, mtime: Date.now() };
+      if (folders.has(path)) return { type: "folder", size: 0, mtime: Date.now() };
+      return null;
+    },
+    async mkdir(value) {
+      folders.add(normalize(value));
+    },
+    async writeBinary(value, data) {
+      const path = normalize(value);
+      files.set(path, new Uint8Array(data instanceof ArrayBuffer ? data : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)));
+    },
+    async readBinary(value) {
+      const bytes = files.get(normalize(value));
+      if (!bytes) throw new Error("not found");
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    },
+    async remove(value) {
+      files.delete(normalize(value));
+    },
+    async list(value) {
+      const root = normalize(value);
+      const prefix = `${root}/`;
+      const listedFiles = [...files.keys()].filter((path) => path.startsWith(prefix) && !path.slice(prefix.length).includes("/"));
+      const listedFolders = [...folders].filter((path) => path.startsWith(prefix) && path !== root && !path.slice(prefix.length).includes("/"));
+      return { files: listedFiles, folders: listedFolders };
+    },
+  };
+  const opened = [];
+  plugin.app = {
+    vault: {
+      adapter,
+      getAbstractFileByPath() { return null; },
+      async createBinary(path, data) {
+        await adapter.writeBinary(path, data);
+        return { path };
+      },
+    },
+    workspace: {
+      trigger() {},
+      getLeaf() { return { async openFile(file) { opened.push(file.path); } }; },
+      async openLinkText(path) { opened.push(path); },
+    },
+    async openWithDefaultApp(path) { opened.push(path); },
+  };
+  return { adapter, files, folders, opened };
+}
+
+async function flushBackgroundWork(turns = 12) {
+  for (let index = 0; index < turns; index += 1) await new Promise((resolve) => setImmediate(resolve));
 }
 
 class FakeWebSocket {
@@ -126,6 +190,10 @@ async function run() {
   assert.match(styles, /\.obsidian-ntfy-chat-composer[\s\S]*?position: relative/);
   assert.match(source, /channelAction: "ntfy-vault-files"/);
   assert.match(source, /msg_type: "file"/);
+  assert.match(source, /openConversationAttachment\(messageId, attachmentPath\)/);
+  assert.match(source, /extractFeishuMessageAttachments\(message\)/);
+  assert.match(source, /incomingAttachmentAutoCleanup/);
+  assert.doesNotMatch(source.slice(source.indexOf("  renderConversationAttachment("), source.indexOf("  renderConnectionStatus(")), /window\.open\(/);
   assert.match(styles, /\.obsidian-ntfy-task-time\.is-editable/);
   assert.match(source, /selectSuggestion\(suggestion(?:, event)?\)[\s\S]*?replaceRange\([\s\S]*?setCursor\(/);
   assert.match(source, /onChooseSuggestion\(suggestion\)[\s\S]*?replaceRange\([\s\S]*?setCursor\(/);
@@ -955,6 +1023,41 @@ async function run() {
   assert.equal(receivePlugin.settings.incomingMessages.length, 1);
   assert.equal(receivePlugin.settings.ntfyReceiveSince, "obntfy-own-message");
 
+  const ntfyAttachmentBytes = new TextEncoder().encode("downloaded from ntfy");
+  const ntfyAttachmentPlugin = createPlugin({
+    topic: "attachment-topic",
+    authToken: "attachment-token",
+    incomingAttachmentFolder: "附件/自动收件",
+    incomingAttachmentAutoCleanup: false,
+  });
+  const ntfyAttachmentVault = attachMemoryVault(ntfyAttachmentPlugin);
+  const ntfyAttachmentRequests = [];
+  ntfyAttachmentPlugin.httpRequest = async (request) => {
+    ntfyAttachmentRequests.push(request);
+    if (request.url.includes("/json?")) return {
+      text: JSON.stringify({
+        event: "message",
+        id: "ntfy-file-1",
+        topic: "attachment-topic",
+        message: "file",
+        attachment: { name: "报告.txt", type: "text/plain", size: ntfyAttachmentBytes.byteLength, url: "https://ntfy.sh/file/ntfy-file-1" },
+      }),
+    };
+    return { arrayBuffer: ntfyAttachmentBytes.buffer };
+  };
+  assert.equal(await ntfyAttachmentPlugin.pollNtfyIncoming(), true);
+  await flushBackgroundWork();
+  const downloadedNtfyAttachment = ntfyAttachmentPlugin.settings.conversationMessages[0].attachments[0];
+  assert.equal(downloadedNtfyAttachment.remoteOnly, false);
+  assert.equal(downloadedNtfyAttachment.downloadState, "ready");
+  assert.equal(downloadedNtfyAttachment.path.startsWith("附件/自动收件/"), true);
+  assert.equal(downloadedNtfyAttachment.temporary, false);
+  assert.equal(ntfyAttachmentVault.files.has(downloadedNtfyAttachment.path), true);
+  assert.equal(ntfyAttachmentRequests[1].headers.Authorization, "Bearer attachment-token");
+  await ntfyAttachmentPlugin.openConversationAttachment("ntfy-file-1", downloadedNtfyAttachment.path);
+  assert.deepEqual(ntfyAttachmentVault.opened, [downloadedNtfyAttachment.path]);
+  assert.deepEqual(await ntfyAttachmentPlugin.cleanupLanInboxAttachments(), { removed: 0, checked: 0, disabled: true });
+
   const additionalTelegramPlugin = createPlugin({ topic: "multi-receive" });
   await additionalTelegramPlugin.addChannelToSettings("telegram", { accountId: "work", name: "Work Telegram" });
   await additionalTelegramPlugin.updateChannelAccount("telegram:work", { config: { botToken: "123456:work-token", chatId: "configured-chat" } });
@@ -1033,6 +1136,51 @@ async function run() {
   const feishuAck = feishuGatewayPlugin.decodeFeishuFrame(feishuSocket.sent.at(-1));
   assert.equal(JSON.parse(new TextDecoder().decode(feishuAck.payload)).code, 200);
   assert.equal(feishuAck.headers.some((header) => header.key === "biz_rt"), true);
+  const feishuAttachmentVault = attachMemoryVault(feishuGatewayPlugin);
+  const feishuAttachmentBytes = new TextEncoder().encode("downloaded from feishu");
+  const feishuAttachmentRequests = [];
+  feishuGatewayPlugin.httpRequest = async (request) => {
+    feishuAttachmentRequests.push(request);
+    if (request.url.endsWith("/tenant_access_token/internal")) return { json: { code: 0, tenant_access_token: "tenant-file-token" } };
+    if (request.url.includes("/resources/file_key_test?type=file")) return { arrayBuffer: feishuAttachmentBytes.buffer };
+    throw new Error(`Unexpected Feishu attachment request: ${request.url}`);
+  };
+  const feishuFileEnvelope = {
+    schema: "2.0",
+    header: { event_type: "im.message.receive_v1", create_time: "1785632524000" },
+    event: {
+      sender: { sender_id: { open_id: "ou_sender" }, sender_type: "user" },
+      message: {
+        message_id: "om_file",
+        chat_id: "oc_chat",
+        chat_type: "p2p",
+        message_type: "file",
+        content: JSON.stringify({ file_key: "file_key_test", file_name: "飞书资料.txt", file_size: feishuAttachmentBytes.byteLength }),
+        create_time: "1785632524000",
+      },
+    },
+  };
+  feishuSocket.messageRaw(feishuGatewayPlugin.encodeFeishuFrame({
+    SeqID: 2,
+    LogID: 3,
+    service: 42,
+    method: 1,
+    headers: [
+      { key: "type", value: "event" },
+      { key: "message_id", value: "frame-file" },
+      { key: "sum", value: "1" },
+      { key: "seq", value: "0" },
+    ],
+    payload: new TextEncoder().encode(JSON.stringify(feishuFileEnvelope)),
+  }));
+  await flushBackgroundWork();
+  const downloadedFeishuMessage = feishuGatewayPlugin.settings.conversationMessages.find((message) => message.id === "feishu-om_file");
+  assert.ok(downloadedFeishuMessage, "Feishu file message was not ingested");
+  assert.equal(downloadedFeishuMessage.attachments.length, 1);
+  assert.equal(downloadedFeishuMessage.attachments[0].downloadState, "ready");
+  assert.equal(downloadedFeishuMessage.attachments[0].remoteOnly, false);
+  assert.equal(feishuAttachmentVault.files.has(downloadedFeishuMessage.attachments[0].path), true);
+  assert.equal(feishuAttachmentRequests.some((request) => request.headers && request.headers.Authorization === "Bearer tenant-file-token"), true);
   feishuGatewayPlugin.closeIncomingSockets();
 
   const terminalQqPlugin = createPlugin({ topic: "qq-terminal-auth" });

@@ -551,9 +551,15 @@ try {
     assert.ok(progressA.some((value) => value.phase === "scanning" && value.total > 0 && value.completed > 0), "LAN scan progress did not expose the full local manifest");
     let previousScanCompleted = -1;
     let previousScanTotal = 0;
-    for (const value of progressA.filter((candidate) => candidate.phase === "scanning" && candidate.total > 0)) {
+    for (const value of progressA) {
+      if (value.phase !== "scanning") {
+        previousScanCompleted = -1;
+        previousScanTotal = 0;
+        continue;
+      }
+      if (value.total <= 0) continue;
       if (value.total !== previousScanTotal) previousScanCompleted = -1;
-      assert.ok(value.completed >= previousScanCompleted, "LAN scan progress regressed within one scan");
+      assert.ok(value.completed >= previousScanCompleted, `LAN scan progress regressed within one active scan: ${previousScanCompleted} -> ${value.completed}/${value.total} (${value.stage || value.phase})`);
       previousScanCompleted = value.completed;
       previousScanTotal = value.total;
     }
@@ -608,6 +614,30 @@ try {
     assert.equal(await storageA.exists(`${storageA.identityRoot}/metadata-index-v1.json`), true, "The full metadata index was not persisted outside the synchronized Vault data plane");
     assert.ok(requestedRoutes.includes("/cancip-lan/v1/metadata/v4/manifest"), "New peers did not use the metadata manifest route");
     assert.ok(serviceB.loadMetadataLedger(deviceA).entries["Notes/identical.md"], "Receiving peer did not persist the reverse metadata ledger");
+
+    const originalListFilesA = storageA.listFiles.bind(storageA);
+    let releaseBackgroundScan;
+    let backgroundScanStarted;
+    const backgroundScanGate = new Promise((resolvePromise) => { releaseBackgroundScan = resolvePromise; });
+    const backgroundScanEntered = new Promise((resolvePromise) => { backgroundScanStarted = resolvePromise; });
+    storageA.listFiles = async (...args) => {
+      backgroundScanStarted();
+      await backgroundScanGate;
+      return await originalListFilesA(...args);
+    };
+    serviceA.requestSync();
+    await backgroundScanEntered;
+    storageA.putText("Realtime/new-during-scan.md", "event lane", 625);
+    serviceA.notifyVaultChange("Realtime/new-during-scan.md");
+    await waitFor(() => storageB.text("Realtime/new-during-scan.md") === "event lane", "new-file transfer while the background reconciliation was still blocked");
+    assert.ok(serviceA.backgroundReconciliation, "The background reconciliation finished before the event-priority transfer was proven");
+    releaseBackgroundScan();
+    await serviceA.backgroundReconciliation;
+    storageA.listFiles = originalListFilesA;
+    await waitFor(
+      () => !serviceA.syncRunning && !serviceA.fullSyncRequested && serviceA.dirtyPaths.size === 0,
+      "background reconciliation settlement"
+    );
 
     const negotiatedPeer = serviceA.peers.get(deviceB);
     negotiatedPeer.capabilities = new Set(["metadata-session-v3"]);
