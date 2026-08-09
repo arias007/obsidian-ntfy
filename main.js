@@ -796,8 +796,9 @@ var NtfyLanSyncRuntime = (() => {
   var REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 6e4;
   var SYNC_MIN_INTERVAL_MS = 400;
   var QUEUED_SYNC_DELAY_MS = 750;
-  var MIN_FULL_RESCAN_INTERVAL_MS = 10 * 6e4;
-  var MAX_FULL_RESCAN_INTERVAL_MS = 60 * 6e4;
+  var CHANGE_JOURNAL_SAVE_DELAY_MS = 100;
+  var CHECKPOINT_MTIME_OVERLAP_MS = 2e3;
+  var BACKGROUND_FULL_RESCAN_INTERVAL_MS = 24 * 60 * 6e4;
   var HASH_CONCURRENCY = 12;
   var LARGE_TRANSFER_CONCURRENCY = 6;
   var MEDIUM_TRANSFER_CONCURRENCY = 8;
@@ -1512,6 +1513,7 @@ ${bodyHash}`;
     hashCache = /* @__PURE__ */ new Map();
     hashCacheLoaded = false;
     hashSaveTimer = null;
+    changeJournalSaveTimer = null;
     manifestBuild = null;
     metadataManifestBuild = null;
     intervals = [];
@@ -1523,6 +1525,7 @@ ${bodyHash}`;
     fullSyncRequestId = "";
     fullSyncRequested = true;
     lastFullScanAt = 0;
+    lastSyncCheckpointAt = 0;
     dirtySequence = 0;
     dirtyPaths = /* @__PURE__ */ new Map();
     inboundSession = null;
@@ -1712,6 +1715,9 @@ ${bodyHash}`;
       this.identity = await this.loadOrCreateIdentity();
       this.deviceId = this.loadOrCreateDeviceId();
       this.lastFullScanAt = this.loadLastFullScanAt();
+      this.loadChangeJournal();
+      this.loadHashCache();
+      await this.captureChangesSinceCheckpoint();
       if (this.lastFullScanAt > 0 && this.now() - this.lastFullScanAt < this.fullRescanIntervalMs()) {
         this.fullSyncRequested = false;
       }
@@ -1721,7 +1727,6 @@ ${bodyHash}`;
       }
       if (!this.syncRequestId) this.syncRequestId = randomId(18);
       this.loadPendingMessages();
-      this.loadHashCache();
       this.runningValue = true;
       this.lastErrorValue = "";
       try {
@@ -1790,6 +1795,11 @@ ${bodyHash}`;
         this.hashSaveTimer = null;
         this.saveHashCache();
       }
+      if (this.changeJournalSaveTimer) {
+        clearTimeout(this.changeJournalSaveTimer);
+        this.changeJournalSaveTimer = null;
+      }
+      this.saveChangeJournal();
       this.peers.clear();
       this.emitPeersChanged();
       this.replayCache.clear();
@@ -1816,6 +1826,7 @@ ${bodyHash}`;
         const newest = [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS);
         this.dirtyPaths = new Map(newest);
       }
+      this.queueChangeJournalSave();
       this.syncRequestId = randomId(18);
       this.scheduleSync(delay, true);
     }
@@ -1862,10 +1873,7 @@ ${bodyHash}`;
       this.scheduleSync(0, false);
     }
     fullRescanIntervalMs() {
-      return Math.min(
-        MAX_FULL_RESCAN_INTERVAL_MS,
-        Math.max(MIN_FULL_RESCAN_INTERVAL_MS, this.settings().checkIntervalSeconds * 1e4)
-      );
+      return BACKGROUND_FULL_RESCAN_INTERVAL_MS;
     }
     lastFullScanStorageKey() {
       return `ntfy.lan-sync.last-full-scan.v1.${this.identity?.vaultId ?? "unknown"}`;
@@ -1880,6 +1888,73 @@ ${bodyHash}`;
         this.localStore()?.setItem(this.lastFullScanStorageKey(), String(this.lastFullScanAt));
       } catch {
       }
+    }
+    changeJournalStorageKey() {
+      return `ntfy.lan-sync.change-journal.v1.${this.identity?.vaultId ?? "unknown"}`;
+    }
+    loadChangeJournal() {
+      this.lastSyncCheckpointAt = this.lastFullScanAt;
+      try {
+        const raw = this.localStore()?.getItem(this.changeJournalStorageKey());
+        if (!raw) return;
+        const parsed = safeJsonObject(raw);
+        if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.entries)) {
+          this.lastFullScanAt = 0;
+          return;
+        }
+        const checkpointAt = Number(parsed.checkpointAt);
+        if (Number.isFinite(checkpointAt) && checkpointAt > 0) this.lastSyncCheckpointAt = checkpointAt;
+        const restored = /* @__PURE__ */ new Map();
+        for (const item of parsed.entries.slice(-MAX_DIRTY_PATHS)) {
+          if (!Array.isArray(item) || item.length !== 2) continue;
+          const path = this.normalizePath(item[0]);
+          const generation = Number(item[1]);
+          if (!path || !Number.isSafeInteger(generation) || generation <= 0) continue;
+          restored.set(path, generation);
+        }
+        this.dirtyPaths = restored;
+        this.dirtySequence = Math.max(Number.isSafeInteger(Number(parsed.sequence)) ? Number(parsed.sequence) : 0, ...restored.values(), 0);
+      } catch {
+        this.dirtyPaths.clear();
+        this.dirtySequence = 0;
+        this.lastFullScanAt = 0;
+      }
+    }
+    async captureChangesSinceCheckpoint() {
+      if (this.lastSyncCheckpointAt <= 0 || !this.options.storage.listFilesChangedSince) return;
+      try {
+        const since = Math.max(0, this.lastSyncCheckpointAt - CHECKPOINT_MTIME_OVERLAP_MS);
+        const changed = await this.options.storage.listFilesChangedSince(since, this.settings().syncConfigFolder);
+        for (const file of changed.slice(0, MAX_DIRTY_PATHS)) this.markDirtyPath(file.path, QUEUED_SYNC_DELAY_MS);
+        if (changed.length > MAX_DIRTY_PATHS) {
+          this.fullSyncRequested = true;
+          this.fullSyncRequestId = randomId(18);
+        }
+      } catch {
+        this.lastFullScanAt = 0;
+      }
+    }
+    queueChangeJournalSave() {
+      if (this.changeJournalSaveTimer) clearTimeout(this.changeJournalSaveTimer);
+      this.changeJournalSaveTimer = setTimeout(() => {
+        this.changeJournalSaveTimer = null;
+        this.saveChangeJournal();
+      }, CHANGE_JOURNAL_SAVE_DELAY_MS);
+    }
+    saveChangeJournal() {
+      try {
+        this.localStore()?.setItem(this.changeJournalStorageKey(), JSON.stringify({
+          schemaVersion: 1,
+          checkpointAt: this.lastSyncCheckpointAt,
+          sequence: this.dirtySequence,
+          entries: [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS)
+        }));
+      } catch {
+      }
+    }
+    recordSyncCheckpoint() {
+      this.lastSyncCheckpointAt = this.now();
+      this.saveChangeJournal();
     }
     isPeriodicInitiator(peers = this.activePeers()) {
       if (!peers.length) return false;
@@ -2738,6 +2813,7 @@ ${bodyHash}`;
           if (localFullSyncRequestId && fullSyncCompletedEverywhere && this.fullSyncRequestId === localFullSyncRequestId) {
             this.fullSyncRequested = false;
           }
+          this.recordSyncCheckpoint();
         }
       } catch (error) {
         this.lastErrorValue = safeErrorCode(error);
@@ -4148,12 +4224,14 @@ ${bodyHash}`;
       for (const [path, generation] of acknowledgedDirtyPaths) {
         if ((this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
       }
+      this.queueChangeJournalSave();
       const acknowledgedFullSyncRequestId = typeof payload.acknowledgedFullSyncRequestId === "string" ? payload.acknowledgedFullSyncRequestId : "";
       if (acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) {
         this.fullSyncRequested = false;
         this.recordFullScan();
       }
       const success = payload.success === true;
+      if (success) this.recordSyncCheckpoint();
       if (success) {
         for (const file of this.activityFiles) {
           if (retryPaths.has(file.path)) file.state = "deferred";
@@ -4858,6 +4936,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       this.lanSync?.notifyVaultChange(oldPath);
       this.lanSync?.notifyVaultChange(file.path);
     }));
+    this.registerEvent(this.app.vault.on("raw", (path) => {
+      if (typeof path === "string") this.lanSync?.notifyVaultChange(path);
+    }));
 
     this.app.workspace.onLayoutReady(() => {
       this.queueStatusCountRefresh();
@@ -5232,6 +5313,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
           for (const file of configFiles) byPath.set(file.path, file);
           return [...byPath.values()];
         },
+        listFilesChangedSince: async (since) => this.app.vault.getFiles()
+          .filter((file) => file.stat.mtime >= since)
+          .map((file) => ({ path: file.path, size: file.stat.size, mtime: file.stat.mtime })),
         statFile: async (path) => {
           const file = this.app.vault.getAbstractFileByPath(path);
           if (file instanceof TFile) return { path: file.path, size: file.stat.size, mtime: file.stat.mtime };
@@ -12923,7 +13007,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       });
     new Setting(group)
       .setName(this.uiText("实时同步检查间隔（秒）", "Live sync check interval (seconds)"))
-      .setDesc(this.uiText("默认每 60 秒检查待处理路径；新建、修改、删除和重命名立即增量同步。完整全库校准只在空闲时低频运行。", "Checks pending paths every 60 seconds by default; create, modify, delete, and rename sync immediately. Full-vault calibration runs infrequently while idle."))
+      .setDesc(this.uiText("默认每 60 秒检查持久化变更日志；新建、修改、删除和重命名立即增量同步。完整全库校准仅每日空闲兜底或手动运行。", "Checks the durable change journal every 60 seconds by default; create, modify, delete, and rename sync immediately. Full-vault calibration runs only as a daily idle fallback or when requested manually."))
       .addText((text) => {
         text.inputEl.type = "number";
         text.inputEl.min = "10";

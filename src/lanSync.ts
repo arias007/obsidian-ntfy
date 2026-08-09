@@ -74,6 +74,7 @@ export type LanSyncFileStat = {
 export type LanSyncStorage = {
   identityRoot: string;
   listFiles(includeConfigFolder: boolean): Promise<LanSyncFileStat[]>;
+  listFilesChangedSince?(since: number, includeConfigFolder: boolean): Promise<LanSyncFileStat[]>;
   statFile(path: string): Promise<LanSyncFileStat | null>;
   readBinary(path: string): Promise<ArrayBuffer>;
   writeBinary(path: string, data: ArrayBuffer, mtime?: number): Promise<void>;
@@ -348,8 +349,9 @@ const PEER_MAX_ADDRESS_HISTORY = 8;
 const REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 const SYNC_MIN_INTERVAL_MS = 400;
 const QUEUED_SYNC_DELAY_MS = 750;
-const MIN_FULL_RESCAN_INTERVAL_MS = 10 * 60_000;
-const MAX_FULL_RESCAN_INTERVAL_MS = 60 * 60_000;
+const CHANGE_JOURNAL_SAVE_DELAY_MS = 100;
+const CHECKPOINT_MTIME_OVERLAP_MS = 2_000;
+const BACKGROUND_FULL_RESCAN_INTERVAL_MS = 24 * 60 * 60_000;
 const HASH_CONCURRENCY = 12;
 const LARGE_TRANSFER_CONCURRENCY = 6;
 const MEDIUM_TRANSFER_CONCURRENCY = 8;
@@ -1193,6 +1195,7 @@ export class NtfyLanSync {
   private hashCache = new Map<string, { signature: string; hash: string }>();
   private hashCacheLoaded = false;
   private hashSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private changeJournalSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private manifestBuild: { includeConfigFolder: boolean; promise: Promise<LanSyncManifestEntry[]> } | null = null;
   private metadataManifestBuild: { includeConfigFolder: boolean; promise: Promise<LanSyncMetadataEntry[]> } | null = null;
   private intervals: Array<ReturnType<typeof setInterval>> = [];
@@ -1204,6 +1207,7 @@ export class NtfyLanSync {
   private fullSyncRequestId = "";
   private fullSyncRequested = true;
   private lastFullScanAt = 0;
+  private lastSyncCheckpointAt = 0;
   private dirtySequence = 0;
   private dirtyPaths = new Map<string, number>();
   private inboundSession: LanSyncInboundSession | null = null;
@@ -1419,6 +1423,9 @@ export class NtfyLanSync {
     this.identity = await this.loadOrCreateIdentity();
     this.deviceId = this.loadOrCreateDeviceId();
     this.lastFullScanAt = this.loadLastFullScanAt();
+    this.loadChangeJournal();
+    this.loadHashCache();
+    await this.captureChangesSinceCheckpoint();
     if (this.lastFullScanAt > 0 && this.now() - this.lastFullScanAt < this.fullRescanIntervalMs()) {
       this.fullSyncRequested = false;
     }
@@ -1428,7 +1435,6 @@ export class NtfyLanSync {
     }
     if (!this.syncRequestId) this.syncRequestId = randomId(18);
     this.loadPendingMessages();
-    this.loadHashCache();
     this.runningValue = true;
     this.lastErrorValue = "";
     try {
@@ -1499,6 +1505,11 @@ export class NtfyLanSync {
       this.hashSaveTimer = null;
       this.saveHashCache();
     }
+    if (this.changeJournalSaveTimer) {
+      clearTimeout(this.changeJournalSaveTimer);
+      this.changeJournalSaveTimer = null;
+    }
+    this.saveChangeJournal();
     this.peers.clear();
     this.emitPeersChanged();
     this.replayCache.clear();
@@ -1527,6 +1538,7 @@ export class NtfyLanSync {
       const newest = [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS);
       this.dirtyPaths = new Map(newest);
     }
+    this.queueChangeJournalSave();
     this.syncRequestId = randomId(18);
     this.scheduleSync(delay, true);
   }
@@ -1578,10 +1590,7 @@ export class NtfyLanSync {
   }
 
   private fullRescanIntervalMs(): number {
-    return Math.min(
-      MAX_FULL_RESCAN_INTERVAL_MS,
-      Math.max(MIN_FULL_RESCAN_INTERVAL_MS, this.settings().checkIntervalSeconds * 10_000)
-    );
+    return BACKGROUND_FULL_RESCAN_INTERVAL_MS;
   }
 
   private lastFullScanStorageKey(): string {
@@ -1600,6 +1609,81 @@ export class NtfyLanSync {
     } catch {
       // The next launch may conservatively run a full scan again.
     }
+  }
+
+  private changeJournalStorageKey(): string {
+    return `ntfy.lan-sync.change-journal.v1.${this.identity?.vaultId ?? "unknown"}`;
+  }
+
+  private loadChangeJournal(): void {
+    this.lastSyncCheckpointAt = this.lastFullScanAt;
+    try {
+      const raw = this.localStore()?.getItem(this.changeJournalStorageKey());
+      if (!raw) return;
+      const parsed = safeJsonObject(raw);
+      if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.entries)) {
+        this.lastFullScanAt = 0;
+        return;
+      }
+      const checkpointAt = Number(parsed.checkpointAt);
+      if (Number.isFinite(checkpointAt) && checkpointAt > 0) this.lastSyncCheckpointAt = checkpointAt;
+      const restored = new Map<string, number>();
+      for (const item of parsed.entries.slice(-MAX_DIRTY_PATHS)) {
+        if (!Array.isArray(item) || item.length !== 2) continue;
+        const path = this.normalizePath(item[0]);
+        const generation = Number(item[1]);
+        if (!path || !Number.isSafeInteger(generation) || generation <= 0) continue;
+        restored.set(path, generation);
+      }
+      this.dirtyPaths = restored;
+      this.dirtySequence = Math.max(Number.isSafeInteger(Number(parsed.sequence)) ? Number(parsed.sequence) : 0, ...restored.values(), 0);
+    } catch {
+      this.dirtyPaths.clear();
+      this.dirtySequence = 0;
+      this.lastFullScanAt = 0;
+    }
+  }
+
+  private async captureChangesSinceCheckpoint(): Promise<void> {
+    if (this.lastSyncCheckpointAt <= 0 || !this.options.storage.listFilesChangedSince) return;
+    try {
+      const since = Math.max(0, this.lastSyncCheckpointAt - CHECKPOINT_MTIME_OVERLAP_MS);
+      const changed = await this.options.storage.listFilesChangedSince(since, this.settings().syncConfigFolder);
+      for (const file of changed.slice(0, MAX_DIRTY_PATHS)) this.markDirtyPath(file.path, QUEUED_SYNC_DELAY_MS);
+      if (changed.length > MAX_DIRTY_PATHS) {
+        this.fullSyncRequested = true;
+        this.fullSyncRequestId = randomId(18);
+      }
+    } catch {
+      this.lastFullScanAt = 0;
+      // A failed checkpoint read deliberately falls back to one full reconciliation.
+    }
+  }
+
+  private queueChangeJournalSave(): void {
+    if (this.changeJournalSaveTimer) clearTimeout(this.changeJournalSaveTimer);
+    this.changeJournalSaveTimer = setTimeout(() => {
+      this.changeJournalSaveTimer = null;
+      this.saveChangeJournal();
+    }, CHANGE_JOURNAL_SAVE_DELAY_MS);
+  }
+
+  private saveChangeJournal(): void {
+    try {
+      this.localStore()?.setItem(this.changeJournalStorageKey(), JSON.stringify({
+        schemaVersion: 1,
+        checkpointAt: this.lastSyncCheckpointAt,
+        sequence: this.dirtySequence,
+        entries: [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS)
+      }));
+    } catch {
+      // A failed persistence write only loses restart acceleration, not the current in-memory queue.
+    }
+  }
+
+  private recordSyncCheckpoint(): void {
+    this.lastSyncCheckpointAt = this.now();
+    this.saveChangeJournal();
   }
 
   private isPeriodicInitiator(peers = this.activePeers()): boolean {
@@ -2573,6 +2657,7 @@ export class NtfyLanSync {
         if (localFullSyncRequestId && fullSyncCompletedEverywhere && this.fullSyncRequestId === localFullSyncRequestId) {
           this.fullSyncRequested = false;
         }
+        this.recordSyncCheckpoint();
       }
     } catch (error) {
       this.lastErrorValue = safeErrorCode(error);
@@ -4133,12 +4218,14 @@ export class NtfyLanSync {
     for (const [path, generation] of acknowledgedDirtyPaths) {
       if ((this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
     }
+    this.queueChangeJournalSave();
     const acknowledgedFullSyncRequestId = typeof payload.acknowledgedFullSyncRequestId === "string" ? payload.acknowledgedFullSyncRequestId : "";
     if (acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) {
       this.fullSyncRequested = false;
       this.recordFullScan();
     }
     const success = payload.success === true;
+    if (success) this.recordSyncCheckpoint();
     if (success) {
       for (const file of this.activityFiles) {
         if (retryPaths.has(file.path)) file.state = "deferred";

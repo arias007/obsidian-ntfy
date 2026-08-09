@@ -41,6 +41,8 @@ class MemoryStorage {
     this.clock = 1000;
     this.readCounts = new Map();
     this.writeCounts = new Map();
+    this.listFilesCalls = 0;
+    this.listFilesChangedSinceCalls = 0;
     this.beforeRead = null;
     this.afterWrite = null;
     this.mtimeTransform = typeof options.mtimeTransform === "function" ? options.mtimeTransform : (mtime) => mtime;
@@ -61,8 +63,16 @@ class MemoryStorage {
   }
 
   async listFiles(includeConfigFolder = false) {
+    this.listFilesCalls += 1;
     return [...this.files.entries()]
       .filter(([path]) => includeConfigFolder || !path.startsWith(".obsidian/"))
+      .map(([path, entry]) => ({ path, size: entry.data.byteLength, mtime: entry.mtime }));
+  }
+
+  async listFilesChangedSince(since, includeConfigFolder = false) {
+    this.listFilesChangedSinceCalls += 1;
+    return [...this.files.entries()]
+      .filter(([path, entry]) => (includeConfigFolder || !path.startsWith(".obsidian/")) && entry.mtime >= since)
       .map(([path, entry]) => ({ path, size: entry.data.byteLength, mtime: entry.mtime }));
   }
 
@@ -473,6 +483,48 @@ try {
   stabilityPeer.consecutiveFailures = 3;
   stabilityClock = 31_500;
   assert.equal(stabilityService.listPeers().length, 0, "A peer should leave the list only after the stable grace window");
+
+  const journalPort = await freePort();
+  const journalDevice = "JOURNALCHECKPOINT123456";
+  const journalStore = memoryLocalStore(journalDevice);
+  const journalStorage = new MemoryStorage(identity, {
+    "Notes/existing-before-checkpoint.md": { content: "existing", mtime: 10 }
+  });
+  const journalOptions = commonOptions(journalStorage, journalPort, journalDevice, [], { autoDiscovery: false });
+  journalOptions.localStore = journalStore;
+  const journalService = new NtfyLanSync(journalOptions);
+  await journalService.start();
+  journalService.recordFullScan();
+  journalService.recordSyncCheckpoint();
+  const savedCheckpoint = journalService.lastSyncCheckpointAt;
+  journalService.notifyVaultChange("Notes/deleted-while-running.md");
+  await journalService.stop();
+  journalStorage.putText("Notes/created-while-stopped.md", "offline change", savedCheckpoint + 100);
+  journalStorage.listFilesCalls = 0;
+  journalStorage.listFilesChangedSinceCalls = 0;
+  const reloadOptions = commonOptions(journalStorage, journalPort, journalDevice, [], { autoDiscovery: false });
+  reloadOptions.localStore = journalStore;
+  const reloadedJournalService = new NtfyLanSync(reloadOptions);
+  await reloadedJournalService.start();
+  assert.equal(reloadedJournalService.fullSyncRequested, false, "A recent checkpoint still forced a full-vault scan after reload");
+  assert.ok(reloadedJournalService.dirtyPaths.has("Notes/deleted-while-running.md"), "The durable deletion journal was lost across reload");
+  assert.ok(reloadedJournalService.dirtyPaths.has("Notes/created-while-stopped.md"), "Checkpoint catch-up missed a file changed while the watcher was stopped");
+  assert.equal(journalStorage.listFilesCalls, 0, "Checkpoint restoration called the full-Vault enumerator");
+  assert.equal(journalStorage.listFilesChangedSinceCalls, 1, "Checkpoint restoration did not use the changed-since index exactly once");
+  await reloadedJournalService.stop();
+
+  const corruptJournalPort = await freePort();
+  const corruptJournalDevice = "CORRUPTJOURNAL12345678";
+  const corruptJournalStore = memoryLocalStore(corruptJournalDevice);
+  corruptJournalStore.setItem(`ntfy.lan-sync.last-full-scan.v1.${identity.vaultId}`, String(Date.now()));
+  corruptJournalStore.setItem(`ntfy.lan-sync.change-journal.v1.${identity.vaultId}`, JSON.stringify({ schemaVersion: 99, entries: [] }));
+  const corruptJournalOptions = commonOptions(new MemoryStorage(identity, {}), corruptJournalPort, corruptJournalDevice, [], { autoDiscovery: false });
+  corruptJournalOptions.localStore = corruptJournalStore;
+  const corruptJournalService = new NtfyLanSync(corruptJournalOptions);
+  await corruptJournalService.start();
+  assert.equal(corruptJournalService.fullSyncRequested, true, "A corrupt durable journal suppressed the safety reconciliation");
+  await corruptJournalService.stop();
+
   const optionsB = commonOptions(storageB, portB, deviceB, progressB);
   const optionsA = commonOptions(storageA, portA, deviceA, progressA, { autoDiscovery: false, manualPeers: [`127.0.0.1:${portB}`] });
   const messagesB = [];
@@ -954,7 +1006,12 @@ try {
   assert.match(lanSource, /const SMALL_TRANSFER_CONCURRENCY = 12/, "Small-file LAN transfers are not using the fast bounded worker pool");
   assert.match(lanSource, /if \(!this\.runningValue \|\| this\.syncRunning \|\| this\.inboundSession \|\| this\.metadataManifestBuild \|\| this\.manifestBuild\) return;/, "Periodic full scans can still interrupt an active transfer or manifest enumeration");
   assert.match(lanSource, /private isPeriodicInitiator\(peers = this\.activePeers\(\)\)/, "Periodic synchronization is still permanently assigned to one device role");
-  assert.match(lanSource, /MIN_FULL_RESCAN_INTERVAL_MS = 10 \* 60_000/, "Large Vaults can still run a full scan every minute");
+  assert.match(lanSource, /BACKGROUND_FULL_RESCAN_INTERVAL_MS = 24 \* 60 \* 60_000/, "Converged Vaults can still run frequent background full scans");
+  assert.match(lanSource, /ntfy\.lan-sync\.change-journal\.v1\./, "Dirty paths are not stored in a durable journal");
+  assert.match(lanSource, /captureChangesSinceCheckpoint\(\)/, "Plugin reload does not catch up from the last successful checkpoint");
+  assert.match(lanSource, /this\.recordSyncCheckpoint\(\)/, "Successful synchronization does not record a checkpoint");
+  assert.match(source, /this\.app\.vault\.on\("raw"/, "Hidden configuration changes are not added to the path journal");
+  assert.match(source, /listFilesChangedSince: async \(since\)/, "Startup catch-up does not use Obsidian's in-memory file index");
   assert.match(lanSource, /this\.metadataManifestBuild \|\| this\.manifestBuild/, "Periodic calibration can still overlap manifest enumeration");
   assert.match(lanSource, /safeErrorCode\(error\) === "precondition_failed"/, "One changing file can still abort the entire transfer batch");
   assert.match(lanSource, /written\.size !== bytes\.byteLength\) throw new LanSyncProtocolError\("precondition_failed", 409\)/, "A receiver-side write race can still abort the entire batch");
