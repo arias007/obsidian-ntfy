@@ -407,14 +407,17 @@ try {
       manualPeers: [],
       ...overrides
     };
+    const activityChanges = [];
     return {
       desktop: true,
       getSettings: () => runtimeSettings,
       storage,
       httpRequest,
       onProgress: (value) => progress.push(value),
+      onActivityChanged: () => activityChanges.push(Date.now()),
       localStore: memoryLocalStore(deviceId),
-      runtimeSettings
+      runtimeSettings,
+      activityChanges
     };
   };
   let stabilityClock = 1_000;
@@ -548,21 +551,8 @@ try {
     assert.equal((await storageA.statFile("Notes/from-b.md")).mtime, 300, "Pulled file did not preserve the source mtime");
     assert.equal((await storageB.statFile("Notes/from-a.md")).mtime, 100, "Pushed file did not preserve the source mtime");
     assert.ok(progressA.some((value) => value.phase === "syncing" && value.active));
-    assert.ok(progressA.some((value) => value.phase === "scanning" && value.total > 0 && value.completed > 0), "LAN scan progress did not expose the full local manifest");
-    let previousScanCompleted = -1;
-    let previousScanTotal = 0;
-    for (const value of progressA) {
-      if (value.phase !== "scanning") {
-        previousScanCompleted = -1;
-        previousScanTotal = 0;
-        continue;
-      }
-      if (value.total <= 0) continue;
-      if (value.total !== previousScanTotal) previousScanCompleted = -1;
-      assert.ok(value.completed >= previousScanCompleted, `LAN scan progress regressed within one active scan: ${previousScanCompleted} -> ${value.completed}/${value.total} (${value.stage || value.phase})`);
-      previousScanCompleted = value.completed;
-      previousScanTotal = value.total;
-    }
+    assert.equal(progressA.some((value) => value.phase === "scanning"), false, "Local scanning still overwrote the transfer progress channel");
+    assert.ok(optionsA.activityChanges.length > 0, "Independent scan activity did not notify the UI");
     await waitFor(() => progressA.some((value) => value.phase === "complete" && value.uploads > 0 && value.downloads > 0), "bidirectional completion progress");
     assert.ok(progressA.some((value) => value.phase === "complete"
       && value.conflicts === 0
@@ -610,6 +600,19 @@ try {
     assert.equal(storageA.totalReads(), readsBeforeCachedScan, "An unchanged follow-up scan reread file contents instead of using metadata/hash cache");
     assert.equal(storageA.listFilesCalls, fullEnumerationsBeforeCachedScanA, "A cached local manifest ignored the persistent metadata index");
     assert.equal(storageB.listFilesCalls, fullEnumerationsBeforeCachedScanB, "An ordinary remote full-manifest request forced the peer to enumerate its filesystem again");
+    const forcedRemoteEnumerationsBefore = storageB.listFilesCalls;
+    const stableScanRequestId = "SCANREQUEST123456789";
+    await serviceA.callPeer(serviceA.peers.get(deviceB), "/metadata/v4/manifest", {
+      syncConfigFolder: false,
+      forceFilesystemScan: true,
+      scanRequestIds: [stableScanRequestId]
+    });
+    await serviceA.callPeer(serviceA.peers.get(deviceB), "/metadata/v4/manifest", {
+      syncConfigFolder: false,
+      forceFilesystemScan: true,
+      scanRequestIds: [stableScanRequestId]
+    });
+    assert.equal(storageB.listFilesCalls, forcedRemoteEnumerationsBefore + 1, "A retried full-scan request enumerated the peer filesystem twice");
     await serviceA.saveMetadataIndex();
     assert.equal(await storageA.exists(`${storageA.identityRoot}/metadata-index-v1.json`), true, "The full metadata index was not persisted outside the synchronized Vault data plane");
     assert.ok(requestedRoutes.includes("/cancip-lan/v1/metadata/v4/manifest"), "New peers did not use the metadata manifest route");
@@ -683,6 +686,53 @@ try {
     assert.equal(mirroredPushA.downloads, mirroredPushB.uploads, "Coordinator downloads did not mirror peer uploads");
     assert.equal(mirroredPushA.uploadCompleted, mirroredPushB.downloadCompleted, "Coordinator completed uploads did not mirror peer completed downloads");
     assert.equal(mirroredPushA.downloadCompleted, mirroredPushB.uploadCompleted, "Coordinator completed downloads did not mirror peer completed uploads");
+    assert.ok(mirroredPushA.sessionId, "Coordinator completion did not retain a transfer session ID");
+    assert.equal(mirroredPushA.sessionId, mirroredPushB.sessionId, "The two peers did not report the same immutable transfer session");
+
+    await waitFor(() => serviceB.dirtyPaths.size === 0, "receiver dirty journal settlement");
+    serviceB.notifyVaultChange("Notes/identical.md");
+    serviceB.notifyVaultChange("Notes/identical.md");
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 60));
+    assert.equal(serviceB.dirtyPaths.has("Notes/identical.md"), false, "A LAN-applied write echoed back into the receiver dirty journal");
+
+    const activeRouteStart = requestedRoutes.length;
+    storageA.putText("Notes/active-fast-lane.md", "active lane", 805);
+    serviceA.notifyActiveEdit("Notes/active-fast-lane.md");
+    await waitFor(() => storageB.text("Notes/active-fast-lane.md") === "active lane", "active-edit fast-lane transfer");
+    await waitFor(
+      () => !serviceA.dirtyPaths.has("Notes/active-fast-lane.md") && !serviceA.activeEditDirty.has("Notes/active-fast-lane.md"),
+      "active-edit dirty checkpoint settlement"
+    );
+    serviceA.clearActiveEdit();
+    const activeManifestRequests = requestedRoutes.slice(activeRouteStart)
+      .filter((route) => route === "/cancip-lan/v1/metadata/v4/manifest/paths");
+    assert.equal(activeManifestRequests.length, 1, "A successful active-edit session immediately started a duplicate bulk comparison");
+
+    const sessionProbe = {
+      sessionId: "SESSIONPROBE123456",
+      total: 0,
+      bytesTotal: 0,
+      uploads: 0,
+      downloads: 0,
+      files: []
+    };
+    const firstSessionProbe = await serviceB.handleMetadataSessionStart(deviceA, sessionProbe);
+    const resumedSessionProbe = await serviceB.handleMetadataSessionStart(deviceA, sessionProbe);
+    assert.equal(firstSessionProbe.sessionId, sessionProbe.sessionId);
+    assert.equal(resumedSessionProbe.resumed, true, "A retried session start reset the receiver plan");
+    await assert.rejects(
+      () => serviceB.handleMetadataSessionStart(deviceA, { ...sessionProbe, sessionId: "SESSIONPROBE654321" }),
+      /sync_session_busy/,
+      "A second session replaced the active receiver plan"
+    );
+    await serviceB.handleMetadataSessionFinish(deviceA, {
+      sessionId: sessionProbe.sessionId,
+      success: true,
+      commits: [],
+      retryPaths: [],
+      acknowledgedDirtyPaths: [],
+      acknowledgedFullSyncRequestId: ""
+    });
 
     storageA.putText("Notes/steady-during-volatile.md", "steady", 810);
     storageA.putText("Notes/volatile.md", "volatile-v1", 811);
@@ -881,8 +931,8 @@ try {
     assert.equal(firstBaseline.total, 3, "Thousands of metadata-only mtime differences entered the transfer plan");
     assert.equal(firstBaseline.uploads, 1, "Large baseline upload count included metadata-equivalent files");
     assert.equal(firstBaseline.downloads, 2, "Large baseline download count included metadata-equivalent files");
-    assert.ok(baselineProgressA.some((value) => value.stage === "fingerprinting" && value.total > 0), "Ambiguous baseline hashing did not expose fingerprint progress");
-    assert.ok(baselineProgressA.some((value) => value.stage === "planning"), "Baseline comparison did not expose the planning stage");
+    assert.ok(baselineServiceA.activity().scan.hashed > 0, "Ambiguous baseline hashing did not expose independent scan activity");
+    assert.equal(baselineProgressA.some((value) => value.phase === "scanning"), false, "Large-vault scanning leaked into transfer progress");
     assert.equal(baselineStorageA.text("Bulk/changed.bin"), "remote-x", "A real same-size content change was not reconciled");
     assert.equal(baselineStorageB.text("Only-A/new.md"), "from A", "A unique local file was not uploaded");
     assert.equal(baselineStorageA.text("Only-B/new.md"), "from B", "A unique remote file was not downloaded");
@@ -952,8 +1002,8 @@ try {
     assert.equal(desktopService.peers.get(mobileDevice).capabilities.has("metadata-session-v3"), true, "Desktop did not accept the mobile v3 compatibility capability");
     assert.equal(desktopService.peers.get(mobileDevice).capabilities.has("metadata-session-v4"), false, "The old-mobile fixture unexpectedly advertised v4");
     await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "automatic full-vault sync");
-    assert.ok(desktopProgress.some((value) => value.stage === "enumerating"), "Passive desktop did not report metadata enumeration");
-    assert.ok(desktopProgress.some((value) => value.stage === "planning"), "Passive desktop did not report transfer planning");
+    assert.ok(desktopOptions.activityChanges.length > 0, "Passive desktop did not report independent scan activity");
+    assert.equal(desktopProgress.some((value) => value.phase === "scanning"), false, "Passive desktop scan overwrote mirrored transfer progress");
     desktopStorage.putText("Desktop/desktop-initiated.md", "started on desktop", 1300);
     desktopService.notifyVaultChange("Desktop/desktop-initiated.md");
     const beforeDesktopInitiatedProgress = desktopProgress.length;
@@ -1055,6 +1105,11 @@ try {
   assert.match(lanSource, /safeErrorCode\(error\) === "precondition_failed"/, "One changing file can still abort the entire transfer batch");
   assert.match(lanSource, /written\.size !== bytes\.byteLength\) throw new LanSyncProtocolError\("precondition_failed", 409\)/, "A receiver-side write race can still abort the entire batch");
   assert.match(lanSource, /retryPaths: \[\.\.\.retryPaths\]/, "Deferred paths are not mirrored to the peer retry queue");
+  assert.match(lanSource, /onActivityChanged\?\.\(\)/, "Scan activity is not reported on its independent channel");
+  assert.doesNotMatch(lanSource, /defaultProgress\("scanning"\)/, "Scanning still writes into the transfer progress state");
+  assert.match(lanSource, /sync_session_busy/, "A second transfer session can still overwrite an active session");
+  assert.match(lanSource, /scanRequestIds/, "Full-vault scan requests are not deduplicated across peers");
+  assert.match(lanSource, /classifyAppliedMutationEvent\(normalized\)/, "LAN-applied writes can still echo back into the dirty journal");
   assert.match(takeoverSource, /plugins\?\.\["remotely-save"\]\?\.statusBarElement/);
   assert.doesNotMatch(takeoverSource, /isSyncing|currSyncMsg|syncEvent|remotelySave\.settings|candidate\.settings|start-sync/);
   assert.doesNotMatch(takeoverSource, /plugins\/remotely-save|plugins\\remotely-save/);

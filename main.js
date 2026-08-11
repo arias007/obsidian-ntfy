@@ -818,6 +818,7 @@ var NtfyLanSyncRuntime = (() => {
   var CHECKPOINT_MTIME_OVERLAP_MS = 2e3;
   var BACKGROUND_FULL_RESCAN_INTERVAL_MS = 24 * 60 * 6e4;
   var METADATA_INDEX_SAVE_DELAY_MS = 2e3;
+  var APPLIED_MUTATION_EVENT_TTL_MS = 3e3;
   var HASH_CONCURRENCY = 12;
   var LARGE_TRANSFER_CONCURRENCY = 6;
   var MEDIUM_TRANSFER_CONCURRENCY = 8;
@@ -1368,6 +1369,7 @@ ${bodyHash}`;
   function defaultProgress(phase = "stopped") {
     const stage = phase === "discovering" ? "discovering" : phase === "connected" ? "waiting-peer-scan" : phase === "scanning" ? "enumerating" : phase === "syncing" ? "transferring" : phase === "complete" ? "complete" : phase === "error" ? "error" : "stopped";
     return {
+      sessionId: "",
       phase,
       stage,
       active: false,
@@ -1593,9 +1595,12 @@ ${bodyHash}`;
     dirtySequence = 0;
     dirtyPaths = /* @__PURE__ */ new Map();
     inboundSession = null;
+    appliedMutationEvents = /* @__PURE__ */ new Map();
+    servedFilesystemScanRequests = /* @__PURE__ */ new Map();
     pendingMessages = /* @__PURE__ */ new Map();
     receivedMessageIds = /* @__PURE__ */ new Set();
     lastTransferAt = 0;
+    currentTransferSessionId = "";
     progressValue = defaultProgress();
     activityFiles = [];
     scanValue = this.emptyScanActivity();
@@ -1884,12 +1889,65 @@ ${bodyHash}`;
       this.replayCache.clear();
       this.rateByClient.clear();
       this.inboundSession = null;
+      this.currentTransferSessionId = "";
+      this.appliedMutationEvents.clear();
+      this.servedFilesystemScanRequests.clear();
       this.activityFiles = [];
       this.scanValue = this.emptyScanActivity();
       this.activityUpdatedAt = this.now();
       this.emit(defaultProgress("stopped"));
     }
     notifyVaultChange(path) {
+      const normalized = this.normalizePath(path, true);
+      if (!normalized) return;
+      if (!this.appliedMutationEvents.has(normalized)) {
+        this.markDirtyPath(normalized, REALTIME_DIRTY_DELAY_MS, true);
+        return;
+      }
+      void this.classifyAppliedMutationEvent(normalized);
+    }
+    markAppliedMutation(path) {
+      if (this.appliedMutationEvents.size >= MAX_DIRTY_PATHS) {
+        const now = this.now();
+        for (const [candidate, token] of this.appliedMutationEvents) {
+          if (token.expiresAt < now) this.appliedMutationEvents.delete(candidate);
+        }
+        while (this.appliedMutationEvents.size >= MAX_DIRTY_PATHS) {
+          const oldest = this.appliedMutationEvents.keys().next().value;
+          if (typeof oldest !== "string") break;
+          this.appliedMutationEvents.delete(oldest);
+        }
+      }
+      this.appliedMutationEvents.set(path, {
+        expiresAt: this.now() + APPLIED_MUTATION_EVENT_TTL_MS
+      });
+    }
+    confirmAppliedMutation(path, expected) {
+      const token = this.appliedMutationEvents.get(path);
+      if (token) token.expected = expected;
+    }
+    clearAppliedMutation(path) {
+      this.appliedMutationEvents.delete(path);
+    }
+    async classifyAppliedMutationEvent(path) {
+      let token = this.appliedMutationEvents.get(path);
+      if (!token) {
+        this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+        return;
+      }
+      if (token.expected === void 0) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        token = this.appliedMutationEvents.get(path);
+      }
+      if (!token || token.expiresAt < this.now() || token.expected === void 0) {
+        this.appliedMutationEvents.delete(path);
+        this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+        return;
+      }
+      const current = await this.options.storage.statFile(path).catch(() => null);
+      const unchanged = token.expected === null ? current === null : Boolean(current && metadataMatches(current, token.expected));
+      if (unchanged) return;
+      this.appliedMutationEvents.delete(path);
       this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
     }
     /**
@@ -2001,6 +2059,15 @@ ${bodyHash}`;
       if (this.metadataManifestBuild && this.manifestBuildStartedAt > 0 && now - this.manifestBuildStartedAt > SYNC_WATCHDOG_MS) {
         this.metadataManifestBuild = null;
         this.manifestBuildStartedAt = 0;
+      }
+      if (this.inboundSession && now - this.inboundSession.updatedAt > SYNC_WATCHDOG_MS) {
+        for (const file of this.activityFiles) {
+          if (file.state === "pending" || file.state === "syncing") file.state = "error";
+        }
+        this.inboundSession = null;
+        this.currentTransferSessionId = "";
+        this.emit({ ...defaultProgress("error"), active: true, error: "inbound_session_timeout" });
+        return;
       }
       const scanning = this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing";
       const busy = this.syncRunning || Boolean(this.inboundSession) || Boolean(this.backgroundReconciliation) || Boolean(this.metadataManifestBuild);
@@ -2371,10 +2438,17 @@ ${bodyHash}`;
       }));
     }
     emit(progress) {
-      this.progressValue = { ...progress, peerCount: this.activePeers().length };
+      const sessionId = progress.sessionId || (progress.phase === "syncing" || progress.phase === "complete" ? this.currentTransferSessionId : "");
+      this.progressValue = { ...progress, sessionId, peerCount: this.activePeers().length };
       this.progressUpdatedAt = this.now();
       try {
         this.options.onProgress({ ...this.progressValue });
+      } catch {
+      }
+    }
+    emitActivityChanged() {
+      try {
+        this.options.onActivityChanged?.();
       } catch {
       }
     }
@@ -2708,9 +2782,10 @@ ${bodyHash}`;
       const now = this.now();
       const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : "";
       if (sessionId && this.inboundSession?.id === sessionId && this.inboundSession.deviceId === deviceId) {
-        const index2 = this.activityFiles.findIndex((file) => file.path === path && (file.state === "pending" || file.state === "syncing"));
+        const index2 = this.activityFiles.findIndex((file) => file.path === path && file.state !== "complete");
         if (index2 < 0) return null;
         this.activityFiles[index2].state = "syncing";
+        this.inboundSession.updatedAt = now;
         this.activityUpdatedAt = now;
         this.emitInboundFileProgress(deviceId);
         return index2;
@@ -2884,6 +2959,20 @@ ${bodyHash}`;
       }
       return paths;
     }
+    parseScanRequestIds(value) {
+      if (!Array.isArray(value)) return [];
+      return [...new Set(value.filter((item) => typeof item === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(item)).slice(0, 4))];
+    }
+    filesystemScanAlreadyServed(deviceId, requestIds) {
+      if (!requestIds.length) return false;
+      const served = new Set(this.servedFilesystemScanRequests.get(deviceId) ?? []);
+      return requestIds.every((requestId) => requestId === this.localFilesystemScanCompletedRequestId || served.has(requestId));
+    }
+    recordServedFilesystemScan(deviceId, requestIds) {
+      if (!requestIds.length) return;
+      const previous = this.servedFilesystemScanRequests.get(deviceId) ?? [];
+      this.servedFilesystemScanRequests.set(deviceId, [.../* @__PURE__ */ new Set([...previous, ...requestIds])].slice(-16));
+    }
     metadataProtocol(peer) {
       return METADATA_PROTOCOLS.find((protocol) => peer.capabilities.has(protocol.capability)) ?? null;
     }
@@ -2905,11 +2994,16 @@ ${bodyHash}`;
     progressSignal() {
       return {
         phase: this.progressValue.phase,
+        sessionId: this.progressValue.sessionId,
         stage: this.progressValue.stage,
         completed: Math.max(0, Math.floor(this.progressValue.completed)),
         total: Math.max(0, Math.floor(this.progressValue.total)),
         bytesTransferred: Math.max(0, Math.floor(this.progressValue.bytesTransferred)),
         bytesTotal: Math.max(0, Math.floor(this.progressValue.bytesTotal)),
+        uploads: Math.max(0, Math.floor(this.progressValue.uploads)),
+        uploadCompleted: Math.max(0, Math.floor(this.progressValue.uploadCompleted)),
+        downloads: Math.max(0, Math.floor(this.progressValue.downloads)),
+        downloadCompleted: Math.max(0, Math.floor(this.progressValue.downloadCompleted)),
         scanCompleted: Math.max(0, Math.floor(this.scanValue.completed)),
         scanTotal: Math.max(0, Math.floor(this.scanValue.total)),
         updatedAt: this.progressUpdatedAt
@@ -2925,12 +3019,17 @@ ${bodyHash}`;
         return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 0;
       };
       return {
+        sessionId: typeof value.sessionId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(value.sessionId) ? value.sessionId : "",
         phase,
         stage: typeof value.stage === "string" && value.stage.length <= 48 ? value.stage : "",
         completed: count(value.completed),
         total: count(value.total),
         bytesTransferred: count(value.bytesTransferred),
         bytesTotal: count(value.bytesTotal),
+        uploads: count(value.uploads),
+        uploadCompleted: count(value.uploadCompleted),
+        downloads: count(value.downloads),
+        downloadCompleted: count(value.downloadCompleted),
         scanCompleted: count(value.scanCompleted),
         scanTotal: count(value.scanTotal),
         receivedAt: this.now()
@@ -2962,18 +3061,22 @@ ${bodyHash}`;
       if (!remote) return;
       if (this.syncRunning || this.inboundSession || this.backgroundReconciliation) return;
       if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing") return;
-      if (remote.phase !== "scanning" && remote.phase !== "syncing") return;
+      if (remote.phase !== "syncing") return;
       if (this.now() - remote.receivedAt > PEER_PROBE_INTERVAL_MS * 4) return;
-      const scanning = remote.phase === "scanning";
       this.emit({
-        ...defaultProgress(remote.phase),
-        stage: scanning ? "waiting-peer-scan" : "transferring",
+        ...defaultProgress("syncing"),
+        sessionId: remote.sessionId,
+        stage: "transferring",
         active: true,
         peerId: peer.deviceId,
-        completed: scanning ? remote.scanCompleted : remote.completed,
-        total: scanning ? remote.scanTotal : remote.total,
+        completed: remote.completed,
+        total: remote.total,
         bytesTransferred: remote.bytesTransferred,
-        bytesTotal: remote.bytesTotal
+        bytesTotal: remote.bytesTotal,
+        uploads: remote.downloads,
+        uploadCompleted: remote.downloadCompleted,
+        downloads: remote.uploads,
+        downloadCompleted: remote.uploadCompleted
       });
     }
     emitPeerConnectionStage(peer) {
@@ -3147,6 +3250,7 @@ ${bodyHash}`;
       } finally {
         this.syncRunning = false;
         this.syncStartedAt = 0;
+        this.currentTransferSessionId = "";
         const hasUrgentWork = this.urgentDirtyPaths.size > 0;
         if (this.syncQueued || hasUrgentWork) {
           this.syncQueued = false;
@@ -3181,6 +3285,9 @@ ${bodyHash}`;
       }
       const peers = this.syncTargets();
       if (!peers.length) return;
+      const localDirty = new Map(paths.map((path) => [path, this.dirtyPaths.get(path) ?? this.dirtySequence]));
+      let settledAcrossPeers = null;
+      let synchronizedPeers = 0;
       this.activeEditSyncRunning = true;
       this.activeEditStartedAt = this.now();
       try {
@@ -3191,8 +3298,7 @@ ${bodyHash}`;
             this.lastErrorValue = "peer_upgrade_required";
             continue;
           }
-          const localDirty = new Map(paths.map((p) => [p, this.dirtyPaths.get(p) ?? this.dirtySequence]));
-          await this.syncPeerMetadata(peer, {
+          const result = await this.syncPeerMetadata(peer, {
             fullSync: false,
             paths: new Set(paths),
             localDirty,
@@ -3203,12 +3309,25 @@ ${bodyHash}`;
             forceLocalFilesystemScan: false,
             forceRemoteFilesystemScan: false
           });
+          settledAcrossPeers = settledAcrossPeers === null ? new Set(result.settledLocalPaths) : new Set([...settledAcrossPeers].filter((path) => result.settledLocalPaths.has(path)));
+          synchronizedPeers += 1;
+        }
+        if (synchronizedPeers === peers.length) {
+          for (const path of settledAcrossPeers ?? []) {
+            const generation = localDirty.get(path);
+            if (generation !== void 0 && (this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
+            this.activeEditDirty.delete(path);
+            this.urgentDirtyPaths.delete(path);
+          }
+          this.queueChangeJournalSave();
+          this.recordSyncCheckpoint();
         }
       } catch (error) {
         this.lastErrorValue = safeErrorCode(error);
       } finally {
         this.activeEditSyncRunning = false;
         this.activeEditStartedAt = 0;
+        this.currentTransferSessionId = "";
         if (this.syncQueued || this.urgentDirtyPaths.size || this.dirtyPaths.size) {
           this.syncQueued = false;
           this.scheduleSync(URGENT_SYNC_DELAY_MS, true);
@@ -3235,9 +3354,7 @@ ${bodyHash}`;
       });
     }
     async syncPeerMetadata(peer, request) {
-      this.activityFiles = [];
-      this.activityUpdatedAt = this.now();
-      this.emit({ ...defaultProgress("scanning"), active: true, peerId: peer.deviceId });
+      this.emitActivityChanged();
       const localPolicy = this.policy();
       const requestedPaths = [...request.paths].sort((left, right) => left.localeCompare(right));
       const [localEntries, remoteResponse, ledger] = await Promise.all([
@@ -3245,7 +3362,11 @@ ${bodyHash}`;
         this.callPeer(
           peer,
           this.metadataRoute(peer, request.fullSync ? "/manifest" : "/manifest/paths"),
-          request.fullSync ? { syncConfigFolder: localPolicy.syncConfigFolder, forceFilesystemScan: request.forceRemoteFilesystemScan } : { syncConfigFolder: localPolicy.syncConfigFolder, paths: requestedPaths },
+          request.fullSync ? {
+            syncConfigFolder: localPolicy.syncConfigFolder,
+            forceFilesystemScan: request.forceRemoteFilesystemScan,
+            scanRequestIds: [request.localFullSyncRequestId, request.remoteFullSyncRequestId].filter(Boolean)
+          } : { syncConfigFolder: localPolicy.syncConfigFolder, paths: requestedPaths },
           // A remote manifest can require a full filesystem walk on the peer.
           // The old 8s default made every large vault fail before the peer
           // could answer, which restarted the same scan forever.
@@ -3291,14 +3412,7 @@ ${bodyHash}`;
             activity.reason = "fingerprint";
           }
         }
-        this.emit({
-          ...defaultProgress("scanning"),
-          stage: "fingerprinting",
-          active: true,
-          peerId: peer.deviceId,
-          completed: scan.completed,
-          total: scan.total
-        });
+        this.emitActivityChanged();
         let verified = 0;
         let lastBootstrapProgressAt = 0;
         const localHashesPromise = this.buildMetadataHashManifest(
@@ -3317,14 +3431,7 @@ ${bodyHash}`;
             const now = this.now();
             if (verified < bootstrapCandidates.length && now - lastBootstrapProgressAt < 40) return;
             lastBootstrapProgressAt = now;
-            this.emit({
-              ...defaultProgress("scanning"),
-              stage: "fingerprinting",
-              active: true,
-              peerId: peer.deviceId,
-              completed: scan.completed,
-              total: scan.total
-            });
+            this.emitActivityChanged();
           }
         );
         const remoteHashesPromise = this.callPeer(peer, this.metadataRoute(peer, "/bootstrap/hashes"), {
@@ -3344,14 +3451,7 @@ ${bodyHash}`;
         scan.phase = "complete";
         scan.completed = scan.total;
       }
-      this.emit({
-        ...defaultProgress("connected"),
-        stage: "planning",
-        active: true,
-        peerId: peer.deviceId,
-        completed: 0,
-        total: 0
-      });
+      this.emitActivityChanged();
       const plannedActions = planLanSyncMetadataReconciliation(filteredLocalEntries, remoteEntries, ledger.entries, localPolicy, remotePolicy);
       const actionPaths = new Set(plannedActions.map((action) => action.path));
       const backoffNow = this.now();
@@ -3385,6 +3485,7 @@ ${bodyHash}`;
       }));
       this.activityUpdatedAt = this.now();
       const sessionId = randomId(18);
+      this.currentTransferSessionId = sessionId;
       await this.callPeer(peer, this.metadataRoute(peer, "/session/start"), {
         sessionId,
         total: actions.length,
@@ -3582,15 +3683,14 @@ ${bodyHash}`;
         downloadCompleted,
         error: this.lastErrorValue
       });
+      this.currentTransferSessionId = "";
       return {
         settledLocalPaths: new Set([...request.localDirty.keys()].filter((path) => settledPaths.has(path))),
         fullSyncComplete: Boolean(request.fullSync && success && !failedPaths.size)
       };
     }
     async syncPeerHashed(peer) {
-      this.activityFiles = [];
-      this.activityUpdatedAt = this.now();
-      this.emit({ ...defaultProgress("scanning"), active: true, peerId: peer.deviceId });
+      this.emitActivityChanged();
       const localPolicy = this.policy();
       const [localEntries, remoteResponse, ledger] = await Promise.all([
         this.buildManifest(localPolicy.syncConfigFolder),
@@ -3821,14 +3921,7 @@ ${bodyHash}`;
           activity.reason = "fingerprint";
         }
       }
-      this.emit({
-        ...defaultProgress("scanning"),
-        stage: "fingerprinting",
-        active: true,
-        peerId,
-        completed: scan.completed,
-        total: scan.total
-      });
+      this.emitActivityChanged();
       let verified = 0;
       let lastReportedAt = 0;
       const entries = await this.buildMetadataHashManifest(expectedEntries, includeConfigFolder, (path, cached) => {
@@ -3844,25 +3937,11 @@ ${bodyHash}`;
         const now = this.now();
         if (verified < expectedEntries.length && now - lastReportedAt < 40) return;
         lastReportedAt = now;
-        this.emit({
-          ...defaultProgress("scanning"),
-          stage: "fingerprinting",
-          active: true,
-          peerId,
-          completed: scan.completed,
-          total: scan.total
-        });
+        this.emitActivityChanged();
       });
       scan.phase = "complete";
       scan.completed = scan.total;
-      this.emit({
-        ...defaultProgress("scanning"),
-        stage: "planning",
-        active: true,
-        peerId,
-        completed: scan.completed,
-        total: scan.total
-      });
+      this.emitActivityChanged();
       return entries;
     }
     // Only one scan session may own the visible counter at a time. The pass the
@@ -3915,14 +3994,8 @@ ${bodyHash}`;
       const exposeScanProgress = this.canExposeScanProgress();
       if (this.canClaimScanValue()) this.scanValue = scan;
       const report = () => {
-        if (!exposeScanProgress || this.scanValue !== scan || this.progressValue.phase === "syncing") return;
-        this.emit({
-          ...defaultProgress("scanning"),
-          active: this.progressValue.active || this.activePeers().length > 0,
-          peerId: this.progressValue.peerId || this.activePeers()[0]?.deviceId || "",
-          completed: scan.completed,
-          total: scan.total
-        });
+        if (!exposeScanProgress || this.scanValue !== scan) return;
+        this.emitActivityChanged();
       };
       report();
       try {
@@ -4055,15 +4128,7 @@ ${bodyHash}`;
         if (!force && scan.completed !== scan.total && now - lastReportedAt < 40) return;
         lastReportedAt = now;
         onProgress?.(scan.completed, scan.total);
-        if (exposeScanProgress && this.scanValue === scan && this.progressValue.phase !== "syncing") {
-          this.emit({
-            ...defaultProgress("scanning"),
-            active: this.progressValue.active || this.activePeers().length > 0,
-            peerId: this.progressValue.peerId || this.activePeers()[0]?.deviceId || "",
-            completed: scan.completed,
-            total: scan.total
-          });
-        }
+        if (exposeScanProgress && this.scanValue === scan) this.emitActivityChanged();
       };
       report(true);
       try {
@@ -4184,21 +4249,41 @@ ${bodyHash}`;
       } else if (!current || !metadataMatches(current, expected)) {
         throw new LanSyncProtocolError("precondition_failed", 409);
       }
-      await this.options.storage.writeBinary(normalized, arrayBuffer(bytes), source.mtime);
-      const written = await this.options.storage.statFile(normalized);
-      if (!written || written.size !== bytes.byteLength) throw new LanSyncProtocolError("precondition_failed", 409);
+      this.markAppliedMutation(normalized);
+      let written = null;
+      try {
+        await this.options.storage.writeBinary(normalized, arrayBuffer(bytes), source.mtime);
+        written = await this.options.storage.statFile(normalized);
+        if (!written || written.size !== bytes.byteLength) throw new LanSyncProtocolError("precondition_failed", 409);
+      } catch (error) {
+        this.clearAppliedMutation(normalized);
+        throw error;
+      }
       this.hashCache.delete(normalized);
       this.queueHashCacheSave();
-      return metadataSnapshot(written);
+      const writtenMetadata = metadataSnapshot(written);
+      this.confirmAppliedMutation(normalized, writtenMetadata);
+      this.metadataIndex.set(normalized, writtenMetadata);
+      this.queueMetadataIndexSave();
+      return writtenMetadata;
     }
     async deleteLocalMetadata(path, expected) {
       const normalized = this.normalizePath(path);
       if (!normalized) throw new LanSyncProtocolError("unsafe_delete");
       const current = await this.options.storage.statFile(normalized);
       if (!current || !metadataMatches(current, expected)) throw new LanSyncProtocolError("precondition_failed", 409);
-      await this.options.storage.deleteFile(normalized);
+      this.markAppliedMutation(normalized);
+      try {
+        await this.options.storage.deleteFile(normalized);
+      } catch (error) {
+        this.clearAppliedMutation(normalized);
+        throw error;
+      }
       this.hashCache.delete(normalized);
       this.queueHashCacheSave();
+      this.confirmAppliedMutation(normalized, null);
+      this.metadataIndex.delete(normalized);
+      this.queueMetadataIndexSave();
       if (await this.options.storage.statFile(normalized)) throw new LanSyncProtocolError("precondition_failed", 409);
     }
     async readRemoteMetadata(peer, entry, sessionId = "") {
@@ -4279,17 +4364,7 @@ ${bodyHash}`;
         if (!force && this.scanValue.completed !== this.scanValue.total && now - lastReportedAt < 60) return;
         lastReportedAt = now;
         onProgress?.(this.scanValue.completed, this.scanValue.total);
-        if (this.progressValue.phase !== "syncing") {
-          this.emit({
-            ...defaultProgress("scanning"),
-            active: this.progressValue.active || this.activePeers().length > 0,
-            peerId: this.progressValue.peerId || this.activePeers()[0]?.deviceId || "",
-            completed: this.scanValue.completed,
-            total: this.scanValue.total
-          });
-        } else {
-          this.emit({ ...this.progressValue });
-        }
+        this.emitActivityChanged();
       };
       report(true);
       try {
@@ -4586,19 +4661,15 @@ ${bodyHash}`;
           };
         } else if (metadataRoute === "/manifest") {
           const policy = this.policy();
+          const scanRequestIds = this.parseScanRequestIds(payload.scanRequestIds);
+          const forceFilesystemScan = payload.forceFilesystemScan === true && !this.filesystemScanAlreadyServed(deviceId, scanRequestIds);
           const files = await this.withInboundManifestScope(() => this.buildMetadataManifest(
             policy.syncConfigFolder && payload.syncConfigFolder === true,
             void 0,
-            payload.forceFilesystemScan === true
+            forceFilesystemScan
           ));
-          this.emit({
-            ...defaultProgress("scanning"),
-            stage: "planning",
-            active: true,
-            peerId: deviceId,
-            completed: this.scanValue.completed,
-            total: this.scanValue.total
-          });
+          this.recordServedFilesystemScan(deviceId, scanRequestIds);
+          this.emitActivityChanged();
           result = {
             files,
             policy
@@ -4611,14 +4682,7 @@ ${bodyHash}`;
             paths,
             policy.syncConfigFolder && payload.syncConfigFolder === true
           ));
-          this.emit({
-            ...defaultProgress("scanning"),
-            stage: "planning",
-            active: true,
-            peerId: deviceId,
-            completed: this.scanValue.completed,
-            total: this.scanValue.total
-          });
+          this.emitActivityChanged();
           result = {
             files,
             policy
@@ -4682,14 +4746,33 @@ ${bodyHash}`;
         if (!path || !action || !Number.isSafeInteger(size) || size < 0 || size > this.settings().maxFileBytes) throw new LanSyncProtocolError("invalid_sync_session");
         return { path, action, state: "pending", size };
       });
+      const planKey = JSON.stringify({
+        total,
+        bytesTotal,
+        uploads: coordinatorDownloads,
+        downloads: coordinatorUploads,
+        files: files.map((file) => [file.path, file.action, file.size])
+      });
+      if (this.inboundSession) {
+        if (this.inboundSession.id === sessionId && this.inboundSession.deviceId === deviceId && this.inboundSession.planKey === planKey) {
+          this.inboundSession.updatedAt = this.now();
+          return { ok: true, sessionId, resumed: true };
+        }
+        throw new LanSyncProtocolError("sync_session_busy", 409);
+      }
+      const startedAt = this.now();
       this.inboundSession = {
         id: sessionId,
         deviceId,
+        planKey,
+        startedAt,
+        updatedAt: startedAt,
         total,
         bytesTotal,
         uploads: coordinatorDownloads,
         downloads: coordinatorUploads
       };
+      this.currentTransferSessionId = sessionId;
       this.activityFiles = files;
       this.activityUpdatedAt = this.now();
       this.emit({
@@ -4709,6 +4792,7 @@ ${bodyHash}`;
       const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : "";
       const session = this.inboundSession;
       if (!session || session.id !== sessionId || session.deviceId !== deviceId) throw new LanSyncProtocolError("invalid_sync_session", 409);
+      session.updatedAt = this.now();
       const commits = Array.isArray(payload.commits) ? payload.commits : [];
       if (commits.length > MAX_MANIFEST_FILES) throw new LanSyncProtocolError("invalid_sync_session");
       const ledger = this.loadMetadataLedger(deviceId);
@@ -4774,6 +4858,7 @@ ${bodyHash}`;
       });
       this.activityUpdatedAt = this.now();
       this.inboundSession = null;
+      this.currentTransferSessionId = "";
       return { ok: true, sessionId, committed: commits.length };
     }
     async handleReadMetadataFile(payload) {
@@ -4987,7 +5072,12 @@ class NtfyLanSyncDetailsModal extends Modal {
           "peer-upgrade-required": "The peer protocols differ; update the older ntfy plugin",
           error: progress.error ? `Error: ${progress.error}` : "Synchronization failed",
         };
-    const effectiveStage = progress.stage || (progress.phase === "scanning" ? "enumerating" : progress.phase === "syncing" ? "transferring" : progress.phase);
+    const scanFingerprinting = scan.phase === "scanning" && Array.isArray(scan.files) && scan.files.some((file) => file.state === "hashing");
+    const effectiveStage = progress.phase === "syncing"
+      ? "transferring"
+      : scan.phase === "scanning"
+        ? (scanFingerprinting ? "fingerprinting" : "enumerating")
+        : (progress.stage || progress.phase);
     const stageSteps = {
       stopped: 0,
       discovering: 0,
@@ -5004,7 +5094,7 @@ class NtfyLanSyncDetailsModal extends Modal {
     };
     const summary = body.createDiv({ cls: "obsidian-ntfy-lan-details-summary" });
     const summaryIcon = summary.createSpan({ cls: "obsidian-ntfy-lan-details-summary-icon" });
-    setIcon(summaryIcon, effectiveStage === "error" || effectiveStage === "peer-upgrade-required" ? "triangle-alert" : progress.phase === "syncing" || progress.phase === "scanning" || effectiveStage === "checking-peer" ? "loader-circle" : "wifi");
+    setIcon(summaryIcon, effectiveStage === "error" || effectiveStage === "peer-upgrade-required" ? "triangle-alert" : progress.phase === "syncing" || scan.phase === "scanning" || effectiveStage === "checking-peer" ? "loader-circle" : "wifi");
     const summaryText = summary.createDiv({ cls: "obsidian-ntfy-lan-details-summary-text" });
     summaryText.createEl("strong", { text: stageLabels[effectiveStage] || phaseLabels[progress.phase] || phaseLabels.stopped });
     if (stageDescriptions[effectiveStage]) summaryText.createDiv({ cls: "obsidian-ntfy-lan-details-stage-description", text: stageDescriptions[effectiveStage] });
@@ -5033,7 +5123,7 @@ class NtfyLanSyncDetailsModal extends Modal {
         "aria-label": chinese ? "立即扫描同步" : "Scan and sync now",
       },
     });
-    setIcon(syncButton, progress.phase === "scanning" || progress.phase === "syncing" ? "loader-circle" : "refresh-cw");
+    setIcon(syncButton, scan.phase === "scanning" || progress.phase === "syncing" ? "loader-circle" : "refresh-cw");
     syncButton.addEventListener("click", () => {
       this.requestSync();
       this.refresh();
@@ -5743,6 +5833,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   emptyLanSyncProgress() {
     return {
+      sessionId: "",
       phase: "stopped",
       stage: "stopped",
       active: false,
@@ -5921,6 +6012,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         this.lanSyncDetailsModal?.refresh();
         this.emitApiEvent("lan-progress", this.cloneApiValue(progress));
       },
+      onActivityChanged: () => {
+        this.renderLanSyncStatusBar();
+        this.lanSyncDetailsModal?.refresh();
+        this.emitApiEvent("lan-activity", this.cloneApiValue(this.lanSyncActivitySnapshot({ includeScanFiles: false, includeTransferFiles: false })));
+      },
       onPeersChanged: () => {
         const peers = this.cloneApiValue(this.lanSync?.listPeers?.() || []);
         if (this.app?.workspace?.trigger) this.app.workspace.trigger("notification-hub:peers-changed", peers);
@@ -5997,10 +6093,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   lanSyncStatusText() {
     const progress = this.lanSyncProgress;
     const scan = this.lanSync?.scanProgress?.();
-    if (progress.phase === "scanning" && scan?.total > 0) return `${scan.completed}/${scan.total}`;
-    if ((progress.phase === "syncing" || progress.phase === "complete") && progress.total > 0) {
+    if (progress.phase === "syncing" && progress.total > 0) {
       return `${progress.completed}/${progress.total}`;
     }
+    if (scan?.phase === "scanning" && scan.total > 0) return `${scan.completed}/${scan.total}`;
+    if (progress.phase === "complete" && progress.total > 0) return `${progress.completed}/${progress.total}`;
     return "";
   }
 
