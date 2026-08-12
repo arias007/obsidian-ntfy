@@ -1082,6 +1082,21 @@ var NtfyLanSyncRuntime = (() => {
     await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, worker));
     return results;
   }
+  function yieldToLanEventLoop() {
+    return new Promise((resolve) => {
+      if (typeof MessageChannel !== "undefined") {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => {
+          channel.port1.close();
+          channel.port2.close();
+          resolve();
+        };
+        channel.port2.postMessage(null);
+        return;
+      }
+      setTimeout(resolve, 0);
+    });
+  }
   async function sha256Bytes(value) {
     const bytes = typeof value === "string" ? utf8(value) : value instanceof Uint8Array ? value : new Uint8Array(value);
     return bytesToBase64Url(await cryptoApi().subtle.digest("SHA-256", arrayBuffer(bytes)));
@@ -1641,8 +1656,22 @@ ${bodyHash}`;
           ...this.scanValue,
           files: includeScanFiles ? scanFiles.map((file) => ({ ...file })) : []
         },
+        remote: this.remoteActivity(),
         transferGroups: summarizeTransferGroups(this.activityFiles),
         scanGroups: summarizeScanGroups(this.scanValue.files)
+      };
+    }
+    remoteActivity() {
+      const peer = this.activePeers().filter((candidate) => candidate.remoteProgress && this.now() - candidate.remoteProgress.receivedAt <= PEER_PROBE_INTERVAL_MS * 4).sort((left, right) => (right.remoteProgress?.receivedAt ?? 0) - (left.remoteProgress?.receivedAt ?? 0))[0];
+      const remote = peer?.remoteProgress;
+      if (!peer || !remote) return null;
+      return {
+        deviceId: peer.deviceId,
+        stage: remote.stage,
+        phase: remote.phase,
+        scanCompleted: remote.scanCompleted,
+        scanTotal: remote.scanTotal,
+        receivedAt: remote.receivedAt
       };
     }
     listPeers() {
@@ -2090,7 +2119,7 @@ ${bodyHash}`;
     requestPeriodicSync() {
       this.recoverFromStalledSync();
       if (!this.runningValue || this.syncRunning || this.inboundSession || this.metadataManifestBuild || this.manifestBuild) return;
-      if (this.fullSyncOnlyPending && (this.backgroundReconciliation || this.metadataManifestBuild)) return;
+      if (this.fullSyncOnlyPending && this.backgroundReconciliation) return;
       if (this.activeEditSyncRunning) return;
       if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing" || this.scanValue.phase === "scanning") return;
       const peers = this.activePeers();
@@ -2785,7 +2814,7 @@ ${bodyHash}`;
       if (firstVerifiedConnection && route.endsWith("/ping")) this.syncRequestId = randomId(18);
       const transfer = route.includes("/file/") || route.includes("/attachment/");
       if (transfer) this.lastTransferAt = this.now();
-      if (!transfer && !(this.progressValue.active && ["enumerating", "fingerprinting", "planning", "transferring"].includes(this.progressValue.stage)) && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
+      if (!transfer && !(this.progressValue.active && ["enumerating", "fingerprinting", "packaging-manifest", "planning", "waiting-plan", "transferring"].includes(this.progressValue.stage)) && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
         this.emit({
           ...defaultProgress("connected"),
           stage: this.metadataProtocol(peer) ? "waiting-peer-scan" : "checking-peer",
@@ -3082,8 +3111,17 @@ ${bodyHash}`;
       if (!remote) return;
       if (this.syncRunning || this.inboundSession || this.backgroundReconciliation) return;
       if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing") return;
-      if (remote.phase !== "syncing") return;
       if (this.now() - remote.receivedAt > PEER_PROBE_INTERVAL_MS * 4) return;
+      if (remote.phase !== "syncing" && !["enumerating", "fingerprinting", "packaging-manifest", "requesting-peer-scan", "planning", "waiting-plan"].includes(remote.stage)) return;
+      if (remote.phase !== "syncing") {
+        this.emit({
+          ...defaultProgress("connected"),
+          stage: remote.stage === "fingerprinting" ? "fingerprinting" : remote.stage === "packaging-manifest" ? "packaging-manifest" : remote.stage === "planning" ? "planning" : remote.stage === "waiting-plan" ? "waiting-plan" : "enumerating",
+          active: true,
+          peerId: peer.deviceId
+        });
+        return;
+      }
       this.emit({
         ...defaultProgress("syncing"),
         sessionId: remote.sessionId,
@@ -3102,7 +3140,7 @@ ${bodyHash}`;
     }
     emitPeerConnectionStage(peer) {
       if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing" || this.inboundSession) return;
-      if (this.progressValue.active && ["enumerating", "fingerprinting", "planning", "transferring"].includes(this.progressValue.stage)) return;
+      if (this.progressValue.active && ["enumerating", "fingerprinting", "packaging-manifest", "planning", "waiting-plan", "transferring"].includes(this.progressValue.stage)) return;
       const hasPendingWork = this.fullSyncRequested || Boolean(peer.remoteFullSyncRequestId) || (peer.remoteDirtyPaths?.size ?? 0) > 0;
       if (this.progressValue.phase === "complete" && !hasPendingWork) return;
       const compatible = this.metadataProtocol(peer) !== null;
@@ -3154,7 +3192,7 @@ ${bodyHash}`;
         peer.consecutiveFailures = 0;
         peer.lastFailureAt = 0;
         this.lastErrorValue = "";
-        if (this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
+        if (this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete" && !["enumerating", "fingerprinting", "packaging-manifest", "planning", "waiting-plan"].includes(this.progressValue.stage)) {
           this.emit({ ...defaultProgress("connected"), stage: "waiting-peer-scan", active: true, peerId: peer.deviceId });
         }
         this.emitPeersChanged();
@@ -3221,7 +3259,7 @@ ${bodyHash}`;
       const forced = this.syncForced;
       this.syncForced = false;
       if (!this.runningValue || this.syncRunning || this.activeEditSyncRunning || !this.isCoordinator()) return;
-      if (this.fullSyncOnlyPending && (this.backgroundReconciliation || this.metadataManifestBuild)) return;
+      if (this.fullSyncOnlyPending && this.backgroundReconciliation) return;
       const peers = this.syncTargets();
       if (!peers.length) return;
       const localDirty = new Map(this.dirtyPaths);
@@ -3235,20 +3273,6 @@ ${bodyHash}`;
       this.syncRunning = true;
       this.syncStartedAt = this.now();
       try {
-        if (this.fullSyncOnlyPending) {
-          const peer = peers[0];
-          this.emit({
-            ...defaultProgress("connected"),
-            stage: "enumerating",
-            active: true,
-            peerId: peer.deviceId
-          });
-          await this.buildMetadataManifest(this.settings().syncConfigFolder, void 0, true);
-          this.localFilesystemScanCompletedRequestId = this.fullSyncRequestId;
-          localFullSyncRequestId = this.fullSyncRequested ? this.fullSyncRequestId : "";
-          localForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
-          remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
-        }
         let settledAcrossPeers = null;
         let fullSyncCompletedEverywhere = Boolean(localFullSyncRequestId);
         let synchronizedPeers = 0;
@@ -3401,8 +3425,19 @@ ${bodyHash}`;
       this.emitActivityChanged();
       const localPolicy = this.policy();
       const requestedPaths = [...request.paths].sort((left, right) => left.localeCompare(right));
+      const localEntriesPromise = (request.fullSync ? this.buildMetadataManifest(localPolicy.syncConfigFolder, void 0, request.forceLocalFilesystemScan) : this.buildMetadataManifestForPaths(requestedPaths, localPolicy.syncConfigFolder)).then((entries) => {
+        if (request.fullSync && this.progressValue.phase !== "syncing") {
+          this.emit({
+            ...defaultProgress("connected"),
+            stage: "waiting-peer-scan",
+            active: true,
+            peerId: peer.deviceId
+          });
+        }
+        return entries;
+      });
       const [localEntries, remoteResponse, ledger] = await Promise.all([
-        request.fullSync ? this.buildMetadataManifest(localPolicy.syncConfigFolder, void 0, request.forceLocalFilesystemScan) : this.buildMetadataManifestForPaths(requestedPaths, localPolicy.syncConfigFolder),
+        localEntriesPromise,
         this.callPeer(
           peer,
           this.metadataRoute(peer, request.fullSync ? "/manifest" : "/manifest/paths"),
@@ -4196,9 +4231,7 @@ ${bodyHash}`;
           scan.completed += 1;
           entries.push({ path: file.path, size: file.size, mtime: file.mtime });
           report();
-          if ((index + 1) % 512 === 0 && index + 1 < candidates.length) {
-            await Promise.resolve();
-          }
+          if ((index + 1) % 256 === 0 && index + 1 < candidates.length) await yieldToLanEventLoop();
         }
         scan.phase = "complete";
         scan.completed = scan.total;
@@ -4728,6 +4761,12 @@ ${bodyHash}`;
             void 0,
             forceFilesystemScan
           ));
+          this.emit({
+            ...defaultProgress("connected"),
+            stage: "packaging-manifest",
+            active: true,
+            peerId: deviceId
+          });
           this.recordServedFilesystemScan(deviceId, scanRequestIds);
           this.emitActivityChanged();
           result = {
@@ -4774,7 +4813,16 @@ ${bodyHash}`;
           throw new LanSyncProtocolError("not_found", 404);
         }
         this.finishInboundFileActivity(deviceId, inboundActivityIndex, true);
-        sendText(response, 200, await encryptLanSyncPayload(this.identity.secret, result));
+        const encryptedResult = await encryptLanSyncPayload(this.identity.secret, result);
+        sendText(response, 200, encryptedResult);
+        if (metadataRoute === "/manifest") {
+          this.emit({
+            ...defaultProgress("connected"),
+            stage: "waiting-plan",
+            active: true,
+            peerId: deviceId
+          });
+        }
       } catch (error) {
         this.finishInboundFileActivity(inboundDeviceId, inboundActivityIndex, false);
         const protocol = error instanceof LanSyncProtocolError ? error : new LanSyncProtocolError(safeErrorCode(error), 500);
@@ -4890,6 +4938,7 @@ ${bodyHash}`;
       if (acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) {
         this.fullSyncRequested = false;
         this.forceFilesystemScanRequested = false;
+        this.fullSyncOnlyPending = false;
         this.localFilesystemScanCompletedRequestId = "";
       }
       const success = payload.success === true;
@@ -5052,6 +5101,7 @@ class NtfyLanSyncDetailsModal extends Modal {
       progress,
       files,
       scan = { phase: "idle", completed: 0, total: 0, cached: 0, hashed: 0, skipped: 0, error: "", files: [] },
+      remote = null,
       scanGroups = [],
       transferGroups = [],
     } = this.getSnapshot({
@@ -5090,7 +5140,9 @@ class NtfyLanSyncDetailsModal extends Modal {
           "waiting-peer-scan": "正在等待清单",
           enumerating: "正在枚举全库文件",
           fingerprinting: "正在核对内容指纹",
+          "packaging-manifest": "正在封装并发送清单",
           planning: "正在计算同步清单",
+          "waiting-plan": "清单已发送，等待同步计划",
           transferring: "正在传输文件",
           complete: "同步完成",
           "peer-upgrade-required": "对端插件需要升级",
@@ -5104,7 +5156,9 @@ class NtfyLanSyncDetailsModal extends Modal {
           "waiting-peer-scan": "Waiting for manifest",
           enumerating: "Enumerating vault files",
           fingerprinting: "Verifying content fingerprints",
+          "packaging-manifest": "Packaging and sending manifest",
           planning: "Planning transfers",
+          "waiting-plan": "Manifest sent; waiting for transfer plan",
           transferring: "Transferring files",
           complete: "Sync complete",
           "peer-upgrade-required": "Peer plugin update required",
@@ -5118,7 +5172,9 @@ class NtfyLanSyncDetailsModal extends Modal {
           "waiting-peer-scan": "已连接，等待对端清单响应",
           enumerating: "正在列出路径、大小和修改时间，不传输文件内容",
           fingerprinting: "只核对同大小模糊文件的 SHA-256，内容相同不会进入传输清单",
+          "packaging-manifest": "文件枚举已经完成，正在封装、加密并返回完整清单",
           planning: "元数据已经收集完成，正在确定真实的上传、下载和删除项目",
+          "waiting-plan": "本机清单已经发出，正在等待协调端计算共同传输计划",
           transferring: "正在按清单传输，下面可查看上传和下载进度",
           complete: "本轮扫描和传输已经完成",
           "peer-upgrade-required": "两端同步协议不一致，请把版本较旧一端的 ntfy 插件升级到当前版本",
@@ -5131,7 +5187,9 @@ class NtfyLanSyncDetailsModal extends Modal {
           "waiting-peer-scan": "Connected; waiting for the peer manifest response",
           enumerating: "Listing paths, sizes, and mtimes without transferring file content",
           fingerprinting: "Hashing only ambiguous same-size files; matching content will not enter the transfer list",
+          "packaging-manifest": "Enumeration is complete; packaging, encrypting, and returning the manifest",
           planning: "Metadata is ready and the real upload, download, and deletion plan is being calculated",
+          "waiting-plan": "The local manifest was sent; waiting for the coordinator's transfer plan",
           transferring: "Transferring the planned files; upload and download progress is shown below",
           complete: "This scan and transfer session is complete",
           "peer-upgrade-required": "The peer protocols differ; update the older ntfy plugin",
@@ -5152,9 +5210,11 @@ class NtfyLanSyncDetailsModal extends Modal {
       "waiting-peer-scan": 2,
       enumerating: 3,
       fingerprinting: 4,
-      planning: 4,
-      transferring: 5,
-      complete: 5,
+      "packaging-manifest": 4,
+      planning: 5,
+      "waiting-plan": 5,
+      transferring: 6,
+      complete: 6,
       error: 1,
     };
     const summary = body.createDiv({ cls: "obsidian-ntfy-lan-details-summary" });
@@ -5165,11 +5225,12 @@ class NtfyLanSyncDetailsModal extends Modal {
     if (stageDescriptions[effectiveStage]) summaryText.createDiv({ cls: "obsidian-ntfy-lan-details-stage-description", text: stageDescriptions[effectiveStage] });
     const stageProgress = summaryText.createEl("progress", {
       cls: "obsidian-ntfy-lan-stage-progress",
-      attr: { max: "5", value: String(stageSteps[effectiveStage] ?? 0), "aria-label": chinese ? "同步阶段进度" : "Sync stage progress" },
+      attr: { max: "6", value: String(stageSteps[effectiveStage] ?? 0), "aria-label": chinese ? "同步阶段进度" : "Sync stage progress" },
     });
-    stageProgress.title = chinese ? `阶段 ${stageSteps[effectiveStage] ?? 0}/5` : `Stage ${stageSteps[effectiveStage] ?? 0}/5`;
+    stageProgress.title = chinese ? `阶段 ${stageSteps[effectiveStage] ?? 0}/6` : `Stage ${stageSteps[effectiveStage] ?? 0}/6`;
     const progressParts = [];
-    if (scan.total > 0) progressParts.push(`${chinese ? "扫描" : "Scan"} ${scan.completed}/${scan.total}`);
+    if (scan.total > 0) progressParts.push(`${chinese ? "本机扫描" : "Local scan"} ${scan.completed}/${scan.total}`);
+    if ((remote?.scanTotal || 0) > 0) progressParts.push(`${chinese ? "对端扫描" : "Peer scan"} ${remote.scanCompleted}/${remote.scanTotal}`);
     if (progress.total > 0) progressParts.push(`${chinese ? "同步" : "Sync"} ${progress.completed}/${progress.total}`);
     if (progress.uploads > 0 || progress.downloads > 0) {
       progressParts.push(chinese
@@ -5184,8 +5245,8 @@ class NtfyLanSyncDetailsModal extends Modal {
       cls: "clickable-icon obsidian-ntfy-lan-sync-now",
       attr: {
         type: "button",
-        title: chinese ? "立即扫描同步" : "Scan and sync now",
-        "aria-label": chinese ? "立即扫描同步" : "Scan and sync now",
+        title: chinese ? "全量扫描并同步" : "Full scan and sync",
+        "aria-label": chinese ? "全量扫描并同步" : "Full scan and sync",
       },
     });
     setIcon(syncButton, scan.phase === "scanning" || progress.phase === "syncing" ? "loader-circle" : "refresh-cw");
@@ -5194,12 +5255,12 @@ class NtfyLanSyncDetailsModal extends Modal {
       this.refresh();
     });
 
-    this.renderScanSection(body, scan, scanGroups, chinese, progress, effectiveStage, stageDescriptions);
+    this.renderScanSection(body, scan, remote, scanGroups, chinese, progress, effectiveStage, stageDescriptions);
     this.renderTransferSection(body, progress, files, transferGroups, chinese, effectiveStage, stageDescriptions);
     body.scrollTop = scrollTop;
   }
 
-  renderScanSection(body, scan, groups, chinese, progress, stage, stageDescriptions) {
+  renderScanSection(body, scan, remote, groups, chinese, progress, stage, stageDescriptions) {
     const details = body.createEl("details", { cls: "obsidian-ntfy-lan-details-section" });
     details.open = this.sectionState.scan;
     details.addEventListener("toggle", () => {
@@ -5209,23 +5270,34 @@ class NtfyLanSyncDetailsModal extends Modal {
     });
     const summary = details.createEl("summary");
     const hasScanWork = (scan.total || 0) > 0;
+    const hasRemoteScanWork = (remote?.scanTotal || 0) > 0;
     const idleLabel = chinese
       ? (stage === "peer-upgrade-required" ? "等待升级" : stage === "checking-peer" ? "检查版本" : stage === "requesting-peer-scan" ? "交换清单" : stage === "waiting-peer-scan" ? "等待清单" : stage === "complete" ? "已完成" : "尚未开始")
       : (stage === "peer-upgrade-required" ? "Update required" : stage === "checking-peer" ? "Checking version" : stage === "requesting-peer-scan" ? "Exchanging manifests" : stage === "waiting-peer-scan" ? "Waiting for manifest" : stage === "complete" ? "Complete" : "Not started");
     const label = hasScanWork
-      ? `${chinese ? "扫描" : "Scan"} ${scan.completed || 0}/${scan.total}`
-      : `${chinese ? "扫描" : "Scan"}：${idleLabel}`;
+      ? `${chinese ? "本机扫描" : "Local scan"} ${scan.completed || 0}/${scan.total}`
+      : hasRemoteScanWork
+        ? `${chinese ? "对端扫描" : "Peer scan"} ${remote.scanCompleted || 0}/${remote.scanTotal}`
+        : `${chinese ? "扫描" : "Scan"}：${idleLabel}`;
     summary.createSpan({ text: label });
     summary.createSpan({ cls: "obsidian-ntfy-lan-details-section-meta", text: hasScanWork
       ? (chinese
           ? `元数据 ${scan.cached || 0} · 内容指纹 ${scan.hashed || 0} · 跳过 ${scan.skipped || 0}`
           : `Metadata ${scan.cached || 0} · Fingerprints ${scan.hashed || 0} · Skipped ${scan.skipped || 0}`)
-      : (stageDescriptions[stage] || "") });
+      : (hasRemoteScanWork
+          ? `${chinese ? "本机等待，对端正在工作" : "Local side waiting while the peer works"} · ${stageDescriptions[remote.stage] || stageDescriptions[stage] || ""}`
+          : (stageDescriptions[stage] || "")) });
     if (!details.open) return;
     const panel = details.createDiv({ cls: "obsidian-ntfy-lan-details-section-body" });
     if (hasScanWork) {
       const scanProgress = panel.createEl("progress", { cls: "obsidian-ntfy-lan-details-progress", attr: { max: String(scan.total), value: String(Math.min(scan.completed || 0, scan.total)) } });
       scanProgress.setAttribute("aria-label", label);
+    }
+    if (hasRemoteScanWork) {
+      const remoteLabel = `${chinese ? "对端扫描" : "Peer scan"} ${remote.scanCompleted || 0}/${remote.scanTotal}`;
+      panel.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: remoteLabel });
+      const remoteProgress = panel.createEl("progress", { cls: "obsidian-ntfy-lan-details-progress", attr: { max: String(remote.scanTotal), value: String(Math.min(remote.scanCompleted || 0, remote.scanTotal)) } });
+      remoteProgress.setAttribute("aria-label", remoteLabel);
     }
     const scanFiles = Array.isArray(scan.files) ? scan.files : [];
     if (!groups.length) panel.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: stageDescriptions[stage] || (chinese ? "连接后自动开始全库扫描" : "A full-vault scan starts automatically after connection") });
@@ -5246,7 +5318,13 @@ class NtfyLanSyncDetailsModal extends Modal {
       ? `${chinese ? "同步" : "Sync"} ${progress.completed || 0}/${progress.total}`
       : stage === "complete"
         ? (chinese ? "同步：无需传输" : "Sync: Nothing to transfer")
-        : (chinese ? "同步：等待扫描结果" : "Sync: Waiting for scan results");
+        : stage === "packaging-manifest"
+          ? (chinese ? "同步：正在封装清单" : "Sync: Packaging manifest")
+          : stage === "planning"
+            ? (chinese ? "同步：正在计算计划" : "Sync: Planning transfers")
+            : stage === "waiting-plan"
+              ? (chinese ? "同步：等待共同计划" : "Sync: Waiting for shared plan")
+              : (chinese ? "同步：等待扫描结果" : "Sync: Waiting for scan results");
     summary.createSpan({ text: label });
     const directionSummary = chinese
       ? `上传 ${progress.uploadCompleted || 0}/${progress.uploads || 0} · 下载 ${progress.downloadCompleted || 0}/${progress.downloads || 0}`
@@ -6162,6 +6240,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       return `${progress.completed}/${progress.total}`;
     }
     if (scan?.phase === "scanning" && scan.total > 0) return `${scan.completed}/${scan.total}`;
+    const remote = this.lanSync?.activity?.({ includeScanFiles: false, includeTransferFiles: false })?.remote;
+    if ((remote?.scanTotal || 0) > 0 && remote.scanCompleted < remote.scanTotal) return `${remote.scanCompleted}/${remote.scanTotal}`;
     if (progress.phase === "complete" && progress.total > 0) return `${progress.completed}/${progress.total}`;
     return "";
   }
@@ -6171,6 +6251,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       progress: Object.assign({}, this.lanSyncProgress),
       files: [],
       scan: { id: "", phase: "idle", completed: 0, total: 0, cached: 0, hashed: 0, skipped: 0, error: "", files: [] },
+      remote: null,
       transferGroups: [],
       scanGroups: [],
     };

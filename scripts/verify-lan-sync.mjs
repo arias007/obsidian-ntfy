@@ -544,6 +544,70 @@ try {
   assert.ok(overflowService.forceFilesystemScanRequested, "Overflow journal did not require a filesystem scan");
   await overflowService.stop();
 
+  // Manual strict sync must start both full filesystem walks concurrently.
+  // A serial coordinator scan made the phone sit at "waiting for manifest"
+  // until a large desktop vault had already finished all 16k paths.
+  const concurrentPortB = await freePort();
+  const concurrentStorageA = new MemoryStorage(identity, { "Concurrent/a.md": { content: "A", mtime: 10 } });
+  const concurrentStorageB = new MemoryStorage(identity, { "Concurrent/b.md": { content: "B", mtime: 20 } });
+  let concurrentScanAStarted = false;
+  let concurrentScanBStarted = false;
+  let releaseConcurrentScanA;
+  let releaseConcurrentScanB;
+  const concurrentScanAGate = new Promise((resolvePromise) => { releaseConcurrentScanA = resolvePromise; });
+  const concurrentScanBGate = new Promise((resolvePromise) => { releaseConcurrentScanB = resolvePromise; });
+  const concurrentListA = concurrentStorageA.listFiles.bind(concurrentStorageA);
+  const concurrentListB = concurrentStorageB.listFiles.bind(concurrentStorageB);
+  concurrentStorageA.listFiles = async (...args) => {
+    concurrentScanAStarted = true;
+    await concurrentScanAGate;
+    return await concurrentListA(...args);
+  };
+  concurrentStorageB.listFiles = async (...args) => {
+    concurrentScanBStarted = true;
+    await concurrentScanBGate;
+    return await concurrentListB(...args);
+  };
+  const concurrentServiceB = new NtfyLanSync(commonOptions(
+    concurrentStorageB,
+    concurrentPortB,
+    "CONCURRENTBBBBBBBBBBB",
+    [],
+    { autoDiscovery: false }
+  ));
+  const concurrentOptionsA = commonOptions(
+    concurrentStorageA,
+    await freePort(),
+    "CONCURRENTAAAAAAAAAAA",
+    [],
+    { autoDiscovery: false, manualPeers: [`127.0.0.1:${concurrentPortB}`] }
+  );
+  const concurrentServiceA = new NtfyLanSync(concurrentOptionsA);
+  let concurrentGatesReleased = false;
+  try {
+    await concurrentServiceB.start();
+    await concurrentServiceA.start();
+    await waitFor(() => concurrentServiceA.status().peerCount === 1, "concurrent full-scan peer");
+    concurrentServiceA.requestSync({ deep: true, strict: true });
+    await waitFor(() => concurrentScanAStarted && concurrentScanBStarted, "both full filesystem walks to start before either completes");
+    assert.equal(concurrentServiceA.progress().phase === "syncing", false, "Transfer started before both strict scans completed");
+    releaseConcurrentScanA();
+    releaseConcurrentScanB();
+    concurrentGatesReleased = true;
+    await waitFor(
+      () => concurrentStorageA.text("Concurrent/b.md") === "B" && concurrentStorageB.text("Concurrent/a.md") === "A",
+      "concurrent strict full scan to hand off to transfer"
+    );
+    assert.equal(concurrentStorageA.listFilesCalls, 1, "Manual strict sync enumerated the coordinator vault more than once");
+    assert.equal(concurrentStorageB.listFilesCalls, 1, "Manual strict sync enumerated the peer vault more than once");
+  } finally {
+    if (!concurrentGatesReleased) {
+      releaseConcurrentScanA?.();
+      releaseConcurrentScanB?.();
+    }
+    await Promise.all([concurrentServiceA.stop(), concurrentServiceB.stop()]);
+  }
+
   const optionsB = commonOptions(storageB, portB, deviceB, progressB);
   const optionsA = commonOptions(storageA, portA, deviceA, progressA, { autoDiscovery: false, manualPeers: [`127.0.0.1:${portB}`] });
   const messagesB = [];
@@ -577,6 +641,15 @@ try {
       && value.uploads > 0
       && value.downloads > 0), "Completion progress did not expose separate upload/download completion counts");
     assert.ok(progressB.some((value) => value.active), "Receiving peer did not expose LAN status");
+    assert.ok(
+      progressB.some((value) => ["enumerating", "packaging-manifest", "waiting-plan"].includes(value.stage)),
+      "Receiving peer did not expose its manifest lifecycle"
+    );
+    const mirroredPeerScan = [serviceA.activity({ includeScanFiles: false, includeTransferFiles: false }).remote, ...serviceA.peers.values()].some((value) => {
+      const remote = value?.remoteProgress || value;
+      return (remote?.scanTotal || 0) > 0;
+    });
+    assert.ok(mirroredPeerScan || progressB.some((value) => value.stage === "packaging-manifest"), "The peer scan produced neither a mirrored counter nor a visible completion stage");
     const firstInboundTransfer = progressB.findIndex((value) => value.phase === "syncing" && value.total > 0);
     assert.ok(firstInboundTransfer >= 0, "Receiving peer did not start a counted transfer session");
     assert.equal(progressB.slice(firstInboundTransfer).some((value) => value.phase === "syncing" && value.total === 0), false, "Receiving progress reset to zero during file requests");
@@ -1057,19 +1130,24 @@ try {
   const statusTextStart = source.indexOf("lanSyncStatusText()");
   const statusTextSource = source.slice(statusTextStart, source.indexOf("\n  lanSyncActivitySnapshot(", statusTextStart));
   assert.match(statusTextSource, /return `\$\{progress\.completed\}\/\$\{progress\.total\}`;/, "LAN progress should stay compact beside the Wi-Fi icon");
+  assert.match(statusTextSource, /remote\.scanCompleted.*remote\.scanTotal/, "LAN status does not continue with peer scan progress after the local scan finishes");
   assert.doesNotMatch(statusTextSource, /progress\.completed.*percent|·.*%/, "LAN progress should not append a percentage or LAN label");
   assert.doesNotMatch(statusTextSource, /LAN (?:connected|scanning|syncing|synced|unavailable)|局域网|已连接|扫描中|同步中|已同步|暂不可用/, "LAN status text should not show visible words");
   assert.match(statusTextSource, /return "";/, "Non-transfer LAN status should leave the visible text empty");
   assert.match(source, /setIcon\(icon, "wifi"\)/, "Connected LAN status should keep the Wi-Fi icon");
   assert.match(source, /registerDomEvent\(item, "click", \(\) => this\.openLanSyncDetails\(\)\)/, "LAN status item should open live details on click");
   assert.match(source, /class NtfyLanSyncDetailsModal extends Modal/, "LAN sync details modal is missing");
-  assert.match(source, /renderScanSection\(body, scan, scanGroups, chinese, progress, effectiveStage, stageDescriptions\)/, "LAN scan section is missing stage context");
+  assert.match(source, /renderScanSection\(body, scan, remote, scanGroups, chinese, progress, effectiveStage, stageDescriptions\)/, "LAN scan section is missing local/peer stage context");
   assert.match(source, /renderTransferSection\(body, progress, files, transferGroups, chinese, effectiveStage, stageDescriptions\)/, "LAN transfer section is missing stage context");
    assert.match(source, /"requesting-peer-scan": "正在交换清单"/, "LAN details do not show manifest exchange");
    assert.match(source, /"waiting-peer-scan": "正在等待清单"/, "LAN details do not explain the peer manifest wait stage");
    assert.doesNotMatch(source, /电脑和手机都可主动发起|Both devices may initiate/, "LAN details still show non-actionable initiator text");
   assert.match(source, /"peer-upgrade-required": "对端插件需要升级"/, "LAN details do not explain an incompatible peer");
   assert.match(source, /正在核对内容指纹/, "LAN details do not expose first-baseline fingerprinting");
+  assert.match(source, /"packaging-manifest": "正在封装并发送清单"/, "LAN details hide manifest packaging after a completed scan");
+  assert.match(source, /"waiting-plan": "清单已发送，等待同步计划"/, "LAN details hide the post-manifest plan wait");
+  assert.match(source, /本机扫描/, "LAN details do not identify the local scan counter");
+  assert.match(source, /对端扫描/, "LAN details do not expose peer scan progress");
   assert.match(source, /const idleLabel = chinese/, "An idle scan does not derive a meaningful stage label");
   assert.match(source, /同步：等待扫描结果/, "An idle transfer section does not explain what it is waiting for");
   assert.doesNotMatch(source, /const label = `\$\{chinese \? "扫描" : "Scan"\} \$\{scan\.completed \|\| 0\}\/\$\{scan\.total \|\| 0\}`/, "LAN details still render an unexplained scan 0/0");
@@ -1077,10 +1155,13 @@ try {
   assert.match(source, /下载/, "LAN transfer details do not label downloads");
   assert.match(source, /progress\.uploadCompleted[^\n]*progress\.uploads/, "LAN details do not show completed/total uploads");
   assert.match(source, /progress\.downloadCompleted[^\n]*progress\.downloads/, "LAN details do not show completed/total downloads");
-   assert.match(source, /title: chinese \? "立即扫描同步" : "Scan and sync now"/, "LAN details are missing the manual sync button");
+   assert.match(source, /title: chinese \? "全量扫描并同步" : "Full scan and sync"/, "LAN details do not identify the manual button as a full scan");
    assert.match(source, /this\.lanSync\?\.requestSync\(\{ deep: true, strict: true \}\)/, "Manual sync button is not wired to a strict full scan");
    assert.match(lanSource, /fullSyncOnlyPending/, "Manual full scan is not serialized before transfer");
-   assert.match(lanSource, /if \(this\.fullSyncOnlyPending && \(this\.backgroundReconciliation \|\| this\.metadataManifestBuild\)\) return;/, "A manual full scan can still be bypassed by an incremental transfer");
+   assert.match(lanSource, /if \(this\.fullSyncOnlyPending && this\.backgroundReconciliation\) return;/, "A manual full scan can still be bypassed by a background reconciliation");
+   assert.doesNotMatch(lanSource, /if \(this\.fullSyncOnlyPending && \(this\.backgroundReconciliation \|\| this\.metadataManifestBuild\)\) return;/, "A completed shared manifest can still strand a manual sync before plan calculation");
+   assert.match(lanSource, /const \[localEntries, remoteResponse, ledger\] = await Promise\.all/, "Full-vault scans are not started concurrently on both devices");
+   assert.doesNotMatch(lanSource, /if \(this\.fullSyncOnlyPending\) \{[\s\S]{0,900}await this\.buildMetadataManifest/, "The coordinator still finishes its full scan before asking the peer to scan");
   assert.match(source, /this\.sectionState = \{ scan: false, transfer: false \}/, "LAN activity file lists should be collapsed by default");
   assert.match(source, /includeScanFiles: this\.sectionState\.scan && expandedScanGroups\.length > 0/, "Collapsed scan groups should not materialize hidden file rows");
   assert.match(source, /includeTransferFiles: this\.sectionState\.transfer && expandedTransferGroups\.length > 0/, "Collapsed transfer groups should not materialize hidden file rows");
@@ -1108,6 +1189,8 @@ try {
   assert.match(lanSource, /capabilities: METADATA_PROTOCOLS\.map/, "Peers do not advertise all safe metadata protocols");
   assert.doesNotMatch(lanSource, /path\.startsWith\(`\$\{API_PREFIX\}\/metadata\/v3\/`\)/, "The server still blocks the v3 rolling-upgrade route");
   assert.match(lanSource, /const SMALL_TRANSFER_CONCURRENCY = 12/, "Small-file LAN transfers are not using the fast bounded worker pool");
+  assert.match(lanSource, /function yieldToLanEventLoop\(\)/, "Full-vault enumeration does not yield to UI and heartbeat updates");
+  assert.match(lanSource, /index \+ 1\) % 256 === 0[\s\S]{0,120}yieldToLanEventLoop/, "Large scans can still starve live progress feedback");
   assert.match(lanSource, /if \(!this\.runningValue \|\| this\.syncRunning \|\| this\.inboundSession \|\| this\.metadataManifestBuild \|\| this\.manifestBuild\) return;/, "Periodic full scans can still interrupt an active transfer or manifest enumeration");
   assert.match(lanSource, /private isPeriodicInitiator\(peers = this\.activePeers\(\)\)/, "Periodic synchronization is still permanently assigned to one device role");
   assert.match(lanSource, /BACKGROUND_FULL_RESCAN_INTERVAL_MS = 24 \* 60 \* 60_000/, "Converged Vaults can still run frequent background full scans");

@@ -109,7 +109,9 @@ export type LanSyncProgressStage =
   | "waiting-peer-scan"
   | "enumerating"
   | "fingerprinting"
+  | "packaging-manifest"
   | "planning"
+  | "waiting-plan"
   | "transferring"
   | "complete"
   | "peer-upgrade-required"
@@ -181,8 +183,18 @@ export type LanSyncActivitySnapshot = {
   progress: LanSyncProgress;
   files: LanSyncFileActivity[];
   scan: LanSyncScanActivity;
+  remote: LanSyncRemoteActivity | null;
   transferGroups: LanSyncActivityGroup[];
   scanGroups: LanSyncActivityGroup[];
+};
+
+export type LanSyncRemoteActivity = {
+  deviceId: string;
+  stage: string;
+  phase: LanSyncProgressPhase;
+  scanCompleted: number;
+  scanTotal: number;
+  receivedAt: number;
 };
 
 export type LanSyncServiceOptions = {
@@ -716,6 +728,24 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, task: (item: 
   };
   await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, worker));
   return results;
+}
+
+function yieldToLanEventLoop(): Promise<void> {
+  return new Promise((resolve) => {
+    // MessageChannel yields to rendering, timers, and heartbeat I/O without
+    // relying on setTimeout(0), which mobile WebViews may heavily throttle.
+    if (typeof MessageChannel !== "undefined") {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => {
+        channel.port1.close();
+        channel.port2.close();
+        resolve();
+      };
+      channel.port2.postMessage(null);
+      return;
+    }
+    setTimeout(resolve, 0);
+  });
 }
 
 async function sha256Bytes(value: ArrayBuffer | Uint8Array | string): Promise<string> {
@@ -1390,8 +1420,25 @@ export class NtfyLanSync {
         ...this.scanValue,
         files: includeScanFiles ? scanFiles.map((file) => ({ ...file })) : []
       },
+      remote: this.remoteActivity(),
       transferGroups: summarizeTransferGroups(this.activityFiles),
       scanGroups: summarizeScanGroups(this.scanValue.files)
+    };
+  }
+
+  private remoteActivity(): LanSyncRemoteActivity | null {
+    const peer = this.activePeers()
+      .filter((candidate) => candidate.remoteProgress && this.now() - candidate.remoteProgress.receivedAt <= PEER_PROBE_INTERVAL_MS * 4)
+      .sort((left, right) => (right.remoteProgress?.receivedAt ?? 0) - (left.remoteProgress?.receivedAt ?? 0))[0];
+    const remote = peer?.remoteProgress;
+    if (!peer || !remote) return null;
+    return {
+      deviceId: peer.deviceId,
+      stage: remote.stage,
+      phase: remote.phase,
+      scanCompleted: remote.scanCompleted,
+      scanTotal: remote.scanTotal,
+      receivedAt: remote.receivedAt
     };
   }
 
@@ -1892,7 +1939,7 @@ export class NtfyLanSync {
   private requestPeriodicSync(): void {
     this.recoverFromStalledSync();
     if (!this.runningValue || this.syncRunning || this.inboundSession || this.metadataManifestBuild || this.manifestBuild) return;
-    if (this.fullSyncOnlyPending && (this.backgroundReconciliation || this.metadataManifestBuild)) return;
+    if (this.fullSyncOnlyPending && this.backgroundReconciliation) return;
     // Never start a periodic tick while the dedicated active-edit lane holds the
     // peer; the lane finishes first and the bulk round yields to it.
     if (this.activeEditSyncRunning) return;
@@ -2688,7 +2735,7 @@ export class NtfyLanSync {
     if (transfer) this.lastTransferAt = this.now();
     if (
       !transfer
-      && !(this.progressValue.active && ["enumerating", "fingerprinting", "planning", "transferring"].includes(this.progressValue.stage))
+      && !(this.progressValue.active && ["enumerating", "fingerprinting", "packaging-manifest", "planning", "waiting-plan", "transferring"].includes(this.progressValue.stage))
       && this.progressValue.phase !== "scanning"
       && this.progressValue.phase !== "syncing"
       && this.progressValue.phase !== "complete"
@@ -3040,8 +3087,28 @@ export class NtfyLanSync {
     // of fighting over the status bar.
     if (this.syncRunning || this.inboundSession || this.backgroundReconciliation) return;
     if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing") return;
-    if (remote.phase !== "syncing") return;
     if (this.now() - remote.receivedAt > PEER_PROBE_INTERVAL_MS * 4) return;
+    if (
+      remote.phase !== "syncing"
+      && !["enumerating", "fingerprinting", "packaging-manifest", "requesting-peer-scan", "planning", "waiting-plan"].includes(remote.stage)
+    ) return;
+    if (remote.phase !== "syncing") {
+      this.emit({
+        ...defaultProgress("connected"),
+        stage: remote.stage === "fingerprinting"
+          ? "fingerprinting"
+          : remote.stage === "packaging-manifest"
+            ? "packaging-manifest"
+            : remote.stage === "planning"
+              ? "planning"
+              : remote.stage === "waiting-plan"
+                ? "waiting-plan"
+              : "enumerating",
+        active: true,
+        peerId: peer.deviceId
+      });
+      return;
+    }
     this.emit({
       ...defaultProgress("syncing"),
       sessionId: remote.sessionId,
@@ -3061,7 +3128,7 @@ export class NtfyLanSync {
 
   private emitPeerConnectionStage(peer: LanSyncPeer): void {
     if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing" || this.inboundSession) return;
-    if (this.progressValue.active && ["enumerating", "fingerprinting", "planning", "transferring"].includes(this.progressValue.stage)) return;
+    if (this.progressValue.active && ["enumerating", "fingerprinting", "packaging-manifest", "planning", "waiting-plan", "transferring"].includes(this.progressValue.stage)) return;
     const hasPendingWork = this.fullSyncRequested || Boolean(peer.remoteFullSyncRequestId) || (peer.remoteDirtyPaths?.size ?? 0) > 0;
     if (this.progressValue.phase === "complete" && !hasPendingWork) return;
     const compatible = this.metadataProtocol(peer) !== null;
@@ -3123,7 +3190,12 @@ export class NtfyLanSync {
       peer.consecutiveFailures = 0;
       peer.lastFailureAt = 0;
       this.lastErrorValue = "";
-      if (this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
+      if (
+        this.progressValue.phase !== "scanning"
+        && this.progressValue.phase !== "syncing"
+        && this.progressValue.phase !== "complete"
+        && !["enumerating", "fingerprinting", "packaging-manifest", "planning", "waiting-plan"].includes(this.progressValue.stage)
+      ) {
         this.emit({ ...defaultProgress("connected"), stage: "waiting-peer-scan", active: true, peerId: peer.deviceId });
       }
       this.emitPeersChanged();
@@ -3210,7 +3282,7 @@ export class NtfyLanSync {
     // Mutually exclusive with the active-edit lane: never run a bulk round and
     // the single-file lane against the same peer at the same time.
     if (!this.runningValue || this.syncRunning || this.activeEditSyncRunning || !this.isCoordinator()) return;
-    if (this.fullSyncOnlyPending && (this.backgroundReconciliation || this.metadataManifestBuild)) return;
+    if (this.fullSyncOnlyPending && this.backgroundReconciliation) return;
     const peers = this.syncTargets();
     if (!peers.length) return;
     const localDirty = new Map(this.dirtyPaths);
@@ -3229,20 +3301,11 @@ export class NtfyLanSync {
     this.syncRunning = true;
     this.syncStartedAt = this.now();
     try {
-      if (this.fullSyncOnlyPending) {
-        const peer = peers[0];
-        this.emit({
-          ...defaultProgress("connected"),
-          stage: "enumerating",
-          active: true,
-          peerId: peer.deviceId
-        });
-        await this.buildMetadataManifest(this.settings().syncConfigFolder, undefined, true);
-        this.localFilesystemScanCompletedRequestId = this.fullSyncRequestId;
-        localFullSyncRequestId = this.fullSyncRequested ? this.fullSyncRequestId : "";
-        localForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
-        remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
-      }
+      // A strict manual round starts both manifest requests immediately. The
+      // local and peer filesystem walks then run concurrently inside
+      // syncPeerMetadata(), while transfer remains gated on both promises.
+      // This keeps the full-vault guarantee without making the phone sit idle
+      // until the desktop finishes a 16k-path scan.
       let settledAcrossPeers: Set<string> | null = null;
       let fullSyncCompletedEverywhere = Boolean(localFullSyncRequestId);
       let synchronizedPeers = 0;
@@ -3436,10 +3499,22 @@ export class NtfyLanSync {
     this.emitActivityChanged();
     const localPolicy = this.policy();
     const requestedPaths = [...request.paths].sort((left, right) => left.localeCompare(right));
-    const [localEntries, remoteResponse, ledger] = await Promise.all([
-      request.fullSync
+    const localEntriesPromise = (request.fullSync
         ? this.buildMetadataManifest(localPolicy.syncConfigFolder, undefined, request.forceLocalFilesystemScan)
-        : this.buildMetadataManifestForPaths(requestedPaths, localPolicy.syncConfigFolder),
+        : this.buildMetadataManifestForPaths(requestedPaths, localPolicy.syncConfigFolder))
+      .then((entries) => {
+        if (request.fullSync && this.progressValue.phase !== "syncing") {
+          this.emit({
+            ...defaultProgress("connected"),
+            stage: "waiting-peer-scan",
+            active: true,
+            peerId: peer.deviceId
+          });
+        }
+        return entries;
+      });
+    const [localEntries, remoteResponse, ledger] = await Promise.all([
+      localEntriesPromise,
       this.callPeer(
         peer,
         this.metadataRoute(peer, request.fullSync ? "/manifest" : "/manifest/paths"),
@@ -4337,9 +4412,7 @@ export class NtfyLanSync {
         scan.completed += 1;
         entries.push({ path: file.path, size: file.size, mtime: file.mtime });
         report();
-        if ((index + 1) % 512 === 0 && index + 1 < candidates.length) {
-          await Promise.resolve();
-        }
+        if ((index + 1) % 256 === 0 && index + 1 < candidates.length) await yieldToLanEventLoop();
       }
       scan.phase = "complete";
       scan.completed = scan.total;
@@ -4945,6 +5018,12 @@ export class NtfyLanSync {
           undefined,
           forceFilesystemScan
         ));
+        this.emit({
+          ...defaultProgress("connected"),
+          stage: "packaging-manifest",
+          active: true,
+          peerId: deviceId
+        });
         this.recordServedFilesystemScan(deviceId, scanRequestIds);
         this.emitActivityChanged();
         result = {
@@ -4991,7 +5070,16 @@ export class NtfyLanSync {
         throw new LanSyncProtocolError("not_found", 404);
       }
       this.finishInboundFileActivity(deviceId, inboundActivityIndex, true);
-      sendText(response, 200, await encryptLanSyncPayload(this.identity.secret, result));
+      const encryptedResult = await encryptLanSyncPayload(this.identity.secret, result);
+      sendText(response, 200, encryptedResult);
+      if (metadataRoute === "/manifest") {
+        this.emit({
+          ...defaultProgress("connected"),
+          stage: "waiting-plan",
+          active: true,
+          peerId: deviceId
+        });
+      }
     } catch (error) {
       this.finishInboundFileActivity(inboundDeviceId, inboundActivityIndex, false);
       const protocol = error instanceof LanSyncProtocolError ? error : new LanSyncProtocolError(safeErrorCode(error), 500);
@@ -5127,6 +5215,7 @@ export class NtfyLanSync {
     if (acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) {
       this.fullSyncRequested = false;
       this.forceFilesystemScanRequested = false;
+      this.fullSyncOnlyPending = false;
       this.localFilesystemScanCompletedRequestId = "";
     }
     const success = payload.success === true;
