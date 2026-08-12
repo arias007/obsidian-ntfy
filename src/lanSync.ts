@@ -1323,6 +1323,7 @@ export class NtfyLanSync {
   private fullSyncRequestId = "";
   private fullSyncRequested = true;
   private forceFilesystemScanRequested = false;
+  private fullSyncOnlyPending = false;
   private localFilesystemScanCompletedRequestId = "";
   private lastFullScanAt = 0;
   private lastSyncCheckpointAt = 0;
@@ -1790,7 +1791,7 @@ export class NtfyLanSync {
     this.scheduleSync(delay, true);
   }
 
-  requestSync(options: { deep?: boolean } = {}): void {
+  requestSync(options: { deep?: boolean; strict?: boolean } = {}): void {
     // Either device may initiate. A non-listening peer receives the request
     // through the authenticated heartbeat and joins the same forced session.
     if (!this.fullSyncRequested) {
@@ -1798,17 +1799,18 @@ export class NtfyLanSync {
       this.fullSyncRequestId = randomId(18);
     }
     // An explicit request keeps its full-reconciliation contract: the user
-    // asked for a verified sweep, so the filesystem walk still runs. What
-    // changed is that the walk no longer gates transfers - dirty paths and
-    // live edits stream to the peer while the sweep is still in flight.
-    // A caller may opt out with { deep: false } when the persistent metadata
-    // index is already authoritative.
+    // asked for a verified sweep, so the filesystem walk still runs. Strict
+    // callers (the manual button) serialize the walk before any transfer;
+    // background callers may keep the live dirty-path lane moving while the
+    // sweep is in flight. A caller may opt out with { deep: false } when the
+    // persistent metadata index is already authoritative.
     const needsFilesystemScan = options.deep !== false
       || !this.canUseMetadataIndex(this.settings().syncConfigFolder)
       || this.now() - this.lastFullScanAt >= this.fullRescanIntervalMs();
     if (needsFilesystemScan) {
+      this.fullSyncOnlyPending = options.strict === true;
       this.forceFilesystemScanRequested = true;
-      this.startBackgroundFilesystemReconciliation();
+      if (!options.strict) this.startBackgroundFilesystemReconciliation();
     }
     this.syncRequestId = randomId(18);
     const passivePeer = this.activePeers().find((peer) => !peer.canHost);
@@ -1890,6 +1892,7 @@ export class NtfyLanSync {
   private requestPeriodicSync(): void {
     this.recoverFromStalledSync();
     if (!this.runningValue || this.syncRunning || this.inboundSession || this.metadataManifestBuild || this.manifestBuild) return;
+    if (this.fullSyncOnlyPending && (this.backgroundReconciliation || this.metadataManifestBuild)) return;
     // Never start a periodic tick while the dedicated active-edit lane holds the
     // peer; the lane finishes first and the bulk round yields to it.
     if (this.activeEditSyncRunning) return;
@@ -1908,12 +1911,21 @@ export class NtfyLanSync {
   }
 
   private startBackgroundFilesystemReconciliation(): void {
-    if (!this.runningValue || this.backgroundReconciliation || this.metadataManifestBuild) return;
+    if (!this.runningValue || this.backgroundReconciliation) return;
     const includeConfigFolder = this.settings().syncConfigFolder;
     this.reconciliationDirtyPaths.clear();
     const startedAt = this.now();
     const generationAtStart = this.dirtySequence;
     const promise = (async (): Promise<void> => {
+      const peer = this.activePeers()[0];
+      if (this.progressValue.phase !== "syncing") {
+        this.emit({
+          ...defaultProgress("connected"),
+          stage: "enumerating",
+          active: Boolean(peer),
+          peerId: peer?.deviceId ?? ""
+        });
+      }
       await this.buildMetadataManifest(includeConfigFolder, undefined, true);
       // Bounded drain. Live editing keeps feeding this set, so an unbounded
       // loop never finished and every full sync stayed gated behind a
@@ -2674,7 +2686,13 @@ export class NtfyLanSync {
     if (firstVerifiedConnection && route.endsWith("/ping")) this.syncRequestId = randomId(18);
     const transfer = route.includes("/file/") || route.includes("/attachment/");
     if (transfer) this.lastTransferAt = this.now();
-    if (!transfer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
+    if (
+      !transfer
+      && !(this.progressValue.active && ["enumerating", "fingerprinting", "planning", "transferring"].includes(this.progressValue.stage))
+      && this.progressValue.phase !== "scanning"
+      && this.progressValue.phase !== "syncing"
+      && this.progressValue.phase !== "complete"
+    ) {
       this.emit({
         ...defaultProgress("connected"),
         stage: this.metadataProtocol(peer) ? "waiting-peer-scan" : "checking-peer",
@@ -3043,6 +3061,7 @@ export class NtfyLanSync {
 
   private emitPeerConnectionStage(peer: LanSyncPeer): void {
     if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing" || this.inboundSession) return;
+    if (this.progressValue.active && ["enumerating", "fingerprinting", "planning", "transferring"].includes(this.progressValue.stage)) return;
     const hasPendingWork = this.fullSyncRequested || Boolean(peer.remoteFullSyncRequestId) || (peer.remoteDirtyPaths?.size ?? 0) > 0;
     if (this.progressValue.phase === "complete" && !hasPendingWork) return;
     const compatible = this.metadataProtocol(peer) !== null;
@@ -3191,25 +3210,39 @@ export class NtfyLanSync {
     // Mutually exclusive with the active-edit lane: never run a bulk round and
     // the single-file lane against the same peer at the same time.
     if (!this.runningValue || this.syncRunning || this.activeEditSyncRunning || !this.isCoordinator()) return;
+    if (this.fullSyncOnlyPending && (this.backgroundReconciliation || this.metadataManifestBuild)) return;
     const peers = this.syncTargets();
     if (!peers.length) return;
     const localDirty = new Map(this.dirtyPaths);
-    // While a whole-vault walk is still running the session deliberately
-    // stays incremental: dirty and freshly edited paths ship immediately
-    // instead of queueing behind a manifest that is not ready yet. The full
-    // pass runs on the next cycle, right after the walk settles.
-    const localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation ? this.fullSyncRequestId : "";
-    const localForceFilesystemScan = Boolean(
+    // A manual full sync is serialized: no incremental session is opened until
+    // the local full manifest has finished and the same full request is ready
+    // to be exchanged with the peer.
+    let localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation ? this.fullSyncRequestId : "";
+    let localForceFilesystemScan = Boolean(
       localFullSyncRequestId
       && this.forceFilesystemScanRequested
       && this.localFilesystemScanCompletedRequestId !== localFullSyncRequestId
     );
-    const remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
+    let remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
     const urgentPaths = new Set(this.urgentDirtyPaths);
     this.urgentDirtyPaths.clear();
     this.syncRunning = true;
     this.syncStartedAt = this.now();
     try {
+      if (this.fullSyncOnlyPending) {
+        const peer = peers[0];
+        this.emit({
+          ...defaultProgress("connected"),
+          stage: "enumerating",
+          active: true,
+          peerId: peer.deviceId
+        });
+        await this.buildMetadataManifest(this.settings().syncConfigFolder, undefined, true);
+        this.localFilesystemScanCompletedRequestId = this.fullSyncRequestId;
+        localFullSyncRequestId = this.fullSyncRequested ? this.fullSyncRequestId : "";
+        localForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
+        remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
+      }
       let settledAcrossPeers: Set<string> | null = null;
       let fullSyncCompletedEverywhere = Boolean(localFullSyncRequestId);
       let synchronizedPeers = 0;
@@ -3233,6 +3266,7 @@ export class NtfyLanSync {
           this.fullSyncRequested = false;
           this.forceFilesystemScanRequested = false;
           this.localFilesystemScanCompletedRequestId = "";
+          this.fullSyncOnlyPending = false;
         }
         this.recordSyncCheckpoint();
       }
@@ -3393,6 +3427,12 @@ export class NtfyLanSync {
   }): Promise<LanSyncPeerResult> {
     // Scanning owns scanValue only. Keep the previous immutable transfer
     // snapshot visible until the next /session/start freezes a new plan.
+    this.emit({
+      ...defaultProgress("connected"),
+      stage: "requesting-peer-scan",
+      active: true,
+      peerId: peer.deviceId
+    });
     this.emitActivityChanged();
     const localPolicy = this.policy();
     const requestedPaths = [...request.paths].sort((left, right) => left.localeCompare(right));
@@ -3417,6 +3457,12 @@ export class NtfyLanSync {
       ),
       Promise.resolve(this.loadMetadataLedger(peer.deviceId))
     ]);
+    this.emit({
+      ...defaultProgress("connected"),
+      stage: "planning",
+      active: true,
+      peerId: peer.deviceId
+    });
     const remotePolicy = policyFromRaw(remoteResponse.policy);
     peer.policy = remotePolicy;
     const shareConfig = localPolicy.syncConfigFolder && remotePolicy.syncConfigFolder;
@@ -4888,6 +4934,12 @@ export class NtfyLanSync {
         const scanRequestIds = this.parseScanRequestIds(payload.scanRequestIds);
         const forceFilesystemScan = payload.forceFilesystemScan === true
           && !this.filesystemScanAlreadyServed(deviceId, scanRequestIds);
+        this.emit({
+          ...defaultProgress("connected"),
+          stage: "enumerating",
+          active: true,
+          peerId: deviceId
+        });
         const files = await this.withInboundManifestScope(() => this.buildMetadataManifest(
           policy.syncConfigFolder && payload.syncConfigFolder === true,
           undefined,

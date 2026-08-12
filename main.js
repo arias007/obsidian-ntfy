@@ -1590,6 +1590,7 @@ ${bodyHash}`;
     fullSyncRequestId = "";
     fullSyncRequested = true;
     forceFilesystemScanRequested = false;
+    fullSyncOnlyPending = false;
     localFilesystemScanCompletedRequestId = "";
     lastFullScanAt = 0;
     lastSyncCheckpointAt = 0;
@@ -2017,8 +2018,9 @@ ${bodyHash}`;
       }
       const needsFilesystemScan = options.deep !== false || !this.canUseMetadataIndex(this.settings().syncConfigFolder) || this.now() - this.lastFullScanAt >= this.fullRescanIntervalMs();
       if (needsFilesystemScan) {
+        this.fullSyncOnlyPending = options.strict === true;
         this.forceFilesystemScanRequested = true;
-        this.startBackgroundFilesystemReconciliation();
+        if (!options.strict) this.startBackgroundFilesystemReconciliation();
       }
       this.syncRequestId = randomId(18);
       const passivePeer = this.activePeers().find((peer) => !peer.canHost);
@@ -2088,6 +2090,7 @@ ${bodyHash}`;
     requestPeriodicSync() {
       this.recoverFromStalledSync();
       if (!this.runningValue || this.syncRunning || this.inboundSession || this.metadataManifestBuild || this.manifestBuild) return;
+      if (this.fullSyncOnlyPending && (this.backgroundReconciliation || this.metadataManifestBuild)) return;
       if (this.activeEditSyncRunning) return;
       if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing" || this.scanValue.phase === "scanning") return;
       const peers = this.activePeers();
@@ -2099,12 +2102,21 @@ ${bodyHash}`;
       return;
     }
     startBackgroundFilesystemReconciliation() {
-      if (!this.runningValue || this.backgroundReconciliation || this.metadataManifestBuild) return;
+      if (!this.runningValue || this.backgroundReconciliation) return;
       const includeConfigFolder = this.settings().syncConfigFolder;
       this.reconciliationDirtyPaths.clear();
       const startedAt = this.now();
       const generationAtStart = this.dirtySequence;
       const promise = (async () => {
+        const peer = this.activePeers()[0];
+        if (this.progressValue.phase !== "syncing") {
+          this.emit({
+            ...defaultProgress("connected"),
+            stage: "enumerating",
+            active: Boolean(peer),
+            peerId: peer?.deviceId ?? ""
+          });
+        }
         await this.buildMetadataManifest(includeConfigFolder, void 0, true);
         let rounds = 0;
         while (this.reconciliationDirtyPaths.size && rounds < 8 && this.now() - startedAt < SCAN_STALL_TIMEOUT_MS) {
@@ -2773,7 +2785,7 @@ ${bodyHash}`;
       if (firstVerifiedConnection && route.endsWith("/ping")) this.syncRequestId = randomId(18);
       const transfer = route.includes("/file/") || route.includes("/attachment/");
       if (transfer) this.lastTransferAt = this.now();
-      if (!transfer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
+      if (!transfer && !(this.progressValue.active && ["enumerating", "fingerprinting", "planning", "transferring"].includes(this.progressValue.stage)) && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
         this.emit({
           ...defaultProgress("connected"),
           stage: this.metadataProtocol(peer) ? "waiting-peer-scan" : "checking-peer",
@@ -3090,6 +3102,7 @@ ${bodyHash}`;
     }
     emitPeerConnectionStage(peer) {
       if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing" || this.inboundSession) return;
+      if (this.progressValue.active && ["enumerating", "fingerprinting", "planning", "transferring"].includes(this.progressValue.stage)) return;
       const hasPendingWork = this.fullSyncRequested || Boolean(peer.remoteFullSyncRequestId) || (peer.remoteDirtyPaths?.size ?? 0) > 0;
       if (this.progressValue.phase === "complete" && !hasPendingWork) return;
       const compatible = this.metadataProtocol(peer) !== null;
@@ -3208,19 +3221,34 @@ ${bodyHash}`;
       const forced = this.syncForced;
       this.syncForced = false;
       if (!this.runningValue || this.syncRunning || this.activeEditSyncRunning || !this.isCoordinator()) return;
+      if (this.fullSyncOnlyPending && (this.backgroundReconciliation || this.metadataManifestBuild)) return;
       const peers = this.syncTargets();
       if (!peers.length) return;
       const localDirty = new Map(this.dirtyPaths);
-      const localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation ? this.fullSyncRequestId : "";
-      const localForceFilesystemScan = Boolean(
+      let localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation ? this.fullSyncRequestId : "";
+      let localForceFilesystemScan = Boolean(
         localFullSyncRequestId && this.forceFilesystemScanRequested && this.localFilesystemScanCompletedRequestId !== localFullSyncRequestId
       );
-      const remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
+      let remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
       const urgentPaths = new Set(this.urgentDirtyPaths);
       this.urgentDirtyPaths.clear();
       this.syncRunning = true;
       this.syncStartedAt = this.now();
       try {
+        if (this.fullSyncOnlyPending) {
+          const peer = peers[0];
+          this.emit({
+            ...defaultProgress("connected"),
+            stage: "enumerating",
+            active: true,
+            peerId: peer.deviceId
+          });
+          await this.buildMetadataManifest(this.settings().syncConfigFolder, void 0, true);
+          this.localFilesystemScanCompletedRequestId = this.fullSyncRequestId;
+          localFullSyncRequestId = this.fullSyncRequested ? this.fullSyncRequestId : "";
+          localForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
+          remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
+        }
         let settledAcrossPeers = null;
         let fullSyncCompletedEverywhere = Boolean(localFullSyncRequestId);
         let synchronizedPeers = 0;
@@ -3242,6 +3270,7 @@ ${bodyHash}`;
             this.fullSyncRequested = false;
             this.forceFilesystemScanRequested = false;
             this.localFilesystemScanCompletedRequestId = "";
+            this.fullSyncOnlyPending = false;
           }
           this.recordSyncCheckpoint();
         }
@@ -3363,6 +3392,12 @@ ${bodyHash}`;
       });
     }
     async syncPeerMetadata(peer, request) {
+      this.emit({
+        ...defaultProgress("connected"),
+        stage: "requesting-peer-scan",
+        active: true,
+        peerId: peer.deviceId
+      });
       this.emitActivityChanged();
       const localPolicy = this.policy();
       const requestedPaths = [...request.paths].sort((left, right) => left.localeCompare(right));
@@ -3383,6 +3418,12 @@ ${bodyHash}`;
         ),
         Promise.resolve(this.loadMetadataLedger(peer.deviceId))
       ]);
+      this.emit({
+        ...defaultProgress("connected"),
+        stage: "planning",
+        active: true,
+        peerId: peer.deviceId
+      });
       const remotePolicy = policyFromRaw(remoteResponse.policy);
       peer.policy = remotePolicy;
       const shareConfig = localPolicy.syncConfigFolder && remotePolicy.syncConfigFolder;
@@ -4676,6 +4717,12 @@ ${bodyHash}`;
           const policy = this.policy();
           const scanRequestIds = this.parseScanRequestIds(payload.scanRequestIds);
           const forceFilesystemScan = payload.forceFilesystemScan === true && !this.filesystemScanAlreadyServed(deviceId, scanRequestIds);
+          this.emit({
+            ...defaultProgress("connected"),
+            stage: "enumerating",
+            active: true,
+            peerId: deviceId
+          });
           const files = await this.withInboundManifestScope(() => this.buildMetadataManifest(
             policy.syncConfigFolder && payload.syncConfigFolder === true,
             void 0,
@@ -5039,8 +5086,8 @@ class NtfyLanSyncDetailsModal extends Modal {
           stopped: "已停止",
           discovering: "正在检测设备",
           "checking-peer": "正在检查手机版本",
-          "requesting-peer-scan": "本机已发起同步",
-          "waiting-peer-scan": "等待对端交换清单",
+          "requesting-peer-scan": "正在交换清单",
+          "waiting-peer-scan": "正在等待清单",
           enumerating: "正在枚举全库文件",
           fingerprinting: "正在核对内容指纹",
           planning: "正在计算同步清单",
@@ -5053,8 +5100,8 @@ class NtfyLanSyncDetailsModal extends Modal {
           stopped: "Stopped",
           discovering: "Finding devices",
           "checking-peer": "Checking mobile version",
-          "requesting-peer-scan": "Sync initiated locally",
-          "waiting-peer-scan": "Waiting for peer manifest",
+          "requesting-peer-scan": "Exchanging manifests",
+          "waiting-peer-scan": "Waiting for manifest",
           enumerating: "Enumerating vault files",
           fingerprinting: "Verifying content fingerprints",
           planning: "Planning transfers",
@@ -5067,8 +5114,8 @@ class NtfyLanSyncDetailsModal extends Modal {
       ? {
           discovering: "正在寻找同一 Vault 的局域网设备",
           "checking-peer": "已连接，正在确认手机是否支持当前同步协议",
-          "requesting-peer-scan": "本机已主动发起本轮同步；对端会通过已认证链路加入同一轮比较",
-          "waiting-peer-scan": "电脑和手机都可主动发起；当前已连接，正在等待对端交换文件清单",
+          "requesting-peer-scan": "正在与对端交换本轮全库清单",
+          "waiting-peer-scan": "已连接，等待对端清单响应",
           enumerating: "正在列出路径、大小和修改时间，不传输文件内容",
           fingerprinting: "只核对同大小模糊文件的 SHA-256，内容相同不会进入传输清单",
           planning: "元数据已经收集完成，正在确定真实的上传、下载和删除项目",
@@ -5080,8 +5127,8 @@ class NtfyLanSyncDetailsModal extends Modal {
       : {
           discovering: "Looking for another device with the same Vault identity",
           "checking-peer": "Connected and checking whether the mobile peer supports this sync protocol",
-          "requesting-peer-scan": "This device initiated the session; the peer will join it over the authenticated link",
-          "waiting-peer-scan": "Both devices may initiate; the connection is ready and waiting for the peer manifest",
+          "requesting-peer-scan": "Exchanging the full-vault manifest with the peer",
+          "waiting-peer-scan": "Connected; waiting for the peer manifest response",
           enumerating: "Listing paths, sizes, and mtimes without transferring file content",
           fingerprinting: "Hashing only ambiguous same-size files; matching content will not enter the transfer list",
           planning: "Metadata is ready and the real upload, download, and deletion plan is being calculated",
@@ -5163,8 +5210,8 @@ class NtfyLanSyncDetailsModal extends Modal {
     const summary = details.createEl("summary");
     const hasScanWork = (scan.total || 0) > 0;
     const idleLabel = chinese
-      ? (stage === "peer-upgrade-required" ? "等待升级" : stage === "checking-peer" ? "检查版本" : stage === "requesting-peer-scan" ? "本机已发起" : stage === "waiting-peer-scan" ? "等待对端" : stage === "complete" ? "已完成" : "尚未开始")
-      : (stage === "peer-upgrade-required" ? "Update required" : stage === "checking-peer" ? "Checking version" : stage === "requesting-peer-scan" ? "Initiated here" : stage === "waiting-peer-scan" ? "Waiting for peer" : stage === "complete" ? "Complete" : "Not started");
+      ? (stage === "peer-upgrade-required" ? "等待升级" : stage === "checking-peer" ? "检查版本" : stage === "requesting-peer-scan" ? "交换清单" : stage === "waiting-peer-scan" ? "等待清单" : stage === "complete" ? "已完成" : "尚未开始")
+      : (stage === "peer-upgrade-required" ? "Update required" : stage === "checking-peer" ? "Checking version" : stage === "requesting-peer-scan" ? "Exchanging manifests" : stage === "waiting-peer-scan" ? "Waiting for manifest" : stage === "complete" ? "Complete" : "Not started");
     const label = hasScanWork
       ? `${chinese ? "扫描" : "Scan"} ${scan.completed || 0}/${scan.total}`
       : `${chinese ? "扫描" : "Scan"}：${idleLabel}`;
@@ -5920,7 +5967,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   }
 
   requestLanSync() {
-    this.lanSync?.requestSync();
+    this.lanSync?.requestSync({ deep: true, strict: true });
   }
 
   refreshLanSyncStatusBar() {

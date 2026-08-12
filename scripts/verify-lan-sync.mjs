@@ -1065,9 +1065,9 @@ try {
   assert.match(source, /class NtfyLanSyncDetailsModal extends Modal/, "LAN sync details modal is missing");
   assert.match(source, /renderScanSection\(body, scan, scanGroups, chinese, progress, effectiveStage, stageDescriptions\)/, "LAN scan section is missing stage context");
   assert.match(source, /renderTransferSection\(body, progress, files, transferGroups, chinese, effectiveStage, stageDescriptions\)/, "LAN transfer section is missing stage context");
-  assert.match(source, /"requesting-peer-scan": "本机已发起同步"/, "LAN details do not identify the local initiator");
-  assert.match(source, /"waiting-peer-scan": "等待对端交换清单"/, "LAN details do not explain the peer manifest wait stage");
-  assert.match(source, /电脑和手机都可主动发起/, "LAN details still imply that only one device may initiate synchronization");
+   assert.match(source, /"requesting-peer-scan": "正在交换清单"/, "LAN details do not show manifest exchange");
+   assert.match(source, /"waiting-peer-scan": "正在等待清单"/, "LAN details do not explain the peer manifest wait stage");
+   assert.doesNotMatch(source, /电脑和手机都可主动发起|Both devices may initiate/, "LAN details still show non-actionable initiator text");
   assert.match(source, /"peer-upgrade-required": "对端插件需要升级"/, "LAN details do not explain an incompatible peer");
   assert.match(source, /正在核对内容指纹/, "LAN details do not expose first-baseline fingerprinting");
   assert.match(source, /const idleLabel = chinese/, "An idle scan does not derive a meaningful stage label");
@@ -1077,8 +1077,10 @@ try {
   assert.match(source, /下载/, "LAN transfer details do not label downloads");
   assert.match(source, /progress\.uploadCompleted[^\n]*progress\.uploads/, "LAN details do not show completed/total uploads");
   assert.match(source, /progress\.downloadCompleted[^\n]*progress\.downloads/, "LAN details do not show completed/total downloads");
-  assert.match(source, /title: chinese \? "立即扫描同步" : "Scan and sync now"/, "LAN details are missing the manual sync button");
-  assert.match(source, /this\.requestSync\(\)/, "LAN details manual sync button is not wired");
+   assert.match(source, /title: chinese \? "立即扫描同步" : "Scan and sync now"/, "LAN details are missing the manual sync button");
+   assert.match(source, /this\.lanSync\?\.requestSync\(\{ deep: true, strict: true \}\)/, "Manual sync button is not wired to a strict full scan");
+   assert.match(lanSource, /fullSyncOnlyPending/, "Manual full scan is not serialized before transfer");
+   assert.match(lanSource, /if \(this\.fullSyncOnlyPending && \(this\.backgroundReconciliation \|\| this\.metadataManifestBuild\)\) return;/, "A manual full scan can still be bypassed by an incremental transfer");
   assert.match(source, /this\.sectionState = \{ scan: false, transfer: false \}/, "LAN activity file lists should be collapsed by default");
   assert.match(source, /includeScanFiles: this\.sectionState\.scan && expandedScanGroups\.length > 0/, "Collapsed scan groups should not materialize hidden file rows");
   assert.match(source, /includeTransferFiles: this\.sectionState\.transfer && expandedTransferGroups\.length > 0/, "Collapsed transfer groups should not materialize hidden file rows");
