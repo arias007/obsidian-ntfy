@@ -798,16 +798,17 @@ var NtfyLanSyncRuntime = (() => {
   var PEER_SWEEP_INTERVAL_MS = 350;
   var PEER_PROBE_INTERVAL_MS = 900;
   var PEER_MIN_STABLE_GRACE_MS = 3e4;
-  var PEER_MAX_ADDRESS_HISTORY = 8;
+  var PEER_MAX_ADDRESS_HISTORY = 2;
   var REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 6e4;
-  var SYNC_MIN_INTERVAL_MS = 400;
+  var SYNC_MIN_INTERVAL_MS = 120;
   var QUEUED_SYNC_DELAY_MS = 750;
   var URGENT_SYNC_DELAY_MS = 60;
   var REALTIME_DIRTY_DELAY_MS = 30;
   var ACTIVE_EDIT_SYNC_DELAY_MS = 20;
+  var RECONNECT_REPROBE_DELAY_MS = 250;
   var MANIFEST_TIMEOUT_MS = 10 * 6e4;
-  var PATH_MANIFEST_TIMEOUT_MS = 9e4;
-  var SESSION_TIMEOUT_MS = 12e4;
+  var PATH_MANIFEST_TIMEOUT_MS = 2e4;
+  var SESSION_TIMEOUT_MS = 3e4;
   var STALE_SESSION_RESUME_MS = 5e3;
   var SYNC_WATCHDOG_MS = 15 * 6e4;
   var SCAN_STALL_TIMEOUT_MS = 9e4;
@@ -947,8 +948,8 @@ var NtfyLanSyncRuntime = (() => {
     return {
       incrementalPush: true,
       incrementalPull: true,
-      deletePush: false,
-      deletePull: false,
+      deletePush: true,
+      deletePull: true,
       syncConfigFolder: false,
       deleteProtocol: true,
       conflictRule: "latest"
@@ -1600,6 +1601,7 @@ ${bodyHash}`;
     activeEditTimer = null;
     activeEditSyncRunning = false;
     activeEditStartedAt = 0;
+    reconnectTimer = null;
     transferBackoff = /* @__PURE__ */ new Map();
     syncRequestId = "";
     fullSyncRequestId = "";
@@ -1669,6 +1671,8 @@ ${bodyHash}`;
         deviceId: peer.deviceId,
         stage: remote.stage,
         phase: remote.phase,
+        scanPhase: remote.scanPhase,
+        scanTotalKnown: remote.scanTotalKnown,
         scanCompleted: remote.scanCompleted,
         scanTotal: remote.scanTotal,
         receivedAt: remote.receivedAt
@@ -2340,8 +2344,11 @@ ${bodyHash}`;
       return {
         incrementalPush: settings.mode === "bidirectional" || settings.mode === "incremental-push" || settings.mode === "delete-push",
         incrementalPull: settings.mode === "bidirectional" || settings.mode === "incremental-pull" || settings.mode === "delete-pull",
-        deletePush: settings.mode === "delete-push",
-        deletePull: settings.mode === "delete-pull",
+        // Bidirectional is the default five-way mode: content changes and
+        // deletions flow both directions. The single-direction modes retain
+        // their explicit delete semantics.
+        deletePush: settings.mode === "bidirectional" || settings.mode === "delete-push",
+        deletePull: settings.mode === "bidirectional" || settings.mode === "delete-pull",
         syncConfigFolder: settings.syncConfigFolder,
         deleteProtocol: true,
         conflictRule: settings.conflictRule
@@ -3056,6 +3063,8 @@ ${bodyHash}`;
         uploadCompleted: Math.max(0, Math.floor(this.progressValue.uploadCompleted)),
         downloads: Math.max(0, Math.floor(this.progressValue.downloads)),
         downloadCompleted: Math.max(0, Math.floor(this.progressValue.downloadCompleted)),
+        scanPhase: this.scanValue.phase,
+        scanTotalKnown: this.scanValue.totalKnown !== false,
         scanCompleted: Math.max(0, Math.floor(this.scanValue.completed)),
         scanTotal: Math.max(0, Math.floor(this.scanValue.total)),
         updatedAt: this.progressUpdatedAt
@@ -3082,6 +3091,8 @@ ${bodyHash}`;
         uploadCompleted: count(value.uploadCompleted),
         downloads: count(value.downloads),
         downloadCompleted: count(value.downloadCompleted),
+        scanPhase: value.scanPhase === "scanning" || value.scanPhase === "complete" || value.scanPhase === "error" || value.scanPhase === "idle" ? value.scanPhase : "idle",
+        scanTotalKnown: value.scanTotalKnown !== false,
         scanCompleted: count(value.scanCompleted),
         scanTotal: count(value.scanTotal),
         receivedAt: this.now()
@@ -3205,9 +3216,17 @@ ${bodyHash}`;
       } catch {
         peer.consecutiveFailures = Math.min(100, peer.consecutiveFailures + 1);
         peer.lastFailureAt = this.now();
+        if (force || peer.consecutiveFailures <= 2) this.scheduleReconnectProbe();
       } finally {
         peer.probing = false;
       }
+    }
+    scheduleReconnectProbe() {
+      if (!this.runningValue || this.reconnectTimer) return;
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        void this.probePeers(true);
+      }, RECONNECT_REPROBE_DELAY_MS);
     }
     async probePeers(force = false) {
       if (!this.runningValue) return;
@@ -3358,7 +3377,11 @@ ${bodyHash}`;
       }, Math.max(0, delay));
     }
     async runActiveEditSync() {
-      if (!this.runningValue || this.activeEditSyncRunning || this.syncRunning || !this.isCoordinator()) return;
+      if (!this.runningValue || this.activeEditSyncRunning || !this.isCoordinator()) return;
+      if (this.syncRunning) {
+        this.syncQueued = true;
+        return;
+      }
       const paths = [...this.activeEditDirty].filter((path) => this.dirtyPaths.has(path)).slice(0, INCREMENTAL_PATH_BATCH_SIZE);
       if (!paths.length) {
         this.activeEditDirty.clear();
@@ -5270,7 +5293,11 @@ class NtfyLanSyncDetailsModal extends Modal {
     if (scan.total > 0) progressParts.push(scan.totalKnown === false
       ? `${chinese ? "本机已检查" : "Local checked"} ${scan.completed}`
       : `${chinese ? "本机扫描" : "Local scan"} ${scan.completed}/${scan.total}`);
-    if ((remote?.scanTotal || 0) > 0) progressParts.push(`${chinese ? "对端已检查" : "Peer checked"} ${remote.scanCompleted}`);
+    if (remote && (remote.scanPhase === "scanning" || remote.scanTotal > 0)) {
+      progressParts.push(remote.scanTotalKnown === false
+        ? `${chinese ? "对端已检查" : "Peer checked"} ${remote.scanCompleted}`
+        : `${chinese ? "对端扫描" : "Peer scan"} ${remote.scanCompleted}/${remote.scanTotal}`);
+    }
     if (progress.total > 0) progressParts.push(`${chinese ? "同步" : "Sync"} ${progress.completed}/${progress.total}`);
     if (progress.uploads > 0 || progress.downloads > 0) {
       progressParts.push(chinese
@@ -5310,7 +5337,7 @@ class NtfyLanSyncDetailsModal extends Modal {
     });
     const summary = details.createEl("summary");
     const hasScanWork = (scan.total || 0) > 0;
-    const hasRemoteScanWork = (remote?.scanTotal || 0) > 0;
+    const hasRemoteScanWork = Boolean(remote && (remote.scanPhase === "scanning" || remote.scanTotal > 0));
     const idleLabel = chinese
       ? (stage === "peer-upgrade-required" ? "等待升级" : stage === "checking-peer" ? "检查版本" : stage === "requesting-peer-scan" ? "交换变化路径" : stage === "waiting-peer-scan" ? "等待变化文件" : stage === "complete" ? "已完成" : "尚未开始")
       : (stage === "peer-upgrade-required" ? "Update required" : stage === "checking-peer" ? "Checking version" : stage === "requesting-peer-scan" ? "Exchanging changed paths" : stage === "waiting-peer-scan" ? "Waiting for changed files" : stage === "complete" ? "Complete" : "Not started");
@@ -5319,7 +5346,9 @@ class NtfyLanSyncDetailsModal extends Modal {
         ? `${chinese ? "本机已检查" : "Local checked"} ${scan.completed || 0}`
         : `${chinese ? "本机扫描" : "Local scan"} ${scan.completed || 0}/${scan.total}`)
       : hasRemoteScanWork
-        ? `${chinese ? "对端扫描" : "Peer scan"} ${remote.scanCompleted || 0}/${remote.scanTotal}`
+        ? (remote.scanTotalKnown === false
+          ? `${chinese ? "对端正在扫描" : "Peer scan"} ${remote.scanCompleted || 0}`
+          : `${chinese ? "对端扫描" : "Peer scan"} ${remote.scanCompleted || 0}/${remote.scanTotal}`)
         : `${chinese ? "扫描" : "Scan"}：${idleLabel}`;
     summary.createSpan({ text: label });
     summary.createSpan({ cls: "obsidian-ntfy-lan-details-section-meta", text: hasScanWork
@@ -5336,7 +5365,9 @@ class NtfyLanSyncDetailsModal extends Modal {
       scanProgress.setAttribute("aria-label", label);
     }
     if (hasRemoteScanWork) {
-      const remoteLabel = `${chinese ? "对端已检查" : "Peer checked"} ${remote.scanCompleted || 0}`;
+      const remoteLabel = remote.scanTotalKnown === false
+        ? `${chinese ? "对端正在扫描，已检查" : "Peer scanning, checked"} ${remote.scanCompleted || 0}`
+        : `${chinese ? "对端已检查" : "Peer checked"} ${remote.scanCompleted || 0}/${remote.scanTotal || 0}`;
       panel.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: remoteLabel });
     }
     const scanFiles = Array.isArray(scan.files) ? scan.files : [];

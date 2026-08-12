@@ -193,6 +193,8 @@ export type LanSyncRemoteActivity = {
   deviceId: string;
   stage: string;
   phase: LanSyncProgressPhase;
+  scanPhase: LanSyncScanActivity["phase"];
+  scanTotalKnown: boolean;
   scanCompleted: number;
   scanTotal: number;
   receivedAt: number;
@@ -305,6 +307,8 @@ type LanSyncRemoteProgress = {
   uploadCompleted: number;
   downloads: number;
   downloadCompleted: number;
+  scanPhase: LanSyncScanActivity["phase"];
+  scanTotalKnown: boolean;
   scanCompleted: number;
   scanTotal: number;
   receivedAt: number;
@@ -383,9 +387,11 @@ const ANNOUNCE_INTERVAL_MS = 750;
 const PEER_SWEEP_INTERVAL_MS = 350;
 const PEER_PROBE_INTERVAL_MS = 900;
 const PEER_MIN_STABLE_GRACE_MS = 30_000;
-const PEER_MAX_ADDRESS_HISTORY = 8;
+// Keep one current LAN address plus one recent fallback. Retaining a long
+// stale address list made reconnect try dead endpoints serially and look stuck.
+const PEER_MAX_ADDRESS_HISTORY = 2;
 const REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
-const SYNC_MIN_INTERVAL_MS = 400;
+const SYNC_MIN_INTERVAL_MS = 120;
 const QUEUED_SYNC_DELAY_MS = 750;
 const URGENT_SYNC_DELAY_MS = 60;
 const REALTIME_DIRTY_DELAY_MS = 30;
@@ -394,9 +400,12 @@ const REALTIME_DIRTY_DELAY_MS = 30;
 // own single-file channel instead of waiting behind a bulk dirty scan.
 const ACTIVE_EDIT_SYNC_DELAY_MS = 20;
 const ACTIVE_EDIT_POLL_MS = SYNC_MIN_INTERVAL_MS;
+const RECONNECT_REPROBE_DELAY_MS = 250;
 const MANIFEST_TIMEOUT_MS = 10 * 60_000;
-const PATH_MANIFEST_TIMEOUT_MS = 90_000;
-const SESSION_TIMEOUT_MS = 120_000;
+// Incremental paths must fail fast when Wi-Fi disappears so reconnect can
+// reprobe and resume the next batch instead of waiting several minutes.
+const PATH_MANIFEST_TIMEOUT_MS = 20_000;
+const SESSION_TIMEOUT_MS = 30_000;
 const STALE_SESSION_RESUME_MS = 5_000;
 const SYNC_WATCHDOG_MS = 15 * 60_000;
 const SCAN_STALL_TIMEOUT_MS = 90_000;
@@ -568,8 +577,8 @@ function defaultLocalPolicy(): LanSyncPolicy {
   return {
     incrementalPush: true,
     incrementalPull: true,
-    deletePush: false,
-    deletePull: false,
+    deletePush: true,
+    deletePull: true,
     syncConfigFolder: false,
     deleteProtocol: true,
     conflictRule: "latest"
@@ -1347,6 +1356,7 @@ export class NtfyLanSync {
   private activeEditTimer: ReturnType<typeof setTimeout> | null = null;
   private activeEditSyncRunning = false;
   private activeEditStartedAt = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private transferBackoff = new Map<string, { failures: number; nextAttemptAt: number }>();
   private syncRequestId = "";
   private fullSyncRequestId = "";
@@ -1435,6 +1445,8 @@ export class NtfyLanSync {
       deviceId: peer.deviceId,
       stage: remote.stage,
       phase: remote.phase,
+      scanPhase: remote.scanPhase,
+      scanTotalKnown: remote.scanTotalKnown,
       scanCompleted: remote.scanCompleted,
       scanTotal: remote.scanTotal,
       receivedAt: remote.receivedAt
@@ -2196,8 +2208,11 @@ export class NtfyLanSync {
     return {
       incrementalPush: settings.mode === "bidirectional" || settings.mode === "incremental-push" || settings.mode === "delete-push",
       incrementalPull: settings.mode === "bidirectional" || settings.mode === "incremental-pull" || settings.mode === "delete-pull",
-      deletePush: settings.mode === "delete-push",
-      deletePull: settings.mode === "delete-pull",
+        // Bidirectional is the default five-way mode: content changes and
+        // deletions flow both directions. The single-direction modes retain
+        // their explicit delete semantics.
+        deletePush: settings.mode === "bidirectional" || settings.mode === "delete-push",
+        deletePull: settings.mode === "bidirectional" || settings.mode === "delete-pull",
       syncConfigFolder: settings.syncConfigFolder,
       deleteProtocol: true,
       conflictRule: settings.conflictRule
@@ -3010,6 +3025,8 @@ export class NtfyLanSync {
       uploadCompleted: Math.max(0, Math.floor(this.progressValue.uploadCompleted)),
       downloads: Math.max(0, Math.floor(this.progressValue.downloads)),
       downloadCompleted: Math.max(0, Math.floor(this.progressValue.downloadCompleted)),
+      scanPhase: this.scanValue.phase,
+      scanTotalKnown: this.scanValue.totalKnown !== false,
       scanCompleted: Math.max(0, Math.floor(this.scanValue.completed)),
       scanTotal: Math.max(0, Math.floor(this.scanValue.total)),
       updatedAt: this.progressUpdatedAt
@@ -3037,6 +3054,10 @@ export class NtfyLanSync {
       uploadCompleted: count(value.uploadCompleted),
       downloads: count(value.downloads),
       downloadCompleted: count(value.downloadCompleted),
+      scanPhase: value.scanPhase === "scanning" || value.scanPhase === "complete" || value.scanPhase === "error" || value.scanPhase === "idle"
+        ? value.scanPhase
+        : "idle",
+      scanTotalKnown: value.scanTotalKnown !== false,
       scanCompleted: count(value.scanCompleted),
       scanTotal: count(value.scanTotal),
       receivedAt: this.now()
@@ -3205,9 +3226,18 @@ export class NtfyLanSync {
       peer.lastFailureAt = this.now();
       // Keep an authenticated peer visible through short network jitter. The
       // stable grace window below decides when it is genuinely offline.
+      if (force || peer.consecutiveFailures <= 2) this.scheduleReconnectProbe();
     } finally {
       peer.probing = false;
     }
+  }
+
+  private scheduleReconnectProbe(): void {
+    if (!this.runningValue || this.reconnectTimer) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.probePeers(true);
+    }, RECONNECT_REPROBE_DELAY_MS);
   }
 
   private async probePeers(force = false): Promise<void> {
@@ -3406,7 +3436,14 @@ export class NtfyLanSync {
   }
 
   private async runActiveEditSync(): Promise<void> {
-    if (!this.runningValue || this.activeEditSyncRunning || this.syncRunning || !this.isCoordinator()) return;
+    if (!this.runningValue || this.activeEditSyncRunning || !this.isCoordinator()) return;
+    // A new edit is a green-lane event. Park the ordinary batch briefly so
+    // this one-path session can start immediately after the current request
+    // boundary, instead of waiting for every bulk file to drain.
+    if (this.syncRunning) {
+      this.syncQueued = true;
+      return;
+    }
     // Only sync paths still tracked as dirty (not yet settled by a bulk round).
     // Once the bulk round settles and removes them from dirtyPaths, the lane has
     // nothing left to do and clears the marker instead of spinning.

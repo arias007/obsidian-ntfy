@@ -264,7 +264,6 @@ try {
   const remote = { path: "Note.md", size: 6, mtime: 200, hash: "b".repeat(43) };
   assert.equal(planLanSyncReconciliation([local], [remote], { "Note.md": local.hash })[0].kind, "pull");
   assert.equal(planLanSyncReconciliation([local], [remote], { "Note.md": remote.hash })[0].kind, "push");
-  assert.deepEqual(planLanSyncReconciliation([local], [], { "Note.md": local.hash }), [], "Deletion was resurrected");
   const firstReconciliation = planLanSyncReconciliation([local], [remote], {});
   assert.equal(firstReconciliation[0].kind, "pull", "The latest first-scan version should replace the original path");
   const largerConflict = planLanSyncReconciliation(
@@ -291,6 +290,22 @@ try {
   };
   const incrementalPushPolicy = { ...passivePolicy, incrementalPush: true };
   const incrementalPullPolicy = { ...passivePolicy, incrementalPull: true };
+  const contentBidirectionalPolicy = {
+    ...incrementalPushPolicy,
+    incrementalPull: true,
+    deletePush: true,
+    deletePull: true
+  };
+  assert.equal(
+    planLanSyncReconciliation([local], [], { "Note.md": local.hash }, contentBidirectionalPolicy, passivePolicy)[0].kind,
+    "delete-local",
+    "Default bidirectional mode did not carry a deletion"
+  );
+  assert.deepEqual(
+    planLanSyncReconciliation([local], [], { "Note.md": local.hash }, incrementalPushPolicy, passivePolicy),
+    [],
+    "Deletion was resurrected in incremental-push mode"
+  );
   const deletePushPolicy = { ...incrementalPushPolicy, deletePush: true };
   const deletePullPolicy = { ...incrementalPullPolicy, deletePull: true };
   assert.equal(planLanSyncReconciliation([local], [remote], { "Note.md": remote.hash }, incrementalPushPolicy, passivePolicy)[0].kind, "push");
@@ -307,7 +322,16 @@ try {
   assert.equal(planLanSyncMetadataReconciliation([localMetadata], [remoteMetadata], { "Note.md": metadataBaseline })[0].kind, "pull");
   assert.equal(planLanSyncMetadataReconciliation([{ ...localMetadata, mtime: 300 }], [localMetadata], { "Note.md": metadataBaseline })[0].kind, "push");
   assert.equal(planLanSyncMetadataReconciliation([localMetadata], [remoteMetadata], {})[0].kind, "pull");
-  assert.deepEqual(planLanSyncMetadataReconciliation([localMetadata], [], { "Note.md": metadataBaseline }), [], "Metadata deletion was resurrected");
+  assert.equal(
+    planLanSyncMetadataReconciliation([localMetadata], [], { "Note.md": metadataBaseline }, contentBidirectionalPolicy, passivePolicy)[0].kind,
+    "delete-local",
+    "Default bidirectional metadata mode did not carry a deletion"
+  );
+  assert.deepEqual(
+    planLanSyncMetadataReconciliation([localMetadata], [], { "Note.md": metadataBaseline }, incrementalPushPolicy, passivePolicy),
+    [],
+    "Metadata deletion was resurrected in incremental-push mode"
+  );
   assert.equal(planLanSyncMetadataReconciliation([], [localMetadata], { "Note.md": metadataBaseline }, deletePushPolicy, passivePolicy)[0].kind, "delete-remote");
   assert.equal(planLanSyncMetadataReconciliation([localMetadata], [], { "Note.md": metadataBaseline }, deletePullPolicy, passivePolicy)[0].kind, "delete-local");
   assert.deepEqual(
@@ -678,6 +702,19 @@ try {
     const notesOnlyActivity = serviceA.activity({ scanGroups: ["Notes"], transferGroups: ["Notes"] });
     assert.ok(notesOnlyActivity.scan.files.length > 0 && notesOnlyActivity.scan.files.every((file) => lanSyncTopLevelGroup(file.path) === "Notes"), "Expanded scan group materialized another folder");
     assert.ok(notesOnlyActivity.files.length > 0 && notesOnlyActivity.files.every((file) => lanSyncTopLevelGroup(file.path) === "Notes"), "Expanded transfer group materialized another folder");
+
+    // The default bidirectional mode must carry file operations as well as
+    // content. A rename is represented by the old-path delete plus the new
+    // path create, so both sides converge without a conflict copy.
+    storageA.files.delete("Notes/from-a.md");
+    serviceA.notifyVaultChange("Notes/from-a.md");
+    storageA.putText("Notes/renamed-from-a.md", "renamed A", 910);
+    serviceA.notifyVaultChange("Notes/renamed-from-a.md");
+    serviceA.requestSync();
+    await waitFor(
+      () => storageB.text("Notes/from-a.md") === null && storageB.text("Notes/renamed-from-a.md") === "renamed A",
+      "bidirectional delete and rename convergence"
+    );
     const periodicRequestId = serviceA.fullSyncRequestId;
     serviceA.syncRunning = true;
     serviceA.requestPeriodicSync();
@@ -1217,6 +1254,10 @@ try {
   assert.match(source, /同步：发现文件即开始/, "The transfer section does not explain that discovered files start immediately");
   assert.match(lanSource, /INCREMENTAL_PATH_BATCH_SIZE = 32/, "Dirty journal is not split into bounded realtime batches");
   assert.match(lanSource, /this\.scheduleActiveEditSync\(REALTIME_DIRTY_DELAY_MS\)/, "Vault events do not enter the immediate transfer lane");
+  assert.match(lanSource, /const RECONNECT_REPROBE_DELAY_MS = 250/, "LAN reconnect does not have a fast reprobe path");
+  assert.match(lanSource, /this\.scheduleReconnectProbe\(\)/, "LAN peer failures do not schedule immediate reconnect probing");
+  assert.match(lanSource, /deletePush: settings\.mode === "bidirectional" \|\| settings\.mode === "delete-push"/, "Default bidirectional mode does not push deletions");
+  assert.match(lanSource, /deletePull: settings\.mode === "bidirectional" \|\| settings\.mode === "delete-pull"/, "Default bidirectional mode does not pull deletions");
   assert.match(lanSource, /remoteRequestedSync \|\| \(peer\.remoteDirtyPaths\?\.size \?\? 0\) > 0/, "Inbound mobile dirty signals do not immediately schedule synchronization");
   assert.doesNotMatch(source, /const label = `\$\{chinese \? "扫描" : "Scan"\} \$\{scan\.completed \|\| 0\}\/\$\{scan\.total \|\| 0\}`/, "LAN details still render an unexplained scan 0/0");
   assert.match(source, /上传/, "LAN transfer details do not label uploads");
