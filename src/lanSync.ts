@@ -409,11 +409,9 @@ const CHECKPOINT_MTIME_OVERLAP_MS = 2_000;
 const BACKGROUND_FULL_RESCAN_INTERVAL_MS = 24 * 60 * 60_000;
 const METADATA_INDEX_SAVE_DELAY_MS = 2_000;
 // Obsidian can deliver modify/raw events well after the underlying write has
-// completed, especially when a large batch is being applied on mobile. A
-// three-second token expired while the batch was still draining and turned
-// every LAN write into a new dirty path, which eventually pinned the queue at
-// MAX_DIRTY_PATHS. Keep the expected snapshot long enough for the whole batch
-// and let the size bound/expiry cleanup keep memory finite.
+// completed, especially when a large batch is being applied on mobile. Keep
+// the expected snapshot long enough for the whole batch and let expiry cleanup
+// keep memory finite.
 const APPLIED_MUTATION_EVENT_TTL_MS = 30 * 60_000;
 const HASH_CONCURRENCY = 12;
 const LARGE_TRANSFER_CONCURRENCY = 6;
@@ -433,7 +431,6 @@ const HASH_CACHE_STORAGE_PREFIX = "ntfy.lan-sync.hash-cache.v1";
 const LAN_INBOX_ROOT = ".trash/ntfy-inbox";
 const MAX_MESSAGE_TEXT_LENGTH = 32_000;
 const MAX_MESSAGE_ATTACHMENTS = 12;
-const MAX_DIRTY_PATHS = 4096;
 const INCREMENTAL_PATH_BATCH_SIZE = 32;
 const MAX_QUEUED_MESSAGES_PER_PEER = 100;
 const MAX_PING_MESSAGES = 20;
@@ -1353,7 +1350,7 @@ export class NtfyLanSync {
   private transferBackoff = new Map<string, { failures: number; nextAttemptAt: number }>();
   private syncRequestId = "";
   private fullSyncRequestId = "";
-  private fullSyncRequested = true;
+  private fullSyncRequested = false;
   private forceFilesystemScanRequested = false;
   private fullSyncOnlyPending = false;
   private localFilesystemScanCompletedRequestId = "";
@@ -1602,10 +1599,11 @@ export class NtfyLanSync {
     this.loadChangeJournal();
     this.loadHashCache();
     await this.loadMetadataIndex();
+    // Only a device with no persisted metadata baseline needs an initial
+    // full-vault handshake. Reloads and ordinary elapsed time never create a
+    // full scan request on their own.
+    this.fullSyncRequested = !this.metadataIndexReady && this.lastFullScanAt <= 0;
     await this.captureChangesSinceCheckpoint();
-    if (this.lastFullScanAt > 0 && this.now() - this.lastFullScanAt < this.fullRescanIntervalMs()) {
-      this.fullSyncRequested = false;
-    }
     if (!this.fullSyncRequestId) {
       this.fullSyncRequestId = randomId(18);
       this.syncRequestId = this.fullSyncRequestId;
@@ -1721,12 +1719,12 @@ export class NtfyLanSync {
   }
 
   private markAppliedMutation(path: string): void {
-    if (this.appliedMutationEvents.size >= MAX_DIRTY_PATHS) {
+    if (this.appliedMutationEvents.size >= MAX_MANIFEST_FILES) {
       const now = this.now();
       for (const [candidate, token] of this.appliedMutationEvents) {
         if (token.expiresAt < now) this.appliedMutationEvents.delete(candidate);
       }
-      while (this.appliedMutationEvents.size >= MAX_DIRTY_PATHS) {
+      while (this.appliedMutationEvents.size >= MAX_MANIFEST_FILES) {
         const oldest = this.appliedMutationEvents.keys().next().value;
         if (typeof oldest !== "string") break;
         this.appliedMutationEvents.delete(oldest);
@@ -1782,8 +1780,8 @@ export class NtfyLanSync {
     this.queueHashCacheSave();
     this.dirtyPaths.set(normalized, ++this.dirtySequence);
     this.urgentDirtyPaths.add(normalized);
-    if (this.urgentDirtyPaths.size > MAX_DIRTY_PATHS) {
-      this.urgentDirtyPaths = new Set([...this.urgentDirtyPaths].slice(-MAX_DIRTY_PATHS));
+    if (this.urgentDirtyPaths.size > MAX_MANIFEST_FILES) {
+      this.urgentDirtyPaths = new Set([...this.urgentDirtyPaths].slice(-MAX_MANIFEST_FILES));
     }
     this.activeEditingPath = normalized;
     this.activeEditDirty.add(normalized);
@@ -1818,36 +1816,24 @@ export class NtfyLanSync {
       // fresh edit clears any parked backoff so it is retried immediately.
       this.transferBackoff.delete(normalized);
       this.urgentDirtyPaths.add(normalized);
-      if (this.urgentDirtyPaths.size > MAX_DIRTY_PATHS) {
-        this.urgentDirtyPaths = new Set([...this.urgentDirtyPaths].slice(-MAX_DIRTY_PATHS));
+      if (this.urgentDirtyPaths.size > MAX_MANIFEST_FILES) {
+        this.urgentDirtyPaths = new Set([...this.urgentDirtyPaths].slice(-MAX_MANIFEST_FILES));
       }
       this.activeEditDirty.add(normalized);
-      if (this.activeEditDirty.size > MAX_DIRTY_PATHS) {
-        this.activeEditDirty = new Set([...this.activeEditDirty].slice(-MAX_DIRTY_PATHS));
+      if (this.activeEditDirty.size > MAX_MANIFEST_FILES) {
+        this.activeEditDirty = new Set([...this.activeEditDirty].slice(-MAX_MANIFEST_FILES));
       }
     }
     if (this.backgroundReconciliation) this.reconciliationDirtyPaths.add(normalized);
-    if (this.dirtyPaths.size > MAX_DIRTY_PATHS) {
-      // Never silently discard the oldest paths. Once the journal is larger
-      // than the wire limit, promote the next pass to one full reconciliation
-      // so deletes/renames and paths outside the retained window are still
-      // compared. The request ID stays stable across retries, preventing the
-      // peer from repeating the same filesystem walk.
-      this.fullSyncRequested = true;
-      if (!this.fullSyncRequestId) this.fullSyncRequestId = randomId(18);
-      this.forceFilesystemScanRequested = true;
-      const newest = [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS);
-      this.dirtyPaths = new Map(newest);
-      this.startBackgroundFilesystemReconciliation();
-    }
     this.queueChangeJournalSave();
     this.syncRequestId = randomId(18);
     this.announce();
     if (urgent) {
-      const now = this.now();
-      const needsImmediateProbe = this.peers.size === 0
-        || [...this.peers.values()].some((peer) => peer.verifiedAt <= 0 || peer.capabilities.size === 0);
-      if (needsImmediateProbe) void this.probePeers(true);
+      // A non-coordinator cannot open the transfer session itself. Push its
+      // compact dirty-path signal to the authenticated coordinator now rather
+      // than waiting for the 900ms probe interval (or losing the wakeup while
+      // another batch is finishing).
+      void this.probePeers(true);
       this.scheduleActiveEditSync(REALTIME_DIRTY_DELAY_MS);
     }
     this.scheduleSync(delay, true);
@@ -1856,19 +1842,15 @@ export class NtfyLanSync {
   requestSync(options: { deep?: boolean; strict?: boolean } = {}): void {
     // Either device may initiate. A non-listening peer receives the request
     // through the authenticated heartbeat and joins the same forced session.
-    if (!this.fullSyncRequested) {
+    const deep = options.deep === true;
+    if (deep && !this.fullSyncRequested) {
       this.fullSyncRequested = true;
       this.fullSyncRequestId = randomId(18);
     }
-    // An explicit request keeps its full-reconciliation contract: the user
-    // asked for a verified sweep, so the filesystem walk still runs. Strict
-    // callers (the manual button) serialize the walk before any transfer;
-    // background callers may keep the live dirty-path lane moving while the
-    // sweep is in flight. A caller may opt out with { deep: false } when the
-    // persistent metadata index is already authoritative.
-    const needsFilesystemScan = options.deep !== false
-      || !this.canUseMetadataIndex(this.settings().syncConfigFolder)
-      || this.now() - this.lastFullScanAt >= this.fullRescanIntervalMs();
+    // Normal wakeups consume only paths already discovered by Vault events or
+    // the background producer. A deep reconciliation is explicit maintenance;
+    // it is never inferred from queue size, index state, or elapsed time.
+    const needsFilesystemScan = deep;
     if (needsFilesystemScan) {
       this.fullSyncOnlyPending = options.strict === true;
       this.forceFilesystemScanRequested = true;
@@ -1879,7 +1861,7 @@ export class NtfyLanSync {
     if (passivePeer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing") {
       this.emit({
         ...defaultProgress("connected"),
-        stage: "requesting-peer-scan",
+        stage: deep || this.dirtyPaths.size > 0 ? "requesting-peer-scan" : "waiting-peer-scan",
         active: true,
         peerId: passivePeer.deviceId
       });
@@ -1895,8 +1877,8 @@ export class NtfyLanSync {
     const failures = Math.min(8, (current?.failures ?? 0) + 1);
     const delay = Math.min(5 * 60_000, 5_000 * 2 ** (failures - 1));
     this.transferBackoff.set(path, { failures, nextAttemptAt: this.now() + delay });
-    if (this.transferBackoff.size > MAX_DIRTY_PATHS) {
-      const oldest = [...this.transferBackoff.keys()].slice(0, this.transferBackoff.size - MAX_DIRTY_PATHS);
+    if (this.transferBackoff.size > MAX_MANIFEST_FILES) {
+      const oldest = [...this.transferBackoff.keys()].slice(0, this.transferBackoff.size - MAX_MANIFEST_FILES);
       for (const key of oldest) this.transferBackoff.delete(key);
     }
   }
@@ -1996,7 +1978,7 @@ export class NtfyLanSync {
       let rounds = 0;
       while (this.reconciliationDirtyPaths.size && rounds < 8 && this.now() - startedAt < SCAN_STALL_TIMEOUT_MS) {
         rounds += 1;
-        const changed = [...this.reconciliationDirtyPaths].slice(0, MAX_DIRTY_PATHS);
+        const changed = [...this.reconciliationDirtyPaths].slice(0, INCREMENTAL_PATH_BATCH_SIZE);
         for (const path of changed) this.reconciliationDirtyPaths.delete(path);
         await this.buildMetadataManifestForPaths(changed, includeConfigFolder);
       }
@@ -2055,7 +2037,7 @@ export class NtfyLanSync {
       const checkpointAt = Number(parsed.checkpointAt);
       if (Number.isFinite(checkpointAt) && checkpointAt > 0) this.lastSyncCheckpointAt = checkpointAt;
       const restored = new Map<string, number>();
-      for (const item of parsed.entries.slice(-MAX_DIRTY_PATHS)) {
+      for (const item of parsed.entries.slice(-MAX_MANIFEST_FILES)) {
         if (!Array.isArray(item) || item.length !== 2) continue;
         const path = this.normalizePath(item[0]);
         const generation = Number(item[1]);
@@ -2064,15 +2046,6 @@ export class NtfyLanSync {
       }
       this.dirtyPaths = restored;
       this.dirtySequence = Math.max(Number.isSafeInteger(Number(parsed.sequence)) ? Number(parsed.sequence) : 0, ...restored.values(), 0);
-      // A journal persisted at the wire limit may already be truncated from a
-      // previous process. Treat it as an incomplete change set and request one
-      // stable full reconciliation instead of repeatedly exchanging the same
-      // 4096-entry tail forever.
-      if (parsed.entries.length >= MAX_DIRTY_PATHS) {
-        this.fullSyncRequested = true;
-        this.fullSyncRequestId = randomId(18);
-        this.forceFilesystemScanRequested = true;
-      }
     } catch {
       this.dirtyPaths.clear();
       this.dirtySequence = 0;
@@ -2085,11 +2058,7 @@ export class NtfyLanSync {
     try {
       const since = Math.max(0, this.lastSyncCheckpointAt - CHECKPOINT_MTIME_OVERLAP_MS);
       const changed = await this.options.storage.listFilesChangedSince(since, this.settings().syncConfigFolder);
-      for (const file of changed.slice(0, MAX_DIRTY_PATHS)) this.markDirtyPath(file.path, QUEUED_SYNC_DELAY_MS);
-      if (changed.length > MAX_DIRTY_PATHS) {
-        this.fullSyncRequested = true;
-        this.fullSyncRequestId = randomId(18);
-      }
+      for (const file of changed.slice(0, MAX_MANIFEST_FILES)) this.markDirtyPath(file.path, QUEUED_SYNC_DELAY_MS);
     } catch {
       this.lastFullScanAt = 0;
       // A failed checkpoint read deliberately falls back to one full reconciliation.
@@ -2110,7 +2079,7 @@ export class NtfyLanSync {
         schemaVersion: 1,
         checkpointAt: this.lastSyncCheckpointAt,
         sequence: this.dirtySequence,
-        entries: [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS)
+        entries: [...this.dirtyPaths.entries()].slice(-MAX_MANIFEST_FILES)
       }));
     } catch {
       // A failed persistence write only loses restart acceleration, not the current in-memory queue.
@@ -2973,7 +2942,7 @@ export class NtfyLanSync {
 
   private parseDirtyPaths(value: unknown): Map<string, number> {
     const paths = new Map<string, number>();
-    if (!Array.isArray(value) || value.length > MAX_DIRTY_PATHS) return paths;
+    if (!Array.isArray(value) || value.length > MAX_MANIFEST_FILES) return paths;
     for (const item of value) {
       if (!isRecord(item)) continue;
       const path = this.normalizePath(item.path, true);
@@ -3092,9 +3061,15 @@ export class NtfyLanSync {
       : "";
     const requested = Boolean(requestId && requestId !== peer.lastRemoteSyncRequestId);
     if (requestId) peer.lastRemoteSyncRequestId = requestId;
-    peer.remoteFullSyncRequestId = typeof payload.fullSyncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.fullSyncRequestId)
+    const remoteFullSyncRequestId = typeof payload.fullSyncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.fullSyncRequestId)
       ? payload.fullSyncRequestId
       : "";
+    // Rolling-upgrade compatibility: old peers may keep broadcasting a stale
+    // full request after an interrupted scan. Once this peer already has a
+    // successful ledger, consume only its real dirty paths and never let that
+    // stale request restart a whole-vault scan.
+    const hasPeerBaseline = Object.keys(this.loadMetadataLedger(peer.deviceId).entries).length > 0;
+    peer.remoteFullSyncRequestId = hasPeerBaseline ? "" : remoteFullSyncRequestId;
     peer.remoteForceFilesystemScan = Boolean(peer.remoteFullSyncRequestId && payload.forceFilesystemScan === true);
     peer.remoteDirtyPaths = this.parseDirtyPaths(payload.dirtyPaths);
     const remoteProgress = this.parseRemoteProgress(payload.progress);
@@ -3281,7 +3256,7 @@ export class NtfyLanSync {
     if (!this.runningValue || !this.syncTargets().length) return;
     if (!force && !this.settings().autoDiscovery) return;
     if (force) this.syncForced = true;
-    if (this.syncRunning) {
+    if (this.syncRunning || this.activeEditSyncRunning) {
       this.syncQueued = true;
       return;
     }
@@ -3306,16 +3281,32 @@ export class NtfyLanSync {
     this.syncForced = false;
     // Keep one transfer session per peer, but let the active lane run while a
     // background filesystem reconciliation is merely enumerating.
-    if (!this.runningValue || this.syncRunning || this.activeEditSyncRunning || !this.isCoordinator()) return;
+    if (!this.runningValue || !this.isCoordinator()) return;
+    if (this.syncRunning || this.activeEditSyncRunning) {
+      this.syncQueued = true;
+      return;
+    }
     if (this.fullSyncOnlyPending && this.backgroundReconciliation) return;
     const peers = this.syncTargets();
     if (!peers.length) return;
-    const localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation ? this.fullSyncRequestId : "";
-    // Background reconciliation does not gate the known dirty-path lane.
-    // Explicit strict/manual scans still serialize their full manifest.
-    const localDirty = localFullSyncRequestId
-      ? new Map(this.dirtyPaths)
-      : new Map([...this.dirtyPaths.entries()].slice(-INCREMENTAL_PATH_BATCH_SIZE));
+    const hasRemoteDirty = peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0);
+    const hasIncrementalWork = this.dirtyPaths.size > 0 || hasRemoteDirty;
+    // A real changed path always outranks reconciliation. Even a full request
+    // already advertised by either side waits until all discovered paths have
+    // drained through bounded transfer batches.
+    const localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation && !hasIncrementalWork
+      ? this.fullSyncRequestId
+      : "";
+    const localDirty = new Map<string, number>();
+    for (const path of this.activeEditDirty) {
+      const generation = this.dirtyPaths.get(path);
+      if (generation !== undefined) localDirty.set(path, generation);
+      if (localDirty.size >= INCREMENTAL_PATH_BATCH_SIZE) break;
+    }
+    for (const [path, generation] of this.dirtyPaths) {
+      if (!localDirty.has(path)) localDirty.set(path, generation);
+      if (localDirty.size >= INCREMENTAL_PATH_BATCH_SIZE) break;
+    }
     // A manual full sync is serialized: no incremental session is opened until
     // the local full manifest has finished and the same full request is ready
     // to be exchanged with the peer.
@@ -3325,8 +3316,8 @@ export class NtfyLanSync {
       && this.localFilesystemScanCompletedRequestId !== localFullSyncRequestId
     );
     let remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
-    const urgentPaths = new Set(this.urgentDirtyPaths);
-    this.urgentDirtyPaths.clear();
+    const urgentPaths = new Set([...localDirty.keys()].filter((path) => this.urgentDirtyPaths.has(path)));
+    for (const path of urgentPaths) this.urgentDirtyPaths.delete(path);
     this.syncRunning = true;
     this.syncStartedAt = this.now();
     try {
@@ -3336,7 +3327,7 @@ export class NtfyLanSync {
       // This keeps the full-vault guarantee without making the phone sit idle
       // until the desktop finishes a 16k-path scan.
       let settledAcrossPeers: Set<string> | null = null;
-      let fullSyncCompletedEverywhere = Boolean(localFullSyncRequestId);
+      let fullSyncCompletedEverywhere = Boolean(localFullSyncRequestId || peers.some((peer) => Boolean(peer.remoteFullSyncRequestId)));
       let synchronizedPeers = 0;
       for (const peer of peers) {
         if (!this.runningValue) break;
@@ -3354,7 +3345,7 @@ export class NtfyLanSync {
           const generation = localDirty.get(path);
           if (generation !== undefined && (this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
         }
-        if (localFullSyncRequestId && fullSyncCompletedEverywhere && this.fullSyncRequestId === localFullSyncRequestId) {
+        if (fullSyncCompletedEverywhere && this.fullSyncRequested && (!localFullSyncRequestId || this.fullSyncRequestId === localFullSyncRequestId)) {
           this.fullSyncRequested = false;
           this.forceFilesystemScanRequested = false;
           this.localFilesystemScanCompletedRequestId = "";
@@ -3381,7 +3372,13 @@ export class NtfyLanSync {
       // further 750ms behind the generic queue delay. Only genuinely new edits
       // take the fast lane, so a permanently deferred path cannot spin.
       const hasUrgentWork = this.urgentDirtyPaths.size > 0;
-      if (this.syncQueued || hasUrgentWork || this.dirtyPaths.size > 0 || peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0)) {
+      if (
+        this.syncQueued
+        || hasUrgentWork
+        || this.dirtyPaths.size > 0
+        || this.fullSyncRequested
+        || peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0 || Boolean(peer.remoteFullSyncRequestId))
+      ) {
         this.syncQueued = false;
         this.scheduleSync(hasUrgentWork || this.dirtyPaths.size > 0 ? URGENT_SYNC_DELAY_MS : QUEUED_SYNC_DELAY_MS, true);
       }
@@ -3475,7 +3472,16 @@ export class NtfyLanSync {
       // (notifyActiveEdit) or by the bulk round's finally block, which avoids a
       // tight retry loop if a peer is temporarily unreachable.
       if (this.activeEditDirty.size) this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
-      if (!this.activeEditDirty.size && (this.syncQueued || this.urgentDirtyPaths.size || this.dirtyPaths.size)) {
+      if (
+        !this.activeEditDirty.size
+        && (
+          this.syncQueued
+          || this.urgentDirtyPaths.size
+          || this.dirtyPaths.size
+          || this.fullSyncRequested
+          || peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0 || Boolean(peer.remoteFullSyncRequestId))
+        )
+      ) {
         this.syncQueued = false;
         this.scheduleSync(URGENT_SYNC_DELAY_MS, true);
       }
@@ -3491,8 +3497,11 @@ export class NtfyLanSync {
     urgentPaths = new Set<string>()
   ): Promise<LanSyncPeerResult> {
     if (!this.metadataProtocol(peer)) throw new LanSyncProtocolError("peer_upgrade_required", 426);
-    const remoteDirty = new Map([...new Map(peer.remoteDirtyPaths ?? []).entries()].slice(-INCREMENTAL_PATH_BATCH_SIZE));
-    const remoteFullSyncRequestId = this.backgroundReconciliation ? "" : peer.remoteFullSyncRequestId ?? "";
+    const remoteDirty = new Map([...new Map(peer.remoteDirtyPaths ?? []).entries()].slice(0, INCREMENTAL_PATH_BATCH_SIZE));
+    const hasIncrementalWork = localDirty.size > 0 || remoteDirty.size > 0;
+    const remoteFullSyncRequestId = this.backgroundReconciliation || hasIncrementalWork
+      ? ""
+      : peer.remoteFullSyncRequestId ?? "";
     const fullSync = Boolean(localFullSyncRequestId || remoteFullSyncRequestId);
     const paths = new Set([...localDirty.keys(), ...remoteDirty.keys()]);
     if (!fullSync && !paths.size) return { settledLocalPaths: new Set(), fullSyncComplete: false };
@@ -4247,7 +4256,7 @@ export class NtfyLanSync {
     paths: string[],
     includeConfigFolder = this.settings().syncConfigFolder
   ): Promise<LanSyncMetadataEntry[]> {
-    const unique = [...new Set(paths)].slice(0, MAX_DIRTY_PATHS);
+    const unique = [...new Set(paths)].slice(0, MAX_MANIFEST_FILES);
     const scan: LanSyncScanActivity = {
       id: randomId(12),
       phase: "scanning",
@@ -4366,7 +4375,7 @@ export class NtfyLanSync {
   ): Promise<LanSyncMetadataEntry[]> {
     const dirtyEntries = [...this.dirtyPaths.entries()]
       .filter(([path, generation]) => generation > this.metadataIndexGeneration && this.normalizePath(path, includeConfigFolder) !== null)
-      .slice(0, MAX_DIRTY_PATHS);
+      .slice(0, MAX_MANIFEST_FILES);
     const dirty = dirtyEntries.map(([path]) => path);
     if (dirty.length) {
       await this.buildMetadataManifestForPaths(dirty, includeConfigFolder);
@@ -5082,7 +5091,7 @@ export class NtfyLanSync {
       } else if (metadataRoute === "/manifest/paths") {
         const policy = this.policy();
         const paths = Array.isArray(payload.paths) ? payload.paths.filter((value): value is string => typeof value === "string") : [];
-        if (paths.length > MAX_DIRTY_PATHS) throw new LanSyncProtocolError("too_many_dirty_paths", 413);
+        if (paths.length > MAX_MANIFEST_FILES) throw new LanSyncProtocolError("too_many_dirty_paths", 413);
         const files = await this.withInboundManifestScope(() => this.buildMetadataManifestForPaths(
           paths,
           policy.syncConfigFolder && payload.syncConfigFolder === true
@@ -5253,7 +5262,7 @@ export class NtfyLanSync {
       (Array.isArray(payload.retryPaths) ? payload.retryPaths : [])
         .map((path) => this.normalizePath(path, true))
         .filter((path): path is string => Boolean(path))
-        .slice(0, MAX_DIRTY_PATHS)
+        .slice(0, MAX_MANIFEST_FILES)
     );
     const acknowledgedDirtyPaths = this.parseDirtyPaths(payload.acknowledgedDirtyPaths);
     for (const [path, generation] of acknowledgedDirtyPaths) {

@@ -474,14 +474,14 @@ try {
   assert.equal(stabilityPeerEvents, 1, "Heartbeat timestamps should not rebuild the chat contact list");
   stabilityPeer.canHost = false;
   stabilityService.requestSync();
-  assert.equal(stabilityService.progress().stage, "requesting-peer-scan", "A local request did not expose that this device initiated synchronization");
+  assert.equal(stabilityService.progress().stage, "waiting-peer-scan", "An empty incremental wakeup pretended to start a full-vault scan");
   stabilityService.applyRemoteSyncSignal(stabilityPeer, {});
   stabilityClock += 3_000;
   stabilityService.emitPeerConnectionStage(stabilityPeer);
   assert.equal(stabilityService.progress().stage, "peer-upgrade-required", "An incompatible passive mobile peer stayed at an unexplained 0/0 state");
   stabilityService.applyRemoteSyncSignal(stabilityPeer, { capabilities: ["metadata-session-v3"] });
   stabilityService.emitPeerConnectionStage(stabilityPeer);
-  assert.equal(stabilityService.progress().stage, "requesting-peer-scan", "A compatible peer did not resume the locally initiated session stage");
+  assert.equal(stabilityService.progress().stage, "waiting-peer-scan", "A compatible peer incorrectly resumed a full-scan stage without discovered changes");
   assert.ok(stabilityProgress.some((value) => value.stage === "checking-peer" || value.stage === "peer-upgrade-required"), "Peer compatibility stages were not emitted");
   stabilityPeer.consecutiveFailures = 3;
   stabilityClock = 31_500;
@@ -530,18 +530,28 @@ try {
 
   const overflowPort = await freePort();
   const overflowDevice = "OVERFLOWJOURNAL123456";
-  const overflowService = new NtfyLanSync(commonOptions(
+  const overflowStore = memoryLocalStore(overflowDevice);
+  overflowStore.setItem(`ntfy.lan-sync.last-full-scan.v1.${identity.vaultId}`, String(Date.now()));
+  overflowStore.setItem(`ntfy.lan-sync.change-journal.v1.${identity.vaultId}`, JSON.stringify({
+    schemaVersion: 1,
+    checkpointAt: Date.now(),
+    sequence: 0,
+    entries: []
+  }));
+  const overflowOptions = commonOptions(
     new MemoryStorage(identity, {}),
     overflowPort,
     overflowDevice,
     [],
     { autoDiscovery: false }
-  ));
+  );
+  overflowOptions.localStore = overflowStore;
+  const overflowService = new NtfyLanSync(overflowOptions);
   await overflowService.start();
   for (let index = 0; index < 4_097; index += 1) overflowService.notifyVaultChange(`Overflow/f-${index}.md`);
-  assert.equal(overflowService.dirtyPaths.size, 4_096, "Overflow journal did not retain the bounded newest window");
-  assert.equal(overflowService.fullSyncRequested, true, "Overflow journal did not promote to a full reconciliation");
-  assert.ok(overflowService.forceFilesystemScanRequested, "Overflow journal did not require a filesystem scan");
+  assert.equal(overflowService.dirtyPaths.size, 4_097, "The change queue discarded real paths at an implementation limit");
+  assert.equal(overflowService.fullSyncRequested, false, "A large change queue incorrectly promoted itself to a blocking full scan");
+  assert.equal(overflowService.forceFilesystemScanRequested, false, "A large change queue incorrectly requested a filesystem scan");
   await overflowService.stop();
 
   // Manual strict sync must start both full filesystem walks concurrently.
@@ -717,7 +727,7 @@ try {
       await backgroundScanGate;
       return await originalListFilesA(...args);
     };
-    serviceA.requestSync();
+    serviceA.requestSync({ deep: true });
     await backgroundScanEntered;
     storageA.putText("Realtime/new-during-scan.md", "event lane", 625);
     serviceA.notifyVaultChange("Realtime/new-during-scan.md");
@@ -729,9 +739,24 @@ try {
     await waitFor(
       () => !serviceA.syncRunning && !serviceA.fullSyncRequested && serviceA.dirtyPaths.size === 0,
       "background reconciliation settlement"
-    );
+    ).catch((error) => {
+      throw new Error(`${error.message}; state=${JSON.stringify({
+        syncRunning: serviceA.syncRunning,
+        syncQueued: serviceA.syncQueued,
+        fullSyncRequested: serviceA.fullSyncRequested,
+        forceFilesystemScanRequested: serviceA.forceFilesystemScanRequested,
+        dirtyPaths: serviceA.dirtyPaths.size,
+        urgentDirtyPaths: serviceA.urgentDirtyPaths.size,
+        activeEditDirty: serviceA.activeEditDirty.size,
+        backgroundReconciliation: Boolean(serviceA.backgroundReconciliation),
+        inboundSession: Boolean(serviceA.inboundSession),
+        progress: serviceA.progress()
+      })}`);
+    });
 
     const negotiatedPeer = serviceA.peers.get(deviceB);
+    const serviceBSyncSignalPayload = serviceB.syncSignalPayload.bind(serviceB);
+    serviceB.syncSignalPayload = () => ({ ...serviceBSyncSignalPayload(), capabilities: ["metadata-session-v3"] });
     negotiatedPeer.capabilities = new Set(["metadata-session-v3"]);
     requestedRoutes.length = 0;
     storageA.putText("Notes/v3-compatible.md", "rolling upgrade", 650);
@@ -741,6 +766,7 @@ try {
     assert.equal(serviceA.listPeers()[0].compatible, true, "A v3 peer was treated as a blocking version conflict");
     assert.ok(requestedRoutes.includes("/cancip-lan/v1/metadata/v3/manifest/paths"), "A v3 peer did not use the negotiated compatibility route");
     assert.equal(requestedRoutes.some((route) => route.includes("/metadata/v4/")), false, "The v3 compatibility pass mixed protocol routes");
+    serviceB.syncSignalPayload = serviceBSyncSignalPayload;
 
     negotiatedPeer.capabilities = new Set(["metadata-session-v2"]);
     requestedRoutes.length = 0;
@@ -884,11 +910,11 @@ try {
     assert.equal(storageB.text(".obsidian/hotkeys.json"), null, "Config folder synced while disabled");
 
     optionsA.runtimeSettings.syncConfigFolder = true;
-    serviceA.requestSync();
+    serviceA.requestSync({ deep: true });
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
     assert.equal(storageB.text(".obsidian/hotkeys.json"), null, "Config folder synced before both peers enabled it");
     optionsB.runtimeSettings.syncConfigFolder = true;
-    serviceA.requestSync();
+    serviceA.requestSync({ deep: true });
     await waitFor(
       () => storageB.text(".obsidian/hotkeys.json") === "hotkeys from A"
         && storageB.text(".obsidian/plugins/example/data.json") === "other plugin data from A",
@@ -914,6 +940,7 @@ try {
 
     optionsA.runtimeSettings.mode = "delete-pull";
     storageB.files.delete("Notes/from-b.md");
+    serviceB.notifyVaultChange("Notes/from-b.md");
     serviceA.requestSync();
     await waitFor(() => storageA.text("Notes/from-b.md") === null, "deletion pull");
 
@@ -974,14 +1001,14 @@ try {
     }, "Receiving peer ledger was not the coordinator ledger inverse");
     const writesBeforeSteadyScan = roundedStorage.totalWrites();
     const readsBeforeSteadyScan = exactStorage.totalReads() + roundedStorage.totalReads();
-    const progressBeforeSteadyScan = exactProgress.length;
+    const exactEnumerationsBeforeIdleWakeup = exactStorage.listFilesCalls;
+    const roundedEnumerationsBeforeIdleWakeup = roundedStorage.listFilesCalls;
     exactService.requestSync();
-    await waitFor(() => exactProgress.slice(progressBeforeSteadyScan).some((value) => value.phase === "complete"), "steady-state full-vault calibration");
-    const steady = exactProgress.slice(progressBeforeSteadyScan).filter((value) => value.phase === "complete").at(-1);
-    assert.equal(steady.total, 0, "A just-synchronized Android-like Vault scheduled files again");
-    assert.equal(steady.bytesTotal, 0, "A just-synchronized Android-like Vault scheduled bytes again");
-    assert.equal(roundedStorage.totalWrites(), writesBeforeSteadyScan, "Steady-state calibration rewrote an unchanged file");
-    assert.equal(exactStorage.totalReads() + roundedStorage.totalReads(), readsBeforeSteadyScan, "Steady-state calibration reread unchanged file content");
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
+    assert.equal(roundedStorage.totalWrites(), writesBeforeSteadyScan, "An empty incremental wakeup rewrote an unchanged file");
+    assert.equal(exactStorage.totalReads() + roundedStorage.totalReads(), readsBeforeSteadyScan, "An empty incremental wakeup reread unchanged file content");
+    assert.equal(exactStorage.listFilesCalls, exactEnumerationsBeforeIdleWakeup, "An empty incremental wakeup enumerated the local Vault");
+    assert.equal(roundedStorage.listFilesCalls, roundedEnumerationsBeforeIdleWakeup, "An empty incremental wakeup enumerated the peer Vault");
   } finally {
     await Promise.all([exactService.stop(), roundedService.stop()]);
   }
@@ -1007,7 +1034,10 @@ try {
   const baselineStorageB = new MemoryStorage(identity, baselineFilesB);
   const baselineProgressA = [];
   const baselineProgressB = [];
-  const baselineOptionsB = commonOptions(baselineStorageB, baselinePortB, baselineDeviceB, baselineProgressB, { checkIntervalSeconds: 60 });
+  const baselineOptionsB = commonOptions(baselineStorageB, baselinePortB, baselineDeviceB, baselineProgressB, {
+    autoDiscovery: false,
+    checkIntervalSeconds: 60
+  });
   const baselineOptionsA = commonOptions(baselineStorageA, baselinePortA, baselineDeviceA, baselineProgressA, {
     autoDiscovery: false,
     manualPeers: [`127.0.0.1:${baselinePortB}`],
@@ -1020,7 +1050,7 @@ try {
     await baselineServiceA.start();
     await waitFor(() => baselineServiceA.status().peerCount === 1, "large baseline peer");
     const firstBaselineProgress = baselineProgressA.length;
-    baselineServiceA.requestSync();
+    baselineServiceA.requestSync({ deep: true });
     await waitFor(
       () => baselineProgressA.slice(firstBaselineProgress).some((value) => value.phase === "complete" && value.total === 3),
       "large Remotely Save baseline",
@@ -1045,22 +1075,39 @@ try {
     baselineStorageA.putText("Bulk/f-0001.bin", "edit-0001", 100_000_000);
     baselineStorageA.files.delete("Bulk/f-0002.bin");
     baselineStorageA.putText("Only-A/second.md", "second A", 100_000_001);
-    baselineStorageB.putText("Only-B/second.md", "second B", 100_000_002);
+    baselineServiceA.notifyVaultChange("Bulk/f-0001.bin");
+    baselineServiceA.notifyVaultChange("Bulk/f-0002.bin");
+    baselineServiceA.notifyVaultChange("Only-A/second.md");
     baselineServiceA.requestSync();
     await waitFor(
-      () => baselineProgressA.slice(beforeIncrementalProgress).some((value) => value.phase === "complete" && value.total === 4),
+      () => baselineStorageB.text("Bulk/f-0001.bin") === "edit-0001"
+        && baselineStorageB.text("Bulk/f-0002.bin") === null
+        && baselineStorageB.text("Only-A/second.md") === "second A"
+        && baselineServiceA.dirtyPaths.size === 0,
       "post-baseline real changes",
       30_000
     ).catch((error) => {
       const completed = baselineProgressA.slice(beforeIncrementalProgress).filter((value) => value.phase === "complete");
       throw new Error(`${error.message}; completions=${JSON.stringify(completed)}`);
     });
-    const incrementalBaseline = baselineProgressA.slice(beforeIncrementalProgress).filter((value) => value.phase === "complete").at(-1);
-    assert.equal(incrementalBaseline.total, 4, "Post-baseline scan scheduled unchanged files");
+    assert.equal(baselineServiceA.dirtyPaths.size, 0, "Post-baseline changes did not drain from the producer queue");
     assert.equal(baselineStorageB.text("Bulk/f-0001.bin"), "edit-0001", "A later same-size edit was not detected");
     assert.equal(baselineStorageB.text("Bulk/f-0002.bin"), null, "A later deletion was not propagated");
     assert.equal(baselineStorageB.text("Only-A/second.md"), "second A", "A later local file was not uploaded");
-    assert.equal(baselineStorageA.text("Only-B/second.md"), "second B", "A later remote file was not downloaded");
+    baselineOptionsA.runtimeSettings.mode = "bidirectional";
+    baselineStorageB.putText("Only-B/second.md", "second B", 100_000_002);
+    baselineServiceB.notifyVaultChange("Only-B/second.md");
+    await waitFor(() => baselineStorageA.text("Only-B/second.md") === "second B", "A later remote file was not downloaded in bidirectional mode").catch((error) => {
+      throw new Error(`${error.message}; state=${JSON.stringify({
+        aDirty: baselineServiceA.dirtyPaths.size,
+        bDirty: baselineServiceB.dirtyPaths.size,
+        aPeers: baselineServiceA.listPeers(),
+        bPeers: baselineServiceB.listPeers(),
+        aRemoteDirty: [...(baselineServiceA.peers.get(baselineDeviceB)?.remoteDirtyPaths ?? [])],
+        aProgress: baselineServiceA.progress(),
+        bProgress: baselineServiceB.progress()
+      })}`);
+    });
     assert.equal([...baselineStorageA.files.keys(), ...baselineStorageB.files.keys()].some((path) => path.includes("LAN conflict")), false, "Baseline reconciliation created a renamed conflict copy");
   } finally {
     await Promise.all([baselineServiceA.stop(), baselineServiceB.stop()]);
@@ -1078,7 +1125,7 @@ try {
   const mobileProgress = [];
   const desktopMessages = [];
   const mobileMessages = [];
-  const desktopOptions = commonOptions(desktopStorage, desktopPort, desktopDevice, desktopProgress);
+  const desktopOptions = commonOptions(desktopStorage, desktopPort, desktopDevice, desktopProgress, { autoDiscovery: false });
   desktopOptions.onMessage = (message) => desktopMessages.push(message);
   const desktopService = new NtfyLanSync(desktopOptions);
   const mobileOptions = commonOptions(mobileStorage, 43190, mobileDevice, mobileProgress, { autoDiscovery: false });
@@ -1108,7 +1155,15 @@ try {
     const beforeDesktopInitiatedProgress = desktopProgress.length;
     desktopService.requestSync();
     assert.ok(["requesting-peer-scan", "enumerating", "planning", "transferring"].includes(desktopService.progress().stage), "Desktop could not actively initiate a LAN synchronization session");
-    await waitFor(() => mobileStorage.text("Desktop/desktop-initiated.md") === "started on desktop", "desktop-initiated LAN synchronization");
+    await waitFor(() => mobileStorage.text("Desktop/desktop-initiated.md") === "started on desktop", "desktop-initiated LAN synchronization").catch((error) => {
+      throw new Error(`${error.message}; state=${JSON.stringify({
+        desktopDirty: [...desktopService.dirtyPaths],
+        mobileDirty: [...mobileService.dirtyPaths],
+        mobileRemoteDirty: [...(mobileService.peers.get(desktopDevice)?.remoteDirtyPaths ?? [])],
+        desktopProgress: desktopService.progress(),
+        mobileProgress: mobileService.progress()
+      })}`);
+    });
     assert.ok(desktopProgress.slice(beforeDesktopInitiatedProgress).some((value) => ["requesting-peer-scan", "enumerating", "planning", "transferring"].includes(value.stage)), "Desktop initiation exposed no active progress");
     mobileStorage.putText("Mobile/mobile-initiated.md", "started on mobile", 1400);
     mobileService.notifyVaultChange("Mobile/mobile-initiated.md");
@@ -1149,8 +1204,8 @@ try {
   assert.match(source, /class NtfyLanSyncDetailsModal extends Modal/, "LAN sync details modal is missing");
   assert.match(source, /renderScanSection\(body, scan, remote, scanGroups, chinese, progress, effectiveStage, stageDescriptions\)/, "LAN scan section is missing local/peer stage context");
   assert.match(source, /renderTransferSection\(body, progress, files, transferGroups, chinese, effectiveStage, stageDescriptions\)/, "LAN transfer section is missing stage context");
-   assert.match(source, /"requesting-peer-scan": "正在交换清单"/, "LAN details do not show manifest exchange");
-   assert.match(source, /"waiting-peer-scan": "正在等待清单"/, "LAN details do not explain the peer manifest wait stage");
+   assert.match(source, /"requesting-peer-scan": "正在交换变化清单"/, "LAN details do not show changed-path exchange");
+   assert.match(source, /"waiting-peer-scan": "等待新的变化文件"/, "LAN details do not explain the idle incremental wait stage");
    assert.doesNotMatch(source, /电脑和手机都可主动发起|Both devices may initiate/, "LAN details still show non-actionable initiator text");
   assert.match(source, /"peer-upgrade-required": "对端插件需要升级"/, "LAN details do not explain an incompatible peer");
   assert.match(source, /正在核对内容指纹/, "LAN details do not expose first-baseline fingerprinting");
@@ -1168,8 +1223,9 @@ try {
   assert.match(source, /下载/, "LAN transfer details do not label downloads");
   assert.match(source, /progress\.uploadCompleted[^\n]*progress\.uploads/, "LAN details do not show completed/total uploads");
   assert.match(source, /progress\.downloadCompleted[^\n]*progress\.downloads/, "LAN details do not show completed/total downloads");
-   assert.match(source, /title: chinese \? "全量扫描并同步" : "Full scan and sync"/, "LAN details do not identify the manual button as a full scan");
-   assert.match(source, /this\.lanSync\?\.requestSync\(\{ deep: true, strict: true \}\)/, "Manual sync button is not wired to a strict full scan");
+   assert.match(source, /title: chinese \? "立即同步已发现变化" : "Synchronize discovered changes now"/, "LAN details do not identify the manual button as an immediate queue wakeup");
+   assert.match(source, /this\.lanSync\?\.requestSync\(\)/, "Manual sync button still starts a blocking full scan");
+   assert.doesNotMatch(lanSource, /MAX_DIRTY_PATHS|4096/, "LAN runtime still contains the obsolete fixed dirty-path ceiling");
    assert.match(lanSource, /fullSyncOnlyPending/, "Manual full scan is not serialized before transfer");
    assert.match(lanSource, /if \(this\.fullSyncOnlyPending && this\.backgroundReconciliation\) return;/, "A manual full scan can still be bypassed by a background reconciliation");
    assert.doesNotMatch(lanSource, /if \(this\.fullSyncOnlyPending && \(this\.backgroundReconciliation \|\| this\.metadataManifestBuild\)\) return;/, "A completed shared manifest can still strand a manual sync before plan calculation");

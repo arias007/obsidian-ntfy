@@ -105,6 +105,18 @@
   height: 30px;
 }
 
+.obsidian-ntfy-lan-sync-now .lucide-loader-circle,
+.obsidian-ntfy-lan-details-summary-icon .lucide-loader-circle {
+  animation: obsidian-ntfy-lan-spin 0.7s linear infinite;
+  transform-origin: center;
+}
+
+@keyframes obsidian-ntfy-lan-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .obsidian-ntfy-lan-sync-now svg {
   width: 16px;
   height: 16px;
