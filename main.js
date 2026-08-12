@@ -2038,6 +2038,12 @@ ${bodyHash}`;
       }
       this.queueChangeJournalSave();
       this.syncRequestId = randomId(18);
+      this.announce();
+      if (urgent) {
+        const now = this.now();
+        const needsImmediateProbe = this.peers.size === 0 || [...this.peers.values()].some((peer) => peer.verifiedAt <= 0 || peer.capabilities.size === 0);
+        if (needsImmediateProbe) void this.probePeers(true);
+      }
       this.scheduleSync(delay, true);
     }
     requestSync(options = {}) {
@@ -3156,10 +3162,10 @@ ${bodyHash}`;
         error
       });
     }
-    async verifyPeer(peer) {
+    async verifyPeer(peer, force = false) {
       const now = this.now();
       const minimumProbeInterval = Math.max(300, PEER_PROBE_INTERVAL_MS - 100);
-      if (!this.runningValue || !peer.canHost || peer.probing || now - peer.lastProbeAt < minimumProbeInterval || !peer.addresses.size) return;
+      if (!this.runningValue || !peer.canHost || peer.probing || !force && now - peer.lastProbeAt < minimumProbeInterval || !peer.addresses.size) return;
       peer.probing = true;
       peer.lastProbeAt = now;
       const firstVerifiedConnection = peer.verifiedAt <= 0;
@@ -3205,11 +3211,11 @@ ${bodyHash}`;
         peer.probing = false;
       }
     }
-    async probePeers() {
+    async probePeers(force = false) {
       if (!this.runningValue) return;
       await this.refreshIdentityIfChanged();
       this.refreshManualPeers();
-      await Promise.all([...this.peers.values()].slice(0, 16).map(async (peer) => await this.verifyPeer(peer)));
+      await Promise.all([...this.peers.values()].slice(0, 16).map(async (peer) => await this.verifyPeer(peer, force)));
       this.emitPeersChanged();
     }
     activePeers() {
@@ -3262,8 +3268,8 @@ ${bodyHash}`;
       if (this.fullSyncOnlyPending && this.backgroundReconciliation) return;
       const peers = this.syncTargets();
       if (!peers.length) return;
+      const localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation ? this.fullSyncRequestId : "";
       const localDirty = new Map(this.dirtyPaths);
-      let localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation ? this.fullSyncRequestId : "";
       let localForceFilesystemScan = Boolean(
         localFullSyncRequestId && this.forceFilesystemScanRequested && this.localFilesystemScanCompletedRequestId !== localFullSyncRequestId
       );

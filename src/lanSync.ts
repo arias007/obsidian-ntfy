@@ -1835,6 +1835,13 @@ export class NtfyLanSync {
     }
     this.queueChangeJournalSave();
     this.syncRequestId = randomId(18);
+    this.announce();
+    if (urgent) {
+      const now = this.now();
+      const needsImmediateProbe = this.peers.size === 0
+        || [...this.peers.values()].some((peer) => peer.verifiedAt <= 0 || peer.capabilities.size === 0);
+      if (needsImmediateProbe) void this.probePeers(true);
+    }
     this.scheduleSync(delay, true);
   }
 
@@ -3153,10 +3160,10 @@ export class NtfyLanSync {
     });
   }
 
-  private async verifyPeer(peer: LanSyncPeer): Promise<void> {
+  private async verifyPeer(peer: LanSyncPeer, force = false): Promise<void> {
     const now = this.now();
     const minimumProbeInterval = Math.max(300, PEER_PROBE_INTERVAL_MS - 100);
-    if (!this.runningValue || !peer.canHost || peer.probing || now - peer.lastProbeAt < minimumProbeInterval || !peer.addresses.size) return;
+    if (!this.runningValue || !peer.canHost || peer.probing || (!force && now - peer.lastProbeAt < minimumProbeInterval) || !peer.addresses.size) return;
     peer.probing = true;
     peer.lastProbeAt = now;
     const firstVerifiedConnection = peer.verifiedAt <= 0;
@@ -3211,13 +3218,14 @@ export class NtfyLanSync {
     }
   }
 
-  private async probePeers(): Promise<void> {
+  private async probePeers(force = false): Promise<void> {
     if (!this.runningValue) return;
     await this.refreshIdentityIfChanged();
     this.refreshManualPeers();
-    await Promise.all([...this.peers.values()].slice(0, 16).map(async (peer) => await this.verifyPeer(peer)));
+    await Promise.all([...this.peers.values()].slice(0, 16).map(async (peer) => await this.verifyPeer(peer, force)));
     this.emitPeersChanged();
   }
+
 
   private activePeers(): LanSyncPeer[] {
     const now = this.now();
@@ -3279,17 +3287,19 @@ export class NtfyLanSync {
   private async syncActivePeers(): Promise<void> {
     const forced = this.syncForced;
     this.syncForced = false;
-    // Mutually exclusive with the active-edit lane: never run a bulk round and
-    // the single-file lane against the same peer at the same time.
+    // Keep one transfer session per peer, but let the active lane run while a
+    // background filesystem reconciliation is merely enumerating.
     if (!this.runningValue || this.syncRunning || this.activeEditSyncRunning || !this.isCoordinator()) return;
     if (this.fullSyncOnlyPending && this.backgroundReconciliation) return;
     const peers = this.syncTargets();
     if (!peers.length) return;
+    const localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation ? this.fullSyncRequestId : "";
+    // Background reconciliation does not gate the known dirty-path lane.
+    // Explicit strict/manual scans still serialize their full manifest.
     const localDirty = new Map(this.dirtyPaths);
     // A manual full sync is serialized: no incremental session is opened until
     // the local full manifest has finished and the same full request is ready
     // to be exchanged with the peer.
-    let localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation ? this.fullSyncRequestId : "";
     let localForceFilesystemScan = Boolean(
       localFullSyncRequestId
       && this.forceFilesystemScanRequested
