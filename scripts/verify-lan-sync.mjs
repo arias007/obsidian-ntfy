@@ -784,6 +784,16 @@ try {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 60));
     assert.equal(serviceB.dirtyPaths.has("Notes/identical.md"), false, "A LAN-applied write echoed back into the receiver dirty journal");
 
+    const burstPaths = Array.from({ length: 40 }, (_value, index) => `Burst/f-${String(index).padStart(2, "0")}.md`);
+    for (const [index, path] of burstPaths.entries()) {
+      storageA.putText(path, `burst-${index}`, 1_000 + index);
+      serviceA.notifyVaultChange(path);
+    }
+    await waitFor(() => storageB.text("Burst/f-00.md") === "burst-0", "first incremental burst batch");
+    assert.ok(serviceA.activity().scan.total <= 32, "Realtime burst scanned more than one bounded batch");
+    await waitFor(() => storageB.text("Burst/f-39.md") === "burst-39", "all incremental burst batches");
+    await waitFor(() => serviceA.dirtyPaths.size === 0 && serviceA.activeEditDirty.size === 0, "incremental burst journal settlement");
+
     const activeRouteStart = requestedRoutes.length;
     storageA.putText("Notes/active-fast-lane.md", "active lane", 805);
     serviceA.notifyActiveEdit("Notes/active-fast-lane.md");
@@ -1149,7 +1159,10 @@ try {
   assert.match(source, /本机扫描/, "LAN details do not identify the local scan counter");
   assert.match(source, /对端扫描/, "LAN details do not expose peer scan progress");
   assert.match(source, /const idleLabel = chinese/, "An idle scan does not derive a meaningful stage label");
-  assert.match(source, /同步：等待扫描结果/, "An idle transfer section does not explain what it is waiting for");
+  assert.match(source, /同步：发现文件即开始/, "The transfer section does not explain that discovered files start immediately");
+  assert.match(lanSource, /INCREMENTAL_PATH_BATCH_SIZE = 32/, "Dirty journal is not split into bounded realtime batches");
+  assert.match(lanSource, /this\.scheduleActiveEditSync\(REALTIME_DIRTY_DELAY_MS\)/, "Vault events do not enter the immediate transfer lane");
+  assert.match(lanSource, /remoteRequestedSync \|\| \(peer\.remoteDirtyPaths\?\.size \?\? 0\) > 0/, "Inbound mobile dirty signals do not immediately schedule synchronization");
   assert.doesNotMatch(source, /const label = `\$\{chinese \? "扫描" : "Scan"\} \$\{scan\.completed \|\| 0\}\/\$\{scan\.total \|\| 0\}`/, "LAN details still render an unexplained scan 0/0");
   assert.match(source, /上传/, "LAN transfer details do not label uploads");
   assert.match(source, /下载/, "LAN transfer details do not label downloads");

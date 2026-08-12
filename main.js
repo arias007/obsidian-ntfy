@@ -839,6 +839,7 @@ var NtfyLanSyncRuntime = (() => {
   var MAX_MESSAGE_TEXT_LENGTH = 32e3;
   var MAX_MESSAGE_ATTACHMENTS = 12;
   var MAX_DIRTY_PATHS = 4096;
+  var INCREMENTAL_PATH_BATCH_SIZE = 32;
   var MAX_QUEUED_MESSAGES_PER_PEER = 100;
   var MAX_PING_MESSAGES = 20;
   var OUTBOUND_MESSAGE_STORAGE_PREFIX = "ntfy.lan-message-outbox.v1";
@@ -2027,6 +2028,10 @@ ${bodyHash}`;
         if (this.urgentDirtyPaths.size > MAX_DIRTY_PATHS) {
           this.urgentDirtyPaths = new Set([...this.urgentDirtyPaths].slice(-MAX_DIRTY_PATHS));
         }
+        this.activeEditDirty.add(normalized);
+        if (this.activeEditDirty.size > MAX_DIRTY_PATHS) {
+          this.activeEditDirty = new Set([...this.activeEditDirty].slice(-MAX_DIRTY_PATHS));
+        }
       }
       if (this.backgroundReconciliation) this.reconciliationDirtyPaths.add(normalized);
       if (this.dirtyPaths.size > MAX_DIRTY_PATHS) {
@@ -2035,6 +2040,7 @@ ${bodyHash}`;
         this.forceFilesystemScanRequested = true;
         const newest = [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS);
         this.dirtyPaths = new Map(newest);
+        this.startBackgroundFilesystemReconciliation();
       }
       this.queueChangeJournalSave();
       this.syncRequestId = randomId(18);
@@ -2043,6 +2049,7 @@ ${bodyHash}`;
         const now = this.now();
         const needsImmediateProbe = this.peers.size === 0 || [...this.peers.values()].some((peer) => peer.verifiedAt <= 0 || peer.capabilities.size === 0);
         if (needsImmediateProbe) void this.probePeers(true);
+        this.scheduleActiveEditSync(REALTIME_DIRTY_DELAY_MS);
       }
       this.scheduleSync(delay, true);
     }
@@ -3001,7 +3008,17 @@ ${bodyHash}`;
       return { ok: true, acked: removed.map((message) => message.id) };
     }
     dirtySnapshot() {
-      return [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS).map(([path, generation]) => ({ path, generation }));
+      const selected = /* @__PURE__ */ new Map();
+      for (const path of this.urgentDirtyPaths) {
+        const generation = this.dirtyPaths.get(path);
+        if (generation !== void 0) selected.set(path, generation);
+        if (selected.size >= INCREMENTAL_PATH_BATCH_SIZE) break;
+      }
+      for (const [path, generation] of [...this.dirtyPaths.entries()].reverse()) {
+        if (selected.size >= INCREMENTAL_PATH_BATCH_SIZE) break;
+        if (!selected.has(path)) selected.set(path, generation);
+      }
+      return [...selected.entries()].map(([path, generation]) => ({ path, generation }));
     }
     parseDirtyPaths(value) {
       const paths = /* @__PURE__ */ new Map();
@@ -3269,7 +3286,7 @@ ${bodyHash}`;
       const peers = this.syncTargets();
       if (!peers.length) return;
       const localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation ? this.fullSyncRequestId : "";
-      const localDirty = new Map(this.dirtyPaths);
+      const localDirty = localFullSyncRequestId ? new Map(this.dirtyPaths) : new Map([...this.dirtyPaths.entries()].slice(-INCREMENTAL_PATH_BATCH_SIZE));
       let localForceFilesystemScan = Boolean(
         localFullSyncRequestId && this.forceFilesystemScanRequested && this.localFilesystemScanCompletedRequestId !== localFullSyncRequestId
       );
@@ -3320,9 +3337,9 @@ ${bodyHash}`;
         this.syncStartedAt = 0;
         this.currentTransferSessionId = "";
         const hasUrgentWork = this.urgentDirtyPaths.size > 0;
-        if (this.syncQueued || hasUrgentWork) {
+        if (this.syncQueued || hasUrgentWork || this.dirtyPaths.size > 0 || peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0)) {
           this.syncQueued = false;
-          this.scheduleSync(hasUrgentWork ? URGENT_SYNC_DELAY_MS : QUEUED_SYNC_DELAY_MS, true);
+          this.scheduleSync(hasUrgentWork || this.dirtyPaths.size > 0 ? URGENT_SYNC_DELAY_MS : QUEUED_SYNC_DELAY_MS, true);
         }
         if (this.activeEditDirty.size > 0) this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
       }
@@ -3346,7 +3363,7 @@ ${bodyHash}`;
     }
     async runActiveEditSync() {
       if (!this.runningValue || this.activeEditSyncRunning || this.syncRunning || !this.isCoordinator()) return;
-      const paths = [...this.activeEditDirty].filter((p) => this.dirtyPaths.has(p));
+      const paths = [...this.activeEditDirty].filter((path) => this.dirtyPaths.has(path)).slice(0, INCREMENTAL_PATH_BATCH_SIZE);
       if (!paths.length) {
         this.activeEditDirty.clear();
         return;
@@ -3381,10 +3398,10 @@ ${bodyHash}`;
           synchronizedPeers += 1;
         }
         if (synchronizedPeers === peers.length) {
+          for (const path of paths) this.activeEditDirty.delete(path);
           for (const path of settledAcrossPeers ?? []) {
             const generation = localDirty.get(path);
             if (generation !== void 0 && (this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
-            this.activeEditDirty.delete(path);
             this.urgentDirtyPaths.delete(path);
           }
           this.queueChangeJournalSave();
@@ -3396,7 +3413,8 @@ ${bodyHash}`;
         this.activeEditSyncRunning = false;
         this.activeEditStartedAt = 0;
         this.currentTransferSessionId = "";
-        if (this.syncQueued || this.urgentDirtyPaths.size || this.dirtyPaths.size) {
+        if (this.activeEditDirty.size) this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
+        if (!this.activeEditDirty.size && (this.syncQueued || this.urgentDirtyPaths.size || this.dirtyPaths.size)) {
           this.syncQueued = false;
           this.scheduleSync(URGENT_SYNC_DELAY_MS, true);
         }
@@ -3404,7 +3422,7 @@ ${bodyHash}`;
     }
     async syncPeer(peer, localDirty = new Map(this.dirtyPaths), localFullSyncRequestId = this.fullSyncRequested ? this.fullSyncRequestId : "", localForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested), remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested), urgentPaths = /* @__PURE__ */ new Set()) {
       if (!this.metadataProtocol(peer)) throw new LanSyncProtocolError("peer_upgrade_required", 426);
-      const remoteDirty = new Map(peer.remoteDirtyPaths ?? []);
+      const remoteDirty = new Map([...new Map(peer.remoteDirtyPaths ?? []).entries()].slice(-INCREMENTAL_PATH_BATCH_SIZE));
       const remoteFullSyncRequestId = this.backgroundReconciliation ? "" : peer.remoteFullSyncRequestId ?? "";
       const fullSync = Boolean(localFullSyncRequestId || remoteFullSyncRequestId);
       const paths = /* @__PURE__ */ new Set([...localDirty.keys(), ...remoteDirty.keys()]);
@@ -4080,6 +4098,7 @@ ${bodyHash}`;
         phase: "scanning",
         completed: 0,
         total: unique.length,
+        totalKnown: false,
         cached: 0,
         hashed: 0,
         skipped: 0,
@@ -4209,6 +4228,7 @@ ${bodyHash}`;
         phase: "scanning",
         completed: skipped,
         total: scanFiles.length,
+        totalKnown: !this.backgroundReconciliation,
         cached: 0,
         hashed: 0,
         skipped,
@@ -4228,8 +4248,14 @@ ${bodyHash}`;
       report(true);
       try {
         const entries = [];
+        const seenPaths = /* @__PURE__ */ new Set();
         for (let index = 0; index < candidates.length; index += 1) {
           const file = candidates[index];
+          seenPaths.add(file.path);
+          const previous = this.metadataIndex.get(file.path);
+          if (this.backgroundReconciliation && (!previous || previous.size !== file.size || previous.mtime !== file.mtime)) {
+            this.markDirtyPath(file.path, REALTIME_DIRTY_DELAY_MS, true);
+          }
           const activity = scan.files[file.scanIndex];
           activity.state = "cached";
           activity.reason = "metadata";
@@ -4238,6 +4264,11 @@ ${bodyHash}`;
           entries.push({ path: file.path, size: file.size, mtime: file.mtime });
           report();
           if ((index + 1) % 256 === 0 && index + 1 < candidates.length) await yieldToLanEventLoop();
+        }
+        for (const path of this.metadataIndex.keys()) {
+          if (this.backgroundReconciliation && !seenPaths.has(path) && this.normalizePath(path, includeConfigFolder)) {
+            this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+          }
         }
         scan.phase = "complete";
         scan.completed = scan.total;
@@ -4740,8 +4771,9 @@ ${bodyHash}`;
         let result;
         if (path === `${API_PREFIX}/ping`) {
           const peer = this.peers.get(deviceId);
+          let remoteRequestedSync = false;
           if (peer) {
-            this.applyRemoteSyncSignal(peer, payload);
+            remoteRequestedSync = this.applyRemoteSyncSignal(peer, payload);
             this.emitPeerConnectionStage(peer);
           }
           result = {
@@ -4752,6 +4784,9 @@ ${bodyHash}`;
             messages: this.pendingMessagesFor(deviceId),
             ...this.syncSignalPayload()
           };
+          if (peer && (remoteRequestedSync || (peer.remoteDirtyPaths?.size ?? 0) > 0)) {
+            this.scheduleSync(0, true);
+          }
         } else if (metadataRoute === "/manifest") {
           const policy = this.policy();
           const scanRequestIds = this.parseScanRequestIds(payload.scanRequestIds);
@@ -5235,8 +5270,10 @@ class NtfyLanSyncDetailsModal extends Modal {
     });
     stageProgress.title = chinese ? `阶段 ${stageSteps[effectiveStage] ?? 0}/6` : `Stage ${stageSteps[effectiveStage] ?? 0}/6`;
     const progressParts = [];
-    if (scan.total > 0) progressParts.push(`${chinese ? "本机扫描" : "Local scan"} ${scan.completed}/${scan.total}`);
-    if ((remote?.scanTotal || 0) > 0) progressParts.push(`${chinese ? "对端扫描" : "Peer scan"} ${remote.scanCompleted}/${remote.scanTotal}`);
+    if (scan.total > 0) progressParts.push(scan.totalKnown === false
+      ? `${chinese ? "本机已检查" : "Local checked"} ${scan.completed}`
+      : `${chinese ? "本机扫描" : "Local scan"} ${scan.completed}/${scan.total}`);
+    if ((remote?.scanTotal || 0) > 0) progressParts.push(`${chinese ? "对端已检查" : "Peer checked"} ${remote.scanCompleted}`);
     if (progress.total > 0) progressParts.push(`${chinese ? "同步" : "Sync"} ${progress.completed}/${progress.total}`);
     if (progress.uploads > 0 || progress.downloads > 0) {
       progressParts.push(chinese
@@ -5281,7 +5318,9 @@ class NtfyLanSyncDetailsModal extends Modal {
       ? (stage === "peer-upgrade-required" ? "等待升级" : stage === "checking-peer" ? "检查版本" : stage === "requesting-peer-scan" ? "交换清单" : stage === "waiting-peer-scan" ? "等待清单" : stage === "complete" ? "已完成" : "尚未开始")
       : (stage === "peer-upgrade-required" ? "Update required" : stage === "checking-peer" ? "Checking version" : stage === "requesting-peer-scan" ? "Exchanging manifests" : stage === "waiting-peer-scan" ? "Waiting for manifest" : stage === "complete" ? "Complete" : "Not started");
     const label = hasScanWork
-      ? `${chinese ? "本机扫描" : "Local scan"} ${scan.completed || 0}/${scan.total}`
+      ? (scan.totalKnown === false
+        ? `${chinese ? "本机已检查" : "Local checked"} ${scan.completed || 0}`
+        : `${chinese ? "本机扫描" : "Local scan"} ${scan.completed || 0}/${scan.total}`)
       : hasRemoteScanWork
         ? `${chinese ? "对端扫描" : "Peer scan"} ${remote.scanCompleted || 0}/${remote.scanTotal}`
         : `${chinese ? "扫描" : "Scan"}：${idleLabel}`;
@@ -5295,15 +5334,13 @@ class NtfyLanSyncDetailsModal extends Modal {
           : (stageDescriptions[stage] || "")) });
     if (!details.open) return;
     const panel = details.createDiv({ cls: "obsidian-ntfy-lan-details-section-body" });
-    if (hasScanWork) {
+    if (hasScanWork && scan.totalKnown !== false) {
       const scanProgress = panel.createEl("progress", { cls: "obsidian-ntfy-lan-details-progress", attr: { max: String(scan.total), value: String(Math.min(scan.completed || 0, scan.total)) } });
       scanProgress.setAttribute("aria-label", label);
     }
     if (hasRemoteScanWork) {
-      const remoteLabel = `${chinese ? "对端扫描" : "Peer scan"} ${remote.scanCompleted || 0}/${remote.scanTotal}`;
+      const remoteLabel = `${chinese ? "对端已检查" : "Peer checked"} ${remote.scanCompleted || 0}`;
       panel.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: remoteLabel });
-      const remoteProgress = panel.createEl("progress", { cls: "obsidian-ntfy-lan-details-progress", attr: { max: String(remote.scanTotal), value: String(Math.min(remote.scanCompleted || 0, remote.scanTotal)) } });
-      remoteProgress.setAttribute("aria-label", remoteLabel);
     }
     const scanFiles = Array.isArray(scan.files) ? scan.files : [];
     if (!groups.length) panel.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: stageDescriptions[stage] || (chinese ? "连接后自动开始全库扫描" : "A full-vault scan starts automatically after connection") });
@@ -5330,7 +5367,7 @@ class NtfyLanSyncDetailsModal extends Modal {
             ? (chinese ? "同步：正在计算计划" : "Sync: Planning transfers")
             : stage === "waiting-plan"
               ? (chinese ? "同步：等待共同计划" : "Sync: Waiting for shared plan")
-              : (chinese ? "同步：等待扫描结果" : "Sync: Waiting for scan results");
+              : (chinese ? "同步：发现文件即开始" : "Sync: Starts as files are found");
     summary.createSpan({ text: label });
     const directionSummary = chinese
       ? `上传 ${progress.uploadCompleted || 0}/${progress.uploads || 0} · 下载 ${progress.downloadCompleted || 0}/${progress.downloads || 0}`
@@ -6245,9 +6282,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (progress.phase === "syncing" && progress.total > 0) {
       return `${progress.completed}/${progress.total}`;
     }
-    if (scan?.phase === "scanning" && scan.total > 0) return `${scan.completed}/${scan.total}`;
+    if (scan?.phase === "scanning" && scan.total > 0) return scan.totalKnown === false ? `${scan.completed}` : `${scan.completed}/${scan.total}`;
     const remote = this.lanSync?.activity?.({ includeScanFiles: false, includeTransferFiles: false })?.remote;
-    if ((remote?.scanTotal || 0) > 0 && remote.scanCompleted < remote.scanTotal) return `${remote.scanCompleted}/${remote.scanTotal}`;
+    if ((remote?.scanTotal || 0) > 0 && remote.scanCompleted < remote.scanTotal) return `${remote.scanCompleted}`;
     if (progress.phase === "complete" && progress.total > 0) return `${progress.completed}/${progress.total}`;
     return "";
   }
