@@ -528,6 +528,22 @@ try {
   assert.equal(corruptJournalService.fullSyncRequested, true, "A corrupt durable journal suppressed the safety reconciliation");
   await corruptJournalService.stop();
 
+  const overflowPort = await freePort();
+  const overflowDevice = "OVERFLOWJOURNAL123456";
+  const overflowService = new NtfyLanSync(commonOptions(
+    new MemoryStorage(identity, {}),
+    overflowPort,
+    overflowDevice,
+    [],
+    { autoDiscovery: false }
+  ));
+  await overflowService.start();
+  for (let index = 0; index < 4_097; index += 1) overflowService.notifyVaultChange(`Overflow/f-${index}.md`);
+  assert.equal(overflowService.dirtyPaths.size, 4_096, "Overflow journal did not retain the bounded newest window");
+  assert.equal(overflowService.fullSyncRequested, true, "Overflow journal did not promote to a full reconciliation");
+  assert.ok(overflowService.forceFilesystemScanRequested, "Overflow journal did not require a filesystem scan");
+  await overflowService.stop();
+
   const optionsB = commonOptions(storageB, portB, deviceB, progressB);
   const optionsA = commonOptions(storageA, portA, deviceA, progressA, { autoDiscovery: false, manualPeers: [`127.0.0.1:${portB}`] });
   const messagesB = [];

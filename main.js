@@ -808,6 +808,7 @@ var NtfyLanSyncRuntime = (() => {
   var MANIFEST_TIMEOUT_MS = 10 * 6e4;
   var PATH_MANIFEST_TIMEOUT_MS = 9e4;
   var SESSION_TIMEOUT_MS = 12e4;
+  var STALE_SESSION_RESUME_MS = 5e3;
   var SYNC_WATCHDOG_MS = 15 * 6e4;
   var SCAN_STALL_TIMEOUT_MS = 9e4;
   var TRANSFER_RETRY_LIMIT = 2;
@@ -818,7 +819,7 @@ var NtfyLanSyncRuntime = (() => {
   var CHECKPOINT_MTIME_OVERLAP_MS = 2e3;
   var BACKGROUND_FULL_RESCAN_INTERVAL_MS = 24 * 60 * 6e4;
   var METADATA_INDEX_SAVE_DELAY_MS = 2e3;
-  var APPLIED_MUTATION_EVENT_TTL_MS = 3e3;
+  var APPLIED_MUTATION_EVENT_TTL_MS = 30 * 6e4;
   var HASH_CONCURRENCY = 12;
   var LARGE_TRANSFER_CONCURRENCY = 6;
   var MEDIUM_TRANSFER_CONCURRENCY = 8;
@@ -1999,6 +2000,9 @@ ${bodyHash}`;
       }
       if (this.backgroundReconciliation) this.reconciliationDirtyPaths.add(normalized);
       if (this.dirtyPaths.size > MAX_DIRTY_PATHS) {
+        this.fullSyncRequested = true;
+        if (!this.fullSyncRequestId) this.fullSyncRequestId = randomId(18);
+        this.forceFilesystemScanRequested = true;
         const newest = [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS);
         this.dirtyPaths = new Map(newest);
       }
@@ -2163,6 +2167,11 @@ ${bodyHash}`;
         }
         this.dirtyPaths = restored;
         this.dirtySequence = Math.max(Number.isSafeInteger(Number(parsed.sequence)) ? Number(parsed.sequence) : 0, ...restored.values(), 0);
+        if (parsed.entries.length >= MAX_DIRTY_PATHS) {
+          this.fullSyncRequested = true;
+          this.fullSyncRequestId = randomId(18);
+          this.forceFilesystemScanRequested = true;
+        }
       } catch {
         this.dirtyPaths.clear();
         this.dirtySequence = 0;
@@ -3484,9 +3493,9 @@ ${bodyHash}`;
         size: transferSize(action)
       }));
       this.activityUpdatedAt = this.now();
-      const sessionId = randomId(18);
+      let sessionId = randomId(18);
       this.currentTransferSessionId = sessionId;
-      await this.callPeer(peer, this.metadataRoute(peer, "/session/start"), {
+      const sessionStart = await this.callPeer(peer, this.metadataRoute(peer, "/session/start"), {
         sessionId,
         total: actions.length,
         bytesTotal,
@@ -3494,6 +3503,10 @@ ${bodyHash}`;
         downloads,
         files: this.activityFiles.map((file) => ({ path: file.path, action: file.action, size: file.size }))
       }, SESSION_TIMEOUT_MS);
+      if (typeof sessionStart.sessionId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(sessionStart.sessionId)) {
+        sessionId = sessionStart.sessionId;
+        this.currentTransferSessionId = sessionId;
+      }
       let completed = 0;
       let uploadCompleted = 0;
       let downloadCompleted = 0;
@@ -4757,6 +4770,11 @@ ${bodyHash}`;
         if (this.inboundSession.id === sessionId && this.inboundSession.deviceId === deviceId && this.inboundSession.planKey === planKey) {
           this.inboundSession.updatedAt = this.now();
           return { ok: true, sessionId, resumed: true };
+        }
+        if (this.inboundSession.deviceId === deviceId && this.inboundSession.planKey === planKey && this.now() - this.inboundSession.updatedAt >= STALE_SESSION_RESUME_MS) {
+          this.inboundSession.updatedAt = this.now();
+          this.currentTransferSessionId = this.inboundSession.id;
+          return { ok: true, sessionId: this.inboundSession.id, resumed: true };
         }
         throw new LanSyncProtocolError("sync_session_busy", 409);
       }

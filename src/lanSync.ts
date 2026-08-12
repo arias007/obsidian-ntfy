@@ -384,6 +384,7 @@ const ACTIVE_EDIT_POLL_MS = SYNC_MIN_INTERVAL_MS;
 const MANIFEST_TIMEOUT_MS = 10 * 60_000;
 const PATH_MANIFEST_TIMEOUT_MS = 90_000;
 const SESSION_TIMEOUT_MS = 120_000;
+const STALE_SESSION_RESUME_MS = 5_000;
 const SYNC_WATCHDOG_MS = 15 * 60_000;
 const SCAN_STALL_TIMEOUT_MS = 90_000;
 const TRANSFER_RETRY_LIMIT = 2;
@@ -394,7 +395,13 @@ const CHANGE_JOURNAL_SAVE_DELAY_MS = 400;
 const CHECKPOINT_MTIME_OVERLAP_MS = 2_000;
 const BACKGROUND_FULL_RESCAN_INTERVAL_MS = 24 * 60 * 60_000;
 const METADATA_INDEX_SAVE_DELAY_MS = 2_000;
-const APPLIED_MUTATION_EVENT_TTL_MS = 3_000;
+// Obsidian can deliver modify/raw events well after the underlying write has
+// completed, especially when a large batch is being applied on mobile. A
+// three-second token expired while the batch was still draining and turned
+// every LAN write into a new dirty path, which eventually pinned the queue at
+// MAX_DIRTY_PATHS. Keep the expected snapshot long enough for the whole batch
+// and let the size bound/expiry cleanup keep memory finite.
+const APPLIED_MUTATION_EVENT_TTL_MS = 30 * 60_000;
 const HASH_CONCURRENCY = 12;
 const LARGE_TRANSFER_CONCURRENCY = 6;
 const MEDIUM_TRANSFER_CONCURRENCY = 8;
@@ -1767,9 +1774,14 @@ export class NtfyLanSync {
     }
     if (this.backgroundReconciliation) this.reconciliationDirtyPaths.add(normalized);
     if (this.dirtyPaths.size > MAX_DIRTY_PATHS) {
-      // Bound memory only: keep the newest dirty paths and let the incremental
-      // scanner drain them round by round. No whole-vault walk is triggered here
-      // anymore - a full reconciliation is explicit only (requestSync({deep:true})).
+      // Never silently discard the oldest paths. Once the journal is larger
+      // than the wire limit, promote the next pass to one full reconciliation
+      // so deletes/renames and paths outside the retained window are still
+      // compared. The request ID stays stable across retries, preventing the
+      // peer from repeating the same filesystem walk.
+      this.fullSyncRequested = true;
+      if (!this.fullSyncRequestId) this.fullSyncRequestId = randomId(18);
+      this.forceFilesystemScanRequested = true;
       const newest = [...this.dirtyPaths.entries()].slice(-MAX_DIRTY_PATHS);
       this.dirtyPaths = new Map(newest);
     }
@@ -1978,6 +1990,15 @@ export class NtfyLanSync {
       }
       this.dirtyPaths = restored;
       this.dirtySequence = Math.max(Number.isSafeInteger(Number(parsed.sequence)) ? Number(parsed.sequence) : 0, ...restored.values(), 0);
+      // A journal persisted at the wire limit may already be truncated from a
+      // previous process. Treat it as an incomplete change set and request one
+      // stable full reconciliation instead of repeatedly exchanging the same
+      // 4096-entry tail forever.
+      if (parsed.entries.length >= MAX_DIRTY_PATHS) {
+        this.fullSyncRequested = true;
+        this.fullSyncRequestId = randomId(18);
+        this.forceFilesystemScanRequested = true;
+      }
     } catch {
       this.dirtyPaths.clear();
       this.dirtySequence = 0;
@@ -3526,9 +3547,9 @@ export class NtfyLanSync {
       size: transferSize(action)
     }));
     this.activityUpdatedAt = this.now();
-    const sessionId = randomId(18);
+    let sessionId = randomId(18);
     this.currentTransferSessionId = sessionId;
-    await this.callPeer(peer, this.metadataRoute(peer, "/session/start"), {
+    const sessionStart = await this.callPeer(peer, this.metadataRoute(peer, "/session/start"), {
       sessionId,
       total: actions.length,
       bytesTotal,
@@ -3536,6 +3557,14 @@ export class NtfyLanSync {
       downloads,
       files: this.activityFiles.map((file) => ({ path: file.path, action: file.action, size: file.size }))
     }, SESSION_TIMEOUT_MS);
+    // The receiver may already own this exact plan after a request timeout.
+    // It returns the authoritative session ID so the coordinator can resume
+    // the existing transfer instead of opening a second session that waits
+    // forever behind the first one.
+    if (typeof sessionStart.sessionId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(sessionStart.sessionId)) {
+      sessionId = sessionStart.sessionId;
+      this.currentTransferSessionId = sessionId;
+    }
     let completed = 0;
     let uploadCompleted = 0;
     let downloadCompleted = 0;
@@ -4961,6 +4990,19 @@ export class NtfyLanSync {
       ) {
         this.inboundSession.updatedAt = this.now();
         return { ok: true, sessionId, resumed: true };
+      }
+      // If the coordinator lost the response to a start request, its retry
+      // carries the same immutable plan but a fresh request ID. Reclaim only
+      // after a short quiet period; an immediate different session remains a
+      // real conflict and is rejected instead of overwriting active work.
+      if (
+        this.inboundSession.deviceId === deviceId
+        && this.inboundSession.planKey === planKey
+        && this.now() - this.inboundSession.updatedAt >= STALE_SESSION_RESUME_MS
+      ) {
+        this.inboundSession.updatedAt = this.now();
+        this.currentTransferSessionId = this.inboundSession.id;
+        return { ok: true, sessionId: this.inboundSession.id, resumed: true };
       }
       throw new LanSyncProtocolError("sync_session_busy", 409);
     }
