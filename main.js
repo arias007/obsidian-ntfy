@@ -12626,6 +12626,19 @@ class NtfyManagerView extends ItemView {
         setIcon(status, statusIcon);
       }
       const messageActions = row.createDiv({ cls: "obsidian-ntfy-chat-message-actions" });
+      const copyableText = message.text || (message.attachments || []).map((attachment) => attachment.name).filter(Boolean).join(", ");
+      if (copyableText) this.iconButton(messageActions, "copy", this.uiText("复制消息", "Copy message"), "secondary", async () => {
+        try {
+          if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+            new Notice(this.uiText("当前设备没有可用的剪贴板接口。", "Clipboard API is unavailable on this device."));
+            return;
+          }
+          await navigator.clipboard.writeText(copyableText);
+          new Notice(this.uiText("消息已复制。", "Message copied."));
+        } catch (error) {
+          new Notice(`${PLUGIN_NAME}: ${error.message || error}`);
+        }
+      });
       if (message.status === "failed") this.iconButton(messageActions, "rotate-ccw", this.uiText("重试", "Retry"), "secondary", async () => {
         try {
           await this.plugin.sendConversationMessage(active.id, message.text, (message.attachments || []).map((attachment) => attachment.path).filter(Boolean));

@@ -1577,6 +1577,8 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
   -webkit-overflow-scrolling: touch;
   padding: 14px 16px;
   scrollbar-gutter: stable;
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .obsidian-ntfy-chat-date {
@@ -1621,6 +1623,8 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
   font-size: 13px;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .obsidian-ntfy-chat-message-meta {
