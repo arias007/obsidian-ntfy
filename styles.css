@@ -1580,7 +1580,6 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
   -webkit-user-select: text;
   user-select: text;
 }
-
 .obsidian-ntfy-chat-date {
   align-self: center;
   color: var(--text-faint);
@@ -1625,6 +1624,20 @@ button.obsidian-ntfy-lan-details-file-path:focus-visible {
   white-space: pre-wrap;
   -webkit-user-select: text;
   user-select: text;
+}
+
+/* All plugin text must be selectable/copyable (overrides Obsidian mobile's
+   inherited user-select:none on custom views and modals). */
+.obsidian-ntfy-manager,
+.obsidian-ntfy-manager *,
+.obsidian-ntfy-lan-details-modal,
+.obsidian-ntfy-lan-details-modal *,
+.obsidian-ntfy-reply-modal,
+.obsidian-ntfy-reply-modal *,
+.obsidian-ntfy-conversation-import-modal,
+.obsidian-ntfy-conversation-import-modal * {
+  -webkit-user-select: text !important;
+  user-select: text !important;
 }
 
 .obsidian-ntfy-chat-message-meta {
