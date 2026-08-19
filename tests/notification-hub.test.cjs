@@ -1312,7 +1312,6 @@ async function run() {
   );
 
   process.stdout.write("notification-hub tests passed\n");
-  process.exit(0);
 }
 
 run().catch((error) => {
