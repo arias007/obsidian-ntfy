@@ -674,6 +674,9 @@ const DEFAULT_SETTINGS = {
   lanSyncSyncConfigFolder: true,
   lanSyncPort: 43190,
   lanSyncMaxFileMb: 512,
+  lanSyncSharedSecret: "",
+  lanSyncLargeFileMode: "wormhole",
+  lanSyncWormholeCommand: "wormhole-cli",
   lanInboxRetentionHours: 168,
   incomingAttachmentFolder: ".trash/ntfy-inbox",
   incomingAttachmentSavedFolder: "附件/ntfy",
@@ -794,17 +797,19 @@ var NtfyLanSyncRuntime = (() => {
   var BOOTSTRAP_MTIME_TOLERANCE_MS = 2e3;
   var MULTICAST_ADDRESS = "239.255.67.19";
   var DISCOVERY_PORT = 43189;
-  var ANNOUNCE_INTERVAL_MS = 750;
-  var PEER_SWEEP_INTERVAL_MS = 350;
-  var PEER_PROBE_INTERVAL_MS = 900;
+  var ANNOUNCE_INTERVAL_MS = 5e3;
+  var PEER_SWEEP_INTERVAL_MS = 2e3;
+  var PEER_PROBE_INTERVAL_MS = 5e3;
   var PEER_MIN_STABLE_GRACE_MS = 3e4;
   var PEER_MAX_ADDRESS_HISTORY = 2;
   var REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 6e4;
-  var SYNC_MIN_INTERVAL_MS = 120;
+  var SYNC_MIN_INTERVAL_MS = 250;
   var QUEUED_SYNC_DELAY_MS = 750;
   var URGENT_SYNC_DELAY_MS = 60;
   var REALTIME_DIRTY_DELAY_MS = 30;
-  var ACTIVE_EDIT_SYNC_DELAY_MS = 20;
+  var ACTIVE_EDIT_SYNC_DELAY_MS = 180;
+  var ACTIVE_EDIT_MIN_INTERVAL_MS = 500;
+  var ACTIVE_EDIT_RETRY_MAX_MS = 3e4;
   var RECONNECT_REPROBE_DELAY_MS = 250;
   var MANIFEST_TIMEOUT_MS = 10 * 6e4;
   var PATH_MANIFEST_TIMEOUT_MS = 2e4;
@@ -840,9 +845,16 @@ var NtfyLanSyncRuntime = (() => {
   var MAX_MESSAGE_TEXT_LENGTH = 32e3;
   var MAX_MESSAGE_ATTACHMENTS = 12;
   var INCREMENTAL_PATH_BATCH_SIZE = 32;
+  var LOCAL_INTERFACE_CACHE_MS = 3e4;
+  var CRYPTO_KEY_CACHE_LIMIT = 4;
+  var PEER_PROBE_CONCURRENCY = 4;
   var MAX_QUEUED_MESSAGES_PER_PEER = 100;
   var MAX_PING_MESSAGES = 20;
   var OUTBOUND_MESSAGE_STORAGE_PREFIX = "ntfy.lan-message-outbox.v1";
+  function configuredLanSecret(settings, identity) {
+    const shared = typeof settings.sharedSecret === "string" ? settings.sharedSecret.trim() : "";
+    return shared || identity.secret;
+  }
   var LanSyncProtocolError = class extends Error {
     constructor(code, status = 400) {
       super(code);
@@ -1102,13 +1114,34 @@ var NtfyLanSyncRuntime = (() => {
     const bytes = typeof value === "string" ? utf8(value) : value instanceof Uint8Array ? value : new Uint8Array(value);
     return bytesToBase64Url(await cryptoApi().subtle.digest("SHA-256", arrayBuffer(bytes)));
   }
+  var aesKeyCache = /* @__PURE__ */ new Map();
+  var hmacKeyCache = /* @__PURE__ */ new Map();
+  function cacheCryptoKey(cache, secret, create) {
+    const existing = cache.get(secret);
+    if (existing) return existing;
+    const pending = create().catch((error) => {
+      cache.delete(secret);
+      throw error;
+    });
+    cache.set(secret, pending);
+    while (cache.size > CRYPTO_KEY_CACHE_LIMIT) {
+      const oldest = cache.keys().next().value;
+      if (oldest === void 0) break;
+      cache.delete(oldest);
+    }
+    return pending;
+  }
   async function aesKey(secret) {
-    const keyMaterial = await cryptoApi().subtle.digest("SHA-256", arrayBuffer(utf8(`cancip-lan-sync:aes:${secret}`)));
-    return await cryptoApi().subtle.importKey("raw", keyMaterial, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+    return await cacheCryptoKey(aesKeyCache, secret, async () => {
+      const keyMaterial = await cryptoApi().subtle.digest("SHA-256", arrayBuffer(utf8(`cancip-lan-sync:aes:${secret}`)));
+      return await cryptoApi().subtle.importKey("raw", keyMaterial, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+    });
   }
   async function hmacKey(secret) {
-    const keyMaterial = await cryptoApi().subtle.digest("SHA-256", arrayBuffer(utf8(`cancip-lan-sync:hmac:${secret}`)));
-    return await cryptoApi().subtle.importKey("raw", keyMaterial, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+    return await cacheCryptoKey(hmacKeyCache, secret, async () => {
+      const keyMaterial = await cryptoApi().subtle.digest("SHA-256", arrayBuffer(utf8(`cancip-lan-sync:hmac:${secret}`)));
+      return await cryptoApi().subtle.importKey("raw", keyMaterial, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+    });
   }
   async function encryptLanSyncPayload(secret, value) {
     const iv = new Uint8Array(12);
@@ -1601,7 +1634,13 @@ ${bodyHash}`;
     activeEditTimer = null;
     activeEditSyncRunning = false;
     activeEditStartedAt = 0;
+    lastActiveEditSyncAt = 0;
+    activeEditFailureStreak = 0;
+    activeEditRetryAt = 0;
     reconnectTimer = null;
+    probeRunning = false;
+    probeQueued = false;
+    lastSyncCycleAt = 0;
     transferBackoff = /* @__PURE__ */ new Map();
     syncRequestId = "";
     fullSyncRequestId = "";
@@ -1631,6 +1670,11 @@ ${bodyHash}`;
     activityUpdatedAt = 0;
     lastErrorValue = "";
     lastPeerFingerprint = "";
+    localInterfaceCache = null;
+    activeSecret() {
+      if (!this.identity) throw new Error("identity_unavailable");
+      return configuredLanSecret(this.settings(), this.identity);
+    }
     running() {
       return this.runningValue;
     }
@@ -1811,7 +1855,9 @@ ${bodyHash}`;
         port: this.boundPort,
         peerCount: this.activePeers().length,
         error: this.lastErrorValue,
-        desktop: this.options.desktop
+        desktop: this.options.desktop,
+        encrypted: true,
+        sharedSecretConfigured: Boolean(String(this.settings().sharedSecret || "").trim())
       };
     }
     async start() {
@@ -2081,6 +2127,13 @@ ${bodyHash}`;
     recoverFromStalledSync() {
       if (!this.runningValue) return;
       const now = this.now();
+      const fullSyncSettled = this.fullSyncRequested && !this.syncRunning && !this.backgroundReconciliation && !this.inboundSession && !this.currentTransferSessionId && this.dirtyPaths.size === 0 && this.localFilesystemScanCompletedRequestId === this.fullSyncRequestId && this.progressValue.phase === "complete" && now - this.progressUpdatedAt > 1e3 && !this.activePeers().some((peer) => Boolean(peer.remoteFullSyncRequestId));
+      if (fullSyncSettled) {
+        this.fullSyncRequested = false;
+        this.forceFilesystemScanRequested = false;
+        this.localFilesystemScanCompletedRequestId = "";
+        this.fullSyncOnlyPending = false;
+      }
       if (this.syncRunning && this.syncStartedAt > 0 && now - this.syncStartedAt > SYNC_WATCHDOG_MS) {
         this.syncRunning = false;
         this.syncStartedAt = 0;
@@ -2551,6 +2604,9 @@ ${bodyHash}`;
       return next;
     }
     localInterfaces() {
+      const cached = this.localInterfaceCache;
+      const now = this.now();
+      if (cached && cached.expiresAt > now) return cached.value;
       const os = nodeRequire("node:os") ?? nodeRequire("os");
       if (!os) return [];
       const interfaces = [];
@@ -2566,7 +2622,9 @@ ${bodyHash}`;
           });
         }
       }
-      return interfaces.sort((left, right) => left.address.localeCompare(right.address));
+      const value = interfaces.sort((left, right) => left.address.localeCompare(right.address));
+      this.localInterfaceCache = { expiresAt: now + LOCAL_INTERFACE_CACHE_MS, value };
+      return value;
     }
     localAddresses() {
       return [...new Set(this.localInterfaces().map((item) => item.address))];
@@ -3230,10 +3288,31 @@ ${bodyHash}`;
     }
     async probePeers(force = false) {
       if (!this.runningValue) return;
-      await this.refreshIdentityIfChanged();
-      this.refreshManualPeers();
-      await Promise.all([...this.peers.values()].slice(0, 16).map(async (peer) => await this.verifyPeer(peer, force)));
-      this.emitPeersChanged();
+      if (this.probeRunning) {
+        this.probeQueued = this.probeQueued || force;
+        return;
+      }
+      this.probeRunning = true;
+      let rerun = false;
+      try {
+        await this.refreshIdentityIfChanged();
+        this.refreshManualPeers();
+        const peers = [...this.peers.values()].slice(0, 16);
+        for (let index = 0; index < peers.length && this.runningValue; index += PEER_PROBE_CONCURRENCY) {
+          await Promise.all(peers.slice(index, index + PEER_PROBE_CONCURRENCY).map(async (peer) => await this.verifyPeer(peer, force)));
+        }
+        this.emitPeersChanged();
+      } finally {
+        this.probeRunning = false;
+        rerun = this.probeQueued;
+        this.probeQueued = false;
+      }
+      if (rerun && this.runningValue) {
+        this.reconnectTimer ??= setTimeout(() => {
+          this.reconnectTimer = null;
+          void this.probePeers(true);
+        }, PEER_PROBE_INTERVAL_MS);
+      }
     }
     activePeers() {
       const now = this.now();
@@ -3241,7 +3320,7 @@ ${bodyHash}`;
     }
     isPeerActive(peer, now = this.now()) {
       if (peer.verifiedAt <= 0) return false;
-      const stableGraceMs = Math.max(PEER_MIN_STABLE_GRACE_MS, PEER_PROBE_INTERVAL_MS * 12);
+      const stableGraceMs = PEER_MIN_STABLE_GRACE_MS;
       return now - peer.verifiedAt <= stableGraceMs;
     }
     sweepPeers() {
@@ -3286,6 +3365,11 @@ ${bodyHash}`;
         this.syncQueued = true;
         return;
       }
+      const cycleWait = this.lastSyncCycleAt + SYNC_MIN_INTERVAL_MS - this.now();
+      if (cycleWait > 0) {
+        this.scheduleSync(cycleWait, false);
+        return;
+      }
       if (this.fullSyncOnlyPending && this.backgroundReconciliation) return;
       const peers = this.syncTargets();
       if (!peers.length) return;
@@ -3309,6 +3393,7 @@ ${bodyHash}`;
       const urgentPaths = new Set([...localDirty.keys()].filter((path) => this.urgentDirtyPaths.has(path)));
       for (const path of urgentPaths) this.urgentDirtyPaths.delete(path);
       this.syncRunning = true;
+      this.lastSyncCycleAt = this.now();
       this.syncStartedAt = this.now();
       try {
         let settledAcrossPeers = null;
@@ -3370,11 +3455,13 @@ ${bodyHash}`;
       if (!this.runningValue || !this.activeEditDirty.size) return;
       if (!this.syncTargets().length) return;
       if (this.activeEditSyncRunning || this.syncRunning) return;
+      const retryWait = this.activeEditRetryAt - this.now();
+      const intervalWait = this.lastActiveEditSyncAt + ACTIVE_EDIT_MIN_INTERVAL_MS - this.now();
       if (this.activeEditTimer) clearTimeout(this.activeEditTimer);
       this.activeEditTimer = setTimeout(() => {
         this.activeEditTimer = null;
         void this.runActiveEditSync();
-      }, Math.max(0, delay));
+      }, Math.max(0, delay, retryWait, intervalWait));
     }
     async runActiveEditSync() {
       if (!this.runningValue || this.activeEditSyncRunning || !this.isCoordinator()) return;
@@ -3393,6 +3480,7 @@ ${bodyHash}`;
       let settledAcrossPeers = null;
       let synchronizedPeers = 0;
       this.activeEditSyncRunning = true;
+      this.lastActiveEditSyncAt = this.now();
       this.activeEditStartedAt = this.now();
       try {
         for (const peer of peers) {
@@ -3417,6 +3505,8 @@ ${bodyHash}`;
           synchronizedPeers += 1;
         }
         if (synchronizedPeers === peers.length) {
+          this.activeEditFailureStreak = 0;
+          this.activeEditRetryAt = 0;
           for (const path of paths) this.activeEditDirty.delete(path);
           for (const path of settledAcrossPeers ?? []) {
             const generation = localDirty.get(path);
@@ -3428,6 +3518,11 @@ ${bodyHash}`;
         }
       } catch (error) {
         this.lastErrorValue = safeErrorCode(error);
+        this.activeEditFailureStreak = Math.min(8, this.activeEditFailureStreak + 1);
+        this.activeEditRetryAt = this.now() + Math.min(
+          ACTIVE_EDIT_RETRY_MAX_MS,
+          ACTIVE_EDIT_SYNC_DELAY_MS * 2 ** this.activeEditFailureStreak
+        );
       } finally {
         this.activeEditSyncRunning = false;
         this.activeEditStartedAt = 0;
@@ -4701,8 +4796,9 @@ ${bodyHash}`;
     async callPeer(peer, route, payload, timeoutMs = 8e3) {
       if (!this.identity) throw new Error("identity_unavailable");
       const path = `${API_PREFIX}${route}`;
-      const body = await encryptLanSyncPayload(this.identity.secret, payload);
-      const headers = await authHeaders(this.identity, this.deviceId, "POST", path, body, this.now());
+      const secret = this.activeSecret();
+      const body = await encryptLanSyncPayload(secret, payload);
+      const headers = await authHeaders({ ...this.identity, secret }, this.deviceId, "POST", path, body, this.now());
       let lastError = null;
       for (const address of peer.addresses) {
         if (!isPrivateLanAddress(address)) continue;
@@ -4724,7 +4820,7 @@ ${bodyHash}`;
             }
             throw new LanSyncProtocolError(code, response.status);
           }
-          const decrypted = await decryptLanSyncPayload(this.identity.secret, response.text);
+          const decrypted = await decryptLanSyncPayload(secret, response.text);
           peer.verifiedAt = this.now();
           peer.consecutiveFailures = 0;
           peer.lastFailureAt = 0;
@@ -4766,8 +4862,9 @@ ${bodyHash}`;
           "x-cancip-nonce": headerValue(request, "x-cancip-nonce"),
           "x-cancip-signature": headerValue(request, "x-cancip-signature")
         };
+        const secret = this.activeSecret();
         const deviceId = await verifyLanSyncRequest({
-          secret: this.identity.secret,
+          secret,
           vaultId: this.identity.vaultId,
           method: request.method,
           path,
@@ -4779,7 +4876,7 @@ ${bodyHash}`;
         authenticated = true;
         const remoteAddress = normalizeRemoteAddress(request.socket.remoteAddress ?? "");
         if (!this.allowedByRateLimit(`${remoteAddress}:${deviceId}`)) throw new LanSyncProtocolError("rate_limited", 429);
-        const payload = await decryptLanSyncPayload(this.identity.secret, body);
+        const payload = await decryptLanSyncPayload(secret, body);
         const metadataProtocol = METADATA_PROTOCOLS.find((protocol) => path.startsWith(`${API_PREFIX}${protocol.routePrefix}/`));
         const metadataRoute = metadataProtocol ? path.slice(`${API_PREFIX}${metadataProtocol.routePrefix}`.length) : "";
         if (path === `${API_PREFIX}/manifest` || path === `${API_PREFIX}/file/read` || path === `${API_PREFIX}/file/write` || path === `${API_PREFIX}/file/delete` || path === `${API_PREFIX}/manifest/metadata` || path === `${API_PREFIX}/manifest/metadata/paths` || path === `${API_PREFIX}/metadata/session/start` || path === `${API_PREFIX}/metadata/session/finish` || path === `${API_PREFIX}/metadata/file/read` || path === `${API_PREFIX}/metadata/file/write` || path === `${API_PREFIX}/metadata/file/delete` || path.startsWith(`${API_PREFIX}/metadata/v2/`)) {
@@ -4874,7 +4971,7 @@ ${bodyHash}`;
           throw new LanSyncProtocolError("not_found", 404);
         }
         this.finishInboundFileActivity(deviceId, inboundActivityIndex, true);
-        const encryptedResult = await encryptLanSyncPayload(this.identity.secret, result);
+        const encryptedResult = await encryptLanSyncPayload(secret, result);
         sendText(response, 200, encryptedResult);
         if (metadataRoute === "/manifest") {
           this.emit({
@@ -5607,6 +5704,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     }
     if (!storedSettings?.agentProtocolToken || storedSettings?.lanSyncFullVaultDefaultsApplied !== true) await this.saveSettings();
     this.externalChannelAdapters = new Map();
+    this.registerLargeFileProvider({
+      id: "wormhole",
+      upload: (input) => this.runWormholeCli("upload", input),
+      download: (input) => this.runWormholeCli("download", input),
+    });
     this.incomingMessageHandlers = new Map();
     this.apiEventListeners = new Map();
     this.agentProtocolRequestTimes = [];
@@ -5989,6 +6091,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     settings.lanSyncSyncConfigFolder = settings.lanSyncSyncConfigFolder !== false;
     settings.lanSyncPort = Math.max(1024, Math.min(65527, this.safePositiveNumber(settings.lanSyncPort, DEFAULT_SETTINGS.lanSyncPort)));
     settings.lanSyncMaxFileMb = Math.max(1, Math.min(512, this.safePositiveNumber(settings.lanSyncMaxFileMb, DEFAULT_SETTINGS.lanSyncMaxFileMb)));
+    settings.lanSyncSharedSecret = String(settings.lanSyncSharedSecret || "").trim().slice(0, 512);
+    settings.lanSyncLargeFileMode = ["disabled", "ask", "wormhole"].includes(settings.lanSyncLargeFileMode) ? settings.lanSyncLargeFileMode : DEFAULT_SETTINGS.lanSyncLargeFileMode;
+    settings.lanSyncWormholeCommand = String(settings.lanSyncWormholeCommand || DEFAULT_SETTINGS.lanSyncWormholeCommand).trim().slice(0, 512);
     settings.lanInboxRetentionHours = Math.max(1, Math.min(2160, this.safePositiveNumber(settings.lanInboxRetentionHours, DEFAULT_SETTINGS.lanInboxRetentionHours)));
     settings.incomingAttachmentFolder = this.normalizeIncomingAttachmentFolder(settings.incomingAttachmentFolder || DEFAULT_SETTINGS.incomingAttachmentFolder);
     settings.incomingAttachmentSavedFolder = this.normalizeIncomingAttachmentFolder(settings.incomingAttachmentSavedFolder || DEFAULT_SETTINGS.incomingAttachmentSavedFolder, false);
@@ -6140,6 +6245,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         configDir,
         port: this.settings.lanSyncPort,
         maxFileBytes: this.settings.lanSyncMaxFileMb * 1024 * 1024,
+        sharedSecret: this.settings.lanSyncSharedSecret,
+        largeFileMode: this.settings.lanSyncLargeFileMode,
+        wormholeCommand: this.settings.lanSyncWormholeCommand,
         inboxRetentionHours: this.settings.incomingAttachmentRetentionHours,
         manualPeers: String(this.settings.lanSyncManualPeers || "").split(/[,;\n]/).map((value) => value.trim()).filter(Boolean),
       }),
@@ -6673,6 +6781,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       sendNow: (id) => this.sendQueueItemNow(id),
       scan: () => this.scanAndSchedule({ showNotice: false }),
     });
+    const largeFiles = Object.freeze({
+      providers: () => [...(this.largeFileProviders || new Map()).keys()],
+      registerProvider: (provider) => this.registerLargeFileProvider(provider),
+      policy: (size) => this.cloneApiValue(this.largeFileTransferPolicy(size)),
+    });
     const lan = Object.freeze({
       status: () => this.cloneApiValue(this.lanSyncStatus()),
       peers: () => this.cloneApiValue(this.lanSync?.listPeers?.() || []),
@@ -6757,6 +6870,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       channels,
       notifications,
       reminders,
+      largeFiles,
       lan,
       events,
       manager: Object.freeze({
@@ -7571,6 +7685,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         savedAt: String(attachment && attachment.savedAt || "").slice(0, 64),
         remotePath: String(attachment && attachment.remotePath || "").replace(/\\/g, "/").slice(0, 1024),
         downloadKind: String(attachment && attachment.downloadKind || "").slice(0, 64),
+        provider: String(attachment && attachment.provider || "").slice(0, 64),
         downloadKey: String(attachment && attachment.downloadKey || "").slice(0, 256),
         downloadMessageId: String(attachment && attachment.downloadMessageId || "").slice(0, 256),
         downloadResourceType: String(attachment && attachment.downloadResourceType || "").slice(0, 32),
@@ -7633,6 +7748,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     }
     if (contact.kind === "history") {
       return messages.filter((message) => message.conversationKey === contact.id);
+    }
+    if (contact.kind === "ntfy-peer") {
+      return messages.filter((message) => message.channelId === contact.channelId
+        && (String(message.sender || "") === String(contact.sender || "") || message.direction === "outgoing")
+        && String(message.conversationId || "") === String(contact.conversationId || ""));
     }
     const peerId = String(contact.deviceId || contact.conversationId || "").trim();
     return messages.filter((message) => {
@@ -7698,6 +7818,28 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         online: active && (channel.deliveryReady === true || ["connected", "poll"].includes(String(channel.connectionStatus || "").toLowerCase())),
         available: active,
         metadata: { imported: true, channelType: channel?.type || message.channelId },
+      });
+    }
+    for (const message of messages) {
+      if (message.channelId !== "ntfy" || message.metadata?.groupTopic !== true) continue;
+      const sender = String(message.sender || "").trim();
+      if (!sender || sender === "me") continue;
+      const peerKey = this.conversationKey("ntfy-peer", `${message.conversationId}:${sender}`);
+      if (contacts.has(peerKey)) continue;
+      const channel = channels.find((item) => item.id === message.channelId);
+      const active = Boolean(channel && this.conversationChannelIsActive(channel));
+      contacts.set(peerKey, {
+        id: peerKey,
+        kind: "ntfy-peer",
+        channelId: "ntfy",
+        conversationId: message.conversationId,
+        sender,
+        name: sender,
+        subtitle: `${channel?.name || "ntfy"} · 私信入口`,
+        icon: "user",
+        online: active,
+        available: active,
+        metadata: { channelType: "ntfy", groupTopic: message.conversationId, privateTarget: sender },
       });
     }
     const now = Date.now();
@@ -7898,6 +8040,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       const headers = {};
       if (sameNtfyOrigin && config.authToken) headers.Authorization = `Bearer ${String(config.authToken).trim()}`;
       response = await this.httpRequest({ url: normalizedUrl, method: "GET", headers, throw: true });
+    } else if (attachment.downloadKind === "wormhole" || attachment.provider === "wormhole") {
+      const provider = this.largeFileProvider("wormhole");
+      if (!provider || !attachment.url) throw new Error("wormhole_provider_unavailable");
+      const downloaded = await provider.download({ url: attachment.url, name: attachment.name, size: attachment.size, hash: attachment.hash });
+      return await this.writeIncomingAttachment(message, attachment, downloaded instanceof Uint8Array ? downloaded : new Uint8Array(downloaded));
     } else {
       throw new Error("This attachment provider does not have a verified background downloader.");
     }
@@ -7994,7 +8141,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const contact = this.conversationContacts().find((item) => item.id === contactId);
     if (!contact) throw new Error("Conversation is unavailable.");
     const content = String(text || "").trim().slice(0, 32000);
-    const inputs = (Array.isArray(filePaths) ? filePaths : []).slice(0, 12);
+    const inputs = Array.isArray(filePaths) ? filePaths : [];
     const fileEntries = [];
     const seenVaultPaths = new Set();
     for (const input of inputs) {
@@ -8031,6 +8178,29 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const id = this.hash(`${Date.now()}:${contact.id}:${content}:${fileEntries.map((entry) => `${entry.kind}:${entry.path || entry.name}:${entry.size}`).join("|")}`);
     const localAttachments = fileEntries.map((entry) => ({ name: entry.name, type: entry.type, size: entry.size, path: entry.path || "", url: "" }));
     this.validateIncomingAttachments({ channelId: contact.channelId, attachments: localAttachments });
+    if (contact.channelId !== "lan") {
+      for (let index = 0; index < fileEntries.length; index += 1) {
+        const entry = fileEntries[index];
+        if (entry.size <= 50 * 1024 * 1024) continue;
+        const policy = this.largeFileTransferPolicy(entry.size);
+        if (policy.mode !== "wormhole") throw new Error(policy.reason);
+        const provider = this.largeFileProvider("wormhole");
+        if (!provider) throw new Error("wormhole_provider_unavailable");
+        const data = entry.kind === "vault"
+          ? await this.app.vault.adapter.readBinary(entry.path)
+          : entry.file ? await entry.file.arrayBuffer() : entry.data;
+        const transfer = await provider.upload({ name: entry.name, type: entry.type, size: entry.size, data });
+        const url = String(transfer && transfer.url || "").trim();
+        if (!/^https:\/\/wormhole\.app\//i.test(url)) throw new Error("wormhole_upload_url_missing");
+        localAttachments[index] = Object.assign({}, localAttachments[index], {
+          url,
+          remoteOnly: true,
+          downloadKind: "wormhole",
+          provider: "wormhole",
+          hash: await hashLanSyncBytes(data),
+        });
+      }
+    }
     const message = this.recordConversationMessage({
       id,
       channelId: contact.channelId,
@@ -8078,7 +8248,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
           message: content || localAttachments.map((attachment) => attachment.name).join(", "),
           channelIds: [contact.channelId],
           attachments: localAttachments,
-          metadata: Object.assign({}, latestIncoming && latestIncoming.metadata || {}, contact.metadata || {}, { conversationId: contact.conversationId }),
+          metadata: Object.assign({}, latestIncoming && latestIncoming.metadata || {}, contact.metadata || {}, {
+            conversationId: contact.conversationId,
+            privateTarget: contact.kind === "ntfy-peer" ? contact.sender : "",
+            groupTopic: contact.kind === "ntfy-peer" ? contact.conversationId : "",
+          }),
           allowRuntimeTarget: true,
           allowRecentTarget: true,
         });
@@ -8113,6 +8287,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       savedAt: String(attachment && attachment.savedAt || "").slice(0, 64),
       remotePath: String(attachment && attachment.remotePath || "").replace(/\\/g, "/").slice(0, 1024),
       downloadKind: String(attachment && attachment.downloadKind || "").slice(0, 64),
+      provider: String(attachment && attachment.provider || "").slice(0, 64),
       downloadKey: String(attachment && attachment.downloadKey || "").slice(0, 256),
       downloadMessageId: String(attachment && attachment.downloadMessageId || "").slice(0, 256),
       downloadResourceType: String(attachment && attachment.downloadResourceType || "").slice(0, 32),
@@ -8174,8 +8349,91 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       ? Math.max(1, Number(this.settings.lanSyncMaxFileMb || 50))
       : Math.max(1, Number(this.settings.attachmentLimitMb || 8));
     const maxBytes = maxMb * 1024 * 1024;
-    const oversized = (message.attachments || []).find((attachment) => Number(attachment.size || 0) > maxBytes);
+    const oversized = (message.attachments || []).find((attachment) => {
+      const size = Number(attachment.size || 0);
+      if (size <= maxBytes) return false;
+      return !(size > 50 * 1024 * 1024 && attachment.provider === "wormhole" && this.settings.lanSyncLargeFileMode === "wormhole");
+    });
     if (oversized) throw new Error(`Attachment '${oversized.name}' exceeds ${maxMb} MB.`);
+  }
+
+  largeFileTransferPolicy(size) {
+    const bytes = Math.max(0, Number(size) || 0);
+    const threshold = 50 * 1024 * 1024;
+    if (bytes <= threshold) return { mode: "ntfy", threshold, requiresConfirmation: false };
+    const mode = ["disabled", "ask", "wormhole"].includes(this.settings.lanSyncLargeFileMode)
+      ? this.settings.lanSyncLargeFileMode
+      : "ask";
+    return {
+      mode: mode === "wormhole" ? "wormhole" : "blocked",
+      threshold,
+      requiresConfirmation: mode === "ask",
+      command: String(this.settings.lanSyncWormholeCommand || "").trim(),
+      reason: mode === "disabled" ? "large_file_transfer_disabled" : mode === "ask" ? "large_file_confirmation_required" : "wormhole_cli_required",
+    };
+  }
+
+  registerLargeFileProvider(provider) {
+    if (!this.largeFileProviders) this.largeFileProviders = new Map();
+    const id = String(provider && provider.id || "").trim().toLowerCase();
+    if (!id || typeof provider.upload !== "function" || typeof provider.download !== "function") throw new Error("A large-file provider requires id, upload, and download functions.");
+    this.largeFileProviders.set(id, provider);
+    return { id };
+  }
+
+  largeFileProvider(id = "wormhole") {
+    if (!this.largeFileProviders) this.largeFileProviders = new Map();
+    return this.largeFileProviders.get(String(id || "wormhole").trim().toLowerCase()) || null;
+  }
+
+  async runWormholeCli(mode, input) {
+    const command = String(this.settings.lanSyncWormholeCommand || "wormhole-cli").trim();
+    let childProcess;
+    let fs;
+    let os;
+    let pathModule;
+    try {
+      childProcess = require("node:child_process");
+      fs = require("node:fs");
+      os = require("node:os");
+      pathModule = require("node:path");
+    } catch {
+      throw new Error("wormhole_cli_unavailable");
+    }
+    const tempRoot = await fs.promises.mkdtemp(pathModule.join(os.tmpdir(), "ntfy-wormhole-"));
+    try {
+      if (mode === "upload") {
+        const source = pathModule.join(tempRoot, safeNtfyAttachmentName(input.name));
+        await fs.promises.writeFile(source, Buffer.from(input.data));
+        const output = await new Promise((resolve, reject) => {
+          const child = childProcess.spawn(command, ["upload", source], { windowsHide: true });
+          let stdout = "";
+          let stderr = "";
+          child.stdout?.on("data", (chunk) => { stdout += chunk.toString(); });
+          child.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
+          child.once("error", reject);
+          child.once("close", (code) => code === 0 ? resolve(`${stdout}\n${stderr}`) : reject(new Error(`wormhole_upload_failed:${code}`)));
+        });
+        const url = String(output).match(/https:\/\/wormhole\.app\/[A-Za-z0-9_-]+#[A-Za-z0-9_-]+/)?.[0];
+        if (!url) throw new Error("wormhole_upload_url_missing");
+        return { url };
+      }
+      const outputDir = pathModule.join(tempRoot, "download");
+      await fs.promises.mkdir(outputDir);
+      await new Promise((resolve, reject) => {
+        const child = childProcess.spawn(command, ["download", String(input.url), "-o", outputDir, "-r"], { windowsHide: true });
+        let stderr = "";
+        child.stderr?.on("data", (chunk) => { stderr += chunk.toString(); });
+        child.once("error", reject);
+        child.once("close", (code) => code === 0 ? resolve() : reject(new Error(`wormhole_download_failed:${code}:${stderr.slice(0, 160)}`)));
+      });
+      const names = await fs.promises.readdir(outputDir);
+      const target = names.find((name) => name && !name.startsWith("."));
+      if (!target) throw new Error("wormhole_download_empty");
+      return new Uint8Array(await fs.promises.readFile(pathModule.join(outputDir, target)));
+    } finally {
+      await fs.promises.rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   isQuietHours(date = new Date()) {
@@ -9354,7 +9612,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
           downloadState: "pending",
         }] : [],
         receivedAt: item.time ? new Date(Number(item.time) * 1000).toISOString() : new Date().toISOString(),
-        metadata: { priority: item.priority, tags: item.tags || [], clickUrl: item.click || "" },
+        metadata: { priority: item.priority, tags: item.tags || [], clickUrl: item.click || "", groupTopic: true, privateTarget: item.headers?.["X-Obsidian-Ntfy-Private-Target"] || "" },
       }, { persist: false, awaitHandler: false });
     }
     config.receivedIds = [...known].slice(-500);
@@ -9723,6 +9981,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       if (notification.tags.length) headers.Tags = this.safeHeader(notification.tags.join(","));
       if (notification.priority && notification.priority !== "default") headers.Priority = this.safeHeader(notification.priority);
       if (notification.clickUrl) headers.Click = this.safeHeader(notification.clickUrl);
+      const privateTarget = String(notification.metadata && notification.metadata.privateTarget || "").trim();
+      if (privateTarget) headers["X-Obsidian-Ntfy-Private-Target"] = this.safeHeader(privateTarget.slice(0, 160));
       const firstAttachment = (notification.attachments || []).find((attachment) => attachment.url);
       if (firstAttachment) {
         headers.Attach = this.safeHeader(firstAttachment.url);
@@ -11766,6 +12026,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (this.settings.priority && this.settings.priority !== "default") {
       headers.Priority = this.safeHeader(String(this.settings.priority));
     }
+    const privateTarget = String(reminder?.metadata?.privateTarget || "").trim();
+    if (privateTarget) headers["X-Obsidian-Ntfy-Private-Target"] = this.safeHeader(privateTarget.slice(0, 160));
 
     if (this.settings.authToken) {
       headers.Authorization = `Bearer ${String(this.settings.authToken).trim()}`;
@@ -12215,6 +12477,7 @@ class NtfyManagerView extends ItemView {
     this.selectedConversationFiles = [];
     this.conversationDrafts = new Map();
     this.viewportCleanup = null;
+    this.largeFileProviders = new Map();
   }
 
   getViewType() {
@@ -14111,6 +14374,62 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
         await this.plugin.restartLanSync();
         this.display();
       }));
+    new Setting(group)
+      .setName(this.uiText("共享加密密钥（可选）", "Shared encryption key (optional)"))
+      .setDesc(this.uiText("两台设备填写完全相同的任意字符后才会通过握手；留空沿用现有同库身份密钥。密钥只保存在本插件设置中。", "Both devices must use exactly the same value to pass the handshake; leave empty to keep the existing vault identity secret. The key stays in this plugin's settings."))
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text.setPlaceholder(this.uiText("任意字符，建议 16 位以上", "Any characters, 16+ recommended"))
+          .setValue(String(this.plugin.settings.lanSyncSharedSecret || ""))
+          .onChange(async (value) => {
+            this.plugin.settings.lanSyncSharedSecret = value.slice(0, 512);
+            await this.plugin.saveSettings();
+            await this.plugin.restartLanSync();
+            this.display();
+          });
+      });
+      // A shared ntfy topic is a lightweight group. Expose active senders as
+      // individual contacts as well, so a user can inspect and address a
+      // member without flattening the group history.
+      if (message.channelId === "ntfy" && String(message.sender || "").trim() && String(message.sender || "").trim() !== "me") {
+        const sender = String(message.sender).trim().slice(0, 160);
+        const peerKey = this.conversationKey("ntfy-peer", `${message.conversationId}:${sender}`);
+        if (!contacts.has(peerKey)) contacts.set(peerKey, {
+          id: peerKey,
+          kind: "ntfy-peer",
+          channelId: "ntfy",
+          conversationId: message.conversationId,
+          sender,
+          name: sender,
+          subtitle: `${channel?.name || "ntfy"} · 私信入口`,
+          icon: "user",
+          online: active,
+          available: active,
+          metadata: { channelType: "ntfy", groupTopic: message.conversationId, privateTarget: sender },
+        });
+      }
+    new Setting(group)
+      .setName(this.uiText("大文件传输", "Large-file transfer"))
+      .setDesc(this.uiText("超过 50 MB 时默认后台走 Wormhole；需要本机已安装 CLI，插件不会自动安装第三方程序。收件端后台下载后仍显示为普通文件。", "Files over 50 MB use Wormhole in the background by default; the CLI must already be installed. The receiver downloads in the background and sees a normal file."))
+      .addDropdown((dropdown) => dropdown
+        .addOption("disabled", this.uiText("禁用", "Disabled"))
+        .addOption("ask", this.uiText("发送时询问", "Ask when sending"))
+        .addOption("wormhole", this.uiText("后台自动 Wormhole（默认）", "Automatic background Wormhole (default)"))
+        .setValue(this.plugin.settings.lanSyncLargeFileMode || "wormhole")
+        .onChange(async (value) => {
+          this.plugin.settings.lanSyncLargeFileMode = ["disabled", "ask", "wormhole"].includes(value) ? value : "ask";
+          await this.plugin.saveSettings();
+          this.display();
+        }));
+    if (this.plugin.settings.lanSyncLargeFileMode === "wormhole") {
+      new Setting(group)
+        .setName(this.uiText("Wormhole CLI 路径（可选）", "Wormhole CLI path (optional)"))
+        .setDesc(this.uiText("仅记录本机可执行文件路径；真正传输仍需用户确认并校验哈希。", "Stores a local executable path; transfers still require confirmation and hash verification."))
+        .addText((text) => text.setPlaceholder("wormhole").setValue(String(this.plugin.settings.lanSyncWormholeCommand || "")).onChange(async (value) => {
+          this.plugin.settings.lanSyncWormholeCommand = value.slice(0, 512);
+          await this.plugin.saveSettings();
+        }));
+    }
     new Setting(group)
       .setName(this.uiText("手动设备地址", "Manual peer addresses"))
       .setDesc(this.uiText("用于热点或数据线屏蔽广播时直连。每行一个私网 IPv4，可带端口，例如 192.168.137.2:43190。", "Direct connection when hotspot or tethering blocks discovery. One private IPv4 per line, optionally with a port, such as 192.168.137.2:43190."))

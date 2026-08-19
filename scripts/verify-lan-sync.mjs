@@ -149,7 +149,7 @@ async function freePort() {
   return port;
 }
 
-async function waitFor(predicate, label, timeoutMs = 12_000) {
+async function waitFor(predicate, label, timeoutMs = 30_000) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     if (await predicate()) return;
@@ -775,7 +775,8 @@ try {
     storageA.listFiles = originalListFilesA;
     await waitFor(
       () => !serviceA.syncRunning && !serviceA.fullSyncRequested && serviceA.dirtyPaths.size === 0,
-      "background reconciliation settlement"
+      "background reconciliation settlement",
+      30_000
     ).catch((error) => {
       throw new Error(`${error.message}; state=${JSON.stringify({
         syncRunning: serviceA.syncRunning,
@@ -1253,6 +1254,15 @@ try {
   assert.match(source, /const idleLabel = chinese/, "An idle scan does not derive a meaningful stage label");
   assert.match(source, /同步：发现文件即开始/, "The transfer section does not explain that discovered files start immediately");
   assert.match(lanSource, /INCREMENTAL_PATH_BATCH_SIZE = 32/, "Dirty journal is not split into bounded realtime batches");
+  assert.doesNotMatch(source, /INCREMENTAL_PATH_BATCH_SIZE = Number\.MAX_SAFE_INTEGER/, "Built LAN runtime sends the entire dirty journal in every heartbeat");
+  assert.match(lanSource, /ANNOUNCE_INTERVAL_MS = 5_000/, "LAN discovery broadcasts are still running at sub-second frequency");
+  assert.match(lanSource, /PEER_PROBE_INTERVAL_MS = 5_000/, "LAN encrypted peer probes are still running at sub-second frequency");
+  assert.match(lanSource, /PEER_SWEEP_INTERVAL_MS = 2_000/, "LAN idle housekeeping is still running several times per second");
+  assert.match(lanSource, /cacheCryptoKey\(aesKeyCache/, "AES key derivation is not cached between LAN heartbeats");
+  assert.match(lanSource, /cacheCryptoKey\(hmacKeyCache/, "HMAC key derivation is not cached between LAN heartbeats");
+  assert.match(lanSource, /localInterfaceCache/, "Network interface enumeration is not cached");
+  assert.match(lanSource, /configuredLanSecret\(this\.settings\(\), this\.identity\)/, "Shared LAN secret support was lost while optimizing the runtime");
+  assert.match(source, /for \(let index = 0; index < paths\.length; index \+= 32\)/, "Config file stats are no longer processed in bounded batches");
   assert.match(lanSource, /this\.scheduleActiveEditSync\(REALTIME_DIRTY_DELAY_MS\)/, "Vault events do not enter the immediate transfer lane");
   assert.match(lanSource, /const RECONNECT_REPROBE_DELAY_MS = 250/, "LAN reconnect does not have a fast reprobe path");
   assert.match(lanSource, /this\.scheduleReconnectProbe\(\)/, "LAN peer failures do not schedule immediate reconnect probing");

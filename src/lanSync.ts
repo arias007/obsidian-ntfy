@@ -11,6 +11,7 @@ export type LanSyncRuntimeSettings = {
   configDir: string;
   port: number;
   maxFileBytes: number;
+  sharedSecret?: string;
   inboxRetentionHours: number;
   manualPeers: string[];
 };
@@ -383,23 +384,25 @@ const METADATA_PROTOCOLS = [
 const BOOTSTRAP_MTIME_TOLERANCE_MS = 2_000;
 const MULTICAST_ADDRESS = "239.255.67.19";
 const DISCOVERY_PORT = 43189;
-const ANNOUNCE_INTERVAL_MS = 750;
-const PEER_SWEEP_INTERVAL_MS = 350;
-const PEER_PROBE_INTERVAL_MS = 900;
+const ANNOUNCE_INTERVAL_MS = 5_000;
+const PEER_SWEEP_INTERVAL_MS = 2_000;
+const PEER_PROBE_INTERVAL_MS = 5_000;
 const PEER_MIN_STABLE_GRACE_MS = 30_000;
 // Keep one current LAN address plus one recent fallback. Retaining a long
 // stale address list made reconnect try dead endpoints serially and look stuck.
 const PEER_MAX_ADDRESS_HISTORY = 2;
 const REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
-const SYNC_MIN_INTERVAL_MS = 120;
+const SYNC_MIN_INTERVAL_MS = 250;
 const QUEUED_SYNC_DELAY_MS = 750;
 const URGENT_SYNC_DELAY_MS = 60;
 const REALTIME_DIRTY_DELAY_MS = 30;
 // Highest-priority lane for the file the user is actively editing. Shorter than
 // any other debounce so a keystroke ships almost immediately, and it runs on its
 // own single-file channel instead of waiting behind a bulk dirty scan.
-const ACTIVE_EDIT_SYNC_DELAY_MS = 20;
-const ACTIVE_EDIT_POLL_MS = SYNC_MIN_INTERVAL_MS;
+const ACTIVE_EDIT_SYNC_DELAY_MS = 180;
+const ACTIVE_EDIT_MIN_INTERVAL_MS = 500;
+const ACTIVE_EDIT_RETRY_MAX_MS = 30_000;
+const ACTIVE_EDIT_POLL_MS = 500;
 const RECONNECT_REPROBE_DELAY_MS = 250;
 const MANIFEST_TIMEOUT_MS = 10 * 60_000;
 // Incremental paths must fail fast when Wi-Fi disappears so reconnect can
@@ -441,9 +444,17 @@ const LAN_INBOX_ROOT = ".trash/ntfy-inbox";
 const MAX_MESSAGE_TEXT_LENGTH = 32_000;
 const MAX_MESSAGE_ATTACHMENTS = 12;
 const INCREMENTAL_PATH_BATCH_SIZE = 32;
+const LOCAL_INTERFACE_CACHE_MS = 30_000;
+const CRYPTO_KEY_CACHE_LIMIT = 4;
+const PEER_PROBE_CONCURRENCY = 4;
 const MAX_QUEUED_MESSAGES_PER_PEER = 100;
 const MAX_PING_MESSAGES = 20;
 const OUTBOUND_MESSAGE_STORAGE_PREFIX = "ntfy.lan-message-outbox.v1";
+
+function configuredLanSecret(settings: LanSyncRuntimeSettings, identity: LanSyncIdentity): string {
+  const shared = typeof settings.sharedSecret === "string" ? settings.sharedSecret.trim() : "";
+  return shared || identity.secret;
+}
 
 class LanSyncProtocolError extends Error {
   constructor(
@@ -761,14 +772,41 @@ async function sha256Bytes(value: ArrayBuffer | Uint8Array | string): Promise<st
   return bytesToBase64Url(await cryptoApi().subtle.digest("SHA-256", arrayBuffer(bytes)));
 }
 
+const aesKeyCache = new Map<string, Promise<CryptoKey>>();
+const hmacKeyCache = new Map<string, Promise<CryptoKey>>();
+
+function cacheCryptoKey(
+  cache: Map<string, Promise<CryptoKey>>,
+  secret: string,
+  create: () => Promise<CryptoKey>
+): Promise<CryptoKey> {
+  const existing = cache.get(secret);
+  if (existing) return existing;
+  const pending = create().catch((error) => {
+    cache.delete(secret);
+    throw error;
+  });
+  cache.set(secret, pending);
+  while (cache.size > CRYPTO_KEY_CACHE_LIMIT) {
+    const oldest = cache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+  return pending;
+}
+
 async function aesKey(secret: string): Promise<CryptoKey> {
-  const keyMaterial = await cryptoApi().subtle.digest("SHA-256", arrayBuffer(utf8(`cancip-lan-sync:aes:${secret}`)));
-  return await cryptoApi().subtle.importKey("raw", keyMaterial, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+  return await cacheCryptoKey(aesKeyCache, secret, async () => {
+    const keyMaterial = await cryptoApi().subtle.digest("SHA-256", arrayBuffer(utf8(`cancip-lan-sync:aes:${secret}`)));
+    return await cryptoApi().subtle.importKey("raw", keyMaterial, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+  });
 }
 
 async function hmacKey(secret: string): Promise<CryptoKey> {
-  const keyMaterial = await cryptoApi().subtle.digest("SHA-256", arrayBuffer(utf8(`cancip-lan-sync:hmac:${secret}`)));
-  return await cryptoApi().subtle.importKey("raw", keyMaterial, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+  return await cacheCryptoKey(hmacKeyCache, secret, async () => {
+    const keyMaterial = await cryptoApi().subtle.digest("SHA-256", arrayBuffer(utf8(`cancip-lan-sync:hmac:${secret}`)));
+    return await cryptoApi().subtle.importKey("raw", keyMaterial, { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+  });
 }
 
 export async function encryptLanSyncPayload(secret: string, value: unknown): Promise<string> {
@@ -1356,7 +1394,13 @@ export class NtfyLanSync {
   private activeEditTimer: ReturnType<typeof setTimeout> | null = null;
   private activeEditSyncRunning = false;
   private activeEditStartedAt = 0;
+  private lastActiveEditSyncAt = 0;
+  private activeEditFailureStreak = 0;
+  private activeEditRetryAt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private probeRunning = false;
+  private probeQueued = false;
+  private lastSyncCycleAt = 0;
   private transferBackoff = new Map<string, { failures: number; nextAttemptAt: number }>();
   private syncRequestId = "";
   private fullSyncRequestId = "";
@@ -1386,8 +1430,14 @@ export class NtfyLanSync {
   private activityUpdatedAt = 0;
   private lastErrorValue = "";
   private lastPeerFingerprint = "";
+  private localInterfaceCache: { expiresAt: number; value: LanNetworkInterface[] } | null = null;
 
   constructor(private readonly options: LanSyncServiceOptions) {}
+
+  private activeSecret(): string {
+    if (!this.identity) throw new Error("identity_unavailable");
+    return configuredLanSecret(this.settings(), this.identity);
+  }
 
   running(): boolean {
     return this.runningValue;
@@ -1588,13 +1638,15 @@ export class NtfyLanSync {
     }
   }
 
-  status(): { running: boolean; port: number; peerCount: number; error: string; desktop: boolean } {
+  status(): { running: boolean; port: number; peerCount: number; error: string; desktop: boolean; encrypted: boolean; sharedSecretConfigured: boolean } {
     return {
       running: this.runningValue,
       port: this.boundPort,
       peerCount: this.activePeers().length,
       error: this.lastErrorValue,
-      desktop: this.options.desktop
+      desktop: this.options.desktop,
+      encrypted: true,
+      sharedSecretConfigured: Boolean(String(this.settings().sharedSecret || "").trim())
     };
   }
 
@@ -1898,6 +1950,25 @@ export class NtfyLanSync {
   private recoverFromStalledSync(): void {
     if (!this.runningValue) return;
     const now = this.now();
+    const fullSyncSettled = this.fullSyncRequested
+      && !this.syncRunning
+      && !this.backgroundReconciliation
+      && !this.inboundSession
+      && !this.currentTransferSessionId
+      && this.dirtyPaths.size === 0
+      && this.localFilesystemScanCompletedRequestId === this.fullSyncRequestId
+      && this.progressValue.phase === "complete"
+      && now - this.progressUpdatedAt > 1_000
+      && !this.activePeers().some((peer) => Boolean(peer.remoteFullSyncRequestId));
+    if (fullSyncSettled) {
+      // A peer can acknowledge the final session before the coordinator's
+      // progress callback arrives. Clear the completed maintenance request so
+      // it cannot turn into an endless full-vault rescan on every timer tick.
+      this.fullSyncRequested = false;
+      this.forceFilesystemScanRequested = false;
+      this.localFilesystemScanCompletedRequestId = "";
+      this.fullSyncOnlyPending = false;
+    }
     if (this.syncRunning && this.syncStartedAt > 0 && now - this.syncStartedAt > SYNC_WATCHDOG_MS) {
       // A hung await used to keep syncRunning latched forever, after which
       // every scheduleSync only flipped syncQueued and nothing ever ran again.
@@ -2445,6 +2516,9 @@ export class NtfyLanSync {
   }
 
   private localInterfaces(): LanNetworkInterface[] {
+    const cached = this.localInterfaceCache;
+    const now = this.now();
+    if (cached && cached.expiresAt > now) return cached.value;
     const os = nodeRequire<NodeOs>("node:os") ?? nodeRequire<NodeOs>("os");
     if (!os) return [];
     const interfaces: LanNetworkInterface[] = [];
@@ -2460,7 +2534,9 @@ export class NtfyLanSync {
         });
       }
     }
-    return interfaces.sort((left, right) => left.address.localeCompare(right.address));
+    const value = interfaces.sort((left, right) => left.address.localeCompare(right.address));
+    this.localInterfaceCache = { expiresAt: now + LOCAL_INTERFACE_CACHE_MS, value };
+    return value;
   }
 
   private localAddresses(): string[] {
@@ -3242,10 +3318,31 @@ export class NtfyLanSync {
 
   private async probePeers(force = false): Promise<void> {
     if (!this.runningValue) return;
+    if (this.probeRunning) {
+      this.probeQueued = this.probeQueued || force;
+      return;
+    }
+    this.probeRunning = true;
+    let rerun = false;
+    try {
     await this.refreshIdentityIfChanged();
     this.refreshManualPeers();
-    await Promise.all([...this.peers.values()].slice(0, 16).map(async (peer) => await this.verifyPeer(peer, force)));
+    const peers = [...this.peers.values()].slice(0, 16);
+    for (let index = 0; index < peers.length && this.runningValue; index += PEER_PROBE_CONCURRENCY) {
+      await Promise.all(peers.slice(index, index + PEER_PROBE_CONCURRENCY).map(async (peer) => await this.verifyPeer(peer, force)));
+    }
     this.emitPeersChanged();
+    } finally {
+      this.probeRunning = false;
+      rerun = this.probeQueued;
+      this.probeQueued = false;
+    }
+    if (rerun && this.runningValue) {
+      this.reconnectTimer ??= setTimeout(() => {
+        this.reconnectTimer = null;
+        void this.probePeers(true);
+      }, PEER_PROBE_INTERVAL_MS);
+    }
   }
 
 
@@ -3258,7 +3355,7 @@ export class NtfyLanSync {
 
   private isPeerActive(peer: LanSyncPeer, now = this.now()): boolean {
     if (peer.verifiedAt <= 0) return false;
-    const stableGraceMs = Math.max(PEER_MIN_STABLE_GRACE_MS, PEER_PROBE_INTERVAL_MS * 12);
+    const stableGraceMs = PEER_MIN_STABLE_GRACE_MS;
     return now - peer.verifiedAt <= stableGraceMs;
   }
 
@@ -3316,6 +3413,11 @@ export class NtfyLanSync {
       this.syncQueued = true;
       return;
     }
+    const cycleWait = this.lastSyncCycleAt + SYNC_MIN_INTERVAL_MS - this.now();
+    if (cycleWait > 0) {
+      this.scheduleSync(cycleWait, false);
+      return;
+    }
     if (this.fullSyncOnlyPending && this.backgroundReconciliation) return;
     const peers = this.syncTargets();
     if (!peers.length) return;
@@ -3349,6 +3451,7 @@ export class NtfyLanSync {
     const urgentPaths = new Set([...localDirty.keys()].filter((path) => this.urgentDirtyPaths.has(path)));
     for (const path of urgentPaths) this.urgentDirtyPaths.delete(path);
     this.syncRunning = true;
+    this.lastSyncCycleAt = this.now();
     this.syncStartedAt = this.now();
     try {
       // A strict manual round starts both manifest requests immediately. The
@@ -3428,11 +3531,13 @@ export class NtfyLanSync {
     if (!this.runningValue || !this.activeEditDirty.size) return;
     if (!this.syncTargets().length) return;
     if (this.activeEditSyncRunning || this.syncRunning) return;
+    const retryWait = this.activeEditRetryAt - this.now();
+    const intervalWait = this.lastActiveEditSyncAt + ACTIVE_EDIT_MIN_INTERVAL_MS - this.now();
     if (this.activeEditTimer) clearTimeout(this.activeEditTimer);
     this.activeEditTimer = setTimeout(() => {
       this.activeEditTimer = null;
       void this.runActiveEditSync();
-    }, Math.max(0, delay));
+    }, Math.max(0, delay, retryWait, intervalWait));
   }
 
   private async runActiveEditSync(): Promise<void> {
@@ -3460,6 +3565,7 @@ export class NtfyLanSync {
     let settledAcrossPeers: Set<string> | null = null;
     let synchronizedPeers = 0;
     this.activeEditSyncRunning = true;
+    this.lastActiveEditSyncAt = this.now();
     this.activeEditStartedAt = this.now();
     try {
       for (const peer of peers) {
@@ -3489,6 +3595,8 @@ export class NtfyLanSync {
         synchronizedPeers += 1;
       }
       if (synchronizedPeers === peers.length) {
+        this.activeEditFailureStreak = 0;
+        this.activeEditRetryAt = 0;
         for (const path of paths) this.activeEditDirty.delete(path);
         for (const path of settledAcrossPeers ?? []) {
           const generation = localDirty.get(path);
@@ -3500,6 +3608,11 @@ export class NtfyLanSync {
       }
     } catch (error) {
       this.lastErrorValue = safeErrorCode(error);
+      this.activeEditFailureStreak = Math.min(8, this.activeEditFailureStreak + 1);
+      this.activeEditRetryAt = this.now() + Math.min(
+        ACTIVE_EDIT_RETRY_MAX_MS,
+        ACTIVE_EDIT_SYNC_DELAY_MS * (2 ** this.activeEditFailureStreak)
+      );
     } finally {
       this.activeEditSyncRunning = false;
       this.activeEditStartedAt = 0;
@@ -4973,8 +5086,9 @@ export class NtfyLanSync {
   private async callPeer(peer: LanSyncPeer, route: string, payload: Record<string, unknown>, timeoutMs = 8000): Promise<Record<string, unknown>> {
     if (!this.identity) throw new Error("identity_unavailable");
     const path = `${API_PREFIX}${route}`;
-    const body = await encryptLanSyncPayload(this.identity.secret, payload);
-    const headers = await authHeaders(this.identity, this.deviceId, "POST", path, body, this.now());
+    const secret = this.activeSecret();
+    const body = await encryptLanSyncPayload(secret, payload);
+    const headers = await authHeaders({ ...this.identity, secret }, this.deviceId, "POST", path, body, this.now());
     let lastError: unknown = null;
     for (const address of peer.addresses) {
       if (!isPrivateLanAddress(address)) continue;
@@ -4997,7 +5111,7 @@ export class NtfyLanSync {
           }
           throw new LanSyncProtocolError(code, response.status);
         }
-        const decrypted = await decryptLanSyncPayload(this.identity.secret, response.text);
+        const decrypted = await decryptLanSyncPayload(secret, response.text);
         peer.verifiedAt = this.now();
         peer.consecutiveFailures = 0;
         peer.lastFailureAt = 0;
@@ -5041,8 +5155,9 @@ export class NtfyLanSync {
         "x-cancip-nonce": headerValue(request, "x-cancip-nonce"),
         "x-cancip-signature": headerValue(request, "x-cancip-signature")
       };
+      const secret = this.activeSecret();
       const deviceId = await verifyLanSyncRequest({
-        secret: this.identity.secret,
+        secret,
         vaultId: this.identity.vaultId,
         method: request.method,
         path,
@@ -5054,7 +5169,7 @@ export class NtfyLanSync {
       authenticated = true;
       const remoteAddress = normalizeRemoteAddress(request.socket.remoteAddress ?? "");
       if (!this.allowedByRateLimit(`${remoteAddress}:${deviceId}`)) throw new LanSyncProtocolError("rate_limited", 429);
-      const payload = await decryptLanSyncPayload(this.identity.secret, body);
+      const payload = await decryptLanSyncPayload(secret, body);
       const metadataProtocol = METADATA_PROTOCOLS.find((protocol) => path.startsWith(`${API_PREFIX}${protocol.routePrefix}/`));
       const metadataRoute = metadataProtocol
         ? path.slice(`${API_PREFIX}${metadataProtocol.routePrefix}`.length)
@@ -5165,7 +5280,7 @@ export class NtfyLanSync {
         throw new LanSyncProtocolError("not_found", 404);
       }
       this.finishInboundFileActivity(deviceId, inboundActivityIndex, true);
-      const encryptedResult = await encryptLanSyncPayload(this.identity.secret, result);
+      const encryptedResult = await encryptLanSyncPayload(secret, result);
       sendText(response, 200, encryptedResult);
       if (metadataRoute === "/manifest") {
         this.emit({
