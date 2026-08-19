@@ -181,6 +181,10 @@ async function run() {
   assert.match(styles, /\.obsidian-ntfy-chat\s*\{[\s\S]*?grid-template-columns:/);
   assert.match(styles, /\.obsidian-ntfy-chat\.is-conversation-open \.obsidian-ntfy-chat-conversation/);
   assert.match(source, /notification-hub:conversations-changed/);
+  assert.match(source, /runWormholeViaNoteweb\("upload", input\)/);
+  assert.match(source, /plugin\.createBrowserSurface\(host, url/);
+  assert.match(source, /ntfy-wormhole-background-host/);
+  assert.doesNotMatch(source, /runWormholeCli|wormhole-cli|node:child_process/);
   assert.match(source, /class NtfyVaultFileSuggestModal extends SuggestModal/);
   assert.match(source, /conversationDrafts = new Map\(\)/);
   assert.match(source, /captureConversationInputState\(\)/);
@@ -225,7 +229,7 @@ async function run() {
   assert.equal(plugin.settings.lanSyncSharedSecret, "");
   assert.equal(typeof plugin.largeFileTransferPolicy, "function");
   assert.equal(plugin.largeFileTransferPolicy(50 * 1024 * 1024).mode, "ntfy");
-  assert.equal(plugin.largeFileTransferPolicy(50 * 1024 * 1024 + 1).reason, "wormhole_cli_required");
+  assert.equal(plugin.largeFileTransferPolicy(50 * 1024 * 1024 + 1).reason, "wormhole_noteweb_required");
 
   const conversationImportPlugin = createPlugin({
     topic: "conversation-import",
