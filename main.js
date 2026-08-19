@@ -5830,6 +5830,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.lanSyncDetailsModal = null;
     void this.stopLanSync();
     this.closeIncomingSockets();
+    for (const session of this.notewebWormholeSessions?.values?.() || []) this.disposeNotewebBackgroundSurface(session?.surface);
+    this.notewebWormholeSessions?.clear?.();
     if (this.app && this.app.workspace && typeof this.app.workspace.trigger === "function") {
       this.app.workspace.trigger("notification-hub:unavailable");
     }
@@ -8358,14 +8360,16 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       for (let offset = 0; offset < bytes.length; offset += chunkSize) await surface.executeJavaScript(`window.__ntfyWormholeUpload.chunks.push(${JSON.stringify(ntfyBytesToBase64(bytes.subarray(offset, Math.min(bytes.length, offset + chunkSize))))})`);
       await surface.executeJavaScript(`(() => { const s=window.__ntfyWormholeUpload, d=s.chunks.map(atob), n=d.reduce((a,b)=>a+b.length,0), b=new Uint8Array(n); let p=0; for(const x of d) for(let i=0;i<x.length;i++) b[p++]=x.charCodeAt(i); const f=new File([b],s.name,{type:s.type}), i=document.querySelector('input[type="file"]'), t=new DataTransfer(); t.items.add(f); i.files=t.files; i.dispatchEvent(new Event("change",{bubbles:true})); const send=[...document.querySelectorAll("button")].find(x=>/send|share|create|发送|分享/i.test(x.textContent||"")&&!x.disabled); send?.click(); return true; })()`);
       const deadline = Date.now() + 10 * 60_000;
-      while (Date.now() < deadline) { const href = await surface.executeJavaScript("String(location.href||'')"); const url = href.match(/^https:\/\/wormhole\.app\/[A-Za-z0-9_-]+#[A-Za-z0-9_-]+/i)?.[0]; if (url) return { url, size: bytes.byteLength }; await new Promise((resolve) => setTimeout(resolve, 250)); }
+      while (Date.now() < deadline) { const state = await surface.executeJavaScript("({href:String(location.href||''),links:[...document.querySelectorAll('a[href]')].map(x=>String(x.href||'')),text:String(document.body?.innerText||'')})"); const url = JSON.stringify(state || {}).match(/https:\/\/wormhole\.app\/[A-Za-z0-9_-]+#[A-Za-z0-9_-]+/i)?.[0]; if (url) { for (const [key, session] of this.notewebWormholeSessions || []) if (Date.now() - Number(session?.createdAt || 0) > 24 * 60 * 60_000) { this.disposeNotewebBackgroundSurface(session?.surface); this.notewebWormholeSessions.delete(key); } this.notewebWormholeSessions?.set(url, { surface, createdAt: Date.now() }); return { url, size: bytes.byteLength }; } await new Promise((resolve) => setTimeout(resolve, 250)); }
+      this.disposeNotewebBackgroundSurface(surface);
       throw new Error("wormhole_upload_timeout");
     }
     if (!/^https:\/\/wormhole\.app\/[A-Za-z0-9_-]+#[A-Za-z0-9_-]+$/i.test(String(input.url || ""))) throw new Error("wormhole_download_url_invalid");
     while (Date.now() - started < 60_000 && !await surface.executeJavaScript("Boolean(document.querySelector('a,button'))")) await new Promise((resolve) => setTimeout(resolve, 120));
     await surface.executeJavaScript(`(() => { window.__ntfyWormholeDownload=null; const old=HTMLAnchorElement.prototype.click; HTMLAnchorElement.prototype.click=function(){ const h=String(this.href||''); if(h.startsWith('blob:')) fetch(h).then(r=>r.arrayBuffer()).then(x=>{const b=new Uint8Array(x),c=[]; for(let o=0;o<b.length;o+=2097152){let s=''; for(const v of b.subarray(o,o+2097152))s+=String.fromCharCode(v); c.push(btoa(s));} window.__ntfyWormholeDownload={chunks:c};}); else return old.call(this); }; const e=[...document.querySelectorAll('a,button')].find(x=>/download|下载/i.test(x.textContent||x.getAttribute('aria-label')||'')); e?.click(); })()`);
     const deadline = Date.now() + 10 * 60_000;
-    while (Date.now() < deadline) { const count = await surface.executeJavaScript("window.__ntfyWormholeDownload?.chunks?.length || 0"); if (count) { const chunks=[]; for(let i=0;i<count;i++) chunks.push(ntfyBase64ToBytes(await surface.executeJavaScript(`window.__ntfyWormholeDownload.chunks[${i}]`))); const bytes=new Uint8Array(chunks.reduce((n,c)=>n+c.length,0)); let p=0; for(const c of chunks){bytes.set(c,p);p+=c.length;} return bytes; } await new Promise((resolve) => setTimeout(resolve, 250)); }
+    while (Date.now() < deadline) { const count = await surface.executeJavaScript("window.__ntfyWormholeDownload?.chunks?.length || 0"); if (count) { const chunks=[]; for(let i=0;i<count;i++) chunks.push(ntfyBase64ToBytes(await surface.executeJavaScript(`window.__ntfyWormholeDownload.chunks[${i}]`))); const bytes=new Uint8Array(chunks.reduce((n,c)=>n+c.length,0)); let p=0; for(const c of chunks){bytes.set(c,p);p+=c.length;} this.disposeNotewebBackgroundSurface(surface); return bytes; } await new Promise((resolve) => setTimeout(resolve, 250)); }
+    this.disposeNotewebBackgroundSurface(surface);
     throw new Error("wormhole_download_timeout");
   }
 
