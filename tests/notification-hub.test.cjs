@@ -221,6 +221,11 @@ async function run() {
   assert.equal(plugin.settings.backgroundReceiveEnabled, true);
   assert.equal(plugin.settings.showObsidianReminderNotices, true);
   assert.deepEqual(plugin.settings.channelHealth, {});
+  assert.equal(plugin.settings.lanSyncLargeFileMode, "wormhole");
+  assert.equal(plugin.settings.lanSyncSharedSecret, "");
+  assert.equal(typeof plugin.largeFileTransferPolicy, "function");
+  assert.equal(plugin.largeFileTransferPolicy(50 * 1024 * 1024).mode, "ntfy");
+  assert.equal(plugin.largeFileTransferPolicy(50 * 1024 * 1024 + 1).reason, "wormhole_cli_required");
 
   const conversationImportPlugin = createPlugin({
     topic: "conversation-import",

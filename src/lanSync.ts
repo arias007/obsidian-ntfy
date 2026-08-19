@@ -13,6 +13,11 @@ export type LanSyncRuntimeSettings = {
   maxFileBytes: number;
   inboxRetentionHours: number;
   manualPeers: string[];
+  /** Optional user-supplied shared secret. When set, both devices must use the same value. */
+  sharedSecret?: string;
+  /** Large-file provider policy. Wormhole is opt-in and never automatic without confirmation. */
+  largeFileMode?: "disabled" | "ask" | "wormhole";
+  wormholeCommand?: string;
 };
 
 export type LanLinkType = "ethernet" | "wifi" | "hotspot" | "bluetooth-pan" | "usb" | "lan" | "manual";
@@ -440,10 +445,19 @@ const HASH_CACHE_STORAGE_PREFIX = "ntfy.lan-sync.hash-cache.v1";
 const LAN_INBOX_ROOT = ".trash/ntfy-inbox";
 const MAX_MESSAGE_TEXT_LENGTH = 32_000;
 const MAX_MESSAGE_ATTACHMENTS = 12;
-const INCREMENTAL_PATH_BATCH_SIZE = 32;
+// Dirty-path reconciliation is intentionally unbounded. The transfer pool
+// still controls concurrent I/O, but discovery and protocol exchange never
+// stop after an arbitrary visible batch size.
+const INCREMENTAL_PATH_BATCH_SIZE = Number.MAX_SAFE_INTEGER;
 const MAX_QUEUED_MESSAGES_PER_PEER = 100;
 const MAX_PING_MESSAGES = 20;
 const OUTBOUND_MESSAGE_STORAGE_PREFIX = "ntfy.lan-message-outbox.v1";
+
+function configuredLanSecret(settings: LanSyncRuntimeSettings, identity: LanSyncIdentity): string {
+  const shared = typeof settings.sharedSecret === "string" ? settings.sharedSecret.trim() : "";
+  // Keep the historical per-vault secret as the backwards-compatible default.
+  return shared || identity.secret;
+}
 
 class LanSyncProtocolError extends Error {
   constructor(
@@ -1389,6 +1403,11 @@ export class NtfyLanSync {
 
   constructor(private readonly options: LanSyncServiceOptions) {}
 
+  private activeSecret(): string {
+    if (!this.identity) throw new Error("identity_unavailable");
+    return configuredLanSecret(this.settings(), this.identity);
+  }
+
   running(): boolean {
     return this.runningValue;
   }
@@ -1588,13 +1607,15 @@ export class NtfyLanSync {
     }
   }
 
-  status(): { running: boolean; port: number; peerCount: number; error: string; desktop: boolean } {
+  status(): { running: boolean; port: number; peerCount: number; error: string; desktop: boolean; encrypted: boolean; sharedSecretConfigured: boolean } {
     return {
       running: this.runningValue,
       port: this.boundPort,
       peerCount: this.activePeers().length,
       error: this.lastErrorValue,
-      desktop: this.options.desktop
+      desktop: this.options.desktop,
+      encrypted: true,
+      sharedSecretConfigured: Boolean(String(this.settings().sharedSecret || "").trim())
     };
   }
 
@@ -1988,11 +2009,23 @@ export class NtfyLanSync {
       // reconciliation that could not complete. Leftover paths stay in
       // dirtyPaths and are picked up by the next incremental pass.
       let rounds = 0;
-      while (this.reconciliationDirtyPaths.size && rounds < 8 && this.now() - startedAt < SCAN_STALL_TIMEOUT_MS) {
+      const reconciledPaths = new Set<string>();
+      // Drain every discovered path. The batch size is only a transport
+      // window; it must never become an implicit "32 files and stop" limit.
+      while (this.reconciliationDirtyPaths.size && this.now() - startedAt < SYNC_WATCHDOG_MS) {
         rounds += 1;
-        const changed = [...this.reconciliationDirtyPaths].slice(0, INCREMENTAL_PATH_BATCH_SIZE);
+        const changed = [...this.reconciliationDirtyPaths].filter((path) => !reconciledPaths.has(path));
+        if (!changed.length) break;
         for (const path of changed) this.reconciliationDirtyPaths.delete(path);
+        for (const path of changed) reconciledPaths.add(path);
         await this.buildMetadataManifestForPaths(changed, includeConfigFolder);
+        for (const path of changed) this.reconciliationDirtyPaths.delete(path);
+        if (rounds % 4 === 0) await yieldToLanEventLoop();
+      }
+      // Keep any paths discovered after the watchdog in the normal dirty queue
+      // so the next pass can continue instead of silently dropping them.
+      if (this.reconciliationDirtyPaths.size) {
+        for (const path of this.reconciliationDirtyPaths) this.markDirtyPath(path, 0, true);
       }
       this.reconciliationDirtyPaths.clear();
       // Only claim coverage up to the generation observed when the walk
@@ -2006,7 +2039,10 @@ export class NtfyLanSync {
       this.lastErrorValue = safeErrorCode(error);
     }).finally(() => {
       if (this.backgroundReconciliation === promise) this.backgroundReconciliation = null;
-      if (this.runningValue) this.scheduleSync(0, true);
+      // A periodic tick may overlap the tail of reconciliation. Do not enqueue
+      // a redundant round while another transfer is already active; the
+      // transfer's finally block will pick up any remaining dirty paths.
+      if (this.runningValue && !this.syncRunning && !this.activeEditSyncRunning) this.scheduleSync(0, true);
     });
   }
 
@@ -2945,10 +2981,8 @@ export class NtfyLanSync {
     for (const path of this.urgentDirtyPaths) {
       const generation = this.dirtyPaths.get(path);
       if (generation !== undefined) selected.set(path, generation);
-      if (selected.size >= INCREMENTAL_PATH_BATCH_SIZE) break;
     }
     for (const [path, generation] of [...this.dirtyPaths.entries()].reverse()) {
-      if (selected.size >= INCREMENTAL_PATH_BATCH_SIZE) break;
       if (!selected.has(path)) selected.set(path, generation);
     }
     return [...selected.entries()]
@@ -3221,7 +3255,9 @@ export class NtfyLanSync {
       this.emitPeersChanged();
       await this.receiveQueuedMessages(peer, response.messages);
       if (firstVerifiedConnection || remoteRequestedSync) this.scheduleSync(remoteRequestedSync ? 0 : 20, true);
-    } catch {
+    } catch (error) {
+      const code = safeErrorCode(error);
+      if (code === "invalid_auth" || code === "peer_rejected" || code === "peer_unreachable") this.lastErrorValue = code;
       peer.consecutiveFailures = Math.min(100, peer.consecutiveFailures + 1);
       peer.lastFailureAt = this.now();
       // Keep an authenticated peer visible through short network jitter. The
@@ -3287,7 +3323,8 @@ export class NtfyLanSync {
     if (!force && !this.settings().autoDiscovery) return;
     if (force) this.syncForced = true;
     if (this.syncRunning || this.activeEditSyncRunning) {
-      this.syncQueued = true;
+      // The durable dirty/remote queues are sufficient; avoid a second latch
+      // that makes the next progress pass look like a restart.
       return;
     }
     if (this.syncTimer) clearTimeout(this.syncTimer);
@@ -3313,7 +3350,9 @@ export class NtfyLanSync {
     // background filesystem reconciliation is merely enumerating.
     if (!this.runningValue || !this.isCoordinator()) return;
     if (this.syncRunning || this.activeEditSyncRunning) {
-      this.syncQueued = true;
+      // Dirty paths and remote signals are durable queues themselves. Do not
+      // toggle a second latch while a transfer is active; that latch used to
+      // make the next progress pass appear to restart from zero.
       return;
     }
     if (this.fullSyncOnlyPending && this.backgroundReconciliation) return;
@@ -3331,11 +3370,9 @@ export class NtfyLanSync {
     for (const path of this.activeEditDirty) {
       const generation = this.dirtyPaths.get(path);
       if (generation !== undefined) localDirty.set(path, generation);
-      if (localDirty.size >= INCREMENTAL_PATH_BATCH_SIZE) break;
     }
     for (const [path, generation] of this.dirtyPaths) {
       if (!localDirty.has(path)) localDirty.set(path, generation);
-      if (localDirty.size >= INCREMENTAL_PATH_BATCH_SIZE) break;
     }
     // A manual full sync is serialized: no incremental session is opened until
     // the local full manifest has finished and the same full request is ready
@@ -3441,15 +3478,12 @@ export class NtfyLanSync {
     // this one-path session can start immediately after the current request
     // boundary, instead of waiting for every bulk file to drain.
     if (this.syncRunning) {
-      this.syncQueued = true;
       return;
     }
     // Only sync paths still tracked as dirty (not yet settled by a bulk round).
     // Once the bulk round settles and removes them from dirtyPaths, the lane has
     // nothing left to do and clears the marker instead of spinning.
-    const paths = [...this.activeEditDirty]
-      .filter((path) => this.dirtyPaths.has(path))
-      .slice(0, INCREMENTAL_PATH_BATCH_SIZE);
+    const paths = [...this.activeEditDirty].filter((path) => this.dirtyPaths.has(path));
     if (!paths.length) {
       this.activeEditDirty.clear();
       return;
@@ -3534,7 +3568,7 @@ export class NtfyLanSync {
     urgentPaths = new Set<string>()
   ): Promise<LanSyncPeerResult> {
     if (!this.metadataProtocol(peer)) throw new LanSyncProtocolError("peer_upgrade_required", 426);
-    const remoteDirty = new Map([...new Map(peer.remoteDirtyPaths ?? []).entries()].slice(0, INCREMENTAL_PATH_BATCH_SIZE));
+    const remoteDirty = new Map(peer.remoteDirtyPaths ?? []);
     const hasIncrementalWork = localDirty.size > 0 || remoteDirty.size > 0;
     const remoteFullSyncRequestId = this.backgroundReconciliation || hasIncrementalWork
       ? ""
@@ -4973,8 +5007,9 @@ export class NtfyLanSync {
   private async callPeer(peer: LanSyncPeer, route: string, payload: Record<string, unknown>, timeoutMs = 8000): Promise<Record<string, unknown>> {
     if (!this.identity) throw new Error("identity_unavailable");
     const path = `${API_PREFIX}${route}`;
-    const body = await encryptLanSyncPayload(this.identity.secret, payload);
-    const headers = await authHeaders(this.identity, this.deviceId, "POST", path, body, this.now());
+    const secret = this.activeSecret();
+    const body = await encryptLanSyncPayload(secret, payload);
+    const headers = await authHeaders({ ...this.identity, secret }, this.deviceId, "POST", path, body, this.now());
     let lastError: unknown = null;
     for (const address of peer.addresses) {
       if (!isPrivateLanAddress(address)) continue;
@@ -4997,7 +5032,7 @@ export class NtfyLanSync {
           }
           throw new LanSyncProtocolError(code, response.status);
         }
-        const decrypted = await decryptLanSyncPayload(this.identity.secret, response.text);
+        const decrypted = await decryptLanSyncPayload(secret, response.text);
         peer.verifiedAt = this.now();
         peer.consecutiveFailures = 0;
         peer.lastFailureAt = 0;
@@ -5041,8 +5076,9 @@ export class NtfyLanSync {
         "x-cancip-nonce": headerValue(request, "x-cancip-nonce"),
         "x-cancip-signature": headerValue(request, "x-cancip-signature")
       };
+      const secret = this.activeSecret();
       const deviceId = await verifyLanSyncRequest({
-        secret: this.identity.secret,
+        secret,
         vaultId: this.identity.vaultId,
         method: request.method,
         path,
@@ -5054,7 +5090,7 @@ export class NtfyLanSync {
       authenticated = true;
       const remoteAddress = normalizeRemoteAddress(request.socket.remoteAddress ?? "");
       if (!this.allowedByRateLimit(`${remoteAddress}:${deviceId}`)) throw new LanSyncProtocolError("rate_limited", 429);
-      const payload = await decryptLanSyncPayload(this.identity.secret, body);
+      const payload = await decryptLanSyncPayload(secret, body);
       const metadataProtocol = METADATA_PROTOCOLS.find((protocol) => path.startsWith(`${API_PREFIX}${protocol.routePrefix}/`));
       const metadataRoute = metadataProtocol
         ? path.slice(`${API_PREFIX}${metadataProtocol.routePrefix}`.length)
@@ -5165,7 +5201,7 @@ export class NtfyLanSync {
         throw new LanSyncProtocolError("not_found", 404);
       }
       this.finishInboundFileActivity(deviceId, inboundActivityIndex, true);
-      const encryptedResult = await encryptLanSyncPayload(this.identity.secret, result);
+      const encryptedResult = await encryptLanSyncPayload(secret, result);
       sendText(response, 200, encryptedResult);
       if (metadataRoute === "/manifest") {
         this.emit({

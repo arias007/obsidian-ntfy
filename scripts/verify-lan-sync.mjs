@@ -239,6 +239,7 @@ try {
   const secret = "s".repeat(43);
   const encrypted = await encryptLanSyncPayload(secret, { text: "private note", count: 2 });
   assert.deepEqual(await decryptLanSyncPayload(secret, encrypted), { text: "private note", count: 2 });
+  assert.deepEqual(await decryptLanSyncPayload(secret, encrypted), { text: "private note", count: 2 }, "shared-key payload remains decryptable");
   const tampered = JSON.parse(encrypted);
   tampered.ciphertext = `${tampered.ciphertext.startsWith("A") ? "B" : "A"}${tampered.ciphertext.slice(1)}`;
   await assert.rejects(() => decryptLanSyncPayload(secret, JSON.stringify(tampered)), /decrypt_failed/);
@@ -853,7 +854,7 @@ try {
       serviceA.notifyVaultChange(path);
     }
     await waitFor(() => storageB.text("Burst/f-00.md") === "burst-0", "first incremental burst batch");
-    assert.ok(serviceA.activity().scan.total <= 32, "Realtime burst scanned more than one bounded batch");
+    assert.ok(serviceA.activity().scan.total >= 40, "Realtime burst did not enqueue every discovered path");
     await waitFor(() => storageB.text("Burst/f-39.md") === "burst-39", "all incremental burst batches");
     await waitFor(() => serviceA.dirtyPaths.size === 0 && serviceA.activeEditDirty.size === 0, "incremental burst journal settlement");
 
@@ -1252,7 +1253,7 @@ try {
   assert.match(source, /对端扫描/, "LAN details do not expose peer scan progress");
   assert.match(source, /const idleLabel = chinese/, "An idle scan does not derive a meaningful stage label");
   assert.match(source, /同步：发现文件即开始/, "The transfer section does not explain that discovered files start immediately");
-  assert.match(lanSource, /INCREMENTAL_PATH_BATCH_SIZE = 32/, "Dirty journal is not split into bounded realtime batches");
+  assert.match(lanSource, /INCREMENTAL_PATH_BATCH_SIZE = Number\.MAX_SAFE_INTEGER/, "Dirty journal must not stop at an arbitrary 32-path limit");
   assert.match(lanSource, /this\.scheduleActiveEditSync\(REALTIME_DIRTY_DELAY_MS\)/, "Vault events do not enter the immediate transfer lane");
   assert.match(lanSource, /const RECONNECT_REPROBE_DELAY_MS = 250/, "LAN reconnect does not have a fast reprobe path");
   assert.match(lanSource, /this\.scheduleReconnectProbe\(\)/, "LAN peer failures do not schedule immediate reconnect probing");
