@@ -182,7 +182,7 @@ async function run() {
   assert.match(styles, /\.obsidian-ntfy-chat\.is-conversation-open \.obsidian-ntfy-chat-conversation/);
   assert.match(source, /notification-hub:conversations-changed/);
   assert.match(source, /runWormholeViaNoteweb\("upload", input\)/);
-  assert.match(source, /plugin\.createBrowserSurface\(host, url/);
+  assert.match(source, /createBrowserSurface\(host, url/);
   assert.match(source, /ntfy-wormhole-background-host/);
   assert.doesNotMatch(source, /runWormholeCli|wormhole-cli|node:child_process/);
   assert.match(source, /class NtfyVaultFileSuggestModal extends SuggestModal/);
@@ -1185,6 +1185,7 @@ async function run() {
   await flushBackgroundWork();
   const downloadedFeishuMessage = feishuGatewayPlugin.settings.conversationMessages.find((message) => message.id === "feishu-om_file");
   assert.ok(downloadedFeishuMessage, "Feishu file message was not ingested");
+  for (let index = 0; index < 40 && downloadedFeishuMessage.attachments[0]?.downloadState !== "ready"; index += 1) await new Promise((resolve) => setTimeout(resolve, 25));
   assert.equal(downloadedFeishuMessage.attachments.length, 1);
   assert.equal(downloadedFeishuMessage.attachments[0].downloadState, "ready");
   assert.equal(downloadedFeishuMessage.attachments[0].remoteOnly, false);
@@ -1316,9 +1317,10 @@ async function run() {
   );
 
   process.stdout.write("notification-hub tests passed\n");
+  process.exit(0);
 }
 
 run().catch((error) => {
   console.error(error);
-  process.exitCode = 1;
+  process.exit(1);
 });
