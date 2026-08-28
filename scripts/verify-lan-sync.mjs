@@ -1233,13 +1233,73 @@ try {
     assert.equal(desktopService.peers.get(mobileDevice).capabilities.has("metadata-session-v3"), true, "Desktop did not accept the mobile v3 compatibility capability");
     assert.equal(desktopService.peers.get(mobileDevice).capabilities.has("metadata-session-v4"), false, "The old-mobile fixture unexpectedly advertised v4");
     await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "automatic full-vault sync");
+    await waitFor(
+      () => !mobileService.syncRunning && !mobileService.activeEditSyncRunning && !mobileService.fullSyncRequested,
+      "automatic full-vault sync settlement",
+      30_000
+    );
     assert.ok(desktopOptions.activityChanges.length > 0, "Passive desktop did not report independent scan activity");
     assert.equal(desktopProgress.some((value) => value.phase === "scanning"), false, "Passive desktop scan overwrote mirrored transfer progress");
+
+    const originalMobileListFiles = mobileStorage.listFiles.bind(mobileStorage);
+    let releaseMobileScan;
+    let mobileScanEntered;
+    const mobileScanGate = new Promise((resolvePromise) => { releaseMobileScan = resolvePromise; });
+    const mobileScanStarted = new Promise((resolvePromise) => { mobileScanEntered = resolvePromise; });
+    mobileStorage.listFiles = async (...args) => {
+      mobileScanEntered();
+      await mobileScanGate;
+      return await originalMobileListFiles(...args);
+    };
+    const historyBeforeConcurrentPriority = mobileService.activity().roundHistory.length;
+    try {
+      mobileService.requestSync({ deep: true, strict: true });
+      await Promise.race([
+        mobileScanStarted,
+        new Promise((_resolve, reject) => setTimeout(() => reject(new Error("Timed out waiting for mobile full scan")), 10_000))
+      ]);
+      await waitFor(
+        () => mobileService.syncRunning && !mobileService.transferSessionActive,
+        "mobile full scan waiting for passive desktop manifest"
+      );
+      const scanBeforeRemoteEdit = mobileService.activity().scan;
+      desktopStorage.putText(".obsidian/realtime-priority.json", "priority config", 1250);
+      desktopService.notifyVaultChange(".obsidian/realtime-priority.json");
+      await waitFor(
+        () => mobileStorage.text(".obsidian/realtime-priority.json") === "priority config",
+        "passive desktop priority transfer during blocked full scan",
+        5_000
+      ).catch((error) => {
+        throw new Error(`${error.message}; state=${JSON.stringify({
+          desktopDirty: [...desktopService.dirtyPaths],
+          mobileRemoteDirty: [...(mobileService.peers.get(desktopDevice)?.remoteDirtyPaths ?? [])],
+          mobileRemotePriority: [...(mobileService.peers.get(desktopDevice)?.remotePriorityDirtyPaths ?? [])],
+          mobileSyncRunning: mobileService.syncRunning,
+          mobileActiveEditSyncRunning: mobileService.activeEditSyncRunning,
+          mobileActiveEditTimer: Boolean(mobileService.activeEditTimer),
+          mobileActiveEditTimerDueAt: mobileService.activeEditTimerDueAt,
+          mobileNow: mobileService.now(),
+          mobileTransferSessionActive: mobileService.transferSessionActive,
+          mobilePriorityPending: mobileService.prioritySyncPending,
+          mobileLastError: mobileService.lastErrorValue,
+          mobileProgress: mobileService.progress(),
+          desktopProgress: desktopService.progress()
+        })}`);
+      });
+      assert.equal(mobileService.activity().roundHistory.length, historyBeforeConcurrentPriority, "A concurrent priority transfer entered history before the full scan finished");
+      const scanAfterRemoteEdit = mobileService.activity().scan;
+      if (scanBeforeRemoteEdit.id) assert.equal(scanAfterRemoteEdit.id, scanBeforeRemoteEdit.id, "A remote priority edit replaced the active full-scan snapshot");
+      if (scanBeforeRemoteEdit.total > 0) assert.equal(scanAfterRemoteEdit.total, scanBeforeRemoteEdit.total, "A remote priority edit reset the full-scan denominator");
+    } finally {
+      releaseMobileScan();
+      mobileStorage.listFiles = originalMobileListFiles;
+    }
+    await waitFor(() => !mobileService.syncRunning && !mobileService.fullSyncRequested, "concurrent full-scan round settlement", 30_000);
+
     desktopStorage.putText("Desktop/desktop-initiated.md", "started on desktop", 1300);
+    const desktopRealtimeStartedAt = Date.now();
     desktopService.notifyVaultChange("Desktop/desktop-initiated.md");
     const beforeDesktopInitiatedProgress = desktopProgress.length;
-    desktopService.requestSync();
-    assert.ok(["requesting-peer-scan", "enumerating", "planning", "transferring"].includes(desktopService.progress().stage), "Desktop could not actively initiate a LAN synchronization session");
     await waitFor(() => mobileStorage.text("Desktop/desktop-initiated.md") === "started on desktop", "desktop-initiated LAN synchronization").catch((error) => {
       throw new Error(`${error.message}; state=${JSON.stringify({
         desktopDirty: [...desktopService.dirtyPaths],
@@ -1249,6 +1309,7 @@ try {
         mobileProgress: mobileService.progress()
       })}`);
     });
+    assert.ok(Date.now() - desktopRealtimeStartedAt < 3_000, "A passive desktop Vault event waited for the periodic/full-scan lane");
     assert.ok(desktopProgress.slice(beforeDesktopInitiatedProgress).some((value) => ["requesting-peer-scan", "enumerating", "planning", "transferring"].includes(value.stage)), "Desktop initiation exposed no active progress");
     mobileStorage.putText("Mobile/mobile-initiated.md", "started on mobile", 1400);
     mobileService.notifyVaultChange("Mobile/mobile-initiated.md");

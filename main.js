@@ -1615,6 +1615,7 @@ ${bodyHash}`;
     activeEditingPath = null;
     activeEditDirty = /* @__PURE__ */ new Set();
     activeEditTimer = null;
+    activeEditTimerDueAt = 0;
     activeEditSyncRunning = false;
     activeEditStartedAt = 0;
     urgentProbePending = false;
@@ -1638,6 +1639,9 @@ ${bodyHash}`;
     receivedMessageIds = /* @__PURE__ */ new Set();
     lastTransferAt = 0;
     currentTransferSessionId = "";
+    // Scanning/manifest exchange may overlap the priority lane, but only one
+    // peer transfer session may own the wire at a time.
+    transferSessionActive = false;
     progressValue = defaultProgress();
     // A full-vault round has one stable counter across all transport batches.
     // Keeping it outside the per-session progress prevents the visible counter
@@ -1923,6 +1927,11 @@ ${bodyHash}`;
         clearTimeout(this.syncTimer);
         this.syncTimer = null;
       }
+      if (this.activeEditTimer) {
+        clearTimeout(this.activeEditTimer);
+        this.activeEditTimer = null;
+      }
+      this.activeEditTimerDueAt = 0;
       if (this.urgentProbeTimer) {
         clearTimeout(this.urgentProbeTimer);
         this.urgentProbeTimer = null;
@@ -1976,6 +1985,7 @@ ${bodyHash}`;
       this.rateByClient.clear();
       this.inboundSession = null;
       this.currentTransferSessionId = "";
+      this.transferSessionActive = false;
       this.prioritySyncPending = false;
       this.appliedMutationEvents.clear();
       this.servedFilesystemScanRequests.clear();
@@ -2129,7 +2139,6 @@ ${bodyHash}`;
           this.fullRoundScanVisible = true;
           this.scanValue = this.emptyScanActivity();
         }
-        if (this.syncRunning) this.prioritySyncPending = true;
       }
       const needsFilesystemScan = deep;
       if (needsFilesystemScan) {
@@ -2985,6 +2994,7 @@ ${bodyHash}`;
           remoteFullSyncRequestId: "",
           remoteForceFilesystemScan: false,
           remoteDirtyPaths: /* @__PURE__ */ new Map(),
+          remotePriorityDirtyPaths: /* @__PURE__ */ new Map(),
           remoteProgress: null,
           policy: passivePeerPolicy(),
           capabilities: /* @__PURE__ */ new Set(),
@@ -3336,13 +3346,24 @@ ${bodyHash}`;
         this.beginSyncRound();
       }
       peer.remoteForceFilesystemScan = Boolean(peer.remoteFullSyncRequestId && payload.forceFilesystemScan === true);
-      peer.remoteDirtyPaths = this.parseDirtyPaths(payload.dirtyPaths);
+      const previousRemoteDirty = peer.remoteDirtyPaths;
+      const incomingRemoteDirty = this.parseDirtyPaths(payload.dirtyPaths);
+      let receivedPriorityPath = false;
+      for (const [path, generation] of incomingRemoteDirty) {
+        if (generation <= (previousRemoteDirty.get(path) ?? 0)) continue;
+        peer.remotePriorityDirtyPaths.set(path, generation);
+        receivedPriorityPath = true;
+      }
+      peer.remoteDirtyPaths = incomingRemoteDirty;
+      if (receivedPriorityPath && (this.syncRunning || this.activeEditSyncRunning)) {
+        this.prioritySyncPending = true;
+      }
       const remoteProgress = this.parseRemoteProgress(payload.progress);
       if (remoteProgress) peer.remoteProgress = remoteProgress;
       this.mergeRemoteRoundHistory(payload.roundHistory);
       this.mirrorRemoteProgress(peer);
       this.emitActivityChanged();
-      return requested;
+      return requested || receivedPriorityPath;
     }
     mirrorRemoteProgress(peer) {
       const remote = peer.remoteProgress;
@@ -3493,7 +3514,10 @@ ${bodyHash}`;
       if (!force && !this.settings().autoDiscovery) return;
       if (force) this.syncForced = true;
       if (this.syncRunning || this.activeEditSyncRunning) {
-        if (this.activeEditDirty.size) this.prioritySyncPending = true;
+        if (this.hasPrioritySyncWork()) {
+          this.prioritySyncPending = true;
+          if (!this.activeEditSyncRunning) this.scheduleActiveEditSync(0);
+        }
         return;
       }
       if (this.syncTimer && delay <= 0) {
@@ -3514,11 +3538,14 @@ ${bodyHash}`;
     syncTargets() {
       return this.activePeers().filter((peer) => peer.canHost);
     }
+    hasPrioritySyncWork() {
+      return this.activeEditDirty.size > 0 || this.syncTargets().some((peer) => peer.remotePriorityDirtyPaths.size > 0);
+    }
     async syncActivePeers() {
       const forced = this.syncForced;
       this.syncForced = false;
       if (!this.runningValue || !this.isCoordinator()) return;
-      if (this.activeEditDirty.size && !this.activeEditSyncRunning) {
+      if (this.hasPrioritySyncWork() && !this.activeEditSyncRunning) {
         this.prioritySyncPending = true;
         this.scheduleActiveEditSync(0);
         return;
@@ -3561,6 +3588,7 @@ ${bodyHash}`;
       let remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
       const urgentPaths = new Set([...localDirty.keys()].filter((path) => this.urgentDirtyPaths.has(path)));
       for (const path of urgentPaths) this.urgentDirtyPaths.delete(path);
+      this.prioritySyncPending = false;
       this.syncRunning = true;
       this.syncStartedAt = this.now();
       try {
@@ -3628,7 +3656,7 @@ ${bodyHash}`;
           this.syncQueued = false;
           this.scheduleSync(hasUrgentWork || this.dirtyPaths.size > 0 ? URGENT_SYNC_DELAY_MS : QUEUED_SYNC_DELAY_MS, true);
         }
-        if (this.activeEditDirty.size > 0) this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
+        if (this.hasPrioritySyncWork()) this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
       }
     }
     /**
@@ -3639,37 +3667,50 @@ ${bodyHash}`;
      * main round if bulk work is still pending.
      */
     scheduleActiveEditSync(delay) {
-      if (!this.runningValue || !this.activeEditDirty.size) return;
+      if (!this.runningValue || !this.hasPrioritySyncWork()) return;
       if (!this.syncTargets().length) return;
       if (this.activeEditSyncRunning) return;
-      if (this.syncRunning) {
+      if (this.syncRunning && this.transferSessionActive) {
         this.prioritySyncPending = true;
         return;
       }
       if (this.activeEditTimer) {
+        if (this.activeEditTimerDueAt <= this.now() + Math.max(0, delay)) return;
         clearTimeout(this.activeEditTimer);
         this.activeEditTimer = null;
       }
+      this.activeEditTimerDueAt = this.now() + Math.max(0, delay);
       this.activeEditTimer = setTimeout(() => {
         this.activeEditTimer = null;
+        this.activeEditTimerDueAt = 0;
         void this.runActiveEditSync();
       }, Math.max(0, delay));
     }
     async runActiveEditSync() {
       if (!this.runningValue || this.activeEditSyncRunning || !this.isCoordinator()) return;
-      if (this.syncRunning) {
+      if (this.syncRunning && this.transferSessionActive) {
         this.prioritySyncPending = true;
         return;
       }
       this.prioritySyncPending = false;
-      const paths = [...this.activeEditDirty].filter((path) => this.dirtyPaths.has(path));
-      if (!paths.length) {
+      const localPaths = [...this.activeEditDirty].filter((path) => this.dirtyPaths.has(path));
+      const remotePriorityByPeer = /* @__PURE__ */ new Map();
+      for (const peer of this.syncTargets()) {
+        const captured = /* @__PURE__ */ new Map();
+        for (const [path, generation] of peer.remotePriorityDirtyPaths) {
+          if ((peer.remoteDirtyPaths.get(path) ?? 0) < generation) continue;
+          captured.set(path, generation);
+          if (peer.remotePriorityDirtyPaths.get(path) === generation) peer.remotePriorityDirtyPaths.delete(path);
+        }
+        if (captured.size) remotePriorityByPeer.set(peer, captured);
+      }
+      if (!localPaths.length && !remotePriorityByPeer.size) {
         this.activeEditDirty.clear();
         return;
       }
       const peers = this.syncTargets();
       if (!peers.length) return;
-      const localDirty = new Map(paths.map((path) => [path, this.dirtyPaths.get(path) ?? this.dirtySequence]));
+      const localDirty = new Map(localPaths.map((path) => [path, this.dirtyPaths.get(path) ?? this.dirtySequence]));
       let settledAcrossPeers = null;
       let synchronizedPeers = 0;
       this.activeEditSyncRunning = true;
@@ -3677,17 +3718,23 @@ ${bodyHash}`;
       try {
         for (const peer of peers) {
           if (!this.runningValue) break;
-          if (this.syncRunning) break;
+          if (this.syncRunning && this.transferSessionActive) break;
           if (!this.metadataProtocol(peer)) {
             this.lastErrorValue = "peer_upgrade_required";
             continue;
           }
+          const remoteDirty = remotePriorityByPeer.get(peer) ?? /* @__PURE__ */ new Map();
+          const priorityPaths = /* @__PURE__ */ new Set([...localPaths, ...remoteDirty.keys()]);
+          if (!priorityPaths.size) {
+            synchronizedPeers += 1;
+            continue;
+          }
           const result = await this.syncPeerMetadata(peer, {
             fullSync: false,
-            paths: new Set(paths),
+            paths: priorityPaths,
             localDirty,
-            remoteDirty: /* @__PURE__ */ new Map(),
-            urgentPaths: new Set(paths),
+            remoteDirty,
+            urgentPaths: priorityPaths,
             localFullSyncRequestId: "",
             remoteFullSyncRequestId: "",
             forceLocalFilesystemScan: false,
@@ -3697,8 +3744,11 @@ ${bodyHash}`;
           synchronizedPeers += 1;
         }
         if (synchronizedPeers === peers.length) {
-          for (const path of paths) this.activeEditDirty.delete(path);
-          for (const path of settledAcrossPeers ?? []) {
+          const settled = settledAcrossPeers ?? /* @__PURE__ */ new Set();
+          for (const path of localPaths) {
+            if (settled.has(path)) this.activeEditDirty.delete(path);
+          }
+          for (const path of settled) {
             const generation = localDirty.get(path);
             if (generation !== void 0 && (this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
             this.urgentDirtyPaths.delete(path);
@@ -3720,11 +3770,21 @@ ${bodyHash}`;
       } catch (error) {
         this.lastErrorValue = safeErrorCode(error);
       } finally {
+        for (const [peer, captured] of remotePriorityByPeer) {
+          for (const [path, generation] of captured) {
+            const pendingGeneration = peer.remoteDirtyPaths.get(path) ?? 0;
+            if (pendingGeneration < generation) continue;
+            peer.remotePriorityDirtyPaths.set(path, Math.max(
+              peer.remotePriorityDirtyPaths.get(path) ?? 0,
+              pendingGeneration
+            ));
+          }
+        }
         this.activeEditSyncRunning = false;
         this.activeEditStartedAt = 0;
         this.currentTransferSessionId = "";
-        if (this.activeEditDirty.size) this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
-        if (!this.activeEditDirty.size && (this.syncQueued || this.urgentDirtyPaths.size || this.dirtyPaths.size || this.fullSyncRequested || peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0 || Boolean(peer.remoteFullSyncRequestId)))) {
+        if (this.hasPrioritySyncWork()) this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
+        if (!this.hasPrioritySyncWork() && (this.syncQueued || this.urgentDirtyPaths.size || this.dirtyPaths.size || this.fullSyncRequested || peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0 || Boolean(peer.remoteFullSyncRequestId)))) {
           this.syncQueued = false;
           this.scheduleSync(URGENT_SYNC_DELAY_MS, true);
         }
@@ -3760,7 +3820,7 @@ ${bodyHash}`;
       this.emitActivityChanged();
       const localPolicy = this.policy();
       const requestedPaths = [...request.paths].sort((left, right) => left.localeCompare(right));
-      const localEntriesPromise = (request.fullSync ? this.buildMetadataManifest(localPolicy.syncConfigFolder, void 0, request.forceLocalFilesystemScan) : this.buildMetadataManifestForPaths(requestedPaths, localPolicy.syncConfigFolder)).then((entries) => {
+      const localEntriesPromise = (request.fullSync ? this.buildMetadataManifest(true, void 0, request.forceLocalFilesystemScan) : this.buildMetadataManifestForPaths(requestedPaths, true)).then((entries) => {
         if (request.fullSync && this.progressValue.phase !== "syncing") {
           this.emit({
             ...defaultProgress("connected"),
@@ -3777,10 +3837,10 @@ ${bodyHash}`;
           peer,
           this.metadataRoute(peer, request.fullSync ? "/manifest" : "/manifest/paths"),
           request.fullSync ? {
-            syncConfigFolder: localPolicy.syncConfigFolder,
+            syncConfigFolder: true,
             forceFilesystemScan: request.forceRemoteFilesystemScan,
             scanRequestIds: [request.localFullSyncRequestId, request.remoteFullSyncRequestId].filter(Boolean)
-          } : { syncConfigFolder: localPolicy.syncConfigFolder, paths: requestedPaths },
+          } : { syncConfigFolder: true, paths: requestedPaths },
           // A remote manifest can require a full filesystem walk on the peer.
           // The old 8s default made every large vault fail before the peer
           // could answer, which restarted the same scan forever.
@@ -3934,14 +3994,27 @@ ${bodyHash}`;
       this.activityUpdatedAt = this.now();
       let sessionId = randomId(18);
       this.currentTransferSessionId = sessionId;
-      const sessionStart = await this.callPeer(peer, this.metadataRoute(peer, "/session/start"), {
-        sessionId,
-        total: actions.length,
-        bytesTotal,
-        uploads,
-        downloads,
-        files: this.activityFiles.map((file) => ({ path: file.path, action: file.action, size: file.size }))
-      }, SESSION_TIMEOUT_MS);
+      if (request.fullSync) {
+        const waitStartedAt = this.now();
+        while (this.activeEditSyncRunning && this.now() - waitStartedAt < SESSION_TIMEOUT_MS) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+      this.transferSessionActive = true;
+      let sessionStart;
+      try {
+        sessionStart = await this.callPeer(peer, this.metadataRoute(peer, "/session/start"), {
+          sessionId,
+          total: actions.length,
+          bytesTotal,
+          uploads,
+          downloads,
+          files: this.activityFiles.map((file) => ({ path: file.path, action: file.action, size: file.size }))
+        }, SESSION_TIMEOUT_MS);
+      } catch (error) {
+        this.transferSessionActive = false;
+        throw error;
+      }
       if (typeof sessionStart.sessionId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(sessionStart.sessionId)) {
         sessionId = sessionStart.sessionId;
         this.currentTransferSessionId = sessionId;
@@ -3985,7 +4058,7 @@ ${bodyHash}`;
       };
       const transferWorker = async () => {
         while (this.runningValue && failure === null && cursor < actions.length) {
-          if (this.prioritySyncPending && this.activeEditDirty.size > 0) break;
+          if (this.prioritySyncPending) break;
           const index = cursor;
           cursor += 1;
           const activity = this.activityFiles[index];
@@ -4092,7 +4165,7 @@ ${bodyHash}`;
       };
       await Promise.all(Array.from({ length: adaptiveTransferConcurrency(this.activityFiles) }, transferWorker));
       this.saveMetadataLedger(peer.deviceId, ledger);
-      const priorityYielded = failure === null && this.prioritySyncPending && this.activeEditDirty.size > 0 && actions.some((action) => !settledPaths.has(action.path));
+      const priorityYielded = failure === null && this.prioritySyncPending && actions.some((action) => !settledPaths.has(action.path));
       if (priorityYielded) {
         for (const action of actions) {
           if (!settledPaths.has(action.path)) retryPaths.add(action.path);
@@ -4122,8 +4195,15 @@ ${bodyHash}`;
         if (!peer.remoteFullSyncRequestId) peer.remoteForceFilesystemScan = false;
         for (const path of retryPaths) this.markDirtyPath(path, QUEUED_SYNC_DELAY_MS);
       }
-      if (failure !== null) throw failure;
-      if (finishFailure !== null) throw finishFailure;
+      if (failure !== null) {
+        this.transferSessionActive = false;
+        throw failure;
+      }
+      if (finishFailure !== null) {
+        this.transferSessionActive = false;
+        throw finishFailure;
+      }
+      this.transferSessionActive = false;
       peer.verifiedAt = this.now();
       peer.consecutiveFailures = 0;
       peer.lastFailureAt = 0;

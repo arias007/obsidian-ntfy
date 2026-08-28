@@ -326,6 +326,7 @@ type LanSyncPeer = {
   remoteFullSyncRequestId: string;
   remoteForceFilesystemScan: boolean;
   remoteDirtyPaths: Map<string, number>;
+  remotePriorityDirtyPaths: Map<string, number>;
   remoteProgress: LanSyncRemoteProgress | null;
   policy: LanSyncPolicy;
   capabilities: Set<string>;
@@ -1421,6 +1422,7 @@ export class NtfyLanSync {
   private activeEditingPath: string | null = null;
   private activeEditDirty = new Set<string>();
   private activeEditTimer: ReturnType<typeof setTimeout> | null = null;
+  private activeEditTimerDueAt = 0;
   private activeEditSyncRunning = false;
   private activeEditStartedAt = 0;
   private urgentProbePending = false;
@@ -1444,6 +1446,9 @@ export class NtfyLanSync {
   private receivedMessageIds = new Set<string>();
   private lastTransferAt = 0;
   private currentTransferSessionId = "";
+  // Scanning/manifest exchange may overlap the priority lane, but only one
+  // peer transfer session may own the wire at a time.
+  private transferSessionActive = false;
   private progressValue = defaultProgress();
   // A full-vault round has one stable counter across all transport batches.
   // Keeping it outside the per-session progress prevents the visible counter
@@ -1763,6 +1768,11 @@ export class NtfyLanSync {
       clearTimeout(this.syncTimer);
       this.syncTimer = null;
     }
+    if (this.activeEditTimer) {
+      clearTimeout(this.activeEditTimer);
+      this.activeEditTimer = null;
+    }
+    this.activeEditTimerDueAt = 0;
     if (this.urgentProbeTimer) {
       clearTimeout(this.urgentProbeTimer);
       this.urgentProbeTimer = null;
@@ -1817,6 +1827,7 @@ export class NtfyLanSync {
     this.rateByClient.clear();
     this.inboundSession = null;
     this.currentTransferSessionId = "";
+    this.transferSessionActive = false;
     this.prioritySyncPending = false;
     this.appliedMutationEvents.clear();
     this.servedFilesystemScanRequests.clear();
@@ -2008,10 +2019,6 @@ export class NtfyLanSync {
         this.fullRoundScanVisible = true;
         this.scanValue = this.emptyScanActivity();
       }
-      // Never lose the wake-up just because a bulk transfer currently owns the
-      // peer session. The transfer worker consumes this flag at an action
-      // boundary and hands the session to the active lane.
-      if (this.syncRunning) this.prioritySyncPending = true;
     }
     // Normal wakeups consume only paths already discovered by Vault events or
     // the background producer. A deep reconciliation is explicit maintenance;
@@ -3020,6 +3027,7 @@ export class NtfyLanSync {
         remoteFullSyncRequestId: "",
         remoteForceFilesystemScan: false,
         remoteDirtyPaths: new Map(),
+        remotePriorityDirtyPaths: new Map(),
         remoteProgress: null,
         policy: passivePeerPolicy(),
         capabilities: new Set(),
@@ -3432,7 +3440,21 @@ export class NtfyLanSync {
       this.beginSyncRound();
     }
     peer.remoteForceFilesystemScan = Boolean(peer.remoteFullSyncRequestId && payload.forceFilesystemScan === true);
-    peer.remoteDirtyPaths = this.parseDirtyPaths(payload.dirtyPaths);
+    const previousRemoteDirty = peer.remoteDirtyPaths;
+    const incomingRemoteDirty = this.parseDirtyPaths(payload.dirtyPaths);
+    let receivedPriorityPath = false;
+    for (const [path, generation] of incomingRemoteDirty) {
+      if (generation <= (previousRemoteDirty.get(path) ?? 0)) continue;
+      peer.remotePriorityDirtyPaths.set(path, generation);
+      receivedPriorityPath = true;
+    }
+    peer.remoteDirtyPaths = incomingRemoteDirty;
+    if (receivedPriorityPath && (this.syncRunning || this.activeEditSyncRunning)) {
+      // The desktop may be a passive HTTP peer. Its Vault event reaches the
+      // mobile coordinator through /ping, so remote dirty generations must
+      // preempt bulk work exactly like a local editor event.
+      this.prioritySyncPending = true;
+    }
     const remoteProgress = this.parseRemoteProgress(payload.progress);
     if (remoteProgress) peer.remoteProgress = remoteProgress;
     this.mergeRemoteRoundHistory(payload.roundHistory);
@@ -3440,7 +3462,7 @@ export class NtfyLanSync {
     // Heartbeat progress is an activity stream too. Refresh the panel even
     // while the local device is scanning so the remote scan never looks stuck.
     this.emitActivityChanged();
-    return requested;
+    return requested || receivedPriorityPath;
   }
 
   private mirrorRemoteProgress(peer: LanSyncPeer): void {
@@ -3642,7 +3664,13 @@ export class NtfyLanSync {
       // Keep a durable wake-up while the current session owns the peer. A live
       // edit is consumed at the next action boundary instead of waiting for a
       // later periodic tick.
-      if (this.activeEditDirty.size) this.prioritySyncPending = true;
+      if (this.hasPrioritySyncWork()) {
+        this.prioritySyncPending = true;
+        // Manifest exchange is not wire ownership. The priority path can run
+        // concurrently with a full scan and will wait only if a transfer
+        // session is already active.
+        if (!this.activeEditSyncRunning) this.scheduleActiveEditSync(0);
+      }
       return;
     }
     // An urgent edit must preempt an older delayed timer. Leaving that timer in
@@ -3670,6 +3698,11 @@ export class NtfyLanSync {
     return this.activePeers().filter((peer) => peer.canHost);
   }
 
+  private hasPrioritySyncWork(): boolean {
+    return this.activeEditDirty.size > 0
+      || this.syncTargets().some((peer) => peer.remotePriorityDirtyPaths.size > 0);
+  }
+
   private async syncActivePeers(): Promise<void> {
     const forced = this.syncForced;
     this.syncForced = false;
@@ -3678,7 +3711,7 @@ export class NtfyLanSync {
     if (!this.runningValue || !this.isCoordinator()) return;
     // A live edit gets the first session boundary. This also covers the race
     // where the ordinary timer fires just before the active-lane timer.
-    if (this.activeEditDirty.size && !this.activeEditSyncRunning) {
+    if (this.hasPrioritySyncWork() && !this.activeEditSyncRunning) {
       this.prioritySyncPending = true;
       this.scheduleActiveEditSync(0);
       return;
@@ -3740,6 +3773,9 @@ export class NtfyLanSync {
     let remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
     const urgentPaths = new Set([...localDirty.keys()].filter((path) => this.urgentDirtyPaths.has(path)));
     for (const path of urgentPaths) this.urgentDirtyPaths.delete(path);
+    // All priority work observed before this point was routed through the fast
+    // lane above. A later event will set the latch again while this batch runs.
+    this.prioritySyncPending = false;
     this.syncRunning = true;
     this.syncStartedAt = this.now();
     try {
@@ -3826,7 +3862,7 @@ export class NtfyLanSync {
         this.scheduleSync(hasUrgentWork || this.dirtyPaths.size > 0 ? URGENT_SYNC_DELAY_MS : QUEUED_SYNC_DELAY_MS, true);
       }
       // After a bulk round, give the actively-edited file its own fast pass.
-      if (this.activeEditDirty.size > 0) this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
+      if (this.hasPrioritySyncWork()) this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
     }
   }
 
@@ -3838,22 +3874,24 @@ export class NtfyLanSync {
    * main round if bulk work is still pending.
    */
   private scheduleActiveEditSync(delay: number): void {
-    if (!this.runningValue || !this.activeEditDirty.size) return;
+    if (!this.runningValue || !this.hasPrioritySyncWork()) return;
     if (!this.syncTargets().length) return;
     if (this.activeEditSyncRunning) return;
-    if (this.syncRunning) {
+    if (this.syncRunning && this.transferSessionActive) {
       this.prioritySyncPending = true;
       return;
     }
-    // A zero-delay realtime wake-up always wins over an older delayed timer.
-    // Otherwise the first edit after a queued scan could wait for the stale
-    // timer and appear not to sync immediately.
+    // Keep the earliest wake-up. Repeated heartbeat/sync signals must never
+    // postpone an already queued 0ms priority pass indefinitely.
     if (this.activeEditTimer) {
+      if (this.activeEditTimerDueAt <= this.now() + Math.max(0, delay)) return;
       clearTimeout(this.activeEditTimer);
       this.activeEditTimer = null;
     }
+    this.activeEditTimerDueAt = this.now() + Math.max(0, delay);
     this.activeEditTimer = setTimeout(() => {
       this.activeEditTimer = null;
+      this.activeEditTimerDueAt = 0;
       void this.runActiveEditSync();
     }, Math.max(0, delay));
   }
@@ -3863,22 +3901,33 @@ export class NtfyLanSync {
     // A new edit is a green-lane event. Park the ordinary batch briefly so
     // this one-path session can start immediately after the current request
     // boundary, instead of waiting for every bulk file to drain.
-    if (this.syncRunning) {
+    if (this.syncRunning && this.transferSessionActive) {
       this.prioritySyncPending = true;
       return;
     }
     this.prioritySyncPending = false;
-    // Only sync paths still tracked as dirty (not yet settled by a bulk round).
-    // Once the bulk round settles and removes them from dirtyPaths, the lane has
-    // nothing left to do and clears the marker instead of spinning.
-    const paths = [...this.activeEditDirty].filter((path) => this.dirtyPaths.has(path));
-    if (!paths.length) {
+    // Snapshot the priority queues. New generations arriving during this pass
+    // remain queued and cause the current plan to yield at its next file
+    // boundary. Removing only the captured generations avoids a stale pass
+    // consuming a newer edit.
+    const localPaths = [...this.activeEditDirty].filter((path) => this.dirtyPaths.has(path));
+    const remotePriorityByPeer = new Map<LanSyncPeer, Map<string, number>>();
+    for (const peer of this.syncTargets()) {
+      const captured = new Map<string, number>();
+      for (const [path, generation] of peer.remotePriorityDirtyPaths) {
+        if ((peer.remoteDirtyPaths.get(path) ?? 0) < generation) continue;
+        captured.set(path, generation);
+        if (peer.remotePriorityDirtyPaths.get(path) === generation) peer.remotePriorityDirtyPaths.delete(path);
+      }
+      if (captured.size) remotePriorityByPeer.set(peer, captured);
+    }
+    if (!localPaths.length && !remotePriorityByPeer.size) {
       this.activeEditDirty.clear();
       return;
     }
     const peers = this.syncTargets();
     if (!peers.length) return;
-    const localDirty = new Map(paths.map((path) => [path, this.dirtyPaths.get(path) ?? this.dirtySequence]));
+    const localDirty = new Map(localPaths.map((path) => [path, this.dirtyPaths.get(path) ?? this.dirtySequence]));
     let settledAcrossPeers: Set<string> | null = null;
     let synchronizedPeers = 0;
     this.activeEditSyncRunning = true;
@@ -3886,20 +3935,25 @@ export class NtfyLanSync {
     try {
       for (const peer of peers) {
         if (!this.runningValue) break;
-        if (this.syncRunning) break; // a bulk round started; yield and let it finish
+        if (this.syncRunning && this.transferSessionActive) break;
         if (!this.metadataProtocol(peer)) {
           this.lastErrorValue = "peer_upgrade_required";
           continue;
         }
-        // Single-file request: paths are exactly the active edit set, remote
-        // dirty set is empty, so this pass scans and transfers only the file(s)
-        // the user is editing and never drags in unrelated remote work.
+        const remoteDirty = remotePriorityByPeer.get(peer) ?? new Map<string, number>();
+        const priorityPaths = new Set([...localPaths, ...remoteDirty.keys()]);
+        if (!priorityPaths.size) {
+          synchronizedPeers += 1;
+          continue;
+        }
+        // Small path-manifest request: it includes only live local edits and
+        // newly announced remote paths, never unrelated bulk reconciliation.
         const result = await this.syncPeerMetadata(peer, {
           fullSync: false,
-          paths: new Set(paths),
+          paths: priorityPaths,
           localDirty,
-          remoteDirty: new Map(),
-          urgentPaths: new Set(paths),
+          remoteDirty,
+          urgentPaths: priorityPaths,
           localFullSyncRequestId: "",
           remoteFullSyncRequestId: "",
           forceLocalFilesystemScan: false,
@@ -3911,8 +3965,14 @@ export class NtfyLanSync {
         synchronizedPeers += 1;
       }
       if (synchronizedPeers === peers.length) {
-        for (const path of paths) this.activeEditDirty.delete(path);
-        for (const path of settledAcrossPeers ?? []) {
+        const settled = settledAcrossPeers ?? new Set<string>();
+        // Keep paths that were superseded or yielded at an action boundary in
+        // the active lane. They remain in dirtyPaths and must be retried as a
+        // fast edit, rather than silently falling back to the slow bulk pass.
+        for (const path of localPaths) {
+          if (settled.has(path)) this.activeEditDirty.delete(path);
+        }
+        for (const path of settled) {
           const generation = localDirty.get(path);
           if (generation !== undefined && (this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
           this.urgentDirtyPaths.delete(path);
@@ -3936,6 +3996,19 @@ export class NtfyLanSync {
     } catch (error) {
       this.lastErrorValue = safeErrorCode(error);
     } finally {
+      // A failed or superseded priority pass remains priority work. The normal
+      // remote dirty journal is authoritative; rebuild the fast queue from any
+      // captured generation that the session did not acknowledge.
+      for (const [peer, captured] of remotePriorityByPeer) {
+        for (const [path, generation] of captured) {
+          const pendingGeneration = peer.remoteDirtyPaths.get(path) ?? 0;
+          if (pendingGeneration < generation) continue;
+          peer.remotePriorityDirtyPaths.set(path, Math.max(
+            peer.remotePriorityDirtyPaths.get(path) ?? 0,
+            pendingGeneration
+          ));
+        }
+      }
       this.activeEditSyncRunning = false;
       this.activeEditStartedAt = 0;
       this.currentTransferSessionId = "";
@@ -3943,9 +4016,9 @@ export class NtfyLanSync {
       // lane does not self-reschedule: it is re-triggered by the next keystroke
       // (notifyActiveEdit) or by the bulk round's finally block, which avoids a
       // tight retry loop if a peer is temporarily unreachable.
-      if (this.activeEditDirty.size) this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
+      if (this.hasPrioritySyncWork()) this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
       if (
-        !this.activeEditDirty.size
+        !this.hasPrioritySyncWork()
         && (
           this.syncQueued
           || this.urgentDirtyPaths.size
@@ -4013,8 +4086,8 @@ export class NtfyLanSync {
     const localPolicy = this.policy();
     const requestedPaths = [...request.paths].sort((left, right) => left.localeCompare(right));
     const localEntriesPromise = (request.fullSync
-        ? this.buildMetadataManifest(localPolicy.syncConfigFolder, undefined, request.forceLocalFilesystemScan)
-        : this.buildMetadataManifestForPaths(requestedPaths, localPolicy.syncConfigFolder))
+        ? this.buildMetadataManifest(true, undefined, request.forceLocalFilesystemScan)
+        : this.buildMetadataManifestForPaths(requestedPaths, true))
       .then((entries) => {
         if (request.fullSync && this.progressValue.phase !== "syncing") {
           this.emit({
@@ -4033,11 +4106,11 @@ export class NtfyLanSync {
         this.metadataRoute(peer, request.fullSync ? "/manifest" : "/manifest/paths"),
         request.fullSync
           ? {
-              syncConfigFolder: localPolicy.syncConfigFolder,
+              syncConfigFolder: true,
               forceFilesystemScan: request.forceRemoteFilesystemScan,
               scanRequestIds: [request.localFullSyncRequestId, request.remoteFullSyncRequestId].filter(Boolean)
             }
-          : { syncConfigFolder: localPolicy.syncConfigFolder, paths: requestedPaths },
+          : { syncConfigFolder: true, paths: requestedPaths },
         // A remote manifest can require a full filesystem walk on the peer.
         // The old 8s default made every large vault fail before the peer
         // could answer, which restarted the same scan forever.
@@ -4222,14 +4295,30 @@ export class NtfyLanSync {
     this.activityUpdatedAt = this.now();
     let sessionId = randomId(18);
     this.currentTransferSessionId = sessionId;
-    const sessionStart = await this.callPeer(peer, this.metadataRoute(peer, "/session/start"), {
-      sessionId,
-      total: actions.length,
-      bytesTotal,
-      uploads,
-      downloads,
-      files: this.activityFiles.map((file) => ({ path: file.path, action: file.action, size: file.size }))
-    }, SESSION_TIMEOUT_MS);
+    // A full-vault manifest can be built while the priority lane transfers a
+    // newly changed path. Do not let the two transfer sessions overlap; wait
+    // only at the actual wire-ownership boundary, never for the full scan.
+    if (request.fullSync) {
+      const waitStartedAt = this.now();
+      while (this.activeEditSyncRunning && this.now() - waitStartedAt < SESSION_TIMEOUT_MS) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    this.transferSessionActive = true;
+    let sessionStart: Record<string, unknown>;
+    try {
+      sessionStart = await this.callPeer(peer, this.metadataRoute(peer, "/session/start"), {
+        sessionId,
+        total: actions.length,
+        bytesTotal,
+        uploads,
+        downloads,
+        files: this.activityFiles.map((file) => ({ path: file.path, action: file.action, size: file.size }))
+      }, SESSION_TIMEOUT_MS);
+    } catch (error) {
+      this.transferSessionActive = false;
+      throw error;
+    }
     // The receiver may already own this exact plan after a request timeout.
     // It returns the authoritative session ID so the coordinator can resume
     // the existing transfer instead of opening a second session that waits
@@ -4281,7 +4370,7 @@ export class NtfyLanSync {
       while (this.runningValue && failure === null && cursor < actions.length) {
         // Yield only between actions. This keeps the current file atomic while
         // preventing a large bulk plan from starving a newly edited file.
-        if (this.prioritySyncPending && this.activeEditDirty.size > 0) break;
+        if (this.prioritySyncPending) break;
         const index = cursor;
         cursor += 1;
         const activity = this.activityFiles[index];
@@ -4394,7 +4483,6 @@ export class NtfyLanSync {
     this.saveMetadataLedger(peer.deviceId, ledger);
     const priorityYielded = failure === null
       && this.prioritySyncPending
-      && this.activeEditDirty.size > 0
       && actions.some((action) => !settledPaths.has(action.path));
     if (priorityYielded) {
       // The receiver must keep unstarted actions resumable. They are retried by
@@ -4429,8 +4517,15 @@ export class NtfyLanSync {
       if (!peer.remoteFullSyncRequestId) peer.remoteForceFilesystemScan = false;
       for (const path of retryPaths) this.markDirtyPath(path, QUEUED_SYNC_DELAY_MS);
     }
-    if (failure !== null) throw failure;
-    if (finishFailure !== null) throw finishFailure;
+    if (failure !== null) {
+      this.transferSessionActive = false;
+      throw failure;
+    }
+    if (finishFailure !== null) {
+      this.transferSessionActive = false;
+      throw finishFailure;
+    }
+    this.transferSessionActive = false;
     peer.verifiedAt = this.now();
     peer.consecutiveFailures = 0;
     peer.lastFailureAt = 0;
