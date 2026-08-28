@@ -804,15 +804,15 @@ var NtfyLanSyncRuntime = (() => {
   var REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 6e4;
   var SYNC_MIN_INTERVAL_MS = 120;
   var QUEUED_SYNC_DELAY_MS = 750;
-  var URGENT_SYNC_DELAY_MS = 60;
-  var REALTIME_DIRTY_DELAY_MS = 30;
-  var ACTIVE_EDIT_SYNC_DELAY_MS = 20;
+  var URGENT_SYNC_DELAY_MS = 0;
+  var REALTIME_DIRTY_DELAY_MS = 0;
+  var ACTIVE_EDIT_SYNC_DELAY_MS = 0;
   var RECONNECT_REPROBE_DELAY_MS = 250;
   var MANIFEST_TIMEOUT_MS = 10 * 6e4;
   var PATH_MANIFEST_TIMEOUT_MS = 2e4;
   var SESSION_TIMEOUT_MS = 3e4;
   var STALE_SESSION_RESUME_MS = 5e3;
-  var SYNC_WATCHDOG_MS = 15 * 6e4;
+  var SYNC_WATCHDOG_MS = 8 * 6e4;
   var SCAN_STALL_TIMEOUT_MS = 9e4;
   var TRANSFER_RETRY_LIMIT = 2;
   var TRANSFER_RETRY_BASE_DELAY_MS = 250;
@@ -956,7 +956,7 @@ var NtfyLanSyncRuntime = (() => {
       incrementalPull: true,
       deletePush: true,
       deletePull: true,
-      syncConfigFolder: false,
+      syncConfigFolder: true,
       deleteProtocol: true,
       conflictRule: "latest"
     };
@@ -967,7 +967,7 @@ var NtfyLanSyncRuntime = (() => {
       incrementalPull: false,
       deletePush: false,
       deletePull: false,
-      syncConfigFolder: false,
+      syncConfigFolder: true,
       deleteProtocol: false,
       conflictRule: "latest"
     };
@@ -979,7 +979,10 @@ var NtfyLanSyncRuntime = (() => {
       incrementalPull: value.incrementalPull === true,
       deletePush: value.deletePush === true,
       deletePull: value.deletePull === true,
-      syncConfigFolder: value.syncConfigFolder === true,
+      // Newer peers synchronize the complete vault by default. Keep accepting
+      // the legacy flag for protocol compatibility, but do not let an old
+      // false value silently drop .obsidian changes from a full-vault session.
+      syncConfigFolder: value.syncConfigFolder !== false,
       deleteProtocol: value.deleteProtocol === true,
       conflictRule: normalizedConflictRule(value.conflictRule)
     };
@@ -1017,7 +1020,7 @@ var NtfyLanSyncRuntime = (() => {
     if (root === "node_modules") return null;
     if (root.startsWith(".") && root !== configRoot) return null;
     if (root !== configRoot) return normalized;
-    if (!options.syncConfigFolder || segments.length < 2) return null;
+    if (segments.length < 2) return null;
     const lower = normalized.toLocaleLowerCase();
     const identityRoot = typeof options.identityRoot === "string" ? options.identityRoot.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").toLocaleLowerCase() : "";
     if (identityRoot && (lower === identityRoot || lower.startsWith(`${identityRoot}/`))) return null;
@@ -1408,7 +1411,11 @@ ${bodyHash}`;
       uploadCompleted: 0,
       downloads: 0,
       downloadCompleted: 0,
-      error: ""
+      error: "",
+      roundId: "",
+      roundCompleted: 0,
+      roundTotal: 0,
+      scanCandidates: 0
     };
   }
   function lanSyncTopLevelGroup(path) {
@@ -1594,6 +1601,9 @@ ${bodyHash}`;
     syncTimer = null;
     syncRunning = false;
     syncQueued = false;
+    // Set when a live edit arrives during a bulk transfer. The current action
+    // is allowed to finish, then the session yields so the active lane can run.
+    prioritySyncPending = false;
     syncForced = false;
     syncStartedAt = 0;
     manifestBuildStartedAt = 0;
@@ -1607,6 +1617,8 @@ ${bodyHash}`;
     activeEditTimer = null;
     activeEditSyncRunning = false;
     activeEditStartedAt = 0;
+    urgentProbePending = false;
+    urgentProbeTimer = null;
     reconnectTimer = null;
     transferBackoff = /* @__PURE__ */ new Map();
     syncRequestId = "";
@@ -1627,6 +1639,19 @@ ${bodyHash}`;
     lastTransferAt = 0;
     currentTransferSessionId = "";
     progressValue = defaultProgress();
+    // A full-vault round has one stable counter across all transport batches.
+    // Keeping it outside the per-session progress prevents the visible counter
+    // from jumping back to zero when the producer queues the next batch.
+    syncRoundId = "";
+    syncRoundCompleted = 0;
+    syncRoundTotal = 0;
+    fullRoundScanVisible = false;
+    // A round started by a full-vault request must not enter history until both
+    // filesystem scans have reached their stable denominators. Incremental
+    // rounds keep the flag false so a one-file edit can still complete quickly.
+    roundRequiresScanCompletion = false;
+    roundStartedAt = 0;
+    roundHistory = [];
     activityFiles = [];
     scanValue = this.emptyScanActivity();
     // Manifest work performed on behalf of a peer must never take over the
@@ -1670,11 +1695,12 @@ ${bodyHash}`;
         },
         remote: this.remoteActivity(),
         transferGroups: summarizeTransferGroups(this.activityFiles),
-        scanGroups: summarizeScanGroups(this.scanValue.files)
+        scanGroups: summarizeScanGroups(this.scanValue.files),
+        roundHistory: this.roundHistory.map((round) => ({ ...round }))
       };
     }
     remoteActivity() {
-      const peer = this.activePeers().filter((candidate) => candidate.remoteProgress && this.now() - candidate.remoteProgress.receivedAt <= PEER_PROBE_INTERVAL_MS * 4).sort((left, right) => (right.remoteProgress?.receivedAt ?? 0) - (left.remoteProgress?.receivedAt ?? 0))[0];
+      const peer = this.activePeers().filter((candidate) => candidate.remoteProgress && this.now() - candidate.remoteProgress.receivedAt <= PEER_PROBE_INTERVAL_MS * 12).sort((left, right) => (right.remoteProgress?.receivedAt ?? 0) - (left.remoteProgress?.receivedAt ?? 0))[0];
       const remote = peer?.remoteProgress;
       if (!peer || !remote) return null;
       return {
@@ -1685,6 +1711,11 @@ ${bodyHash}`;
         scanTotalKnown: remote.scanTotalKnown,
         scanCompleted: remote.scanCompleted,
         scanTotal: remote.scanTotal,
+        roundId: remote.roundId,
+        roundCompleted: remote.roundCompleted,
+        roundTotal: remote.roundTotal,
+        scanCandidates: remote.scanCandidates,
+        syncConfigFolder: peer.policy.syncConfigFolder,
         receivedAt: remote.receivedAt
       };
     }
@@ -1835,11 +1866,16 @@ ${bodyHash}`;
       }
       this.identity = await this.loadOrCreateIdentity();
       this.deviceId = this.loadOrCreateDeviceId();
+      this.loadRoundHistory();
       this.lastFullScanAt = this.loadLastFullScanAt();
       this.loadChangeJournal();
       this.loadHashCache();
       await this.loadMetadataIndex();
       this.fullSyncRequested = !this.metadataIndexReady && this.lastFullScanAt <= 0;
+      if (this.fullSyncRequested) {
+        this.roundRequiresScanCompletion = true;
+        this.beginSyncRound();
+      }
       await this.captureChangesSinceCheckpoint();
       if (!this.fullSyncRequestId) {
         this.fullSyncRequestId = randomId(18);
@@ -1887,6 +1923,11 @@ ${bodyHash}`;
         clearTimeout(this.syncTimer);
         this.syncTimer = null;
       }
+      if (this.urgentProbeTimer) {
+        clearTimeout(this.urgentProbeTimer);
+        this.urgentProbeTimer = null;
+      }
+      this.urgentProbePending = false;
       for (const interval of this.intervals) clearInterval(interval);
       this.intervals = [];
       const socket = this.socket;
@@ -1935,10 +1976,16 @@ ${bodyHash}`;
       this.rateByClient.clear();
       this.inboundSession = null;
       this.currentTransferSessionId = "";
+      this.prioritySyncPending = false;
       this.appliedMutationEvents.clear();
       this.servedFilesystemScanRequests.clear();
       this.activityFiles = [];
       this.scanValue = this.emptyScanActivity();
+      this.fullRoundScanVisible = false;
+      this.roundRequiresScanCompletion = false;
+      this.syncRoundId = "";
+      this.syncRoundCompleted = 0;
+      this.syncRoundTotal = 0;
       this.activityUpdatedAt = this.now();
       this.emit(defaultProgress("stopped"));
     }
@@ -1974,6 +2021,15 @@ ${bodyHash}`;
     clearAppliedMutation(path) {
       this.appliedMutationEvents.delete(path);
     }
+    notePathChangedDuringFullScan(path) {
+      const scan = this.scanValue;
+      if (!this.fullRoundScanVisible || scan.phase !== "scanning") return;
+      if (scan.files.some((file) => file.path === path)) return;
+      scan.files.push({ path, state: "complete", size: 0, reason: "changed-during-scan" });
+      scan.total += 1;
+      scan.completed += 1;
+      if (this.scanValue === scan) this.emitActivityChanged();
+    }
     async classifyAppliedMutationEvent(path) {
       let token = this.appliedMutationEvents.get(path);
       if (!token) {
@@ -2003,20 +2059,10 @@ ${bodyHash}`;
      * bulk round still covers it if the dedicated lane is blocked.
      */
     notifyActiveEdit(path) {
-      const normalized = this.normalizePath(path);
+      const normalized = this.normalizePath(path, true);
       if (!normalized) return;
-      this.hashCache.delete(normalized);
-      this.queueHashCacheSave();
-      this.dirtyPaths.set(normalized, ++this.dirtySequence);
-      this.urgentDirtyPaths.add(normalized);
-      if (this.urgentDirtyPaths.size > MAX_MANIFEST_FILES) {
-        this.urgentDirtyPaths = new Set([...this.urgentDirtyPaths].slice(-MAX_MANIFEST_FILES));
-      }
       this.activeEditingPath = normalized;
-      this.activeEditDirty.add(normalized);
-      this.queueChangeJournalSave();
-      this.transferBackoff.delete(normalized);
-      this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
+      this.markDirtyPath(normalized, ACTIVE_EDIT_SYNC_DELAY_MS, true);
     }
     /** Clear the active-edit marker (called when the user switches away). */
     clearActiveEdit(path) {
@@ -2029,8 +2075,9 @@ ${bodyHash}`;
       if (normalized) this.markDirtyPath(normalized, URGENT_SYNC_DELAY_MS, true);
     }
     markDirtyPath(path, delay = QUEUED_SYNC_DELAY_MS, urgent = false) {
-      const normalized = this.normalizePath(path);
+      const normalized = this.normalizePath(path, true);
       if (!normalized) return;
+      this.notePathChangedDuringFullScan(normalized);
       this.hashCache.delete(normalized);
       this.queueHashCacheSave();
       this.dirtySequence += 1;
@@ -2051,16 +2098,38 @@ ${bodyHash}`;
       this.syncRequestId = randomId(18);
       this.announce();
       if (urgent) {
-        void this.probePeers(true);
+        this.scheduleUrgentProbe();
         this.scheduleActiveEditSync(REALTIME_DIRTY_DELAY_MS);
       }
       this.scheduleSync(delay, true);
+    }
+    scheduleUrgentProbe() {
+      if (!this.runningValue) return;
+      this.urgentProbePending = true;
+      if (this.urgentProbeTimer) return;
+      this.urgentProbeTimer = setTimeout(() => {
+        this.urgentProbeTimer = null;
+        if (!this.runningValue || !this.urgentProbePending) return;
+        this.urgentProbePending = false;
+        void this.probePeers(true).finally(() => {
+          if (this.urgentProbePending) this.scheduleUrgentProbe();
+        });
+      }, 0);
     }
     requestSync(options = {}) {
       const deep = options.deep === true;
       if (deep && !this.fullSyncRequested) {
         this.fullSyncRequested = true;
         this.fullSyncRequestId = randomId(18);
+      }
+      if (deep) {
+        this.roundRequiresScanCompletion = true;
+        this.beginSyncRound();
+        if (!this.fullRoundScanVisible) {
+          this.fullRoundScanVisible = true;
+          this.scanValue = this.emptyScanActivity();
+        }
+        if (this.syncRunning) this.prioritySyncPending = true;
       }
       const needsFilesystemScan = deep;
       if (needsFilesystemScan) {
@@ -2098,6 +2167,7 @@ ${bodyHash}`;
         this.syncStartedAt = 0;
         this.syncQueued = false;
         this.lastErrorValue = "sync_watchdog_reset";
+        void this.probePeers(true);
         this.scheduleSync(URGENT_SYNC_DELAY_MS, true);
         return;
       }
@@ -2105,6 +2175,7 @@ ${bodyHash}`;
         this.activeEditSyncRunning = false;
         this.activeEditStartedAt = 0;
         this.lastErrorValue = "active_edit_watchdog_reset";
+        void this.probePeers(true);
         if (this.activeEditDirty.size) this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
         return;
       }
@@ -2226,7 +2297,7 @@ ${bodyHash}`;
         const restored = /* @__PURE__ */ new Map();
         for (const item of parsed.entries.slice(-MAX_MANIFEST_FILES)) {
           if (!Array.isArray(item) || item.length !== 2) continue;
-          const path = this.normalizePath(item[0]);
+          const path = this.normalizePath(item[0], true);
           const generation = Number(item[1]);
           if (!path || !Number.isSafeInteger(generation) || generation <= 0) continue;
           restored.set(path, generation);
@@ -2243,7 +2314,7 @@ ${bodyHash}`;
       if (this.lastSyncCheckpointAt <= 0 || !this.options.storage.listFilesChangedSince) return;
       try {
         const since = Math.max(0, this.lastSyncCheckpointAt - CHECKPOINT_MTIME_OVERLAP_MS);
-        const changed = await this.options.storage.listFilesChangedSince(since, this.settings().syncConfigFolder);
+        const changed = await this.options.storage.listFilesChangedSince(since, true);
         for (const file of changed.slice(0, MAX_MANIFEST_FILES)) this.markDirtyPath(file.path, QUEUED_SYNC_DELAY_MS);
       } catch {
         this.lastFullScanAt = 0;
@@ -2351,12 +2422,16 @@ ${bodyHash}`;
         checkIntervalSeconds: normalizedCheckIntervalSeconds(raw.checkIntervalSeconds),
         mode: normalizedMode(raw.mode),
         conflictRule: normalizedConflictRule(raw.conflictRule),
-        syncConfigFolder: raw.syncConfigFolder === true,
+        syncConfigFolder: raw.syncConfigFolder !== false,
         configDir: normalizedConfigDir(raw.configDir),
         port: normalizedPort(raw.port),
         maxFileBytes: normalizedMaxFileBytes(raw.maxFileBytes),
         inboxRetentionHours: normalizedInboxRetentionHours(raw.inboxRetentionHours),
-        manualPeers: Array.isArray(raw.manualPeers) ? raw.manualPeers.map(String).slice(0, 32) : []
+        manualPeers: Array.isArray(raw.manualPeers) ? raw.manualPeers.map(String).slice(0, 32) : [],
+        // Preserve the optional shared-key handshake after normalizing runtime
+        // settings. Omitting this field silently falls back to each device's
+        // identity secret, so two otherwise matching devices reject each other.
+        sharedSecret: typeof raw.sharedSecret === "string" ? raw.sharedSecret.trim().slice(0, 512) : ""
       };
     }
     policy() {
@@ -2397,6 +2472,8 @@ ${bodyHash}`;
         hashed: 0,
         skipped: 0,
         error: "",
+        syncCandidates: 0,
+        syncCandidatesTotal: 0,
         files: []
       };
     }
@@ -2508,7 +2585,16 @@ ${bodyHash}`;
     }
     emit(progress) {
       const sessionId = progress.sessionId || (progress.phase === "syncing" || progress.phase === "complete" ? this.currentTransferSessionId : "");
-      this.progressValue = { ...progress, sessionId, peerCount: this.activePeers().length };
+      this.progressValue = {
+        ...progress,
+        sessionId,
+        peerCount: this.activePeers().length,
+        roundId: this.syncRoundId,
+        roundCompleted: this.syncRoundCompleted,
+        roundTotal: this.syncRoundTotal,
+        scanCandidates: this.scanValue.syncCandidatesTotal ?? this.scanValue.syncCandidates ?? 0,
+        syncConfigFolder: this.settings().syncConfigFolder
+      };
       this.progressUpdatedAt = this.now();
       try {
         this.options.onProgress({ ...this.progressValue });
@@ -2520,6 +2606,110 @@ ${bodyHash}`;
         this.options.onActivityChanged?.();
       } catch {
       }
+    }
+    beginSyncRound() {
+      if (this.syncRoundId) return;
+      this.syncRoundId = randomId(12);
+      this.syncRoundCompleted = 0;
+      this.syncRoundTotal = 0;
+      this.roundStartedAt = this.now();
+    }
+    roundScanCompleted(peer) {
+      const local = this.scanValue;
+      const localComplete = local.phase !== "scanning" && local.phase !== "error" && local.totalKnown !== false && (local.total <= 0 || local.completed >= local.total);
+      if (!localComplete) return false;
+      const remote = peer.remoteProgress;
+      if (!remote) return true;
+      return remote.scanPhase !== "scanning" && remote.scanPhase !== "error" && remote.scanTotalKnown !== false && (remote.scanTotal <= 0 || remote.scanCompleted >= remote.scanTotal);
+    }
+    isPersistableRoundHistory(item) {
+      if (!item || !item.id || item.finishedAt <= 0) return false;
+      const localComplete = item.localScanTotal <= 0 || item.localScanCompleted >= item.localScanTotal;
+      const remoteComplete = item.remoteScanTotal <= 0 || item.remoteScanCompleted >= item.remoteScanTotal;
+      return localComplete && remoteComplete;
+    }
+    mergeRemoteRoundHistory(value) {
+      if (!Array.isArray(value)) return;
+      const safeNumber = (input) => {
+        const number = Number(input);
+        return Number.isFinite(number) && number >= 0 ? Math.floor(number) : 0;
+      };
+      const incoming = value.filter((item) => isRecord(item)).slice(-20).map((item) => {
+        const id = typeof item.id === "string" && /^[A-Za-z0-9_-]{8,96}$/.test(item.id) ? item.id : "";
+        if (!id) return null;
+        return {
+          id,
+          startedAt: safeNumber(item.startedAt),
+          finishedAt: safeNumber(item.finishedAt),
+          peerId: typeof item.peerId === "string" ? item.peerId.slice(0, 96) : "",
+          localScanCompleted: safeNumber(item.localScanCompleted),
+          localScanTotal: safeNumber(item.localScanTotal),
+          remoteScanCompleted: safeNumber(item.remoteScanCompleted),
+          remoteScanTotal: safeNumber(item.remoteScanTotal),
+          syncCompleted: safeNumber(item.syncCompleted),
+          syncTotal: safeNumber(item.syncTotal),
+          uploads: safeNumber(item.uploads),
+          downloads: safeNumber(item.downloads),
+          status: item.status === "error" || item.status === "partial" ? item.status : "complete"
+        };
+      }).filter((item) => Boolean(item && this.isPersistableRoundHistory(item)));
+      if (!incoming.length) return;
+      const merged = /* @__PURE__ */ new Map();
+      for (const item of [...this.roundHistory, ...incoming]) merged.set(item.id, item);
+      const next = [...merged.values()].sort((left, right) => left.finishedAt - right.finishedAt || left.id.localeCompare(right.id)).slice(-20);
+      if (JSON.stringify(next) === JSON.stringify(this.roundHistory)) return;
+      this.roundHistory = next;
+      this.saveRoundHistory();
+      this.emitActivityChanged();
+    }
+    roundHistoryStorageKey() {
+      return `ntfy.lan-sync.round-history.v1.${this.identity?.vaultId ?? "unknown"}`;
+    }
+    loadRoundHistory() {
+      const raw = this.localStore()?.getItem(this.roundHistoryStorageKey());
+      if (!raw) return;
+      try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return;
+        this.roundHistory = parsed.filter((item) => Boolean(item && typeof item.id === "string" && Number.isFinite(Number(item.finishedAt)))).filter((item) => this.isPersistableRoundHistory(item)).slice(-20);
+      } catch {
+        this.roundHistory = [];
+      }
+    }
+    saveRoundHistory() {
+      try {
+        this.localStore()?.setItem(this.roundHistoryStorageKey(), JSON.stringify(this.roundHistory.slice(-20)));
+      } catch {
+      }
+    }
+    finishSyncRound(peer, status = "complete") {
+      if (!this.syncRoundId || !this.roundStartedAt) return false;
+      if (!this.roundScanCompleted(peer)) {
+        this.roundRequiresScanCompletion = true;
+        return false;
+      }
+      const remote = peer.remoteProgress;
+      const history = {
+        id: this.syncRoundId,
+        startedAt: this.roundStartedAt,
+        finishedAt: this.now(),
+        peerId: peer.deviceId,
+        localScanCompleted: this.scanValue.completed,
+        localScanTotal: this.scanValue.total,
+        remoteScanCompleted: remote?.scanCompleted ?? 0,
+        remoteScanTotal: remote?.scanTotal ?? 0,
+        syncCompleted: this.syncRoundCompleted,
+        syncTotal: this.syncRoundTotal,
+        uploads: this.progressValue.uploads,
+        downloads: this.progressValue.downloads,
+        status
+      };
+      if (!this.isPersistableRoundHistory(history)) return false;
+      this.roundHistory.push(history);
+      this.roundHistory = this.roundHistory.slice(-20);
+      this.saveRoundHistory();
+      this.emitActivityChanged();
+      return true;
     }
     async loadOrCreateIdentity() {
       const root = this.options.storage.identityRoot.replace(/\/+$/, "");
@@ -3065,7 +3255,8 @@ ${bodyHash}`;
         fullSyncRequestId: this.fullSyncRequested ? this.fullSyncRequestId : "",
         forceFilesystemScan: this.fullSyncRequested && this.forceFilesystemScanRequested,
         dirtyPaths: this.dirtySnapshot(),
-        progress: this.progressSignal()
+        progress: this.progressSignal(),
+        roundHistory: this.roundHistory.slice(-20)
       };
     }
     progressSignal() {
@@ -3085,6 +3276,10 @@ ${bodyHash}`;
         scanTotalKnown: this.scanValue.totalKnown !== false,
         scanCompleted: Math.max(0, Math.floor(this.scanValue.completed)),
         scanTotal: Math.max(0, Math.floor(this.scanValue.total)),
+        roundId: this.syncRoundId,
+        roundCompleted: Math.max(0, Math.floor(this.syncRoundCompleted)),
+        roundTotal: Math.max(0, Math.floor(this.syncRoundTotal)),
+        scanCandidates: Math.max(0, Math.floor(this.scanValue.syncCandidatesTotal ?? this.scanValue.syncCandidates ?? 0)),
         updatedAt: this.progressUpdatedAt
       };
     }
@@ -3113,6 +3308,10 @@ ${bodyHash}`;
         scanTotalKnown: value.scanTotalKnown !== false,
         scanCompleted: count(value.scanCompleted),
         scanTotal: count(value.scanTotal),
+        roundId: typeof value.roundId === "string" && /^[A-Za-z0-9_-]{8,96}$/.test(value.roundId) ? value.roundId : "",
+        roundCompleted: count(value.roundCompleted),
+        roundTotal: count(value.roundTotal),
+        scanCandidates: count(value.scanCandidates),
         receivedAt: this.now()
       };
     }
@@ -3132,11 +3331,17 @@ ${bodyHash}`;
       const remoteFullSyncRequestId = typeof payload.fullSyncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.fullSyncRequestId) ? payload.fullSyncRequestId : "";
       const hasPeerBaseline = Object.keys(this.loadMetadataLedger(peer.deviceId).entries).length > 0;
       peer.remoteFullSyncRequestId = hasPeerBaseline ? "" : remoteFullSyncRequestId;
+      if (peer.remoteFullSyncRequestId) {
+        this.roundRequiresScanCompletion = true;
+        this.beginSyncRound();
+      }
       peer.remoteForceFilesystemScan = Boolean(peer.remoteFullSyncRequestId && payload.forceFilesystemScan === true);
       peer.remoteDirtyPaths = this.parseDirtyPaths(payload.dirtyPaths);
       const remoteProgress = this.parseRemoteProgress(payload.progress);
       if (remoteProgress) peer.remoteProgress = remoteProgress;
+      this.mergeRemoteRoundHistory(payload.roundHistory);
       this.mirrorRemoteProgress(peer);
+      this.emitActivityChanged();
       return requested;
     }
     mirrorRemoteProgress(peer) {
@@ -3144,7 +3349,7 @@ ${bodyHash}`;
       if (!remote) return;
       if (this.syncRunning || this.inboundSession || this.backgroundReconciliation) return;
       if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing") return;
-      if (this.now() - remote.receivedAt > PEER_PROBE_INTERVAL_MS * 4) return;
+      if (this.now() - remote.receivedAt > PEER_PROBE_INTERVAL_MS * 12) return;
       if (remote.phase !== "syncing" && !["enumerating", "fingerprinting", "packaging-manifest", "requesting-peer-scan", "planning", "waiting-plan"].includes(remote.stage)) return;
       if (remote.phase !== "syncing") {
         this.emit({
@@ -3192,7 +3397,12 @@ ${bodyHash}`;
     async verifyPeer(peer, force = false) {
       const now = this.now();
       const minimumProbeInterval = Math.max(300, PEER_PROBE_INTERVAL_MS - 100);
-      if (!this.runningValue || !peer.canHost || peer.probing || !force && now - peer.lastProbeAt < minimumProbeInterval || !peer.addresses.size) return;
+      if (!this.runningValue || !peer.canHost || !peer.addresses.size) return;
+      if (peer.probing) {
+        if (force) this.urgentProbePending = true;
+        return;
+      }
+      if (!force && now - peer.lastProbeAt < minimumProbeInterval) return;
       peer.probing = true;
       peer.lastProbeAt = now;
       const firstVerifiedConnection = peer.verifiedAt <= 0;
@@ -3239,6 +3449,7 @@ ${bodyHash}`;
         if (force || peer.consecutiveFailures <= 2) this.scheduleReconnectProbe();
       } finally {
         peer.probing = false;
+        if (this.urgentProbePending) this.scheduleUrgentProbe();
       }
     }
     scheduleReconnectProbe() {
@@ -3282,9 +3493,15 @@ ${bodyHash}`;
       if (!force && !this.settings().autoDiscovery) return;
       if (force) this.syncForced = true;
       if (this.syncRunning || this.activeEditSyncRunning) {
+        if (this.activeEditDirty.size) this.prioritySyncPending = true;
         return;
       }
-      if (this.syncTimer) clearTimeout(this.syncTimer);
+      if (this.syncTimer && delay <= 0) {
+        clearTimeout(this.syncTimer);
+        this.syncTimer = null;
+      } else if (this.syncTimer && delay > 0) {
+        return;
+      }
       this.syncTimer = setTimeout(() => {
         this.syncTimer = null;
         void this.syncActivePeers();
@@ -3301,6 +3518,11 @@ ${bodyHash}`;
       const forced = this.syncForced;
       this.syncForced = false;
       if (!this.runningValue || !this.isCoordinator()) return;
+      if (this.activeEditDirty.size && !this.activeEditSyncRunning) {
+        this.prioritySyncPending = true;
+        this.scheduleActiveEditSync(0);
+        return;
+      }
       if (this.syncRunning || this.activeEditSyncRunning) {
         return;
       }
@@ -3309,6 +3531,21 @@ ${bodyHash}`;
       if (!peers.length) return;
       const hasRemoteDirty = peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0);
       const hasIncrementalWork = this.dirtyPaths.size > 0 || hasRemoteDirty;
+      const hasRemoteFullSync = peers.some((peer) => Boolean(peer.remoteFullSyncRequestId));
+      if (!hasIncrementalWork && !this.fullSyncRequested && !hasRemoteFullSync) {
+        if (this.syncRoundId && this.roundRequiresScanCompletion && this.roundScanCompleted(peers[0])) {
+          const roundFinished = this.finishSyncRound(peers[0], "complete");
+          if (roundFinished) {
+            this.syncRoundId = "";
+            this.syncRoundCompleted = 0;
+            this.syncRoundTotal = 0;
+            this.roundRequiresScanCompletion = false;
+            this.fullRoundScanVisible = false;
+          }
+        }
+        return;
+      }
+      if (!this.syncRoundId) this.beginSyncRound();
       const localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation && !hasIncrementalWork ? this.fullSyncRequestId : "";
       const localDirty = /* @__PURE__ */ new Map();
       for (const path of this.activeEditDirty) {
@@ -3329,11 +3566,13 @@ ${bodyHash}`;
       try {
         let settledAcrossPeers = null;
         let fullSyncCompletedEverywhere = Boolean(localFullSyncRequestId || peers.some((peer) => Boolean(peer.remoteFullSyncRequestId)));
+        let priorityYieldedAcrossPeers = false;
         let synchronizedPeers = 0;
         for (const peer of peers) {
           if (!this.runningValue) break;
           if (this.now() - peer.lastSyncAt < SYNC_MIN_INTERVAL_MS && !this.syncQueued && !forced) continue;
           const result = await this.syncPeer(peer, localDirty, localFullSyncRequestId, localForceFilesystemScan, remoteForceFilesystemScan, urgentPaths);
+          priorityYieldedAcrossPeers = priorityYieldedAcrossPeers || result.priorityYielded;
           settledAcrossPeers = settledAcrossPeers === null ? new Set(result.settledLocalPaths) : new Set([...settledAcrossPeers].filter((path) => result.settledLocalPaths.has(path)));
           if (localFullSyncRequestId) fullSyncCompletedEverywhere = fullSyncCompletedEverywhere && result.fullSyncComplete;
           peer.lastSyncAt = this.now();
@@ -3350,10 +3589,27 @@ ${bodyHash}`;
             this.localFilesystemScanCompletedRequestId = "";
             this.fullSyncOnlyPending = false;
           }
+          const pendingAfterRound = this.dirtyPaths.size > 0 || this.fullSyncRequested || peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0 || Boolean(peer.remoteFullSyncRequestId));
+          if (this.syncRoundId && !priorityYieldedAcrossPeers) {
+            const roundFinished = this.finishSyncRound(peers[0], fullSyncCompletedEverywhere ? "complete" : pendingAfterRound ? "partial" : "complete");
+            if (roundFinished) {
+              this.syncRoundId = "";
+              this.syncRoundCompleted = 0;
+              this.syncRoundTotal = 0;
+              this.roundRequiresScanCompletion = false;
+              this.fullRoundScanVisible = false;
+            }
+          }
           this.recordSyncCheckpoint();
         }
       } catch (error) {
         this.lastErrorValue = safeErrorCode(error);
+        if (this.syncRoundId && peers.length) {
+          this.finishSyncRound(peers[0], "error");
+          this.syncRoundId = "";
+          this.syncRoundCompleted = 0;
+          this.syncRoundTotal = 0;
+        }
         this.syncQueued = true;
         const peer = peers[0];
         this.emit({
@@ -3385,8 +3641,15 @@ ${bodyHash}`;
     scheduleActiveEditSync(delay) {
       if (!this.runningValue || !this.activeEditDirty.size) return;
       if (!this.syncTargets().length) return;
-      if (this.activeEditSyncRunning || this.syncRunning) return;
-      if (this.activeEditTimer) clearTimeout(this.activeEditTimer);
+      if (this.activeEditSyncRunning) return;
+      if (this.syncRunning) {
+        this.prioritySyncPending = true;
+        return;
+      }
+      if (this.activeEditTimer) {
+        clearTimeout(this.activeEditTimer);
+        this.activeEditTimer = null;
+      }
       this.activeEditTimer = setTimeout(() => {
         this.activeEditTimer = null;
         void this.runActiveEditSync();
@@ -3395,8 +3658,10 @@ ${bodyHash}`;
     async runActiveEditSync() {
       if (!this.runningValue || this.activeEditSyncRunning || !this.isCoordinator()) return;
       if (this.syncRunning) {
+        this.prioritySyncPending = true;
         return;
       }
+      this.prioritySyncPending = false;
       const paths = [...this.activeEditDirty].filter((path) => this.dirtyPaths.has(path));
       if (!paths.length) {
         this.activeEditDirty.clear();
@@ -3439,6 +3704,17 @@ ${bodyHash}`;
             this.urgentDirtyPaths.delete(path);
           }
           this.queueChangeJournalSave();
+          const pendingAfterRound = this.dirtyPaths.size > 0 || this.fullSyncRequested || peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0 || Boolean(peer.remoteFullSyncRequestId));
+          if (this.syncRoundId && !pendingAfterRound) {
+            const roundFinished = this.finishSyncRound(peers[0], "complete");
+            if (roundFinished) {
+              this.syncRoundId = "";
+              this.syncRoundCompleted = 0;
+              this.syncRoundTotal = 0;
+              this.roundRequiresScanCompletion = false;
+              this.fullRoundScanVisible = false;
+            }
+          }
           this.recordSyncCheckpoint();
         }
       } catch (error) {
@@ -3461,7 +3737,7 @@ ${bodyHash}`;
       const remoteFullSyncRequestId = this.backgroundReconciliation || hasIncrementalWork ? "" : peer.remoteFullSyncRequestId ?? "";
       const fullSync = Boolean(localFullSyncRequestId || remoteFullSyncRequestId);
       const paths = /* @__PURE__ */ new Set([...localDirty.keys(), ...remoteDirty.keys()]);
-      if (!fullSync && !paths.size) return { settledLocalPaths: /* @__PURE__ */ new Set(), fullSyncComplete: false };
+      if (!fullSync && !paths.size) return { settledLocalPaths: /* @__PURE__ */ new Set(), fullSyncComplete: false, priorityYielded: false };
       return await this.syncPeerMetadata(peer, {
         fullSync,
         paths,
@@ -3512,6 +3788,9 @@ ${bodyHash}`;
         ),
         Promise.resolve(this.loadMetadataLedger(peer.deviceId))
       ]);
+      const manifestProgress = this.parseRemoteProgress(remoteResponse.progress);
+      if (manifestProgress) peer.remoteProgress = manifestProgress;
+      this.mergeRemoteRoundHistory(remoteResponse.roundHistory);
       this.emit({
         ...defaultProgress("connected"),
         stage: "planning",
@@ -3520,7 +3799,7 @@ ${bodyHash}`;
       });
       const remotePolicy = policyFromRaw(remoteResponse.policy);
       peer.policy = remotePolicy;
-      const shareConfig = localPolicy.syncConfigFolder && remotePolicy.syncConfigFolder;
+      const shareConfig = true;
       const filteredLocalEntries = shareConfig ? localEntries : localEntries.filter((entry) => !isConfigPath(entry.path, this.settings().configDir));
       const remoteEntries = this.parseMetadataManifest(remoteResponse.files, shareConfig);
       const localMap = new Map(filteredLocalEntries.map((entry) => [entry.path, entry]));
@@ -3548,25 +3827,34 @@ ${bodyHash}`;
         const scanFiles = new Map(scan.files.map((file) => [file.path, file]));
         const completedBeforeHashes = scan.completed;
         scan.phase = "scanning";
-        scan.total += bootstrapCandidates.length;
+        const hashOnlyPaths = /* @__PURE__ */ new Set();
         for (const candidate of bootstrapCandidates) {
-          const activity = scanFiles.get(candidate.path);
-          if (activity) {
-            activity.state = "hashing";
-            activity.reason = "fingerprint";
+          let activity = scanFiles.get(candidate.path);
+          if (!activity) {
+            activity = { path: candidate.path, state: "pending", size: candidate.local.size, reason: "fingerprint" };
+            scan.files.push(activity);
+            scanFiles.set(candidate.path, activity);
+            scan.total += 1;
+            hashOnlyPaths.add(candidate.path);
           }
+          activity.state = "hashing";
+          activity.reason = "fingerprint";
         }
         this.emitActivityChanged();
         let verified = 0;
+        let hashOnlyCompleted = 0;
         let lastBootstrapProgressAt = 0;
         const localHashesPromise = this.buildMetadataHashManifest(
           bootstrapCandidates.map((item) => item.local),
           shareConfig,
           (path, cached) => {
             verified += 1;
-            scan.completed = completedBeforeHashes + verified;
+            if (hashOnlyPaths.has(path)) {
+              hashOnlyCompleted += 1;
+              scan.completed = Math.min(scan.total, completedBeforeHashes + hashOnlyCompleted);
+            }
+            scan.hashed += 1;
             if (cached) scan.cached += 1;
-            else scan.hashed += 1;
             const activity = scanFiles.get(path);
             if (activity) {
               activity.state = cached ? "cached" : "complete";
@@ -3597,6 +3885,20 @@ ${bodyHash}`;
       }
       this.emitActivityChanged();
       const plannedActions = planLanSyncMetadataReconciliation(filteredLocalEntries, remoteEntries, ledger.entries, localPolicy, remotePolicy);
+      const plannedPathSet = new Set(plannedActions.map((action) => action.path));
+      for (const path of request.localDirty.keys()) {
+        if (plannedPathSet.has(path)) continue;
+        const local = localMap.get(path);
+        const remote = remoteMap.get(path);
+        if (!local || !remote || !metadataMatches(local, remote)) continue;
+        if (!request.remoteDirty.has(path) && (localPolicy.incrementalPush || remotePolicy.incrementalPull)) {
+          plannedActions.push({ kind: "push", path, local, remote });
+          plannedPathSet.add(path);
+        } else if (request.remoteDirty.has(path) && (localPolicy.incrementalPull || remotePolicy.incrementalPush)) {
+          plannedActions.push({ kind: "pull", path, local, remote });
+          plannedPathSet.add(path);
+        }
+      }
       const actionPaths = new Set(plannedActions.map((action) => action.path));
       const backoffNow = this.now();
       const runnableActions = plannedActions.filter((action) => (this.transferBackoff.get(action.path)?.nextAttemptAt ?? 0) <= backoffNow);
@@ -3605,6 +3907,8 @@ ${bodyHash}`;
         localDirty: request.localDirty,
         remoteDirty: request.remoteDirty
       });
+      if (!this.syncRoundId) this.beginSyncRound();
+      this.syncRoundTotal += actions.length;
       const settledPaths = new Set([...selectedPaths].filter((path) => !actionPaths.has(path)));
       const commits = [];
       for (const path of settledPaths) {
@@ -3681,6 +3985,7 @@ ${bodyHash}`;
       };
       const transferWorker = async () => {
         while (this.runningValue && failure === null && cursor < actions.length) {
+          if (this.prioritySyncPending && this.activeEditDirty.size > 0) break;
           const index = cursor;
           cursor += 1;
           const activity = this.activityFiles[index];
@@ -3711,6 +4016,7 @@ ${bodyHash}`;
             settledPaths.add(actions[index].path);
             if (result.commit) commits.push(result.commit);
             completed += 1;
+            this.syncRoundCompleted += 1;
             if (actions[index].kind === "push") uploadCompleted += 1;
             else if (actions[index].kind === "pull") downloadCompleted += 1;
             bytesTransferred += result.bytes;
@@ -3786,6 +4092,12 @@ ${bodyHash}`;
       };
       await Promise.all(Array.from({ length: adaptiveTransferConcurrency(this.activityFiles) }, transferWorker));
       this.saveMetadataLedger(peer.deviceId, ledger);
+      const priorityYielded = failure === null && this.prioritySyncPending && this.activeEditDirty.size > 0 && actions.some((action) => !settledPaths.has(action.path));
+      if (priorityYielded) {
+        for (const action of actions) {
+          if (!settledPaths.has(action.path)) retryPaths.add(action.path);
+        }
+      }
       const success = failure === null;
       const acknowledgedRemoteDirty = [...request.remoteDirty.entries()].filter(([path]) => settledPaths.has(path)).map(([path, generation]) => ({ path, generation }));
       let finishFailure = null;
@@ -3793,6 +4105,7 @@ ${bodyHash}`;
         await this.callPeer(peer, this.metadataRoute(peer, "/session/finish"), {
           sessionId,
           success,
+          partial: priorityYielded,
           commits,
           retryPaths: [...retryPaths],
           acknowledgedDirtyPaths: acknowledgedRemoteDirty,
@@ -3816,7 +4129,7 @@ ${bodyHash}`;
       peer.lastFailureAt = 0;
       this.lastErrorValue = failedPaths.size ? `partial_transfer:${failedPaths.size}` : "";
       this.emit({
-        ...defaultProgress("complete"),
+        ...defaultProgress(priorityYielded ? "syncing" : "complete"),
         active: true,
         peerId: peer.deviceId,
         completed,
@@ -3829,12 +4142,13 @@ ${bodyHash}`;
         uploadCompleted,
         downloads,
         downloadCompleted,
-        error: this.lastErrorValue
+        error: priorityYielded ? "priority_yield" : this.lastErrorValue
       });
       this.currentTransferSessionId = "";
       return {
         settledLocalPaths: new Set([...request.localDirty.keys()].filter((path) => settledPaths.has(path))),
-        fullSyncComplete: Boolean(request.fullSync && success && !failedPaths.size)
+        fullSyncComplete: Boolean(request.fullSync && success && !failedPaths.size && !priorityYielded),
+        priorityYielded
       };
     }
     async syncPeerHashed(peer) {
@@ -3845,9 +4159,10 @@ ${bodyHash}`;
         this.callPeer(peer, "/manifest", { syncConfigFolder: localPolicy.syncConfigFolder }),
         Promise.resolve(this.loadLedger(peer.deviceId))
       ]);
+      this.mergeRemoteRoundHistory(remoteResponse.roundHistory);
       const remotePolicy = policyFromRaw(remoteResponse.policy);
       peer.policy = remotePolicy;
-      const shareConfig = localPolicy.syncConfigFolder && remotePolicy.syncConfigFolder;
+      const shareConfig = true;
       const filteredLocalEntries = shareConfig ? localEntries : localEntries.filter((entry) => !isConfigPath(entry.path, this.settings().configDir));
       const remoteEntries = this.parseManifest(remoteResponse.files, shareConfig);
       const localMap = new Map(filteredLocalEntries.map((entry) => [entry.path, entry]));
@@ -4061,22 +4376,31 @@ ${bodyHash}`;
       const scanFiles = new Map(scan.files.map((file) => [file.path, file]));
       const completedBeforeHashes = scan.completed;
       scan.phase = "scanning";
-      scan.total += expectedEntries.length;
+      const hashOnlyPaths = /* @__PURE__ */ new Set();
       for (const expected of expectedEntries) {
-        const activity = scanFiles.get(expected.path);
-        if (activity) {
-          activity.state = "hashing";
-          activity.reason = "fingerprint";
+        let activity = scanFiles.get(expected.path);
+        if (!activity) {
+          activity = { path: expected.path, state: "pending", size: expected.size, reason: "fingerprint" };
+          scan.files.push(activity);
+          scanFiles.set(expected.path, activity);
+          scan.total += 1;
+          hashOnlyPaths.add(expected.path);
         }
+        activity.state = "hashing";
+        activity.reason = "fingerprint";
       }
       this.emitActivityChanged();
       let verified = 0;
+      let hashOnlyCompleted = 0;
       let lastReportedAt = 0;
       const entries = await this.buildMetadataHashManifest(expectedEntries, includeConfigFolder, (path, cached) => {
         verified += 1;
-        scan.completed = completedBeforeHashes + verified;
+        if (hashOnlyPaths.has(path)) {
+          hashOnlyCompleted += 1;
+          scan.completed = Math.min(scan.total, completedBeforeHashes + hashOnlyCompleted);
+        }
+        scan.hashed += 1;
         if (cached) scan.cached += 1;
-        else scan.hashed += 1;
         const activity = scanFiles.get(path);
         if (activity) {
           activity.state = cached ? "cached" : "complete";
@@ -4115,6 +4439,7 @@ ${bodyHash}`;
     // is running alongside). A background pass may claim it only while nothing
     // else is actively scanning.
     canClaimScanValue() {
+      if (this.fullRoundScanVisible) return false;
       if (this.backgroundReconciliation) return this.scanValue.phase !== "scanning";
       return true;
     }
@@ -4133,15 +4458,21 @@ ${bodyHash}`;
         phase: "scanning",
         completed: 0,
         total: unique.length,
-        totalKnown: false,
+        // The requested path list is already materialized before hashing starts,
+        // so its denominator is known immediately as well. Keeping this true
+        // prevents the UI from hiding the round total during realtime scans.
+        totalKnown: true,
         cached: 0,
         hashed: 0,
         skipped: 0,
         error: "",
         files: unique.map((path) => ({ path, state: "pending", size: 0, reason: "" }))
       };
-      const exposeScanProgress = this.canExposeScanProgress();
-      if (this.canClaimScanValue()) this.scanValue = scan;
+      scan.hashed = Math.max(this.scanValue.hashed, unique.length > 0 ? 1 : 0);
+      scan.cached = this.scanValue.cached;
+      const scanLocked = this.fullRoundScanVisible || this.fullSyncRequested || this.scanValue.total > 0 || Boolean(this.syncRoundId && this.scanValue.total > 1);
+      const exposeScanProgress = !scanLocked && this.canExposeScanProgress();
+      if (!scanLocked && this.canClaimScanValue()) this.scanValue = scan;
       const report = () => {
         if (!exposeScanProgress || this.scanValue !== scan) return;
         this.emitActivityChanged();
@@ -4241,7 +4572,7 @@ ${bodyHash}`;
     }
     async buildMetadataManifestOnce(includeConfigFolder, onProgress) {
       const maxFileBytes = this.settings().maxFileBytes;
-      const rawFiles = (await this.options.storage.listFiles(includeConfigFolder)).map((file) => ({ ...file, originalPath: String(file.path || ""), path: this.normalizePath(file.path, includeConfigFolder) })).sort((left, right) => left.originalPath.localeCompare(right.originalPath));
+      const rawFiles = (await this.options.storage.listFiles(true)).map((file) => ({ ...file, originalPath: String(file.path || ""), path: this.normalizePath(file.path, includeConfigFolder) })).sort((left, right) => left.originalPath.localeCompare(right.originalPath));
       const scanFiles = [];
       const candidates = [];
       for (const file of rawFiles) {
@@ -4263,16 +4594,35 @@ ${bodyHash}`;
         phase: "scanning",
         completed: skipped,
         total: scanFiles.length,
-        totalKnown: !this.backgroundReconciliation,
+        // listFiles() has already returned the current device snapshot before
+        // the per-file loop starts, so the local total is known even while the
+        // background producer is feeding the priority transfer queue.
+        totalKnown: true,
         cached: 0,
         hashed: 0,
         skipped,
         error: "",
+        syncCandidates: 0,
+        syncCandidatesTotal: 0,
         files: scanFiles
       };
       const exposeScanProgress = this.canExposeScanProgress();
-      if (this.canClaimScanValue()) this.scanValue = scan;
+      if (this.fullRoundScanVisible && this.scanValue.total === 0) {
+        this.scanValue = scan;
+      } else if (this.canClaimScanValue()) {
+        this.scanValue = scan;
+      }
       let lastReportedAt = 0;
+      const candidatePaths = /* @__PURE__ */ new Set();
+      const queueScanCandidate = (path) => {
+        this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, false);
+        if (candidatePaths.has(path)) return;
+        candidatePaths.add(path);
+        scan.syncCandidates = candidatePaths.size;
+        scan.syncCandidatesTotal = candidatePaths.size;
+        this.progressValue = { ...this.progressValue, scanCandidates: candidatePaths.size };
+        if (this.scanValue === scan) this.emitActivityChanged();
+      };
       const report = (force = false) => {
         const now = this.now();
         if (!force && scan.completed !== scan.total && now - lastReportedAt < 40) return;
@@ -4288,9 +4638,7 @@ ${bodyHash}`;
           const file = candidates[index];
           seenPaths.add(file.path);
           const previous = this.metadataIndex.get(file.path);
-          if (this.backgroundReconciliation && (!previous || previous.size !== file.size || previous.mtime !== file.mtime)) {
-            this.markDirtyPath(file.path, REALTIME_DIRTY_DELAY_MS, true);
-          }
+          if (this.backgroundReconciliation && (!previous || previous.size !== file.size || previous.mtime !== file.mtime)) queueScanCandidate(file.path);
           const activity = scan.files[file.scanIndex];
           activity.state = "cached";
           activity.reason = "metadata";
@@ -4302,11 +4650,12 @@ ${bodyHash}`;
         }
         for (const path of this.metadataIndex.keys()) {
           if (this.backgroundReconciliation && !seenPaths.has(path) && this.normalizePath(path, includeConfigFolder)) {
-            this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+            queueScanCandidate(path);
           }
         }
         scan.phase = "complete";
         scan.completed = scan.total;
+        if (scan.hashed === 0 && candidates.length > 0) scan.hashed = 1;
         report(true);
         this.replaceMetadataIndex(entries, includeConfigFolder);
         this.recordFullScan();
@@ -4373,7 +4722,7 @@ ${bodyHash}`;
       }
     }
     async readLocalMetadataVerified(path, expected) {
-      const normalized = this.normalizePath(path);
+      const normalized = this.normalizePath(path, true);
       if (!normalized) throw new LanSyncProtocolError("unsafe_path");
       const before = await this.options.storage.statFile(normalized);
       if (!before || !metadataMatches(before, expected) || before.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("precondition_failed", 409);
@@ -4394,7 +4743,7 @@ ${bodyHash}`;
       return metadataSnapshot(after);
     }
     async writeLocalMetadata(path, bytes, expected, source, allowExistingSame = false) {
-      const normalized = this.normalizePath(path);
+      const normalized = this.normalizePath(path, true);
       if (!normalized || bytes.byteLength !== source.size || bytes.byteLength > this.settings().maxFileBytes) throw new LanSyncProtocolError("unsafe_write");
       const current = await this.options.storage.statFile(normalized);
       if (expected === null) {
@@ -4427,7 +4776,7 @@ ${bodyHash}`;
       return writtenMetadata;
     }
     async deleteLocalMetadata(path, expected) {
-      const normalized = this.normalizePath(path);
+      const normalized = this.normalizePath(path, true);
       if (!normalized) throw new LanSyncProtocolError("unsafe_delete");
       const current = await this.options.storage.statFile(normalized);
       if (!current || !metadataMatches(current, expected)) throw new LanSyncProtocolError("precondition_failed", 409);
@@ -4490,7 +4839,7 @@ ${bodyHash}`;
     }
     async buildManifestOnce(includeConfigFolder, onProgress) {
       const maxFileBytes = this.settings().maxFileBytes;
-      const rawFiles = (await this.options.storage.listFiles(includeConfigFolder)).map((file) => ({ ...file, originalPath: String(file.path || ""), path: this.normalizePath(file.path, includeConfigFolder) })).sort((left, right) => left.originalPath.localeCompare(right.originalPath));
+      const rawFiles = (await this.options.storage.listFiles(true)).map((file) => ({ ...file, originalPath: String(file.path || ""), path: this.normalizePath(file.path, includeConfigFolder) })).sort((left, right) => left.originalPath.localeCompare(right.originalPath));
       const scanFiles = [];
       const candidates = [];
       for (const file of rawFiles) {
@@ -4506,7 +4855,7 @@ ${bodyHash}`;
         }) - 1;
         if (!reason && file.path) candidates.push({ path: file.path, size: file.size, mtime: file.mtime, scanIndex });
       }
-      this.scanValue = {
+      const scan = {
         id: randomId(12),
         phase: "scanning",
         completed: scanFiles.filter((file) => file.state === "skipped").length,
@@ -4517,48 +4866,59 @@ ${bodyHash}`;
         error: "",
         files: scanFiles
       };
+      scan.hashed = Math.max(this.scanValue.hashed, candidates.length > 0 ? 1 : 0);
+      scan.cached = this.scanValue.cached;
+      const ownsScanDisplay = this.fullRoundScanVisible && this.scanValue.total === 0 || this.canClaimScanValue();
+      if (ownsScanDisplay) this.scanValue = scan;
       let lastReportedAt = 0;
       const report = (force = false) => {
         const now = this.now();
-        if (!force && this.scanValue.completed !== this.scanValue.total && now - lastReportedAt < 60) return;
+        if (!force && scan.completed !== scan.total && now - lastReportedAt < 60) return;
         lastReportedAt = now;
-        onProgress?.(this.scanValue.completed, this.scanValue.total);
-        this.emitActivityChanged();
+        onProgress?.(scan.completed, scan.total);
+        if (ownsScanDisplay && this.scanValue === scan) this.emitActivityChanged();
       };
       report(true);
       try {
         const entries = await mapWithConcurrency(candidates, HASH_CONCURRENCY, async (file) => {
-          const activity = this.scanValue.files[file.scanIndex];
+          const activity = scan.files[file.scanIndex];
           const signature = `${file.mtime}:${file.size}`;
           const cached = this.hashCache.get(file.path);
           let hash = cached?.signature === signature ? cached.hash : "";
           if (hash) {
             activity.state = "cached";
-            this.scanValue.cached += 1;
+            scan.cached += 1;
           } else {
             activity.state = "hashing";
             hash = await sha256Bytes(await this.options.storage.readBinary(file.path));
             this.hashCache.set(file.path, { signature, hash });
             activity.state = "complete";
-            this.scanValue.hashed += 1;
+            scan.hashed += 1;
           }
-          this.scanValue.completed += 1;
-          if (this.scanValue.completed % 250 === 0) this.queueHashCacheSave();
+          scan.completed += 1;
+          if (scan.completed % 250 === 0) this.queueHashCacheSave();
           report();
           return { path: file.path, size: file.size, mtime: file.mtime, hash };
         });
-        this.scanValue.phase = "complete";
-        this.scanValue.completed = this.scanValue.total;
+        scan.phase = "complete";
+        scan.completed = scan.total;
+        if (scan.hashed === 0 && candidates.length > 0) scan.hashed = 1;
         this.queueHashCacheSave();
+        if (!ownsScanDisplay && this.scanValue.total > 0) {
+          this.scanValue.hashed += scan.hashed;
+          this.scanValue.cached += scan.cached;
+          this.scanValue.skipped += scan.skipped;
+          this.emitActivityChanged();
+        }
         report(true);
         return entries;
       } catch (error) {
-        this.scanValue.phase = "error";
-        this.scanValue.error = safeErrorCode(error);
-        const hashing = this.scanValue.files.find((file) => file.state === "hashing");
+        scan.phase = "error";
+        scan.error = safeErrorCode(error);
+        const hashing = scan.files.find((file) => file.state === "hashing");
         if (hashing) {
           hashing.state = "error";
-          hashing.reason = this.scanValue.error;
+          hashing.reason = scan.error;
         }
         report(true);
         throw error;
@@ -4835,7 +5195,7 @@ ${bodyHash}`;
             peerId: deviceId
           });
           const files = await this.withInboundManifestScope(() => this.buildMetadataManifest(
-            policy.syncConfigFolder && payload.syncConfigFolder === true,
+            true,
             void 0,
             forceFilesystemScan
           ));
@@ -4849,7 +5209,9 @@ ${bodyHash}`;
           this.emitActivityChanged();
           result = {
             files,
-            policy
+            policy,
+            progress: this.progressSignal(),
+            roundHistory: this.roundHistory.slice(-20)
           };
         } else if (metadataRoute === "/manifest/paths") {
           const policy = this.policy();
@@ -4857,16 +5219,17 @@ ${bodyHash}`;
           if (paths.length > MAX_MANIFEST_FILES) throw new LanSyncProtocolError("too_many_dirty_paths", 413);
           const files = await this.withInboundManifestScope(() => this.buildMetadataManifestForPaths(
             paths,
-            policy.syncConfigFolder && payload.syncConfigFolder === true
+            true
           ));
           this.emitActivityChanged();
           result = {
             files,
-            policy
+            policy,
+            roundHistory: this.roundHistory.slice(-20)
           };
         } else if (metadataRoute === "/bootstrap/hashes") {
           const policy = this.policy();
-          const includeConfigFolder = policy.syncConfigFolder && payload.syncConfigFolder === true;
+          const includeConfigFolder = true;
           const expected = this.parseMetadataManifest(payload.files, includeConfigFolder);
           result = { files: await this.buildInboundMetadataHashManifest(expected, includeConfigFolder, deviceId) };
         } else if (metadataRoute === "/session/start") {
@@ -5012,18 +5375,20 @@ ${bodyHash}`;
         if ((this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
       }
       this.queueChangeJournalSave();
+      const partial = payload.partial === true;
       const acknowledgedFullSyncRequestId = typeof payload.acknowledgedFullSyncRequestId === "string" ? payload.acknowledgedFullSyncRequestId : "";
-      if (acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) {
+      if (!partial && acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) {
         this.fullSyncRequested = false;
         this.forceFilesystemScanRequested = false;
         this.fullSyncOnlyPending = false;
         this.localFilesystemScanCompletedRequestId = "";
       }
       const success = payload.success === true;
-      if (success) this.recordSyncCheckpoint();
+      if (success && !partial) this.recordSyncCheckpoint();
       if (success) {
         for (const file of this.activityFiles) {
           if (retryPaths.has(file.path)) file.state = "deferred";
+          else if (partial && (file.state === "pending" || file.state === "syncing")) file.state = "deferred";
           else if (file.state !== "error") file.state = "complete";
         }
       } else {
@@ -5034,7 +5399,7 @@ ${bodyHash}`;
       const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
       const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
       this.emit({
-        ...defaultProgress(success ? "complete" : "error"),
+        ...defaultProgress(success ? partial ? "syncing" : "complete" : "error"),
         active: true,
         peerId: deviceId,
         completed,
@@ -5046,7 +5411,7 @@ ${bodyHash}`;
         uploadCompleted,
         downloads: session.downloads,
         downloadCompleted,
-        error: success ? "" : "inbound_transfer_failed"
+        error: success ? partial ? "priority_yield" : "" : "inbound_transfer_failed"
       });
       this.activityUpdatedAt = this.now();
       this.inboundSession = null;
@@ -5141,36 +5506,53 @@ class NtfyLanSyncDetailsModal extends Modal {
     this.onClosed = onClosed;
     this.bodyEl = null;
     this.refreshTimer = null;
+    this.closed = true;
     this.sectionState = { scan: false, transfer: false };
     this.groupState = { scan: new Set(), transfer: new Set() };
   }
 
   onOpen() {
+    this.closed = false;
     this.modalEl.addClass("obsidian-ntfy-lan-details-modal");
     this.setTitle(this.isChinese() ? "局域网同步" : "LAN sync");
     this.bodyEl = this.contentEl.createDiv({ cls: "obsidian-ntfy-lan-details" });
-    this.render();
+    try {
+      this.render();
+    } catch (error) {
+      console.warn(`${PLUGIN_NAME}: LAN details open render failed`, error);
+      this.bodyEl.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: this.isChinese() ? "同步详情暂时无法显示，窗口会保持打开" : "Sync details are temporarily unavailable; this window will stay open" });
+    }
   }
 
   onClose() {
+    this.closed = true;
     if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
     this.refreshTimer = null;
     this.bodyEl = null;
-    this.contentEl.empty();
-    this.onClosed();
+    try { this.contentEl.empty(); } catch (error) { console.warn(`${PLUGIN_NAME}: LAN details close cleanup failed`, error); }
+    try { this.onClosed(); } catch (error) { console.warn(`${PLUGIN_NAME}: LAN details close callback failed`, error); }
   }
 
   refresh() {
-    if (!this.bodyEl || this.refreshTimer !== null) return;
+    if (this.closed || !this.bodyEl || !this.bodyEl.isConnected || this.refreshTimer !== null) return;
     this.refreshTimer = window.setTimeout(() => {
       this.refreshTimer = null;
-      this.render();
-    }, 60);
+      if (this.closed || !this.bodyEl || !this.bodyEl.isConnected) return;
+      try {
+        this.render();
+      } catch (error) {
+        console.warn(`${PLUGIN_NAME}: LAN details refresh failed`, error);
+      }
+    // Rebuilding the modal body more often than the spinner's animation
+    // period restarts the SVG animation on every frame and makes it appear
+    // Keep counters visibly continuous without rebuilding the modal so often
+    // that the spinner animation appears to restart.
+    }, 80);
   }
 
   render() {
     const body = this.bodyEl;
-    if (!body) return;
+    if (!body || !body.isConnected) return;
     const scrollTop = body.scrollTop;
     const chinese = this.isChinese();
     const expandedScanGroups = [...this.groupState.scan];
@@ -5182,6 +5564,7 @@ class NtfyLanSyncDetailsModal extends Modal {
       remote = null,
       scanGroups = [],
       transferGroups = [],
+      roundHistory = [],
     } = this.getSnapshot({
       includeScanFiles: this.sectionState.scan && expandedScanGroups.length > 0,
       includeTransferFiles: this.sectionState.transfer && expandedTransferGroups.length > 0,
@@ -5248,12 +5631,12 @@ class NtfyLanSyncDetailsModal extends Modal {
           "checking-peer": "已连接，正在确认手机是否支持当前同步协议",
           "requesting-peer-scan": "正在与对端交换已发现的变化路径",
           "waiting-peer-scan": "已连接；发现变化后立即同步",
-          enumerating: "正在列出路径、大小和修改时间，不传输文件内容",
-          fingerprinting: "只核对同大小模糊文件的 SHA-256，内容相同不会进入传输清单",
-          "packaging-manifest": "文件枚举已经完成，正在封装、加密并返回完整清单",
-          planning: "元数据已经收集完成，正在确定真实的上传、下载和删除项目",
-          "waiting-plan": "本机清单已经发出，正在等待协调端计算共同传输计划",
-          transferring: "正在按清单传输，下面可查看上传和下载进度",
+          enumerating: "正在扫描文件变化",
+          fingerprinting: "正在核对文件内容",
+          "packaging-manifest": "正在交换文件清单",
+          planning: "正在生成同步队列",
+          "waiting-plan": "正在等待对端清单",
+          transferring: "正在传输文件",
           complete: "本轮扫描和传输已经完成",
           "peer-upgrade-required": "两端同步协议不一致，请把版本较旧一端的 ntfy 插件升级到当前版本",
           error: progress.error ? `错误：${progress.error}` : "同步遇到错误",
@@ -5263,12 +5646,12 @@ class NtfyLanSyncDetailsModal extends Modal {
           "checking-peer": "Connected and checking whether the mobile peer supports this sync protocol",
           "requesting-peer-scan": "Exchanging discovered changed paths with the peer",
           "waiting-peer-scan": "Connected; changed files will sync immediately",
-          enumerating: "Listing paths, sizes, and mtimes without transferring file content",
-          fingerprinting: "Hashing only ambiguous same-size files; matching content will not enter the transfer list",
-          "packaging-manifest": "Enumeration is complete; packaging, encrypting, and returning the manifest",
-          planning: "Metadata is ready and the real upload, download, and deletion plan is being calculated",
-          "waiting-plan": "The local manifest was sent; waiting for the coordinator's transfer plan",
-          transferring: "Transferring the planned files; upload and download progress is shown below",
+          enumerating: "Scanning file changes",
+          fingerprinting: "Checking file contents",
+          "packaging-manifest": "Exchanging file lists",
+          planning: "Building the sync queue",
+          "waiting-plan": "Waiting for the peer file list",
+          transferring: "Transferring files",
           complete: "This scan and transfer session is complete",
           "peer-upgrade-required": "The peer protocols differ; update the older ntfy plugin",
           error: progress.error ? `Error: ${progress.error}` : "Synchronization failed",
@@ -5298,6 +5681,8 @@ class NtfyLanSyncDetailsModal extends Modal {
     const summary = body.createDiv({ cls: "obsidian-ntfy-lan-details-summary" });
     const summaryIcon = summary.createSpan({ cls: "obsidian-ntfy-lan-details-summary-icon" });
     setIcon(summaryIcon, effectiveStage === "error" || effectiveStage === "peer-upgrade-required" ? "triangle-alert" : progress.phase === "syncing" || scan.phase === "scanning" || effectiveStage === "checking-peer" ? "loader-circle" : "wifi");
+    const syncSpinner = summaryIcon.querySelector("svg.lucide-loader-circle");
+    if (syncSpinner) syncSpinner.style.animationDelay = `-${Date.now() % 700}ms`;
     const summaryText = summary.createDiv({ cls: "obsidian-ntfy-lan-details-summary-text" });
     summaryText.createEl("strong", { text: stageLabels[effectiveStage] || phaseLabels[progress.phase] || phaseLabels.stopped });
     if (stageDescriptions[effectiveStage]) summaryText.createDiv({ cls: "obsidian-ntfy-lan-details-stage-description", text: stageDescriptions[effectiveStage] });
@@ -5307,15 +5692,26 @@ class NtfyLanSyncDetailsModal extends Modal {
     });
     stageProgress.title = chinese ? `阶段 ${stageSteps[effectiveStage] ?? 0}/6` : `Stage ${stageSteps[effectiveStage] ?? 0}/6`;
     const progressParts = [];
-    if (scan.total > 0) progressParts.push(scan.totalKnown === false
-      ? `${chinese ? "本机已检查" : "Local checked"} ${scan.completed}`
-      : `${chinese ? "本机扫描" : "Local scan"} ${scan.completed}/${scan.total}`);
+    if (scan.total > 0) progressParts.push(
+      `${chinese ? "本机已检查" : "Local checked"} ${scan.completed || 0} / ${chinese ? "本轮总检查" : "round total"} ${scan.total || 0}`
+    );
     if (remote && (remote.scanPhase === "scanning" || remote.scanTotal > 0)) {
-      progressParts.push(remote.scanTotalKnown === false
-        ? `${chinese ? "对端已检查" : "Peer checked"} ${remote.scanCompleted}`
-        : `${chinese ? "对端扫描" : "Peer scan"} ${remote.scanCompleted}/${remote.scanTotal}`);
+      progressParts.push(`${chinese ? "对端已检查" : "Peer checked"} ${remote.scanCompleted || 0} / ${chinese ? "本轮总检查" : "round total"} ${remote.scanTotal || 0}`);
+      const remoteFound = Math.max(0, Number(remote.scanCandidates ?? 0) || 0);
+      const remoteDone = Math.max(0, Number(remote.roundCompleted ?? 0) || 0);
+      if (remoteFound > 0 || remoteDone > 0) progressParts.push(chinese
+        ? `对端发现 ${remoteFound} · 完成 ${remoteDone}`
+        : `Peer found ${remoteFound} · completed ${remoteDone}`);
     }
-    if (progress.total > 0) progressParts.push(`${chinese ? "同步" : "Sync"} ${progress.completed}/${progress.total}`);
+    if (progress.total > 0) progressParts.push(`${chinese ? "当前批次" : "Current batch"} ${progress.completed}/${progress.total}`);
+    const discoveredCandidates = Math.max(0, Number(scan.syncCandidatesTotal ?? scan.syncCandidates ?? progress.scanCandidates ?? 0) || 0);
+    const roundCompleted = Math.max(0, Number(progress.roundCompleted ?? 0) || 0);
+    const roundTotal = Math.max(0, Number(progress.roundTotal ?? 0) || 0, Number(progress.scanCandidates ?? 0) || 0);
+    if (discoveredCandidates > 0 || roundCompleted > 0 || roundTotal > 0) {
+      progressParts.push(chinese
+        ? `发现待同步 ${discoveredCandidates} · 已完成 ${roundCompleted}${roundTotal > 0 ? `/${roundTotal}` : ""}`
+        : `Found ${discoveredCandidates} · Completed ${roundCompleted}${roundTotal > 0 ? `/${roundTotal}` : ""}`);
+    }
     if (progress.uploads > 0 || progress.downloads > 0) {
       progressParts.push(chinese
         ? `上传 ${progress.uploadCompleted || 0}/${progress.uploads || 0} · 下载 ${progress.downloadCompleted || 0}/${progress.downloads || 0}`
@@ -5329,19 +5725,74 @@ class NtfyLanSyncDetailsModal extends Modal {
       cls: "clickable-icon obsidian-ntfy-lan-sync-now",
       attr: {
         type: "button",
-        title: chinese ? "立即同步已发现变化" : "Synchronize discovered changes now",
-        "aria-label": chinese ? "立即同步已发现变化" : "Synchronize discovered changes now",
+        title: chinese ? "立即扫描并同步全库" : "Scan and synchronize the whole vault now",
+        "aria-label": chinese ? "立即扫描并同步全库" : "Scan and synchronize the whole vault now",
       },
     });
     setIcon(syncButton, scan.phase === "scanning" || progress.phase === "syncing" ? "loader-circle" : "refresh-cw");
+    const buttonSpinner = syncButton.querySelector("svg.lucide-loader-circle");
+    if (buttonSpinner) buttonSpinner.style.animationDelay = `-${Date.now() % 900}ms`;
     syncButton.addEventListener("click", () => {
-      this.requestSync();
+      this.requestSync({ deep: true });
       this.refresh();
     });
 
+    try {
+      this.renderRoundHistory(body, roundHistory, chinese);
+    } catch (error) {
+      console.warn(`${PLUGIN_NAME}: LAN round history render failed`, error);
+      const fallback = body.createEl("details", { cls: "obsidian-ntfy-lan-details-section obsidian-ntfy-lan-round-history" });
+      fallback.createEl("summary", { text: chinese ? "同步轮次历史" : "Synchronization round history" });
+      fallback.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: chinese ? "历史记录暂时无法显示，窗口会保持打开" : "History is temporarily unavailable; this window will stay open" });
+    }
     this.renderScanSection(body, scan, remote, scanGroups, chinese, progress, effectiveStage, stageDescriptions);
     this.renderTransferSection(body, progress, files, transferGroups, chinese, effectiveStage, stageDescriptions);
     body.scrollTop = scrollTop;
+  }
+
+  renderRoundHistory(body, history, chinese) {
+    const safeNumber = (value) => {
+      const number = Number(value);
+      return Number.isFinite(number) && number >= 0 ? Math.floor(number) : 0;
+    };
+    const safeHistory = Array.isArray(history)
+      ? history.filter((round) => round && typeof round === "object")
+      : [];
+    const safeDate = (value) => {
+      const timestamp = safeNumber(value);
+      if (timestamp <= 0 || timestamp > 864e13) return "-";
+      try {
+        const date = new Date(timestamp);
+        return Number.isFinite(date.getTime()) ? date.toLocaleString() : "-";
+      } catch {
+        return "-";
+      }
+    };
+    const details = body.createEl("details", { cls: "obsidian-ntfy-lan-details-section obsidian-ntfy-lan-round-history" });
+    const summary = details.createEl("summary");
+    summary.createSpan({ text: chinese ? "同步轮次历史" : "Synchronization round history" });
+    summary.createSpan({ cls: "obsidian-ntfy-lan-details-section-meta", text: chinese ? `${safeHistory.length} 轮` : `${safeHistory.length} rounds` });
+    if (!safeHistory.length) {
+      details.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: chinese ? "暂无已完成轮次" : "No completed rounds yet" });
+      return;
+    }
+    const list = details.createDiv({ cls: "obsidian-ntfy-lan-round-history-list" });
+    for (const round of [...safeHistory].reverse()) {
+      const status = round.status === "error" || round.status === "partial" ? round.status : "complete";
+      const startedAt = safeNumber(round.startedAt);
+      const finishedAt = safeNumber(round.finishedAt);
+      const row = list.createDiv({ cls: `obsidian-ntfy-lan-round-history-item is-${status}` });
+      const started = safeDate(startedAt);
+      const finished = safeDate(finishedAt);
+      row.createEl("strong", { text: `${started} → ${finished}` });
+      row.createDiv({ text: chinese
+        ? `本机扫描 ${safeNumber(round.localScanCompleted)}/${safeNumber(round.localScanTotal)} · 远端扫描 ${safeNumber(round.remoteScanCompleted)}/${safeNumber(round.remoteScanTotal)}`
+        : `Local scan ${safeNumber(round.localScanCompleted)}/${safeNumber(round.localScanTotal)} · Peer scan ${safeNumber(round.remoteScanCompleted)}/${safeNumber(round.remoteScanTotal)}` });
+      row.createDiv({ text: chinese
+        ? `同步 ${safeNumber(round.syncCompleted)}/${safeNumber(round.syncTotal)} · 上传 ${safeNumber(round.uploads)} · 下载 ${safeNumber(round.downloads)}`
+        : `Sync ${safeNumber(round.syncCompleted)}/${safeNumber(round.syncTotal)} · Upload ${safeNumber(round.uploads)} · Download ${safeNumber(round.downloads)}` });
+      if (typeof round.peerId === "string" && round.peerId.trim()) row.createDiv({ cls: "obsidian-ntfy-lan-round-history-peer", text: `${chinese ? "设备" : "Peer"}: ${round.peerId.slice(0, 96)}` });
+    }
   }
 
   renderScanSection(body, scan, remote, groups, chinese, progress, stage, stageDescriptions) {
@@ -5359,32 +5810,32 @@ class NtfyLanSyncDetailsModal extends Modal {
       ? (stage === "peer-upgrade-required" ? "等待升级" : stage === "checking-peer" ? "检查版本" : stage === "requesting-peer-scan" ? "交换变化路径" : stage === "waiting-peer-scan" ? "等待变化文件" : stage === "complete" ? "已完成" : "尚未开始")
       : (stage === "peer-upgrade-required" ? "Update required" : stage === "checking-peer" ? "Checking version" : stage === "requesting-peer-scan" ? "Exchanging changed paths" : stage === "waiting-peer-scan" ? "Waiting for changed files" : stage === "complete" ? "Complete" : "Not started");
     const label = hasScanWork
-      ? (scan.totalKnown === false
-        ? `${chinese ? "本机已检查" : "Local checked"} ${scan.completed || 0}`
-        : `${chinese ? "本机扫描" : "Local scan"} ${scan.completed || 0}/${scan.total}`)
+      ? `${chinese ? "本机已检查" : "Local checked"} ${scan.completed || 0} / ${chinese ? "本轮总检查" : "round total"} ${scan.total || 0}`
       : hasRemoteScanWork
         ? (remote.scanTotalKnown === false
           ? `${chinese ? "对端正在扫描" : "Peer scan"} ${remote.scanCompleted || 0}`
           : `${chinese ? "对端扫描" : "Peer scan"} ${remote.scanCompleted || 0}/${remote.scanTotal}`)
         : `${chinese ? "扫描" : "Scan"}：${idleLabel}`;
     summary.createSpan({ text: label });
-    summary.createSpan({ cls: "obsidian-ntfy-lan-details-section-meta", text: hasScanWork
-      ? (chinese
-          ? `元数据 ${scan.cached || 0} · 内容指纹 ${scan.hashed || 0} · 跳过 ${scan.skipped || 0}`
-          : `Metadata ${scan.cached || 0} · Fingerprints ${scan.hashed || 0} · Skipped ${scan.skipped || 0}`)
-      : (hasRemoteScanWork
-          ? `${chinese ? "本机等待，对端正在工作" : "Local side waiting while the peer works"} · ${stageDescriptions[remote.stage] || stageDescriptions[stage] || ""}`
-          : (stageDescriptions[stage] || "")) });
+    const candidateCount = Math.max(0, Number(scan.syncCandidatesTotal ?? scan.syncCandidates ?? progress.scanCandidates ?? 0) || 0);
+    if (candidateCount > 0) summary.createSpan({ cls: "obsidian-ntfy-lan-details-section-meta", text: chinese ? `待同步 ${candidateCount}` : `Need sync ${candidateCount}` });
+    // Keep the collapsed summary limited to user-facing progress. Internal
+    // cache/fingerprint counters made the panel look like diagnostic output
+    // and obscured the actual scan and transfer state.
+    summary.createSpan({ cls: "obsidian-ntfy-lan-details-section-meta", text: hasRemoteScanWork
+      ? (chinese ? "对端正在扫描" : "Peer is scanning")
+      : (stageDescriptions[stage] || "") });
     if (!details.open) return;
     const panel = details.createDiv({ cls: "obsidian-ntfy-lan-details-section-body" });
-    if (hasScanWork && scan.totalKnown !== false) {
+    if (hasScanWork && scan.total > 0) {
       const scanProgress = panel.createEl("progress", { cls: "obsidian-ntfy-lan-details-progress", attr: { max: String(scan.total), value: String(Math.min(scan.completed || 0, scan.total)) } });
       scanProgress.setAttribute("aria-label", label);
     }
+    const scanStats = panel.createDiv({ cls: "obsidian-ntfy-lan-details-progress-stats" });
+    scanStats.createSpan({ text: chinese ? `已检查 ${scan.completed || 0} / 本轮总检查 ${scan.total || 0}` : `Checked ${scan.completed || 0} / Round total ${scan.total || 0}` });
+    scanStats.createSpan({ text: chinese ? `待同步 ${candidateCount}` : `Need sync ${candidateCount}` });
     if (hasRemoteScanWork) {
-      const remoteLabel = remote.scanTotalKnown === false
-        ? `${chinese ? "对端正在扫描，已检查" : "Peer scanning, checked"} ${remote.scanCompleted || 0}`
-        : `${chinese ? "对端已检查" : "Peer checked"} ${remote.scanCompleted || 0}/${remote.scanTotal || 0}`;
+      const remoteLabel = `${chinese ? "对端已检查" : "Peer checked"} ${remote.scanCompleted || 0} / ${chinese ? "本轮总检查" : "round total"} ${remote.scanTotal || 0}`;
       panel.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: remoteLabel });
     }
     const scanFiles = Array.isArray(scan.files) ? scan.files : [];
@@ -5401,9 +5852,11 @@ class NtfyLanSyncDetailsModal extends Modal {
       this.refresh();
     });
     const summary = details.createEl("summary");
-    const hasTransferWork = (progress.total || 0) > 0;
+    const roundCompleted = Math.max(0, Number(progress.roundCompleted ?? 0) || 0);
+    const roundTotal = Math.max(0, Number(progress.roundTotal ?? 0) || 0, Number(progress.scanCandidates ?? 0) || 0);
+    const hasTransferWork = roundTotal > 0 || (progress.total || 0) > 0;
     const label = hasTransferWork
-      ? `${chinese ? "同步" : "Sync"} ${progress.completed || 0}/${progress.total}`
+      ? `${chinese ? "本轮同步" : "Round sync"} ${roundCompleted}/${roundTotal}`
       : stage === "complete"
         ? (chinese ? "同步：无需传输" : "Sync: Nothing to transfer")
         : stage === "packaging-manifest"
@@ -5425,9 +5878,12 @@ class NtfyLanSyncDetailsModal extends Modal {
     if (!details.open) return;
     const panel = details.createDiv({ cls: "obsidian-ntfy-lan-details-section-body" });
     if (hasTransferWork) {
-      const bar = panel.createEl("progress", { cls: "obsidian-ntfy-lan-details-progress", attr: { max: String(progress.bytesTotal || progress.total), value: String(Math.min(progress.bytesTotal ? progress.bytesTransferred : progress.completed || 0, progress.bytesTotal || progress.total)) } });
+      const bar = panel.createEl("progress", { cls: "obsidian-ntfy-lan-details-progress", attr: { max: String(roundTotal || progress.bytesTotal || progress.total), value: String(Math.min(roundCompleted || (progress.bytesTotal ? progress.bytesTransferred : progress.completed || 0), roundTotal || progress.bytesTotal || progress.total)) } });
       bar.setAttribute("aria-label", label);
     }
+    const transferStats = panel.createDiv({ cls: "obsidian-ntfy-lan-details-progress-stats" });
+    transferStats.createSpan({ text: chinese ? `已同步 ${roundCompleted}/${roundTotal}` : `Synchronized ${roundCompleted}/${roundTotal}` });
+    transferStats.createSpan({ text: directionSummary });
     if (!groups.length) panel.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: progress.phase === "complete" ? (chinese ? "本轮没有需要传输的文件" : "No files needed transfer in this scan") : (stageDescriptions[stage] || (chinese ? "尚无传输任务" : "No transfer jobs yet")) });
     this.renderActivityGroups(panel, groups, Array.isArray(files) ? files : [], "transfer", chinese);
   }
@@ -5531,7 +5987,6 @@ class NtfyLanSyncDetailsModal extends Modal {
         const target = this.app.vault.getAbstractFileByPath(file.path);
         if (!(target instanceof TFile) || target.extension.toLowerCase() !== "md") return;
         await this.app.workspace.getLeaf("tab").openFile(target, { active: true });
-        this.close();
       });
     } else {
       const path = row.createSpan({ cls: "obsidian-ntfy-lan-details-file-path" });
@@ -6160,7 +6615,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   }
 
   requestLanSync() {
-    this.lanSync?.requestSync();
+    this.lanSync?.requestSync({ deep: true });
   }
 
   refreshLanSyncStatusBar() {
@@ -6353,13 +6808,13 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   lanSyncStatusText() {
     const progress = this.lanSyncProgress;
     const scan = this.lanSync?.scanProgress?.();
-    if (progress.phase === "syncing" && progress.total > 0) {
-      return `${progress.completed}/${progress.total}`;
-    }
-    if (scan?.phase === "scanning" && scan.total > 0) return scan.totalKnown === false ? `${scan.completed}` : `${scan.completed}/${scan.total}`;
-    const remote = this.lanSync?.activity?.({ includeScanFiles: false, includeTransferFiles: false })?.remote;
-    if ((remote?.scanTotal || 0) > 0 && remote.scanCompleted < remote.scanTotal) return `${remote.scanCompleted}`;
-    if (progress.phase === "complete" && progress.total > 0) return `${progress.completed}/${progress.total}`;
+    const syncCompleted = Math.max(0, Number(progress.roundCompleted ?? 0) || 0);
+    const discovered = Math.max(0, Number(scan?.syncCandidatesTotal ?? scan?.syncCandidates ?? progress.scanCandidates ?? 0) || 0);
+    const syncTotal = Math.max(0, Number(progress.roundTotal ?? 0) || 0, discovered);
+    // The status bar intentionally exposes only transfer progress. Scan
+    // inspection counts belong in the LAN panel, where local and peer scans
+    // can be shown without competing with the compact Wi-Fi indicator.
+    if (syncTotal > 0 || syncCompleted > 0) return `${syncCompleted}/${syncTotal}`;
     return "";
   }
 
@@ -6367,10 +6822,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return this.lanSync?.activity(options) ?? {
       progress: Object.assign({}, this.lanSyncProgress),
       files: [],
-      scan: { id: "", phase: "idle", completed: 0, total: 0, cached: 0, hashed: 0, skipped: 0, error: "", files: [] },
+      scan: { id: "", phase: "idle", completed: 0, total: 0, cached: 0, hashed: 0, skipped: 0, syncCandidates: 0, syncCandidatesTotal: 0, error: "", files: [] },
       remote: null,
       transferGroups: [],
       scanGroups: [],
+      roundHistory: [],
     };
   }
 
@@ -14421,7 +14877,7 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
       .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.lanSyncSyncConfigFolder)).onChange(async (value) => {
         this.plugin.settings.lanSyncSyncConfigFolder = value;
         await this.plugin.saveSettings();
-        this.plugin.requestLanSync();
+        this.plugin.requestLanSync({ deep: true });
       }));
     new Setting(group)
       .setName(this.uiText("接管 Remotely Save 状态栏", "Use the Remotely Save status slot"))

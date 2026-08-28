@@ -140,6 +140,12 @@ export type LanSyncProgress = {
   downloads: number;
   downloadCompleted: number;
   error: string;
+  /** Monotonic counters for the current full-vault round. Optional for old peers. */
+  roundId?: string;
+  roundCompleted?: number;
+  roundTotal?: number;
+  scanCandidates?: number;
+  syncConfigFolder?: boolean;
 };
 
 export type LanSyncFileAction = "push" | "pull" | "delete-local" | "delete-remote";
@@ -168,6 +174,10 @@ export type LanSyncScanActivity = {
   hashed: number;
   skipped: number;
   error: string;
+  /** Number of paths discovered by the producer as needing reconciliation. */
+  syncCandidates?: number;
+  /** Monotonic candidate count for this scan (no fixed batch ceiling). */
+  syncCandidatesTotal?: number;
   files: LanSyncScanFileActivity[];
 };
 
@@ -192,6 +202,23 @@ export type LanSyncActivitySnapshot = {
   remote: LanSyncRemoteActivity | null;
   transferGroups: LanSyncActivityGroup[];
   scanGroups: LanSyncActivityGroup[];
+  roundHistory: LanSyncRoundHistory[];
+};
+
+export type LanSyncRoundHistory = {
+  id: string;
+  startedAt: number;
+  finishedAt: number;
+  peerId: string;
+  localScanCompleted: number;
+  localScanTotal: number;
+  remoteScanCompleted: number;
+  remoteScanTotal: number;
+  syncCompleted: number;
+  syncTotal: number;
+  uploads: number;
+  downloads: number;
+  status: "complete" | "partial" | "error";
 };
 
 export type LanSyncRemoteActivity = {
@@ -202,6 +229,11 @@ export type LanSyncRemoteActivity = {
   scanTotalKnown: boolean;
   scanCompleted: number;
   scanTotal: number;
+  roundId?: string;
+  roundCompleted?: number;
+  roundTotal?: number;
+  scanCandidates?: number;
+  syncConfigFolder?: boolean;
   receivedAt: number;
 };
 
@@ -316,6 +348,10 @@ type LanSyncRemoteProgress = {
   scanTotalKnown: boolean;
   scanCompleted: number;
   scanTotal: number;
+  roundId?: string;
+  roundCompleted?: number;
+  roundTotal?: number;
+  scanCandidates?: number;
   receivedAt: number;
 };
 
@@ -340,6 +376,7 @@ type LanSyncMetadataActionResult = {
 type LanSyncPeerResult = {
   settledLocalPaths: Set<string>;
   fullSyncComplete: boolean;
+  priorityYielded: boolean;
 };
 
 type LanSyncInboundSession = {
@@ -398,12 +435,15 @@ const PEER_MAX_ADDRESS_HISTORY = 2;
 const REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 const SYNC_MIN_INTERVAL_MS = 120;
 const QUEUED_SYNC_DELAY_MS = 750;
-const URGENT_SYNC_DELAY_MS = 60;
-const REALTIME_DIRTY_DELAY_MS = 30;
+// Real-time vault events are scheduled on the next event-loop turn. There is
+// no polling debounce on the fast lane; duplicate paths are coalesced by the
+// dirty journal and active-edit set.
+const URGENT_SYNC_DELAY_MS = 0;
+const REALTIME_DIRTY_DELAY_MS = 0;
 // Highest-priority lane for the file the user is actively editing. Shorter than
 // any other debounce so a keystroke ships almost immediately, and it runs on its
 // own single-file channel instead of waiting behind a bulk dirty scan.
-const ACTIVE_EDIT_SYNC_DELAY_MS = 20;
+const ACTIVE_EDIT_SYNC_DELAY_MS = 0;
 const ACTIVE_EDIT_POLL_MS = SYNC_MIN_INTERVAL_MS;
 const RECONNECT_REPROBE_DELAY_MS = 250;
 const MANIFEST_TIMEOUT_MS = 10 * 60_000;
@@ -412,7 +452,7 @@ const MANIFEST_TIMEOUT_MS = 10 * 60_000;
 const PATH_MANIFEST_TIMEOUT_MS = 20_000;
 const SESSION_TIMEOUT_MS = 30_000;
 const STALE_SESSION_RESUME_MS = 5_000;
-const SYNC_WATCHDOG_MS = 15 * 60_000;
+const SYNC_WATCHDOG_MS = 8 * 60_000;
 const SCAN_STALL_TIMEOUT_MS = 90_000;
 const TRANSFER_RETRY_LIMIT = 2;
 const TRANSFER_RETRY_BASE_DELAY_MS = 250;
@@ -593,7 +633,7 @@ function defaultLocalPolicy(): LanSyncPolicy {
     incrementalPull: true,
     deletePush: true,
     deletePull: true,
-    syncConfigFolder: false,
+    syncConfigFolder: true,
     deleteProtocol: true,
     conflictRule: "latest"
   };
@@ -605,7 +645,7 @@ function passivePeerPolicy(): LanSyncPolicy {
     incrementalPull: false,
     deletePush: false,
     deletePull: false,
-    syncConfigFolder: false,
+    syncConfigFolder: true,
     deleteProtocol: false,
     conflictRule: "latest"
   };
@@ -618,7 +658,10 @@ function policyFromRaw(value: unknown): LanSyncPolicy {
     incrementalPull: value.incrementalPull === true,
     deletePush: value.deletePush === true,
     deletePull: value.deletePull === true,
-    syncConfigFolder: value.syncConfigFolder === true,
+    // Newer peers synchronize the complete vault by default. Keep accepting
+    // the legacy flag for protocol compatibility, but do not let an old
+    // false value silently drop .obsidian changes from a full-vault session.
+    syncConfigFolder: value.syncConfigFolder !== false,
     deleteProtocol: value.deleteProtocol === true,
     conflictRule: normalizedConflictRule(value.conflictRule)
   };
@@ -663,7 +706,10 @@ export function normalizeLanSyncPath(value: unknown, options: LanSyncPathOptions
   if (root === "node_modules") return null;
   if (root.startsWith(".") && root !== configRoot) return null;
   if (root !== configRoot) return normalized;
-  if (!options.syncConfigFolder || segments.length < 2) return null;
+  // The whole vault is shareable. The option remains in the wire policy for
+  // older peers, but configuration-folder files are no longer dropped solely
+  // because one side retained a legacy false setting.
+  if (segments.length < 2) return null;
   const lower = normalized.toLocaleLowerCase();
   const identityRoot = typeof options.identityRoot === "string"
     ? options.identityRoot.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").toLocaleLowerCase()
@@ -1154,7 +1200,11 @@ function defaultProgress(phase: LanSyncProgressPhase = "stopped"): LanSyncProgre
     uploadCompleted: 0,
     downloads: 0,
     downloadCompleted: 0,
-    error: ""
+    error: "",
+    roundId: "",
+    roundCompleted: 0,
+    roundTotal: 0,
+    scanCandidates: 0
   };
 }
 
@@ -1357,6 +1407,9 @@ export class NtfyLanSync {
   private syncTimer: ReturnType<typeof setTimeout> | null = null;
   private syncRunning = false;
   private syncQueued = false;
+  // Set when a live edit arrives during a bulk transfer. The current action
+  // is allowed to finish, then the session yields so the active lane can run.
+  private prioritySyncPending = false;
   private syncForced = false;
   private syncStartedAt = 0;
   private manifestBuildStartedAt = 0;
@@ -1370,6 +1423,8 @@ export class NtfyLanSync {
   private activeEditTimer: ReturnType<typeof setTimeout> | null = null;
   private activeEditSyncRunning = false;
   private activeEditStartedAt = 0;
+  private urgentProbePending = false;
+  private urgentProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private transferBackoff = new Map<string, { failures: number; nextAttemptAt: number }>();
   private syncRequestId = "";
@@ -1390,6 +1445,19 @@ export class NtfyLanSync {
   private lastTransferAt = 0;
   private currentTransferSessionId = "";
   private progressValue = defaultProgress();
+  // A full-vault round has one stable counter across all transport batches.
+  // Keeping it outside the per-session progress prevents the visible counter
+  // from jumping back to zero when the producer queues the next batch.
+  private syncRoundId = "";
+  private syncRoundCompleted = 0;
+  private syncRoundTotal = 0;
+  private fullRoundScanVisible = false;
+  // A round started by a full-vault request must not enter history until both
+  // filesystem scans have reached their stable denominators. Incremental
+  // rounds keep the flag false so a one-file edit can still complete quickly.
+  private roundRequiresScanCompletion = false;
+  private roundStartedAt = 0;
+  private roundHistory: LanSyncRoundHistory[] = [];
   private activityFiles: LanSyncFileActivity[] = [];
   private scanValue: LanSyncScanActivity = this.emptyScanActivity();
   // Manifest work performed on behalf of a peer must never take over the
@@ -1450,13 +1518,14 @@ export class NtfyLanSync {
       },
       remote: this.remoteActivity(),
       transferGroups: summarizeTransferGroups(this.activityFiles),
-      scanGroups: summarizeScanGroups(this.scanValue.files)
+      scanGroups: summarizeScanGroups(this.scanValue.files),
+      roundHistory: this.roundHistory.map((round) => ({ ...round }))
     };
   }
 
   private remoteActivity(): LanSyncRemoteActivity | null {
     const peer = this.activePeers()
-      .filter((candidate) => candidate.remoteProgress && this.now() - candidate.remoteProgress.receivedAt <= PEER_PROBE_INTERVAL_MS * 4)
+      .filter((candidate) => candidate.remoteProgress && this.now() - candidate.remoteProgress.receivedAt <= PEER_PROBE_INTERVAL_MS * 12)
       .sort((left, right) => (right.remoteProgress?.receivedAt ?? 0) - (left.remoteProgress?.receivedAt ?? 0))[0];
     const remote = peer?.remoteProgress;
     if (!peer || !remote) return null;
@@ -1468,6 +1537,11 @@ export class NtfyLanSync {
       scanTotalKnown: remote.scanTotalKnown,
       scanCompleted: remote.scanCompleted,
       scanTotal: remote.scanTotal,
+      roundId: remote.roundId,
+      roundCompleted: remote.roundCompleted,
+      roundTotal: remote.roundTotal,
+      scanCandidates: remote.scanCandidates,
+      syncConfigFolder: peer.policy.syncConfigFolder,
       receivedAt: remote.receivedAt
     };
   }
@@ -1628,6 +1702,7 @@ export class NtfyLanSync {
     }
     this.identity = await this.loadOrCreateIdentity();
     this.deviceId = this.loadOrCreateDeviceId();
+    this.loadRoundHistory();
     this.lastFullScanAt = this.loadLastFullScanAt();
     this.loadChangeJournal();
     this.loadHashCache();
@@ -1636,6 +1711,10 @@ export class NtfyLanSync {
     // full-vault handshake. Reloads and ordinary elapsed time never create a
     // full scan request on their own.
     this.fullSyncRequested = !this.metadataIndexReady && this.lastFullScanAt <= 0;
+    if (this.fullSyncRequested) {
+      this.roundRequiresScanCompletion = true;
+      this.beginSyncRound();
+    }
     await this.captureChangesSinceCheckpoint();
     if (!this.fullSyncRequestId) {
       this.fullSyncRequestId = randomId(18);
@@ -1684,6 +1763,11 @@ export class NtfyLanSync {
       clearTimeout(this.syncTimer);
       this.syncTimer = null;
     }
+    if (this.urgentProbeTimer) {
+      clearTimeout(this.urgentProbeTimer);
+      this.urgentProbeTimer = null;
+    }
+    this.urgentProbePending = false;
     for (const interval of this.intervals) clearInterval(interval);
     this.intervals = [];
     const socket = this.socket;
@@ -1733,10 +1817,16 @@ export class NtfyLanSync {
     this.rateByClient.clear();
     this.inboundSession = null;
     this.currentTransferSessionId = "";
+    this.prioritySyncPending = false;
     this.appliedMutationEvents.clear();
     this.servedFilesystemScanRequests.clear();
     this.activityFiles = [];
     this.scanValue = this.emptyScanActivity();
+    this.fullRoundScanVisible = false;
+    this.roundRequiresScanCompletion = false;
+    this.syncRoundId = "";
+    this.syncRoundCompleted = 0;
+    this.syncRoundTotal = 0;
     this.activityUpdatedAt = this.now();
     this.emit(defaultProgress("stopped"));
   }
@@ -1777,6 +1867,19 @@ export class NtfyLanSync {
     this.appliedMutationEvents.delete(path);
   }
 
+  private notePathChangedDuringFullScan(path: string): void {
+    const scan = this.scanValue;
+    if (!this.fullRoundScanVisible || scan.phase !== "scanning") return;
+    if (scan.files.some((file) => file.path === path)) return;
+    // The Vault event itself is a valid observation of a changed path. Add it
+    // to the current device total immediately so a create/delete during the
+    // walk cannot make the displayed denominator stale or reset the round.
+    scan.files.push({ path, state: "complete", size: 0, reason: "changed-during-scan" });
+    scan.total += 1;
+    scan.completed += 1;
+    if (this.scanValue === scan) this.emitActivityChanged();
+  }
+
   private async classifyAppliedMutationEvent(path: string): Promise<void> {
     let token = this.appliedMutationEvents.get(path);
     if (!token) {
@@ -1807,21 +1910,16 @@ export class NtfyLanSync {
    * bulk round still covers it if the dedicated lane is blocked.
    */
   notifyActiveEdit(path: string): void {
-    const normalized = this.normalizePath(path);
+    // Keep configuration-folder edits in the journal even when the local
+    // preference is temporarily off. The peer policy filters them at plan
+    // time; dropping them here made .obsidian changes impossible to recover
+    // after the toggle was enabled again.
+    const normalized = this.normalizePath(path, true);
     if (!normalized) return;
-    this.hashCache.delete(normalized);
-    this.queueHashCacheSave();
-    this.dirtyPaths.set(normalized, ++this.dirtySequence);
-    this.urgentDirtyPaths.add(normalized);
-    if (this.urgentDirtyPaths.size > MAX_MANIFEST_FILES) {
-      this.urgentDirtyPaths = new Set([...this.urgentDirtyPaths].slice(-MAX_MANIFEST_FILES));
-    }
     this.activeEditingPath = normalized;
-    this.activeEditDirty.add(normalized);
-    this.queueChangeJournalSave();
-    // Drop any parked backoff so the live edit retries immediately.
-    this.transferBackoff.delete(normalized);
-    this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
+    // Editor events can precede the Vault modify notification. Route them
+    // through the same announced dirty path so the peer is woken immediately.
+    this.markDirtyPath(normalized, ACTIVE_EDIT_SYNC_DELAY_MS, true);
   }
 
   /** Clear the active-edit marker (called when the user switches away). */
@@ -1838,8 +1936,12 @@ export class NtfyLanSync {
   }
 
   private markDirtyPath(path: string, delay = QUEUED_SYNC_DELAY_MS, urgent = false): void {
-    const normalized = this.normalizePath(path);
+    // Always retain a normalized config-folder path in the durable dirty
+    // journal. Whether it is shareable is decided later from both policies,
+    // so a setting toggle cannot erase an edit before the next sync pass.
+    const normalized = this.normalizePath(path, true);
     if (!normalized) return;
+    this.notePathChangedDuringFullScan(normalized);
     this.hashCache.delete(normalized);
     this.queueHashCacheSave();
     this.dirtySequence += 1;
@@ -1866,10 +1968,26 @@ export class NtfyLanSync {
       // compact dirty-path signal to the authenticated coordinator now rather
       // than waiting for the 900ms probe interval (or losing the wakeup while
       // another batch is finishing).
-      void this.probePeers(true);
+      this.scheduleUrgentProbe();
       this.scheduleActiveEditSync(REALTIME_DIRTY_DELAY_MS);
     }
     this.scheduleSync(delay, true);
+  }
+
+  private scheduleUrgentProbe(): void {
+    if (!this.runningValue) return;
+    this.urgentProbePending = true;
+    if (this.urgentProbeTimer) return;
+    this.urgentProbeTimer = setTimeout(() => {
+      this.urgentProbeTimer = null;
+      if (!this.runningValue || !this.urgentProbePending) return;
+      this.urgentProbePending = false;
+      void this.probePeers(true).finally(() => {
+        // A new event can arrive while the forced probe is in flight. Do not
+        // wait for the regular 900ms probe interval in that case.
+        if (this.urgentProbePending) this.scheduleUrgentProbe();
+      });
+    }, 0);
   }
 
   requestSync(options: { deep?: boolean; strict?: boolean } = {}): void {
@@ -1879,6 +1997,21 @@ export class NtfyLanSync {
     if (deep && !this.fullSyncRequested) {
       this.fullSyncRequested = true;
       this.fullSyncRequestId = randomId(18);
+    }
+    if (deep) {
+      this.roundRequiresScanCompletion = true;
+      this.beginSyncRound();
+      // Claim the scan display before any background or realtime producer can
+      // run. This prevents a small path manifest (1/5 files) from replacing a
+      // four-thousand-file full-vault denominator mid-round.
+      if (!this.fullRoundScanVisible) {
+        this.fullRoundScanVisible = true;
+        this.scanValue = this.emptyScanActivity();
+      }
+      // Never lose the wake-up just because a bulk transfer currently owns the
+      // peer session. The transfer worker consumes this flag at an action
+      // boundary and hands the session to the active lane.
+      if (this.syncRunning) this.prioritySyncPending = true;
     }
     // Normal wakeups consume only paths already discovered by Vault events or
     // the background producer. A deep reconciliation is explicit maintenance;
@@ -1926,6 +2059,7 @@ export class NtfyLanSync {
       this.syncStartedAt = 0;
       this.syncQueued = false;
       this.lastErrorValue = "sync_watchdog_reset";
+      void this.probePeers(true);
       this.scheduleSync(URGENT_SYNC_DELAY_MS, true);
       return;
     }
@@ -1934,6 +2068,7 @@ export class NtfyLanSync {
       this.activeEditSyncRunning = false;
       this.activeEditStartedAt = 0;
       this.lastErrorValue = "active_edit_watchdog_reset";
+      void this.probePeers(true);
       if (this.activeEditDirty.size) this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
       return;
     }
@@ -2087,7 +2222,10 @@ export class NtfyLanSync {
       const restored = new Map<string, number>();
       for (const item of parsed.entries.slice(-MAX_MANIFEST_FILES)) {
         if (!Array.isArray(item) || item.length !== 2) continue;
-        const path = this.normalizePath(item[0]);
+        // Restore config-folder paths even when the setting is currently off;
+        // the two-device policy is evaluated during planning, not while
+        // recovering the durable journal.
+        const path = this.normalizePath(item[0], true);
         const generation = Number(item[1]);
         if (!path || !Number.isSafeInteger(generation) || generation <= 0) continue;
         restored.set(path, generation);
@@ -2105,7 +2243,10 @@ export class NtfyLanSync {
     if (this.lastSyncCheckpointAt <= 0 || !this.options.storage.listFilesChangedSince) return;
     try {
       const since = Math.max(0, this.lastSyncCheckpointAt - CHECKPOINT_MTIME_OVERLAP_MS);
-      const changed = await this.options.storage.listFilesChangedSince(since, this.settings().syncConfigFolder);
+      // Checkpoint recovery must include the complete vault. Filtering with
+      // the legacy preference here used to drop .obsidian changes before they
+      // reached the durable dirty journal.
+      const changed = await this.options.storage.listFilesChangedSince(since, true);
       for (const file of changed.slice(0, MAX_MANIFEST_FILES)) this.markDirtyPath(file.path, QUEUED_SYNC_DELAY_MS);
     } catch {
       this.lastFullScanAt = 0;
@@ -2230,12 +2371,16 @@ export class NtfyLanSync {
       checkIntervalSeconds: normalizedCheckIntervalSeconds(raw.checkIntervalSeconds),
       mode: normalizedMode(raw.mode),
       conflictRule: normalizedConflictRule(raw.conflictRule),
-      syncConfigFolder: raw.syncConfigFolder === true,
+      syncConfigFolder: raw.syncConfigFolder !== false,
       configDir: normalizedConfigDir(raw.configDir),
       port: normalizedPort(raw.port),
       maxFileBytes: normalizedMaxFileBytes(raw.maxFileBytes),
       inboxRetentionHours: normalizedInboxRetentionHours(raw.inboxRetentionHours),
-      manualPeers: Array.isArray(raw.manualPeers) ? raw.manualPeers.map(String).slice(0, 32) : []
+      manualPeers: Array.isArray(raw.manualPeers) ? raw.manualPeers.map(String).slice(0, 32) : [],
+      // Preserve the optional shared-key handshake after normalizing runtime
+      // settings. Omitting this field silently falls back to each device's
+      // identity secret, so two otherwise matching devices reject each other.
+      sharedSecret: typeof raw.sharedSecret === "string" ? raw.sharedSecret.trim().slice(0, 512) : ""
     };
   }
 
@@ -2281,6 +2426,8 @@ export class NtfyLanSync {
       hashed: 0,
       skipped: 0,
       error: "",
+      syncCandidates: 0,
+      syncCandidatesTotal: 0,
       files: []
     };
   }
@@ -2410,7 +2557,16 @@ export class NtfyLanSync {
   private emit(progress: LanSyncProgress): void {
     const sessionId = progress.sessionId
       || ((progress.phase === "syncing" || progress.phase === "complete") ? this.currentTransferSessionId : "");
-    this.progressValue = { ...progress, sessionId, peerCount: this.activePeers().length };
+    this.progressValue = {
+      ...progress,
+      sessionId,
+      peerCount: this.activePeers().length,
+      roundId: this.syncRoundId,
+      roundCompleted: this.syncRoundCompleted,
+      roundTotal: this.syncRoundTotal,
+      scanCandidates: this.scanValue.syncCandidatesTotal ?? this.scanValue.syncCandidates ?? 0,
+      syncConfigFolder: this.settings().syncConfigFolder
+    };
     this.progressUpdatedAt = this.now();
     try {
       this.options.onProgress({ ...this.progressValue });
@@ -2425,6 +2581,143 @@ export class NtfyLanSync {
     } catch {
       // Activity reporting must never interrupt synchronization.
     }
+  }
+
+  private beginSyncRound(): void {
+    if (this.syncRoundId) return;
+    this.syncRoundId = randomId(12);
+    this.syncRoundCompleted = 0;
+    this.syncRoundTotal = 0;
+    this.roundStartedAt = this.now();
+  }
+
+  private roundScanCompleted(peer: LanSyncPeer): boolean {
+    const local = this.scanValue;
+    const localComplete = local.phase !== "scanning"
+      && local.phase !== "error"
+      && local.totalKnown !== false
+      && (local.total <= 0 || local.completed >= local.total);
+    if (!localComplete) return false;
+    // Older peers do not include progress in their manifest response. The
+    // awaited manifest itself is the compatibility fallback in that case.
+    const remote = peer.remoteProgress;
+    if (!remote) return true;
+    return remote.scanPhase !== "scanning"
+      && remote.scanPhase !== "error"
+      && remote.scanTotalKnown !== false
+      && (remote.scanTotal <= 0 || remote.scanCompleted >= remote.scanTotal);
+  }
+
+  private isPersistableRoundHistory(item: LanSyncRoundHistory): boolean {
+    if (!item || !item.id || item.finishedAt <= 0) return false;
+    const localComplete = item.localScanTotal <= 0 || item.localScanCompleted >= item.localScanTotal;
+    const remoteComplete = item.remoteScanTotal <= 0 || item.remoteScanCompleted >= item.remoteScanTotal;
+    return localComplete && remoteComplete;
+  }
+
+  private mergeRemoteRoundHistory(value: unknown): void {
+    if (!Array.isArray(value)) return;
+    const safeNumber = (input: unknown): number => {
+      const number = Number(input);
+      return Number.isFinite(number) && number >= 0 ? Math.floor(number) : 0;
+    };
+    const incoming = value
+      .filter((item): item is Record<string, unknown> => isRecord(item))
+      .slice(-20)
+      .map((item): LanSyncRoundHistory | null => {
+        const id = typeof item.id === "string" && /^[A-Za-z0-9_-]{8,96}$/.test(item.id) ? item.id : "";
+        if (!id) return null;
+        return {
+          id,
+          startedAt: safeNumber(item.startedAt),
+          finishedAt: safeNumber(item.finishedAt),
+          peerId: typeof item.peerId === "string" ? item.peerId.slice(0, 96) : "",
+          localScanCompleted: safeNumber(item.localScanCompleted),
+          localScanTotal: safeNumber(item.localScanTotal),
+          remoteScanCompleted: safeNumber(item.remoteScanCompleted),
+          remoteScanTotal: safeNumber(item.remoteScanTotal),
+          syncCompleted: safeNumber(item.syncCompleted),
+          syncTotal: safeNumber(item.syncTotal),
+          uploads: safeNumber(item.uploads),
+          downloads: safeNumber(item.downloads),
+          status: item.status === "error" || item.status === "partial" ? item.status : "complete"
+        };
+      })
+      .filter((item): item is LanSyncRoundHistory => Boolean(item && this.isPersistableRoundHistory(item)));
+    if (!incoming.length) return;
+    const merged = new Map<string, LanSyncRoundHistory>();
+    for (const item of [...this.roundHistory, ...incoming]) merged.set(item.id, item);
+    const next = [...merged.values()]
+      .sort((left, right) => (left.finishedAt - right.finishedAt) || left.id.localeCompare(right.id))
+      .slice(-20);
+    if (JSON.stringify(next) === JSON.stringify(this.roundHistory)) return;
+    this.roundHistory = next;
+    this.saveRoundHistory();
+    this.emitActivityChanged();
+  }
+
+  private roundHistoryStorageKey(): string {
+    return `ntfy.lan-sync.round-history.v1.${this.identity?.vaultId ?? "unknown"}`;
+  }
+
+  private loadRoundHistory(): void {
+    const raw = this.localStore()?.getItem(this.roundHistoryStorageKey());
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return;
+      this.roundHistory = parsed
+        .filter((item): item is LanSyncRoundHistory => Boolean(item && typeof item.id === "string" && Number.isFinite(Number(item.finishedAt))))
+        .filter((item) => this.isPersistableRoundHistory(item))
+        .slice(-20);
+    } catch {
+      this.roundHistory = [];
+    }
+  }
+
+  private saveRoundHistory(): void {
+    try {
+      this.localStore()?.setItem(this.roundHistoryStorageKey(), JSON.stringify(this.roundHistory.slice(-20)));
+    } catch {
+      // History is diagnostic state; synchronization must continue if storage
+      // is temporarily unavailable.
+    }
+  }
+
+  private finishSyncRound(peer: LanSyncPeer, status: LanSyncRoundHistory["status"] = "complete"): boolean {
+    if (!this.syncRoundId || !this.roundStartedAt) return false;
+    // Active-edit transfers can finish while a full-vault scan is still
+    // enumerating. Keep the round alive and visible; history is written only
+    // after the scan gate is satisfied.
+    if (!this.roundScanCompleted(peer)) {
+      // Even an incremental transfer can overlap the independent filesystem
+      // walk. Promote it to a gated round so the next scheduler tick retries
+      // the history commit after scanning reaches its denominator.
+      this.roundRequiresScanCompletion = true;
+      return false;
+    }
+    const remote = peer.remoteProgress;
+    const history: LanSyncRoundHistory = {
+      id: this.syncRoundId,
+      startedAt: this.roundStartedAt,
+      finishedAt: this.now(),
+      peerId: peer.deviceId,
+      localScanCompleted: this.scanValue.completed,
+      localScanTotal: this.scanValue.total,
+      remoteScanCompleted: remote?.scanCompleted ?? 0,
+      remoteScanTotal: remote?.scanTotal ?? 0,
+      syncCompleted: this.syncRoundCompleted,
+      syncTotal: this.syncRoundTotal,
+      uploads: this.progressValue.uploads,
+      downloads: this.progressValue.downloads,
+      status
+    };
+    if (!this.isPersistableRoundHistory(history)) return false;
+    this.roundHistory.push(history);
+    this.roundHistory = this.roundHistory.slice(-20);
+    this.saveRoundHistory();
+    this.emitActivityChanged();
+    return true;
   }
 
   private async loadOrCreateIdentity(): Promise<LanSyncIdentity> {
@@ -3038,7 +3331,8 @@ export class NtfyLanSync {
       fullSyncRequestId: this.fullSyncRequested ? this.fullSyncRequestId : "",
       forceFilesystemScan: this.fullSyncRequested && this.forceFilesystemScanRequested,
       dirtyPaths: this.dirtySnapshot(),
-      progress: this.progressSignal()
+      progress: this.progressSignal(),
+      roundHistory: this.roundHistory.slice(-20)
     };
   }
 
@@ -3063,6 +3357,10 @@ export class NtfyLanSync {
       scanTotalKnown: this.scanValue.totalKnown !== false,
       scanCompleted: Math.max(0, Math.floor(this.scanValue.completed)),
       scanTotal: Math.max(0, Math.floor(this.scanValue.total)),
+      roundId: this.syncRoundId,
+      roundCompleted: Math.max(0, Math.floor(this.syncRoundCompleted)),
+      roundTotal: Math.max(0, Math.floor(this.syncRoundTotal)),
+      scanCandidates: Math.max(0, Math.floor(this.scanValue.syncCandidatesTotal ?? this.scanValue.syncCandidates ?? 0)),
       updatedAt: this.progressUpdatedAt
     };
   }
@@ -3094,6 +3392,10 @@ export class NtfyLanSync {
       scanTotalKnown: value.scanTotalKnown !== false,
       scanCompleted: count(value.scanCompleted),
       scanTotal: count(value.scanTotal),
+      roundId: typeof value.roundId === "string" && /^[A-Za-z0-9_-]{8,96}$/.test(value.roundId) ? value.roundId : "",
+      roundCompleted: count(value.roundCompleted),
+      roundTotal: count(value.roundTotal),
+      scanCandidates: count(value.scanCandidates),
       receivedAt: this.now()
     };
   }
@@ -3125,11 +3427,19 @@ export class NtfyLanSync {
     // stale request restart a whole-vault scan.
     const hasPeerBaseline = Object.keys(this.loadMetadataLedger(peer.deviceId).entries).length > 0;
     peer.remoteFullSyncRequestId = hasPeerBaseline ? "" : remoteFullSyncRequestId;
+    if (peer.remoteFullSyncRequestId) {
+      this.roundRequiresScanCompletion = true;
+      this.beginSyncRound();
+    }
     peer.remoteForceFilesystemScan = Boolean(peer.remoteFullSyncRequestId && payload.forceFilesystemScan === true);
     peer.remoteDirtyPaths = this.parseDirtyPaths(payload.dirtyPaths);
     const remoteProgress = this.parseRemoteProgress(payload.progress);
     if (remoteProgress) peer.remoteProgress = remoteProgress;
+    this.mergeRemoteRoundHistory(payload.roundHistory);
     this.mirrorRemoteProgress(peer);
+    // Heartbeat progress is an activity stream too. Refresh the panel even
+    // while the local device is scanning so the remote scan never looks stuck.
+    this.emitActivityChanged();
     return requested;
   }
 
@@ -3141,7 +3451,7 @@ export class NtfyLanSync {
     // of fighting over the status bar.
     if (this.syncRunning || this.inboundSession || this.backgroundReconciliation) return;
     if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing") return;
-    if (this.now() - remote.receivedAt > PEER_PROBE_INTERVAL_MS * 4) return;
+    if (this.now() - remote.receivedAt > PEER_PROBE_INTERVAL_MS * 12) return;
     if (
       remote.phase !== "syncing"
       && !["enumerating", "fingerprinting", "packaging-manifest", "requesting-peer-scan", "planning", "waiting-plan"].includes(remote.stage)
@@ -3210,7 +3520,12 @@ export class NtfyLanSync {
   private async verifyPeer(peer: LanSyncPeer, force = false): Promise<void> {
     const now = this.now();
     const minimumProbeInterval = Math.max(300, PEER_PROBE_INTERVAL_MS - 100);
-    if (!this.runningValue || !peer.canHost || peer.probing || (!force && now - peer.lastProbeAt < minimumProbeInterval) || !peer.addresses.size) return;
+    if (!this.runningValue || !peer.canHost || !peer.addresses.size) return;
+    if (peer.probing) {
+      if (force) this.urgentProbePending = true;
+      return;
+    }
+    if (!force && now - peer.lastProbeAt < minimumProbeInterval) return;
     peer.probing = true;
     peer.lastProbeAt = now;
     const firstVerifiedConnection = peer.verifiedAt <= 0;
@@ -3265,6 +3580,7 @@ export class NtfyLanSync {
       if (force || peer.consecutiveFailures <= 2) this.scheduleReconnectProbe();
     } finally {
       peer.probing = false;
+      if (this.urgentProbePending) this.scheduleUrgentProbe();
     }
   }
 
@@ -3323,11 +3639,22 @@ export class NtfyLanSync {
     if (!force && !this.settings().autoDiscovery) return;
     if (force) this.syncForced = true;
     if (this.syncRunning || this.activeEditSyncRunning) {
-      // The durable dirty/remote queues are sufficient; avoid a second latch
-      // that makes the next progress pass look like a restart.
+      // Keep a durable wake-up while the current session owns the peer. A live
+      // edit is consumed at the next action boundary instead of waiting for a
+      // later periodic tick.
+      if (this.activeEditDirty.size) this.prioritySyncPending = true;
       return;
     }
-    if (this.syncTimer) clearTimeout(this.syncTimer);
+    // An urgent edit must preempt an older delayed timer. Leaving that timer in
+    // place made a fresh change wait behind the previous 750ms wake-up.
+    if (this.syncTimer && delay <= 0) {
+      clearTimeout(this.syncTimer);
+      this.syncTimer = null;
+    } else if (this.syncTimer && delay > 0) {
+      // Keep the earliest queued wake-up; ordinary edits must not keep
+      // postponing a pending transfer by resetting its timer.
+      return;
+    }
     this.syncTimer = setTimeout(() => {
       this.syncTimer = null;
       void this.syncActivePeers();
@@ -3349,6 +3676,13 @@ export class NtfyLanSync {
     // Keep one transfer session per peer, but let the active lane run while a
     // background filesystem reconciliation is merely enumerating.
     if (!this.runningValue || !this.isCoordinator()) return;
+    // A live edit gets the first session boundary. This also covers the race
+    // where the ordinary timer fires just before the active-lane timer.
+    if (this.activeEditDirty.size && !this.activeEditSyncRunning) {
+      this.prioritySyncPending = true;
+      this.scheduleActiveEditSync(0);
+      return;
+    }
     if (this.syncRunning || this.activeEditSyncRunning) {
       // Dirty paths and remote signals are durable queues themselves. Do not
       // toggle a second latch while a transfer is active; that latch used to
@@ -3360,6 +3694,27 @@ export class NtfyLanSync {
     if (!peers.length) return;
     const hasRemoteDirty = peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0);
     const hasIncrementalWork = this.dirtyPaths.size > 0 || hasRemoteDirty;
+    // Every transfer pass is a visible round, including ordinary incremental
+    // edits. Previously history was created only for explicit full-vault
+    // requests, so successful one-file syncs never appeared in the panel.
+    const hasRemoteFullSync = peers.some((peer) => Boolean(peer.remoteFullSyncRequestId));
+    if (!hasIncrementalWork && !this.fullSyncRequested && !hasRemoteFullSync) {
+      // A realtime lane may have drained the transfer while a background
+      // filesystem walk was still finishing. Give that same round one final
+      // chance to commit history once both scan counters are complete.
+      if (this.syncRoundId && this.roundRequiresScanCompletion && this.roundScanCompleted(peers[0])) {
+        const roundFinished = this.finishSyncRound(peers[0], "complete");
+        if (roundFinished) {
+          this.syncRoundId = "";
+          this.syncRoundCompleted = 0;
+          this.syncRoundTotal = 0;
+          this.roundRequiresScanCompletion = false;
+          this.fullRoundScanVisible = false;
+        }
+      }
+      return;
+    }
+    if (!this.syncRoundId) this.beginSyncRound();
     // A real changed path always outranks reconciliation. Even a full request
     // already advertised by either side waits until all discovered paths have
     // drained through bounded transfer batches.
@@ -3395,11 +3750,13 @@ export class NtfyLanSync {
       // until the desktop finishes a 16k-path scan.
       let settledAcrossPeers: Set<string> | null = null;
       let fullSyncCompletedEverywhere = Boolean(localFullSyncRequestId || peers.some((peer) => Boolean(peer.remoteFullSyncRequestId)));
+      let priorityYieldedAcrossPeers = false;
       let synchronizedPeers = 0;
       for (const peer of peers) {
         if (!this.runningValue) break;
         if (this.now() - peer.lastSyncAt < SYNC_MIN_INTERVAL_MS && !this.syncQueued && !forced) continue;
         const result = await this.syncPeer(peer, localDirty, localFullSyncRequestId, localForceFilesystemScan, remoteForceFilesystemScan, urgentPaths);
+        priorityYieldedAcrossPeers = priorityYieldedAcrossPeers || result.priorityYielded;
         settledAcrossPeers = settledAcrossPeers === null
           ? new Set(result.settledLocalPaths)
           : new Set([...settledAcrossPeers].filter((path) => result.settledLocalPaths.has(path)));
@@ -3418,10 +3775,29 @@ export class NtfyLanSync {
           this.localFilesystemScanCompletedRequestId = "";
           this.fullSyncOnlyPending = false;
         }
+        const pendingAfterRound = this.dirtyPaths.size > 0
+          || this.fullSyncRequested
+          || peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0 || Boolean(peer.remoteFullSyncRequestId));
+        if (this.syncRoundId && !priorityYieldedAcrossPeers) {
+          const roundFinished = this.finishSyncRound(peers[0], fullSyncCompletedEverywhere ? "complete" : (pendingAfterRound ? "partial" : "complete"));
+          if (roundFinished) {
+            this.syncRoundId = "";
+            this.syncRoundCompleted = 0;
+            this.syncRoundTotal = 0;
+            this.roundRequiresScanCompletion = false;
+            this.fullRoundScanVisible = false;
+          }
+        }
         this.recordSyncCheckpoint();
       }
     } catch (error) {
       this.lastErrorValue = safeErrorCode(error);
+      if (this.syncRoundId && peers.length) {
+        this.finishSyncRound(peers[0], "error");
+        this.syncRoundId = "";
+        this.syncRoundCompleted = 0;
+        this.syncRoundTotal = 0;
+      }
       this.syncQueued = true;
       const peer = peers[0];
       this.emit({
@@ -3464,8 +3840,18 @@ export class NtfyLanSync {
   private scheduleActiveEditSync(delay: number): void {
     if (!this.runningValue || !this.activeEditDirty.size) return;
     if (!this.syncTargets().length) return;
-    if (this.activeEditSyncRunning || this.syncRunning) return;
-    if (this.activeEditTimer) clearTimeout(this.activeEditTimer);
+    if (this.activeEditSyncRunning) return;
+    if (this.syncRunning) {
+      this.prioritySyncPending = true;
+      return;
+    }
+    // A zero-delay realtime wake-up always wins over an older delayed timer.
+    // Otherwise the first edit after a queued scan could wait for the stale
+    // timer and appear not to sync immediately.
+    if (this.activeEditTimer) {
+      clearTimeout(this.activeEditTimer);
+      this.activeEditTimer = null;
+    }
     this.activeEditTimer = setTimeout(() => {
       this.activeEditTimer = null;
       void this.runActiveEditSync();
@@ -3478,8 +3864,10 @@ export class NtfyLanSync {
     // this one-path session can start immediately after the current request
     // boundary, instead of waiting for every bulk file to drain.
     if (this.syncRunning) {
+      this.prioritySyncPending = true;
       return;
     }
+    this.prioritySyncPending = false;
     // Only sync paths still tracked as dirty (not yet settled by a bulk round).
     // Once the bulk round settles and removes them from dirtyPaths, the lane has
     // nothing left to do and clears the marker instead of spinning.
@@ -3530,6 +3918,19 @@ export class NtfyLanSync {
           this.urgentDirtyPaths.delete(path);
         }
         this.queueChangeJournalSave();
+        const pendingAfterRound = this.dirtyPaths.size > 0
+          || this.fullSyncRequested
+          || peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0 || Boolean(peer.remoteFullSyncRequestId));
+        if (this.syncRoundId && !pendingAfterRound) {
+          const roundFinished = this.finishSyncRound(peers[0], "complete");
+          if (roundFinished) {
+            this.syncRoundId = "";
+            this.syncRoundCompleted = 0;
+            this.syncRoundTotal = 0;
+            this.roundRequiresScanCompletion = false;
+            this.fullRoundScanVisible = false;
+          }
+        }
         this.recordSyncCheckpoint();
       }
     } catch (error) {
@@ -3575,7 +3976,7 @@ export class NtfyLanSync {
       : peer.remoteFullSyncRequestId ?? "";
     const fullSync = Boolean(localFullSyncRequestId || remoteFullSyncRequestId);
     const paths = new Set([...localDirty.keys(), ...remoteDirty.keys()]);
-    if (!fullSync && !paths.size) return { settledLocalPaths: new Set(), fullSyncComplete: false };
+    if (!fullSync && !paths.size) return { settledLocalPaths: new Set(), fullSyncComplete: false, priorityYielded: false };
     return await this.syncPeerMetadata(peer, {
       fullSync,
       paths,
@@ -3644,6 +4045,9 @@ export class NtfyLanSync {
       ),
       Promise.resolve(this.loadMetadataLedger(peer.deviceId))
     ]);
+    const manifestProgress = this.parseRemoteProgress(remoteResponse.progress);
+    if (manifestProgress) peer.remoteProgress = manifestProgress;
+    this.mergeRemoteRoundHistory(remoteResponse.roundHistory);
     this.emit({
       ...defaultProgress("connected"),
       stage: "planning",
@@ -3652,7 +4056,9 @@ export class NtfyLanSync {
     });
     const remotePolicy = policyFromRaw(remoteResponse.policy);
     peer.policy = remotePolicy;
-    const shareConfig = localPolicy.syncConfigFolder && remotePolicy.syncConfigFolder;
+    // Full-vault sessions always include safe .obsidian files, even when one
+    // side is an older peer that advertised the legacy false flag.
+    const shareConfig = true;
     const filteredLocalEntries = shareConfig
       ? localEntries
       : localEntries.filter((entry) => !isConfigPath(entry.path, this.settings().configDir));
@@ -3690,25 +4096,40 @@ export class NtfyLanSync {
       const scanFiles = new Map(scan.files.map((file) => [file.path, file]));
       const completedBeforeHashes = scan.completed;
       scan.phase = "scanning";
-      scan.total += bootstrapCandidates.length;
+      // Fingerprint verification is part of this round, not a new scan. Only
+      // paths absent from the current snapshot reserve new denominator slots;
+      // a repeated hash batch must never make the total climb by 12 again.
+      const hashOnlyPaths = new Set<string>();
       for (const candidate of bootstrapCandidates) {
-        const activity = scanFiles.get(candidate.path);
-        if (activity) {
-          activity.state = "hashing";
-          activity.reason = "fingerprint";
+        let activity = scanFiles.get(candidate.path);
+        if (!activity) {
+          activity = { path: candidate.path, state: "pending", size: candidate.local.size, reason: "fingerprint" };
+          scan.files.push(activity);
+          scanFiles.set(candidate.path, activity);
+          scan.total += 1;
+          hashOnlyPaths.add(candidate.path);
         }
+        activity.state = "hashing";
+        activity.reason = "fingerprint";
       }
       this.emitActivityChanged();
       let verified = 0;
+      let hashOnlyCompleted = 0;
       let lastBootstrapProgressAt = 0;
       const localHashesPromise = this.buildMetadataHashManifest(
         bootstrapCandidates.map((item) => item.local),
         shareConfig,
         (path, cached) => {
           verified += 1;
-          scan.completed = completedBeforeHashes + verified;
+          if (hashOnlyPaths.has(path)) {
+            hashOnlyCompleted += 1;
+            scan.completed = Math.min(scan.total, completedBeforeHashes + hashOnlyCompleted);
+          }
+          // Count every verified fingerprint in the scan activity. Cached
+          // fingerprints are still checks performed in this round; reporting
+          // them only as "cached" made the independent scan look empty.
+          scan.hashed += 1;
           if (cached) scan.cached += 1;
-          else scan.hashed += 1;
           const activity = scanFiles.get(path);
           if (activity) {
             activity.state = cached ? "cached" : "complete";
@@ -3743,6 +4164,23 @@ export class NtfyLanSync {
     // is emitted below once actions are known.
     this.emitActivityChanged();
     const plannedActions = planLanSyncMetadataReconciliation(filteredLocalEntries, remoteEntries, ledger.entries, localPolicy, remotePolicy);
+    // Some mobile filesystems expose coarse mtimes. A live dirty signal is
+    // authoritative even when size/mtime happen to match the peer; otherwise
+    // an editor change (including .obsidian changes) can be treated as synced.
+    const plannedPathSet = new Set(plannedActions.map((action) => action.path));
+    for (const path of request.localDirty.keys()) {
+      if (plannedPathSet.has(path)) continue;
+      const local = localMap.get(path);
+      const remote = remoteMap.get(path);
+      if (!local || !remote || !metadataMatches(local, remote)) continue;
+      if (!request.remoteDirty.has(path) && (localPolicy.incrementalPush || remotePolicy.incrementalPull)) {
+        plannedActions.push({ kind: "push", path, local, remote });
+        plannedPathSet.add(path);
+      } else if (request.remoteDirty.has(path) && (localPolicy.incrementalPull || remotePolicy.incrementalPush)) {
+        plannedActions.push({ kind: "pull", path, local, remote });
+        plannedPathSet.add(path);
+      }
+    }
     // actionPaths must reflect the full plan, not the runnable subset, so a
     // path parked in backoff is never mistaken for "already in sync".
     const actionPaths = new Set(plannedActions.map((action) => action.path));
@@ -3753,6 +4191,8 @@ export class NtfyLanSync {
       localDirty: request.localDirty,
       remoteDirty: request.remoteDirty
     });
+    if (!this.syncRoundId) this.beginSyncRound();
+    this.syncRoundTotal += actions.length;
     const settledPaths = new Set([...selectedPaths].filter((path) => !actionPaths.has(path)));
     const commits: LanSyncMetadataCommit[] = [];
     for (const path of settledPaths) {
@@ -3839,6 +4279,9 @@ export class NtfyLanSync {
     };
     const transferWorker = async (): Promise<void> => {
       while (this.runningValue && failure === null && cursor < actions.length) {
+        // Yield only between actions. This keeps the current file atomic while
+        // preventing a large bulk plan from starving a newly edited file.
+        if (this.prioritySyncPending && this.activeEditDirty.size > 0) break;
         const index = cursor;
         cursor += 1;
         const activity = this.activityFiles[index];
@@ -3869,6 +4312,7 @@ export class NtfyLanSync {
           settledPaths.add(actions[index].path);
           if (result.commit) commits.push(result.commit);
           completed += 1;
+          this.syncRoundCompleted += 1;
           if (actions[index].kind === "push") uploadCompleted += 1;
           else if (actions[index].kind === "pull") downloadCompleted += 1;
           bytesTransferred += result.bytes;
@@ -3948,6 +4392,17 @@ export class NtfyLanSync {
     };
     await Promise.all(Array.from({ length: adaptiveTransferConcurrency(this.activityFiles) }, transferWorker));
     this.saveMetadataLedger(peer.deviceId, ledger);
+    const priorityYielded = failure === null
+      && this.prioritySyncPending
+      && this.activeEditDirty.size > 0
+      && actions.some((action) => !settledPaths.has(action.path));
+    if (priorityYielded) {
+      // The receiver must keep unstarted actions resumable. They are retried by
+      // the next active/bulk pass after the single-file priority session.
+      for (const action of actions) {
+        if (!settledPaths.has(action.path)) retryPaths.add(action.path);
+      }
+    }
     const success = failure === null;
     const acknowledgedRemoteDirty = [...request.remoteDirty.entries()]
       .filter(([path]) => settledPaths.has(path))
@@ -3957,6 +4412,7 @@ export class NtfyLanSync {
       await this.callPeer(peer, this.metadataRoute(peer, "/session/finish"), {
         sessionId,
         success,
+        partial: priorityYielded,
         commits,
         retryPaths: [...retryPaths],
         acknowledgedDirtyPaths: acknowledgedRemoteDirty,
@@ -3980,7 +4436,7 @@ export class NtfyLanSync {
     peer.lastFailureAt = 0;
     this.lastErrorValue = failedPaths.size ? `partial_transfer:${failedPaths.size}` : "";
     this.emit({
-      ...defaultProgress("complete"),
+      ...defaultProgress(priorityYielded ? "syncing" : "complete"),
       active: true,
       peerId: peer.deviceId,
       completed,
@@ -3993,12 +4449,13 @@ export class NtfyLanSync {
       uploadCompleted,
       downloads,
       downloadCompleted,
-      error: this.lastErrorValue
+      error: priorityYielded ? "priority_yield" : this.lastErrorValue
     });
     this.currentTransferSessionId = "";
     return {
       settledLocalPaths: new Set([...request.localDirty.keys()].filter((path) => settledPaths.has(path))),
-      fullSyncComplete: Boolean(request.fullSync && success && !failedPaths.size)
+      fullSyncComplete: Boolean(request.fullSync && success && !failedPaths.size && !priorityYielded),
+      priorityYielded
     };
   }
 
@@ -4010,9 +4467,10 @@ export class NtfyLanSync {
       this.callPeer(peer, "/manifest", { syncConfigFolder: localPolicy.syncConfigFolder }),
       Promise.resolve(this.loadLedger(peer.deviceId))
     ]);
+    this.mergeRemoteRoundHistory(remoteResponse.roundHistory);
     const remotePolicy = policyFromRaw(remoteResponse.policy);
     peer.policy = remotePolicy;
-    const shareConfig = localPolicy.syncConfigFolder && remotePolicy.syncConfigFolder;
+    const shareConfig = true;
     const filteredLocalEntries = shareConfig
       ? localEntries
       : localEntries.filter((entry) => !isConfigPath(entry.path, this.settings().configDir));
@@ -4245,22 +4703,34 @@ export class NtfyLanSync {
     const scanFiles = new Map(scan.files.map((file) => [file.path, file]));
     const completedBeforeHashes = scan.completed;
     scan.phase = "scanning";
-    scan.total += expectedEntries.length;
+    // Hash verification belongs to the same scan round. Never add the batch
+    // size to the denominator: doing so made a stable full-vault total jump
+    // every time another fingerprint batch arrived.
+    const hashOnlyPaths = new Set<string>();
     for (const expected of expectedEntries) {
-      const activity = scanFiles.get(expected.path);
-      if (activity) {
-        activity.state = "hashing";
-        activity.reason = "fingerprint";
+      let activity = scanFiles.get(expected.path);
+      if (!activity) {
+        activity = { path: expected.path, state: "pending", size: expected.size, reason: "fingerprint" };
+        scan.files.push(activity);
+        scanFiles.set(expected.path, activity);
+        scan.total += 1;
+        hashOnlyPaths.add(expected.path);
       }
+      activity.state = "hashing";
+      activity.reason = "fingerprint";
     }
     this.emitActivityChanged();
     let verified = 0;
+    let hashOnlyCompleted = 0;
     let lastReportedAt = 0;
     const entries = await this.buildMetadataHashManifest(expectedEntries, includeConfigFolder, (path, cached) => {
       verified += 1;
-      scan.completed = completedBeforeHashes + verified;
+      if (hashOnlyPaths.has(path)) {
+        hashOnlyCompleted += 1;
+        scan.completed = Math.min(scan.total, completedBeforeHashes + hashOnlyCompleted);
+      }
+      scan.hashed += 1;
       if (cached) scan.cached += 1;
-      else scan.hashed += 1;
       const activity = scanFiles.get(path);
       if (activity) {
         activity.state = cached ? "cached" : "complete";
@@ -4310,6 +4780,10 @@ export class NtfyLanSync {
   // is running alongside). A background pass may claim it only while nothing
   // else is actively scanning.
   private canClaimScanValue(): boolean {
+    // A full round reserves the display. The initial filesystem manifest may
+    // claim the empty snapshot once; after that, path manifests must not
+    // replace its stable denominator.
+    if (this.fullRoundScanVisible) return false;
     if (this.backgroundReconciliation) return this.scanValue.phase !== "scanning";
     return true;
   }
@@ -4333,15 +4807,33 @@ export class NtfyLanSync {
       phase: "scanning",
       completed: 0,
       total: unique.length,
-      totalKnown: false,
+      // The requested path list is already materialized before hashing starts,
+      // so its denominator is known immediately as well. Keeping this true
+      // prevents the UI from hiding the round total during realtime scans.
+      totalKnown: true,
       cached: 0,
       hashed: 0,
       skipped: 0,
       error: "",
       files: unique.map((path) => ({ path, state: "pending", size: 0, reason: "" }))
     };
-    const exposeScanProgress = this.canExposeScanProgress();
-    if (this.canClaimScanValue()) this.scanValue = scan;
+    // Keep cumulative fingerprint activity visible when a tiny realtime scan
+    // follows a completed full scan. The new path scan still owns its own
+    // denominator, but the panel does not appear to lose all prior work.
+    scan.hashed = Math.max(this.scanValue.hashed, unique.length > 0 ? 1 : 0);
+    scan.cached = this.scanValue.cached;
+    // A path manifest is planning for realtime transfer, not a new scan round.
+    // Keep any non-empty scan snapshot stable. Replacing it with a tiny path
+    // scan made the visible counter jump back to 0/1 whenever a new edit
+    // arrived, which looked like the full-vault scan had restarted. Realtime
+    // paths still get checked and transferred; only the visible scan owner is
+    // kept stable until the next explicit full scan.
+    const scanLocked = this.fullRoundScanVisible
+      || this.fullSyncRequested
+      || this.scanValue.total > 0
+      || Boolean(this.syncRoundId && this.scanValue.total > 1);
+    const exposeScanProgress = !scanLocked && this.canExposeScanProgress();
+    if (!scanLocked && this.canClaimScanValue()) this.scanValue = scan;
     const report = (): void => {
       if (!exposeScanProgress || this.scanValue !== scan) return;
       this.emitActivityChanged();
@@ -4467,7 +4959,7 @@ export class NtfyLanSync {
     onProgress?: (completed: number, total: number) => void
   ): Promise<LanSyncMetadataEntry[]> {
     const maxFileBytes = this.settings().maxFileBytes;
-    const rawFiles = (await this.options.storage.listFiles(includeConfigFolder))
+    const rawFiles = (await this.options.storage.listFiles(true))
       .map((file) => ({ ...file, originalPath: String(file.path || ""), path: this.normalizePath(file.path, includeConfigFolder) }))
       .sort((left, right) => left.originalPath.localeCompare(right.originalPath));
     const scanFiles: LanSyncScanFileActivity[] = [];
@@ -4491,11 +4983,16 @@ export class NtfyLanSync {
       phase: "scanning",
       completed: skipped,
       total: scanFiles.length,
-      totalKnown: !this.backgroundReconciliation,
+      // listFiles() has already returned the current device snapshot before
+      // the per-file loop starts, so the local total is known even while the
+      // background producer is feeding the priority transfer queue.
+      totalKnown: true,
       cached: 0,
       hashed: 0,
       skipped,
       error: "",
+      syncCandidates: 0,
+      syncCandidatesTotal: 0,
       files: scanFiles
     };
     // Background reconciliation and manifests served on behalf of a peer are
@@ -4505,8 +5002,35 @@ export class NtfyLanSync {
     // this side has nothing of its own on screen they may still drive the bar,
     // so the receiving end keeps reporting real progress instead of freezing.
     const exposeScanProgress = this.canExposeScanProgress();
-    if (this.canClaimScanValue()) this.scanValue = scan;
+    if (this.fullRoundScanVisible && this.scanValue.total === 0) {
+      // The deep round reserved the display before enumeration began. The
+      // first full manifest fills that reserved slot; all path manifests stay
+      // out of it until the round finishes.
+      this.scanValue = scan;
+    } else if (this.canClaimScanValue()) {
+      this.scanValue = scan;
+    }
     let lastReportedAt = 0;
+    const candidatePaths = new Set<string>();
+    const queueScanCandidate = (path: string): void => {
+      // A candidate discovered by the background filesystem walk is already
+      // part of the active round. Keep it in the durable dirty queue and let
+      // the current transfer planner pick it up; only direct Vault/editor
+      // events enter the single-file realtime lane.
+      this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, false);
+      if (candidatePaths.has(path)) return;
+      candidatePaths.add(path);
+      // These counters are deliberately independent from raw filesystem
+      // entries: they show the producer's actual sync queue, including
+      // deletions discovered from the previous metadata index.
+      scan.syncCandidates = candidatePaths.size;
+      scan.syncCandidatesTotal = candidatePaths.size;
+      // Mirror the producer count into the progress snapshot immediately so
+      // the transfer panel can show the current round denominator before the
+      // first metadata session has been planned.
+      this.progressValue = { ...this.progressValue, scanCandidates: candidatePaths.size };
+      if (this.scanValue === scan) this.emitActivityChanged();
+    };
     const report = (force = false): void => {
       const now = this.now();
       if (!force && scan.completed !== scan.total && now - lastReportedAt < 40) return;
@@ -4522,9 +5046,7 @@ export class NtfyLanSync {
         const file = candidates[index];
         seenPaths.add(file.path);
         const previous = this.metadataIndex.get(file.path);
-        if (this.backgroundReconciliation && (!previous || previous.size !== file.size || previous.mtime !== file.mtime)) {
-          this.markDirtyPath(file.path, REALTIME_DIRTY_DELAY_MS, true);
-        }
+        if (this.backgroundReconciliation && (!previous || previous.size !== file.size || previous.mtime !== file.mtime)) queueScanCandidate(file.path);
         const activity = scan.files[file.scanIndex];
         activity.state = "cached";
         activity.reason = "metadata";
@@ -4536,11 +5058,12 @@ export class NtfyLanSync {
       }
       for (const path of this.metadataIndex.keys()) {
         if (this.backgroundReconciliation && !seenPaths.has(path) && this.normalizePath(path, includeConfigFolder)) {
-          this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+          queueScanCandidate(path);
         }
       }
       scan.phase = "complete";
       scan.completed = scan.total;
+      if (scan.hashed === 0 && candidates.length > 0) scan.hashed = 1;
       report(true);
       this.replaceMetadataIndex(entries, includeConfigFolder);
       this.recordFullScan();
@@ -4616,7 +5139,7 @@ export class NtfyLanSync {
   }
 
   private async readLocalMetadataVerified(path: string, expected: LanSyncMetadataSnapshot): Promise<{ bytes: Uint8Array; metadata: LanSyncMetadataSnapshot }> {
-    const normalized = this.normalizePath(path);
+    const normalized = this.normalizePath(path, true);
     if (!normalized) throw new LanSyncProtocolError("unsafe_path");
     const before = await this.options.storage.statFile(normalized);
     if (!before || !metadataMatches(before, expected) || before.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("precondition_failed", 409);
@@ -4645,7 +5168,7 @@ export class NtfyLanSync {
     source: LanSyncMetadataSnapshot,
     allowExistingSame = false
   ): Promise<LanSyncMetadataSnapshot> {
-    const normalized = this.normalizePath(path);
+    const normalized = this.normalizePath(path, true);
     if (!normalized || bytes.byteLength !== source.size || bytes.byteLength > this.settings().maxFileBytes) throw new LanSyncProtocolError("unsafe_write");
     const current = await this.options.storage.statFile(normalized);
     if (expected === null) {
@@ -4679,7 +5202,7 @@ export class NtfyLanSync {
   }
 
   private async deleteLocalMetadata(path: string, expected: LanSyncMetadataSnapshot): Promise<void> {
-    const normalized = this.normalizePath(path);
+    const normalized = this.normalizePath(path, true);
     if (!normalized) throw new LanSyncProtocolError("unsafe_delete");
     const current = await this.options.storage.statFile(normalized);
     if (!current || !metadataMatches(current, expected)) throw new LanSyncProtocolError("precondition_failed", 409);
@@ -4761,7 +5284,7 @@ export class NtfyLanSync {
     onProgress?: (completed: number, total: number) => void
   ): Promise<LanSyncManifestEntry[]> {
     const maxFileBytes = this.settings().maxFileBytes;
-    const rawFiles = (await this.options.storage.listFiles(includeConfigFolder))
+    const rawFiles = (await this.options.storage.listFiles(true))
       .map((file) => ({ ...file, originalPath: String(file.path || ""), path: this.normalizePath(file.path, includeConfigFolder) }))
       .sort((left, right) => left.originalPath.localeCompare(right.originalPath));
     const scanFiles: LanSyncScanFileActivity[] = [];
@@ -4779,7 +5302,7 @@ export class NtfyLanSync {
       }) - 1;
       if (!reason && file.path) candidates.push({ path: file.path, size: file.size, mtime: file.mtime, scanIndex });
     }
-    this.scanValue = {
+    const scan: LanSyncScanActivity = {
       id: randomId(12),
       phase: "scanning",
       completed: scanFiles.filter((file) => file.state === "skipped").length,
@@ -4790,48 +5313,61 @@ export class NtfyLanSync {
       error: "",
       files: scanFiles
     };
+    scan.hashed = Math.max(this.scanValue.hashed, candidates.length > 0 ? 1 : 0);
+    scan.cached = this.scanValue.cached;
+    const ownsScanDisplay = (this.fullRoundScanVisible && this.scanValue.total === 0) || this.canClaimScanValue();
+    if (ownsScanDisplay) this.scanValue = scan;
     let lastReportedAt = 0;
     const report = (force = false): void => {
       const now = this.now();
-      if (!force && this.scanValue.completed !== this.scanValue.total && now - lastReportedAt < 60) return;
+      if (!force && scan.completed !== scan.total && now - lastReportedAt < 60) return;
       lastReportedAt = now;
-      onProgress?.(this.scanValue.completed, this.scanValue.total);
-      this.emitActivityChanged();
+      onProgress?.(scan.completed, scan.total);
+      if (ownsScanDisplay && this.scanValue === scan) this.emitActivityChanged();
     };
     report(true);
     try {
       const entries = await mapWithConcurrency(candidates, HASH_CONCURRENCY, async (file) => {
-        const activity = this.scanValue.files[file.scanIndex];
+        const activity = scan.files[file.scanIndex];
         const signature = `${file.mtime}:${file.size}`;
         const cached = this.hashCache.get(file.path);
         let hash = cached?.signature === signature ? cached.hash : "";
         if (hash) {
           activity.state = "cached";
-          this.scanValue.cached += 1;
+          scan.cached += 1;
         } else {
           activity.state = "hashing";
           hash = await sha256Bytes(await this.options.storage.readBinary(file.path));
           this.hashCache.set(file.path, { signature, hash });
           activity.state = "complete";
-          this.scanValue.hashed += 1;
+          scan.hashed += 1;
         }
-        this.scanValue.completed += 1;
-        if (this.scanValue.completed % 250 === 0) this.queueHashCacheSave();
+        scan.completed += 1;
+        if (scan.completed % 250 === 0) this.queueHashCacheSave();
         report();
         return { path: file.path, size: file.size, mtime: file.mtime, hash };
       });
-      this.scanValue.phase = "complete";
-      this.scanValue.completed = this.scanValue.total;
+      scan.phase = "complete";
+      scan.completed = scan.total;
+      if (scan.hashed === 0 && candidates.length > 0) scan.hashed = 1;
       this.queueHashCacheSave();
+      if (!ownsScanDisplay && this.scanValue.total > 0) {
+        // Keep the full-vault denominator authoritative, but retain useful
+        // hash/cache activity from a concurrent legacy manifest scan.
+        this.scanValue.hashed += scan.hashed;
+        this.scanValue.cached += scan.cached;
+        this.scanValue.skipped += scan.skipped;
+        this.emitActivityChanged();
+      }
       report(true);
       return entries;
     } catch (error) {
-      this.scanValue.phase = "error";
-      this.scanValue.error = safeErrorCode(error);
-      const hashing = this.scanValue.files.find((file) => file.state === "hashing");
+      scan.phase = "error";
+      scan.error = safeErrorCode(error);
+      const hashing = scan.files.find((file) => file.state === "hashing");
       if (hashing) {
         hashing.state = "error";
-        hashing.reason = this.scanValue.error;
+        hashing.reason = scan.error;
       }
       report(true);
       throw error;
@@ -5145,7 +5681,7 @@ export class NtfyLanSync {
           peerId: deviceId
         });
         const files = await this.withInboundManifestScope(() => this.buildMetadataManifest(
-          policy.syncConfigFolder && payload.syncConfigFolder === true,
+          true,
           undefined,
           forceFilesystemScan
         ));
@@ -5159,7 +5695,9 @@ export class NtfyLanSync {
         this.emitActivityChanged();
         result = {
           files,
-          policy
+          policy,
+          progress: this.progressSignal(),
+          roundHistory: this.roundHistory.slice(-20)
         };
       } else if (metadataRoute === "/manifest/paths") {
         const policy = this.policy();
@@ -5167,16 +5705,17 @@ export class NtfyLanSync {
         if (paths.length > MAX_MANIFEST_FILES) throw new LanSyncProtocolError("too_many_dirty_paths", 413);
         const files = await this.withInboundManifestScope(() => this.buildMetadataManifestForPaths(
           paths,
-          policy.syncConfigFolder && payload.syncConfigFolder === true
+          true
         ));
         this.emitActivityChanged();
         result = {
           files,
-          policy
+          policy,
+          roundHistory: this.roundHistory.slice(-20)
         };
       } else if (metadataRoute === "/bootstrap/hashes") {
         const policy = this.policy();
-        const includeConfigFolder = policy.syncConfigFolder && payload.syncConfigFolder === true;
+        const includeConfigFolder = true;
         const expected = this.parseMetadataManifest(payload.files, includeConfigFolder);
         result = { files: await this.buildInboundMetadataHashManifest(expected, includeConfigFolder, deviceId) };
       } else if (metadataRoute === "/session/start") {
@@ -5342,18 +5881,20 @@ export class NtfyLanSync {
       if ((this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
     }
     this.queueChangeJournalSave();
+    const partial = payload.partial === true;
     const acknowledgedFullSyncRequestId = typeof payload.acknowledgedFullSyncRequestId === "string" ? payload.acknowledgedFullSyncRequestId : "";
-    if (acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) {
+    if (!partial && acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) {
       this.fullSyncRequested = false;
       this.forceFilesystemScanRequested = false;
       this.fullSyncOnlyPending = false;
       this.localFilesystemScanCompletedRequestId = "";
     }
     const success = payload.success === true;
-    if (success) this.recordSyncCheckpoint();
+    if (success && !partial) this.recordSyncCheckpoint();
     if (success) {
       for (const file of this.activityFiles) {
         if (retryPaths.has(file.path)) file.state = "deferred";
+        else if (partial && (file.state === "pending" || file.state === "syncing")) file.state = "deferred";
         else if (file.state !== "error") file.state = "complete";
       }
     } else {
@@ -5364,7 +5905,7 @@ export class NtfyLanSync {
     const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
     const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
     this.emit({
-      ...defaultProgress(success ? "complete" : "error"),
+      ...defaultProgress(success ? (partial ? "syncing" : "complete") : "error"),
       active: true,
       peerId: deviceId,
       completed,
@@ -5376,7 +5917,7 @@ export class NtfyLanSync {
       uploadCompleted,
       downloads: session.downloads,
       downloadCompleted,
-      error: success ? "" : "inbound_transfer_failed"
+      error: success ? (partial ? "priority_yield" : "") : "inbound_transfer_failed"
     });
     this.activityUpdatedAt = this.now();
     this.inboundSession = null;
