@@ -18,6 +18,23 @@ export type LanSyncRuntimeSettings = {
   /** Large-file provider policy. Wormhole is opt-in and never automatic without confirmation. */
   largeFileMode?: "disabled" | "ask" | "wormhole";
   wormholeCommand?: string;
+  /** Opt-in test channel: advertise/build-install the current test bundle. */
+  testMode?: boolean;
+  testAutoUpdate?: boolean;
+  testDebug?: boolean;
+};
+
+export type LanSyncTestBuildFile = {
+  name: "main.js" | "manifest.json" | "styles.css";
+  size: number;
+  hash: string;
+};
+
+export type LanSyncTestBuild = {
+  version: string;
+  buildId: string;
+  createdAt: string;
+  files: LanSyncTestBuildFile[];
 };
 
 export type LanLinkType = "ethernet" | "wifi" | "hotspot" | "bluetooth-pan" | "usb" | "lan" | "manual";
@@ -248,6 +265,10 @@ export type LanSyncServiceOptions = {
   onPeersChanged?(peers: LanSyncPeerInfo[]): void;
   localStore?: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null;
   now?: () => number;
+  getTestBuild?(): Promise<LanSyncTestBuild | null>;
+  readTestBuildFile?(name: LanSyncTestBuildFile["name"]): Promise<ArrayBuffer>;
+  installTestBuild?(build: LanSyncTestBuild, files: Record<string, ArrayBuffer>): Promise<void>;
+  onTestDebug?(event: Record<string, unknown>): void | Promise<void>;
 };
 
 export type LanSyncManifestEntry = {
@@ -331,6 +352,7 @@ type LanSyncPeer = {
   policy: LanSyncPolicy;
   capabilities: Set<string>;
   compatibilityPendingSince: number;
+  testBuild: LanSyncTestBuild | null;
 };
 
 type LanSyncRemoteProgress = {
@@ -483,6 +505,9 @@ const METADATA_PROTOCOLS = [
   { capability: "metadata-session-v3", routePrefix: "/metadata/v3" }
 ] as const;
 const REALTIME_WAKEUP_CAPABILITY = "realtime-wakeup-v1";
+const TEST_UPDATE_CAPABILITY = "test-update-v1";
+const TEST_DEBUG_CAPABILITY = "test-debug-v1";
+const TEST_BUILD_FILE_NAMES = ["main.js", "manifest.json", "styles.css"] as const;
 const REALTIME_WAKEUP_TIMEOUT_MS = 20_000;
 const BOOTSTRAP_MTIME_TOLERANCE_MS = 2_000;
 const MULTICAST_ADDRESS = "239.255.67.19";
@@ -1634,6 +1659,9 @@ export class NtfyLanSync {
   private activityUpdatedAt = 0;
   private lastErrorValue = "";
   private lastPeerFingerprint = "";
+  private localTestBuild: LanSyncTestBuild | null = null;
+  private testUpdateInFlight = false;
+  private lastTestUpdateBuildId = "";
 
   constructor(private readonly options: LanSyncServiceOptions) {}
 
@@ -1880,6 +1908,7 @@ export class NtfyLanSync {
       return;
     }
     this.identity = await this.loadOrCreateIdentity();
+    this.localTestBuild = this.settings().testMode ? await this.options.getTestBuild?.() ?? null : null;
     this.deviceId = this.loadOrCreateDeviceId();
     this.loadRoundHistory();
     this.lastFullScanAt = this.loadLastFullScanAt();
@@ -2035,6 +2064,9 @@ export class NtfyLanSync {
     this.changePollInitialized = false;
     this.changePollLastMtime = 0;
     this.changePollSignatures.clear();
+    this.localTestBuild = null;
+    this.testUpdateInFlight = false;
+    this.lastTestUpdateBuildId = "";
     this.emit(defaultProgress("stopped"));
   }
 
@@ -2709,6 +2741,9 @@ export class NtfyLanSync {
       maxFileBytes: normalizedMaxFileBytes(raw.maxFileBytes),
       inboxRetentionHours: normalizedInboxRetentionHours(raw.inboxRetentionHours),
       manualPeers: Array.isArray(raw.manualPeers) ? raw.manualPeers.map(String).slice(0, 32) : [],
+      testMode: raw.testMode === true,
+      testAutoUpdate: raw.testAutoUpdate === true,
+      testDebug: raw.testDebug === true,
       // Preserve the optional shared-key handshake after normalizing runtime
       // settings. Omitting this field silently falls back to each device's
       // identity secret, so two otherwise matching devices reject each other.
@@ -3449,7 +3484,8 @@ export class NtfyLanSync {
         remoteProgress: null,
         policy: passivePeerPolicy(),
         capabilities: new Set(),
-        compatibilityPendingSince: 0
+        compatibilityPendingSince: 0,
+        testBuild: null
       };
       this.peers.set(deviceId, peer);
     }
@@ -3753,12 +3789,84 @@ export class NtfyLanSync {
     return `${protocol.routePrefix}${suffix}`;
   }
 
+  private parseTestBuild(value: unknown): LanSyncTestBuild | null {
+    if (!isRecord(value)) return null;
+    const version = typeof value.version === "string" && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(value.version)
+      ? value.version
+      : "";
+    const buildId = typeof value.buildId === "string" && /^[A-Za-z0-9_.-]{8,128}$/.test(value.buildId)
+      ? value.buildId
+      : "";
+    const createdAt = typeof value.createdAt === "string" ? value.createdAt.slice(0, 64) : "";
+    if (!version || !buildId || !createdAt || !Array.isArray(value.files)) return null;
+    const files: LanSyncTestBuildFile[] = [];
+    for (const item of value.files) {
+      if (!isRecord(item) || !TEST_BUILD_FILE_NAMES.includes(item.name as typeof TEST_BUILD_FILE_NAMES[number])) continue;
+      const size = Number(item.size);
+      const hash = typeof item.hash === "string" ? item.hash : "";
+      if (!Number.isSafeInteger(size) || size < 0 || size > 20 * 1024 * 1024 || !/^[A-Za-z0-9_-]{32,64}$/.test(hash)) continue;
+      files.push({ name: item.name as LanSyncTestBuildFile["name"], size, hash });
+    }
+    return files.length === TEST_BUILD_FILE_NAMES.length ? { version, buildId, createdAt, files } : null;
+  }
+
+  private compareTestVersions(left: string, right: string): number {
+    const parse = (value: string): number[] => {
+      const match = /^(\d+)\.(\d+)\.(\d+)(?:-test\.(\d+))?/i.exec(value);
+      return match ? match.slice(1).map((item) => Number(item || 0)) : [0, 0, 0, 0];
+    };
+    const a = parse(left);
+    const b = parse(right);
+    for (let index = 0; index < a.length; index += 1) if (a[index] !== b[index]) return a[index] - b[index];
+    return left.localeCompare(right);
+  }
+
+  private async maybeAutoUpdateTestBuild(peer: LanSyncPeer): Promise<void> {
+    const local = this.localTestBuild;
+    const remote = peer.testBuild;
+    if (!local || !remote || !this.settings().testAutoUpdate || !this.options.installTestBuild) return;
+    if (!peer.capabilities.has(TEST_UPDATE_CAPABILITY) || this.compareTestVersions(remote.version, local.version) <= 0) return;
+    if (this.testUpdateInFlight || this.lastTestUpdateBuildId === remote.buildId) return;
+    this.testUpdateInFlight = true;
+    this.lastTestUpdateBuildId = remote.buildId;
+    try {
+      const response = await this.callPeer(peer, "/test/update/manifest", {}, 15_000);
+      const build = this.parseTestBuild(response.build);
+      if (!build || build.buildId !== remote.buildId) throw new Error("invalid_test_build");
+      const files: Record<string, ArrayBuffer> = {};
+      for (const descriptor of build.files) {
+        const result = await this.callPeer(peer, "/test/update/file", { name: descriptor.name, buildId: build.buildId }, 30_000);
+        const data = base64UrlToBytes(typeof result.data === "string" ? result.data : "");
+        if (data.byteLength !== descriptor.size || await sha256Bytes(data) !== descriptor.hash) throw new Error("test_build_hash_mismatch");
+        files[descriptor.name] = arrayBuffer(data);
+      }
+      await this.options.installTestBuild(build, files);
+      void this.sendTestDebug({ type: "test-build-installed", version: build.version, buildId: build.buildId });
+    } catch (error) {
+      this.lastErrorValue = `test_update:${safeErrorCode(error)}`;
+      void this.sendTestDebug({ type: "test-build-update-failed", error: safeErrorCode(error) });
+    } finally {
+      this.testUpdateInFlight = false;
+    }
+  }
+
+  async sendTestDebug(event: Record<string, unknown>): Promise<void> {
+    if (!this.settings().testMode) return;
+    const safeEvent = Object.fromEntries(Object.entries(event).slice(0, 32).map(([key, value]) => [String(key).slice(0, 64), typeof value === "string" ? value.slice(0, 2000) : value]));
+    await Promise.all(this.syncTargets().filter((peer) => peer.capabilities.has(TEST_DEBUG_CAPABILITY)).map(async (peer) => {
+      await this.callPeer(peer, "/test/debug", { event: safeEvent, sentAt: new Date(this.now()).toISOString() }, 10_000).catch(() => undefined);
+    }));
+  }
+
   private syncSignalPayload(): Record<string, unknown> {
+    const testEnabled = Boolean(this.settings().testMode && this.localTestBuild);
     return {
       capabilities: [
         ...METADATA_PROTOCOLS.map((protocol) => protocol.capability),
-        REALTIME_WAKEUP_CAPABILITY
+        REALTIME_WAKEUP_CAPABILITY,
+        ...(testEnabled ? [TEST_UPDATE_CAPABILITY, TEST_DEBUG_CAPABILITY] : [])
       ],
+      testBuild: testEnabled ? this.localTestBuild : null,
       syncRequestId: this.syncRequestId,
       // Include the current authenticated endpoint in every response. Mobile
       // peers may have a stale descriptor after a DHCP/adapter change; the
@@ -3868,6 +3976,15 @@ export class NtfyLanSync {
     if (capabilities.includes(REALTIME_WAKEUP_CAPABILITY)) {
       peer.capabilities.add(REALTIME_WAKEUP_CAPABILITY);
       this.ensureRealtimeWakeupPoll(peer);
+    }
+    if (capabilities.includes(TEST_UPDATE_CAPABILITY) || capabilities.includes(TEST_DEBUG_CAPABILITY)) {
+      if (capabilities.includes(TEST_UPDATE_CAPABILITY)) peer.capabilities.add(TEST_UPDATE_CAPABILITY);
+      if (capabilities.includes(TEST_DEBUG_CAPABILITY)) peer.capabilities.add(TEST_DEBUG_CAPABILITY);
+      const remoteBuild = this.parseTestBuild(payload.testBuild);
+      peer.testBuild = remoteBuild;
+      void this.maybeAutoUpdateTestBuild(peer);
+    } else {
+      peer.testBuild = null;
     }
     const requestId = typeof payload.syncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.syncRequestId)
       ? payload.syncRequestId
@@ -4020,6 +4137,11 @@ export class NtfyLanSync {
         if (existing && existing !== peer) {
           for (const address of peer.addresses) existing.addresses.add(address);
           existing.port = peer.port;
+          // An inbound heartbeat can create the device-id keyed peer before
+          // the configured manual endpoint finishes its first probe. Preserve
+          // the endpoint's host capability when those two records merge;
+          // otherwise the verified peer is silently excluded from syncTargets.
+          existing.canHost = existing.canHost || peer.canHost;
           existing.manual = true;
           peer = existing;
         } else {
@@ -6390,6 +6512,7 @@ export class NtfyLanSync {
       const metadataRoute = metadataProtocol
         ? path.slice(`${API_PREFIX}${metadataProtocol.routePrefix}`.length)
         : "";
+      const testRoute = path.slice(`${API_PREFIX}/test`.length);
       if (
         path === `${API_PREFIX}/manifest`
         || path === `${API_PREFIX}/file/read`
@@ -6441,6 +6564,23 @@ export class NtfyLanSync {
           messages: this.pendingMessagesFor(deviceId),
           ...this.syncSignalPayload()
         };
+      } else if (testRoute === "/update/manifest") {
+        if (!this.settings().testMode || !this.localTestBuild) throw new LanSyncProtocolError("test_mode_disabled", 403);
+        result = { ok: true, build: this.localTestBuild };
+      } else if (testRoute === "/update/file") {
+        if (!this.settings().testMode || !this.localTestBuild || !this.options.readTestBuildFile) throw new LanSyncProtocolError("test_mode_disabled", 403);
+        const name = TEST_BUILD_FILE_NAMES.find((candidate) => candidate === payload.name);
+        const buildId = typeof payload.buildId === "string" ? payload.buildId : "";
+        if (!name || buildId !== this.localTestBuild.buildId) throw new LanSyncProtocolError("invalid_test_build", 400);
+        const bytes = new Uint8Array(await this.options.readTestBuildFile(name));
+        const descriptor = this.localTestBuild.files.find((file) => file.name === name);
+        if (!descriptor || bytes.byteLength !== descriptor.size || await sha256Bytes(bytes) !== descriptor.hash) throw new LanSyncProtocolError("test_build_changed", 409);
+        result = { ok: true, name, buildId, data: bytesToBase64Url(bytes) };
+      } else if (testRoute === "/debug") {
+        if (!this.settings().testMode) throw new LanSyncProtocolError("test_mode_disabled", 403);
+        const event = isRecord(payload.event) ? payload.event : { value: payload.event };
+        await this.options.onTestDebug?.({ ...event, deviceId, receivedAt: new Date(this.now()).toISOString() });
+        result = { ok: true };
       } else if (metadataRoute === "/manifest") {
         const policy = this.policy();
         const scanRequestIds = this.parseScanRequestIds(payload.scanRequestIds);

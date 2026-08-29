@@ -676,6 +676,9 @@ const DEFAULT_SETTINGS = {
   lanSyncMaxFileMb: 512,
   lanSyncSharedSecret: "",
   lanSyncLargeFileMode: "wormhole",
+  lanSyncTestMode: true,
+  lanSyncTestAutoUpdate: true,
+  lanSyncTestDebug: true,
   lanInboxRetentionHours: 168,
   incomingAttachmentFolder: ".trash/ntfy-inbox",
   incomingAttachmentSavedFolder: "附件/ntfy",
@@ -839,6 +842,9 @@ var NtfyLanSyncRuntime = (() => {
     { capability: "metadata-session-v3", routePrefix: "/metadata/v3" }
   ];
   var REALTIME_WAKEUP_CAPABILITY = "realtime-wakeup-v1";
+  var TEST_UPDATE_CAPABILITY = "test-update-v1";
+  var TEST_DEBUG_CAPABILITY = "test-debug-v1";
+  var TEST_BUILD_FILE_NAMES = ["main.js", "manifest.json", "styles.css"];
   var REALTIME_WAKEUP_TIMEOUT_MS = 2e4;
   var BOOTSTRAP_MTIME_TOLERANCE_MS = 2e3;
   var MULTICAST_ADDRESS = "239.255.67.19";
@@ -1777,6 +1783,9 @@ ${bodyHash}`;
     activityUpdatedAt = 0;
     lastErrorValue = "";
     lastPeerFingerprint = "";
+    localTestBuild = null;
+    testUpdateInFlight = false;
+    lastTestUpdateBuildId = "";
     activeSecret() {
       if (!this.identity) throw new Error("identity_unavailable");
       return configuredLanSecret(this.settings(), this.identity);
@@ -1990,6 +1999,7 @@ ${bodyHash}`;
         return;
       }
       this.identity = await this.loadOrCreateIdentity();
+      this.localTestBuild = this.settings().testMode ? await this.options.getTestBuild?.() ?? null : null;
       this.deviceId = this.loadOrCreateDeviceId();
       this.loadRoundHistory();
       this.lastFullScanAt = this.loadLastFullScanAt();
@@ -2134,6 +2144,9 @@ ${bodyHash}`;
       this.changePollInitialized = false;
       this.changePollLastMtime = 0;
       this.changePollSignatures.clear();
+      this.localTestBuild = null;
+      this.testUpdateInFlight = false;
+      this.lastTestUpdateBuildId = "";
       this.emit(defaultProgress("stopped"));
     }
     async pollFilesystemChanges() {
@@ -2649,6 +2662,9 @@ ${bodyHash}`;
         maxFileBytes: normalizedMaxFileBytes(raw.maxFileBytes),
         inboxRetentionHours: normalizedInboxRetentionHours(raw.inboxRetentionHours),
         manualPeers: Array.isArray(raw.manualPeers) ? raw.manualPeers.map(String).slice(0, 32) : [],
+        testMode: raw.testMode === true,
+        testAutoUpdate: raw.testAutoUpdate === true,
+        testDebug: raw.testDebug === true,
         // Preserve the optional shared-key handshake after normalizing runtime
         // settings. Omitting this field silently falls back to each device's
         // identity secret, so two otherwise matching devices reject each other.
@@ -3281,7 +3297,8 @@ ${bodyHash}`;
           remoteProgress: null,
           policy: passivePeerPolicy(),
           capabilities: /* @__PURE__ */ new Set(),
-          compatibilityPendingSince: 0
+          compatibilityPendingSince: 0,
+          testBuild: null
         };
         this.peers.set(deviceId, peer);
       }
@@ -3544,12 +3561,76 @@ ${bodyHash}`;
       if (!protocol) throw new LanSyncProtocolError("peer_upgrade_required", 426);
       return `${protocol.routePrefix}${suffix}`;
     }
+    parseTestBuild(value) {
+      if (!isRecord(value)) return null;
+      const version = typeof value.version === "string" && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(value.version) ? value.version : "";
+      const buildId = typeof value.buildId === "string" && /^[A-Za-z0-9_.-]{8,128}$/.test(value.buildId) ? value.buildId : "";
+      const createdAt = typeof value.createdAt === "string" ? value.createdAt.slice(0, 64) : "";
+      if (!version || !buildId || !createdAt || !Array.isArray(value.files)) return null;
+      const files = [];
+      for (const item of value.files) {
+        if (!isRecord(item) || !TEST_BUILD_FILE_NAMES.includes(item.name)) continue;
+        const size = Number(item.size);
+        const hash = typeof item.hash === "string" ? item.hash : "";
+        if (!Number.isSafeInteger(size) || size < 0 || size > 20 * 1024 * 1024 || !/^[A-Za-z0-9_-]{32,64}$/.test(hash)) continue;
+        files.push({ name: item.name, size, hash });
+      }
+      return files.length === TEST_BUILD_FILE_NAMES.length ? { version, buildId, createdAt, files } : null;
+    }
+    compareTestVersions(left, right) {
+      const parse = (value) => {
+        const match = /^(\d+)\.(\d+)\.(\d+)(?:-test\.(\d+))?/i.exec(value);
+        return match ? match.slice(1).map((item) => Number(item || 0)) : [0, 0, 0, 0];
+      };
+      const a = parse(left);
+      const b = parse(right);
+      for (let index = 0; index < a.length; index += 1) if (a[index] !== b[index]) return a[index] - b[index];
+      return left.localeCompare(right);
+    }
+    async maybeAutoUpdateTestBuild(peer) {
+      const local = this.localTestBuild;
+      const remote = peer.testBuild;
+      if (!local || !remote || !this.settings().testAutoUpdate || !this.options.installTestBuild) return;
+      if (!peer.capabilities.has(TEST_UPDATE_CAPABILITY) || this.compareTestVersions(remote.version, local.version) <= 0) return;
+      if (this.testUpdateInFlight || this.lastTestUpdateBuildId === remote.buildId) return;
+      this.testUpdateInFlight = true;
+      this.lastTestUpdateBuildId = remote.buildId;
+      try {
+        const response = await this.callPeer(peer, "/test/update/manifest", {}, 15e3);
+        const build = this.parseTestBuild(response.build);
+        if (!build || build.buildId !== remote.buildId) throw new Error("invalid_test_build");
+        const files = {};
+        for (const descriptor of build.files) {
+          const result = await this.callPeer(peer, "/test/update/file", { name: descriptor.name, buildId: build.buildId }, 3e4);
+          const data = base64UrlToBytes(typeof result.data === "string" ? result.data : "");
+          if (data.byteLength !== descriptor.size || await sha256Bytes(data) !== descriptor.hash) throw new Error("test_build_hash_mismatch");
+          files[descriptor.name] = arrayBuffer(data);
+        }
+        await this.options.installTestBuild(build, files);
+        void this.sendTestDebug({ type: "test-build-installed", version: build.version, buildId: build.buildId });
+      } catch (error) {
+        this.lastErrorValue = `test_update:${safeErrorCode(error)}`;
+        void this.sendTestDebug({ type: "test-build-update-failed", error: safeErrorCode(error) });
+      } finally {
+        this.testUpdateInFlight = false;
+      }
+    }
+    async sendTestDebug(event) {
+      if (!this.settings().testMode) return;
+      const safeEvent = Object.fromEntries(Object.entries(event).slice(0, 32).map(([key, value]) => [String(key).slice(0, 64), typeof value === "string" ? value.slice(0, 2e3) : value]));
+      await Promise.all(this.syncTargets().filter((peer) => peer.capabilities.has(TEST_DEBUG_CAPABILITY)).map(async (peer) => {
+        await this.callPeer(peer, "/test/debug", { event: safeEvent, sentAt: new Date(this.now()).toISOString() }, 1e4).catch(() => void 0);
+      }));
+    }
     syncSignalPayload() {
+      const testEnabled = Boolean(this.settings().testMode && this.localTestBuild);
       return {
         capabilities: [
           ...METADATA_PROTOCOLS.map((protocol) => protocol.capability),
-          REALTIME_WAKEUP_CAPABILITY
+          REALTIME_WAKEUP_CAPABILITY,
+          ...testEnabled ? [TEST_UPDATE_CAPABILITY, TEST_DEBUG_CAPABILITY] : []
         ],
+        testBuild: testEnabled ? this.localTestBuild : null,
         syncRequestId: this.syncRequestId,
         // Include the current authenticated endpoint in every response. Mobile
         // peers may have a stale descriptor after a DHCP/adapter change; the
@@ -3645,6 +3726,15 @@ ${bodyHash}`;
       if (capabilities.includes(REALTIME_WAKEUP_CAPABILITY)) {
         peer.capabilities.add(REALTIME_WAKEUP_CAPABILITY);
         this.ensureRealtimeWakeupPoll(peer);
+      }
+      if (capabilities.includes(TEST_UPDATE_CAPABILITY) || capabilities.includes(TEST_DEBUG_CAPABILITY)) {
+        if (capabilities.includes(TEST_UPDATE_CAPABILITY)) peer.capabilities.add(TEST_UPDATE_CAPABILITY);
+        if (capabilities.includes(TEST_DEBUG_CAPABILITY)) peer.capabilities.add(TEST_DEBUG_CAPABILITY);
+        const remoteBuild = this.parseTestBuild(payload.testBuild);
+        peer.testBuild = remoteBuild;
+        void this.maybeAutoUpdateTestBuild(peer);
+      } else {
+        peer.testBuild = null;
       }
       const requestId = typeof payload.syncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.syncRequestId) ? payload.syncRequestId : "";
       const requested = Boolean(requestId && requestId !== peer.lastRemoteSyncRequestId);
@@ -3753,6 +3843,7 @@ ${bodyHash}`;
           if (existing && existing !== peer) {
             for (const address of peer.addresses) existing.addresses.add(address);
             existing.port = peer.port;
+            existing.canHost = existing.canHost || peer.canHost;
             existing.manual = true;
             peer = existing;
           } else {
@@ -5672,6 +5763,7 @@ ${bodyHash}`;
         const payload = await decryptLanSyncPayload(secret, body);
         const metadataProtocol = METADATA_PROTOCOLS.find((protocol) => path.startsWith(`${API_PREFIX}${protocol.routePrefix}/`));
         const metadataRoute = metadataProtocol ? path.slice(`${API_PREFIX}${metadataProtocol.routePrefix}`.length) : "";
+        const testRoute = path.slice(`${API_PREFIX}/test`.length);
         if (path === `${API_PREFIX}/manifest` || path === `${API_PREFIX}/file/read` || path === `${API_PREFIX}/file/write` || path === `${API_PREFIX}/file/delete` || path === `${API_PREFIX}/manifest/metadata` || path === `${API_PREFIX}/manifest/metadata/paths` || path === `${API_PREFIX}/metadata/session/start` || path === `${API_PREFIX}/metadata/session/finish` || path === `${API_PREFIX}/metadata/file/read` || path === `${API_PREFIX}/metadata/file/write` || path === `${API_PREFIX}/metadata/file/delete` || path.startsWith(`${API_PREFIX}/metadata/v2/`)) {
           throw new LanSyncProtocolError("peer_upgrade_required", 426);
         }
@@ -5708,6 +5800,23 @@ ${bodyHash}`;
             messages: this.pendingMessagesFor(deviceId),
             ...this.syncSignalPayload()
           };
+        } else if (testRoute === "/update/manifest") {
+          if (!this.settings().testMode || !this.localTestBuild) throw new LanSyncProtocolError("test_mode_disabled", 403);
+          result = { ok: true, build: this.localTestBuild };
+        } else if (testRoute === "/update/file") {
+          if (!this.settings().testMode || !this.localTestBuild || !this.options.readTestBuildFile) throw new LanSyncProtocolError("test_mode_disabled", 403);
+          const name = TEST_BUILD_FILE_NAMES.find((candidate) => candidate === payload.name);
+          const buildId = typeof payload.buildId === "string" ? payload.buildId : "";
+          if (!name || buildId !== this.localTestBuild.buildId) throw new LanSyncProtocolError("invalid_test_build", 400);
+          const bytes = new Uint8Array(await this.options.readTestBuildFile(name));
+          const descriptor = this.localTestBuild.files.find((file) => file.name === name);
+          if (!descriptor || bytes.byteLength !== descriptor.size || await sha256Bytes(bytes) !== descriptor.hash) throw new LanSyncProtocolError("test_build_changed", 409);
+          result = { ok: true, name, buildId, data: bytesToBase64Url(bytes) };
+        } else if (testRoute === "/debug") {
+          if (!this.settings().testMode) throw new LanSyncProtocolError("test_mode_disabled", 403);
+          const event = isRecord(payload.event) ? payload.event : { value: payload.event };
+          await this.options.onTestDebug?.({ ...event, deviceId, receivedAt: new Date(this.now()).toISOString() });
+          result = { ok: true };
         } else if (metadataRoute === "/manifest") {
           const policy = this.policy();
           const scanRequestIds = this.parseScanRequestIds(payload.scanRequestIds);
@@ -7087,6 +7196,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     settings.lanSyncMaxFileMb = Math.max(1, Math.min(512, this.safePositiveNumber(settings.lanSyncMaxFileMb, DEFAULT_SETTINGS.lanSyncMaxFileMb)));
     settings.lanSyncSharedSecret = String(settings.lanSyncSharedSecret || "").trim().slice(0, 512);
     settings.lanSyncLargeFileMode = ["disabled", "ask", "wormhole"].includes(settings.lanSyncLargeFileMode) ? settings.lanSyncLargeFileMode : DEFAULT_SETTINGS.lanSyncLargeFileMode;
+    settings.lanSyncTestMode = settings.lanSyncTestMode !== false;
+    settings.lanSyncTestAutoUpdate = settings.lanSyncTestAutoUpdate !== false;
+    settings.lanSyncTestDebug = settings.lanSyncTestDebug !== false;
     settings.lanInboxRetentionHours = Math.max(1, Math.min(2160, this.safePositiveNumber(settings.lanInboxRetentionHours, DEFAULT_SETTINGS.lanInboxRetentionHours)));
     settings.incomingAttachmentFolder = this.normalizeIncomingAttachmentFolder(settings.incomingAttachmentFolder || DEFAULT_SETTINGS.incomingAttachmentFolder);
     settings.incomingAttachmentSavedFolder = this.normalizeIncomingAttachmentFolder(settings.incomingAttachmentSavedFolder || DEFAULT_SETTINGS.incomingAttachmentSavedFolder, false);
@@ -7241,6 +7353,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         maxFileBytes: this.settings.lanSyncMaxFileMb * 1024 * 1024,
         sharedSecret: this.settings.lanSyncSharedSecret,
         largeFileMode: this.settings.lanSyncLargeFileMode,
+        testMode: this.settings.lanSyncTestMode,
+        testAutoUpdate: this.settings.lanSyncTestAutoUpdate,
+        testDebug: this.settings.lanSyncTestDebug,
         inboxRetentionHours: this.settings.incomingAttachmentRetentionHours,
         manualPeers: String(this.settings.lanSyncManualPeers || "").split(/[,;\n]/).map((value) => value.trim()).filter(Boolean),
       }),
@@ -7310,6 +7425,55 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         writeText: async (path, content) => await adapter.write(path, content),
         ensureFolder: async (path) => await ensureNtfyLanFolder(adapter, path),
         listDirectory: async (path) => (await adapter.list(path)).files,
+      },
+      getTestBuild: async () => {
+        if (!this.settings.lanSyncTestMode) return null;
+        const names = ["main.js", "manifest.json", "styles.css"];
+        const files = [];
+        for (const name of names) {
+          const data = await adapter.readBinary(`${configDir}/plugins/${this.manifest.id}/${name}`);
+          files.push({ name, size: data.byteLength, hash: await hashLanSyncBytes(data) });
+        }
+        const buildId = await hashLanSyncBytes(new TextEncoder().encode(files.map((file) => `${file.name}:${file.size}:${file.hash}`).join("|")));
+        return { version: String(this.manifest.version), buildId, createdAt: new Date().toISOString(), files };
+      },
+      readTestBuildFile: async (name) => await adapter.readBinary(`${configDir}/plugins/${this.manifest.id}/${name}`),
+      installTestBuild: async (build, files) => {
+        if (!this.settings.lanSyncTestMode || !this.settings.lanSyncTestAutoUpdate) return;
+        const pluginRoot = `${configDir}/plugins/${this.manifest.id}`;
+        for (const name of ["main.js", "manifest.json", "styles.css"]) {
+          const data = files[name];
+          // ArrayBuffer objects can cross a WebView realm on Android, where
+          // instanceof ArrayBuffer is false even though the bytes are valid.
+          // Normalize by byteLength so automatic updates remain portable.
+          if (!data || !Number.isSafeInteger(Number(data.byteLength)) || Number(data.byteLength) < 0) throw new Error(`Invalid test bundle file: ${name}`);
+          const binary = data instanceof ArrayBuffer
+            ? data
+            : data instanceof Uint8Array
+              ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+              : new Uint8Array(data).buffer;
+          await adapter.writeBinary(`${pluginRoot}/${name}`, binary);
+        }
+        this.lanTestDebugEvents.push({ type: "test-build-installed", version: build.version, buildId: build.buildId, receivedAt: new Date().toISOString() });
+        this.lanTestDebugEvents = this.lanTestDebugEvents.slice(-200);
+        this.emitApiEvent("lan-test-debug", this.cloneApiValue(this.lanTestDebugEvents.at(-1)));
+        new Notice(this.uiText(`已自动安装测试版 ${build.version}，准备重载`, `Test build ${build.version} installed; reloading`));
+        window.setTimeout(() => {
+          void (async () => {
+            try {
+              await this.app.plugins.disablePlugin?.(this.manifest.id);
+              await this.app.plugins.enablePlugin?.(this.manifest.id);
+            } catch (error) {
+              console.warn(`${PLUGIN_NAME}: automatic test build reload failed`, error);
+            }
+          })();
+        }, 250);
+      },
+      onTestDebug: async (event) => {
+        if (!this.settings.lanSyncTestDebug) return;
+        this.lanTestDebugEvents.push(event);
+        this.lanTestDebugEvents = this.lanTestDebugEvents.slice(-200);
+        this.emitApiEvent("lan-test-debug", this.cloneApiValue(event));
       },
       httpRequest: async (request) => {
         if (typeof requestUrl === "function") {
@@ -7387,6 +7551,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.lanSync = null;
     this.remotelySaveStatusTakeover.restore();
     this.lanSyncProgress = this.emptyLanSyncProgress();
+    this.lanTestDebugEvents = [];
     this.renderLanSyncStatusBar();
     this.lanSyncDetailsModal?.refresh();
     if (service) await service.stop();
@@ -15403,6 +15568,33 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
             this.display();
           });
       });
+    new Setting(group)
+      .setName(this.uiText("测试版内网分发", "Test build LAN distribution"))
+      .setDesc(this.uiText("开启后，测试版会向同库设备广播构建信息，并允许自动安装更新包。仅传输 main.js、manifest.json、styles.css。", "When enabled, the test build advertises its bundle to matching peers and can install updates automatically. Only main.js, manifest.json, and styles.css are transferred."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.lanSyncTestMode)).onChange(async (value) => {
+        this.plugin.settings.lanSyncTestMode = value;
+        await this.plugin.saveSettings();
+        await this.plugin.restartLanSync();
+        this.display();
+      }));
+    new Setting(group)
+      .setName(this.uiText("自动安装最新测试版", "Automatically install newer test builds"))
+      .setDesc(this.uiText("同一加密通道内发现版本更高的测试包时，后台校验哈希后写入本插件目录并尝试重载。", "When a newer test bundle is found on the encrypted channel, verify hashes, install it into this plugin directory, and attempt a reload."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.lanSyncTestAutoUpdate)).onChange(async (value) => {
+        this.plugin.settings.lanSyncTestAutoUpdate = value;
+        await this.plugin.saveSettings();
+        await this.plugin.restartLanSync();
+        this.display();
+      }));
+    new Setting(group)
+      .setName(this.uiText("收发测试调试数据", "Exchange test diagnostics"))
+      .setDesc(this.uiText("允许通过同一加密通道收发受限的测试事件，供 API 和调试面板读取。", "Allow bounded test events over the same encrypted channel for API and diagnostics."))
+      .addToggle((toggle) => toggle.setValue(Boolean(this.plugin.settings.lanSyncTestDebug)).onChange(async (value) => {
+        this.plugin.settings.lanSyncTestDebug = value;
+        await this.plugin.saveSettings();
+        await this.plugin.restartLanSync();
+        this.display();
+      }));
       // A shared ntfy topic is a lightweight group. Expose active senders as
       // individual contacts as well, so a user can inspect and address a
       // member without flattening the group history.
