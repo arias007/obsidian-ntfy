@@ -526,6 +526,11 @@ const TRANSFER_ABORT_FAILURE_STREAK = 6;
 const TRANSFER_IDLE_RESET_MS = 3_000;
 const CHANGE_JOURNAL_SAVE_DELAY_MS = 400;
 const CHECKPOINT_MTIME_OVERLAP_MS = 2_000;
+// Obsidian normally reports modify/raw events immediately, but adapters and
+// external editors can occasionally omit or delay them. This short, metadata-
+// only safety poll catches those writes without starting a full reconciliation.
+const CHANGE_POLL_INTERVAL_MS = 350;
+const CHANGE_POLL_OVERLAP_MS = 1_000;
 const BACKGROUND_FULL_RESCAN_INTERVAL_MS = 24 * 60 * 60_000;
 const METADATA_INDEX_SAVE_DELAY_MS = 2_000;
 // Obsidian can deliver modify/raw events well after the underlying write has
@@ -1542,6 +1547,10 @@ export class NtfyLanSync {
     promise: Promise<LanSyncMetadataEntry[]>;
   } | null = null;
   private intervals: Array<ReturnType<typeof setInterval>> = [];
+  private changePollInFlight = false;
+  private changePollInitialized = false;
+  private changePollLastMtime = 0;
+  private changePollSignatures = new Map<string, string>();
   private syncTimer: ReturnType<typeof setTimeout> | null = null;
   private syncRunning = false;
   private syncQueued = false;
@@ -1913,6 +1922,17 @@ export class NtfyLanSync {
       this.intervals.push(setInterval(() => {
         if (this.settings().autoDiscovery) this.requestPeriodicSync();
       }, settings.checkIntervalSeconds * 1000));
+      // Event callbacks remain the primary fast path. The metadata poll is a
+      // bounded fallback for adapters that miss an external/config-folder
+      // write; it only enqueues paths whose size/mtime signature changed.
+      if (this.options.storage.listFilesChangedSince) {
+        this.intervals.push(setInterval(() => {
+          // Do not compete with the first full baseline walk. Once a complete
+          // index exists and a peer is connected, the poll covers only missed
+          // external writes while Vault events remain the normal fast path.
+          if (this.metadataIndexReady && this.syncTargets().length > 0) void this.pollFilesystemChanges();
+        }, CHANGE_POLL_INTERVAL_MS));
+      }
       this.intervals.push(setInterval(() => this.sweepPeers(), PEER_SWEEP_INTERVAL_MS));
       this.announce();
       this.emit({ ...defaultProgress("discovering"), active: false });
@@ -2011,7 +2031,58 @@ export class NtfyLanSync {
     this.syncRoundTotal = 0;
     this.syncRoundPaths.clear();
     this.activityUpdatedAt = this.now();
+    this.changePollInFlight = false;
+    this.changePollInitialized = false;
+    this.changePollLastMtime = 0;
+    this.changePollSignatures.clear();
     this.emit(defaultProgress("stopped"));
+  }
+
+  private async pollFilesystemChanges(): Promise<void> {
+    const listChangedSince = this.options.storage.listFilesChangedSince;
+    if (!this.runningValue || !listChangedSince || this.changePollInFlight) return;
+    this.changePollInFlight = true;
+    try {
+      // The overlap handles coarse filesystem timestamp precision. Signatures
+      // suppress duplicate notifications caused by that overlap, so a stable
+      // file never re-enters the transfer queue on every poll.
+      const since = this.changePollInitialized
+        ? Math.max(0, this.changePollLastMtime - CHANGE_POLL_OVERLAP_MS)
+        : 0;
+      const files = await listChangedSince.call(this.options.storage, since, true);
+      const nextSignatures = new Map(this.changePollSignatures);
+      let maxMtime = this.changePollLastMtime;
+      if (!this.changePollInitialized) {
+        for (const file of files) {
+          const path = this.normalizePath(file.path, true);
+          if (path) {
+            nextSignatures.set(path, `${Math.max(0, file.size)}:${Math.max(0, file.mtime)}`);
+            maxMtime = Math.max(maxMtime, Number(file.mtime) || 0);
+          }
+        }
+        this.changePollInitialized = true;
+      } else {
+        for (const file of files) {
+          const path = this.normalizePath(file.path, true);
+          if (!path) continue;
+          const signature = `${Math.max(0, file.size)}:${Math.max(0, file.mtime)}`;
+          const previous = nextSignatures.get(path);
+          nextSignatures.set(path, signature);
+          maxMtime = Math.max(maxMtime, Number(file.mtime) || 0);
+          if (previous !== undefined && previous === signature) continue;
+          // New paths and genuine metadata changes go through the same urgent
+          // queue as Vault events, including .obsidian/config-folder paths.
+          this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+        }
+      }
+      this.changePollSignatures = nextSignatures;
+      this.changePollLastMtime = maxMtime;
+    } catch {
+      // Polling is a safety net. A transient adapter read failure must never
+      // interrupt an active transfer or replace the live progress snapshot.
+    } finally {
+      this.changePollInFlight = false;
+    }
   }
 
   notifyVaultChange(path: string): void {

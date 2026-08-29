@@ -871,6 +871,8 @@ var NtfyLanSyncRuntime = (() => {
   var TRANSFER_IDLE_RESET_MS = 3e3;
   var CHANGE_JOURNAL_SAVE_DELAY_MS = 400;
   var CHECKPOINT_MTIME_OVERLAP_MS = 2e3;
+  var CHANGE_POLL_INTERVAL_MS = 350;
+  var CHANGE_POLL_OVERLAP_MS = 1e3;
   var BACKGROUND_FULL_RESCAN_INTERVAL_MS = 24 * 60 * 6e4;
   var METADATA_INDEX_SAVE_DELAY_MS = 2e3;
   var APPLIED_MUTATION_EVENT_TTL_MS = 30 * 6e4;
@@ -1688,6 +1690,10 @@ ${bodyHash}`;
     manifestBuild = null;
     metadataManifestBuild = null;
     intervals = [];
+    changePollInFlight = false;
+    changePollInitialized = false;
+    changePollLastMtime = 0;
+    changePollSignatures = /* @__PURE__ */ new Map();
     syncTimer = null;
     syncRunning = false;
     syncQueued = false;
@@ -2023,6 +2029,11 @@ ${bodyHash}`;
         this.intervals.push(setInterval(() => {
           if (this.settings().autoDiscovery) this.requestPeriodicSync();
         }, settings.checkIntervalSeconds * 1e3));
+        if (this.options.storage.listFilesChangedSince) {
+          this.intervals.push(setInterval(() => {
+            if (this.metadataIndexReady && this.syncTargets().length > 0) void this.pollFilesystemChanges();
+          }, CHANGE_POLL_INTERVAL_MS));
+        }
         this.intervals.push(setInterval(() => this.sweepPeers(), PEER_SWEEP_INTERVAL_MS));
         this.announce();
         this.emit({ ...defaultProgress("discovering"), active: false });
@@ -2119,7 +2130,48 @@ ${bodyHash}`;
       this.syncRoundTotal = 0;
       this.syncRoundPaths.clear();
       this.activityUpdatedAt = this.now();
+      this.changePollInFlight = false;
+      this.changePollInitialized = false;
+      this.changePollLastMtime = 0;
+      this.changePollSignatures.clear();
       this.emit(defaultProgress("stopped"));
+    }
+    async pollFilesystemChanges() {
+      const listChangedSince = this.options.storage.listFilesChangedSince;
+      if (!this.runningValue || !listChangedSince || this.changePollInFlight) return;
+      this.changePollInFlight = true;
+      try {
+        const since = this.changePollInitialized ? Math.max(0, this.changePollLastMtime - CHANGE_POLL_OVERLAP_MS) : 0;
+        const files = await listChangedSince.call(this.options.storage, since, true);
+        const nextSignatures = new Map(this.changePollSignatures);
+        let maxMtime = this.changePollLastMtime;
+        if (!this.changePollInitialized) {
+          for (const file of files) {
+            const path = this.normalizePath(file.path, true);
+            if (path) {
+              nextSignatures.set(path, `${Math.max(0, file.size)}:${Math.max(0, file.mtime)}`);
+              maxMtime = Math.max(maxMtime, Number(file.mtime) || 0);
+            }
+          }
+          this.changePollInitialized = true;
+        } else {
+          for (const file of files) {
+            const path = this.normalizePath(file.path, true);
+            if (!path) continue;
+            const signature = `${Math.max(0, file.size)}:${Math.max(0, file.mtime)}`;
+            const previous = nextSignatures.get(path);
+            nextSignatures.set(path, signature);
+            maxMtime = Math.max(maxMtime, Number(file.mtime) || 0);
+            if (previous !== void 0 && previous === signature) continue;
+            this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+          }
+        }
+        this.changePollSignatures = nextSignatures;
+        this.changePollLastMtime = maxMtime;
+      } catch {
+      } finally {
+        this.changePollInFlight = false;
+      }
     }
     notifyVaultChange(path) {
       const normalized = this.normalizePath(path, true);

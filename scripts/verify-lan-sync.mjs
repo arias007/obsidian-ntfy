@@ -1275,6 +1275,17 @@ try {
         bProgress: baselineServiceB.progress()
       })}`);
     });
+    // Adapter safety net: an external write with no Vault event must still be
+    // observed by the metadata poll and transferred without a manual scan.
+    await waitFor(() => baselineServiceA.changePollInitialized === true, "metadata poll baseline");
+    baselineStorageA.putText("Only-A/poll-without-event.md", "poll detected", 100_000_010);
+    await baselineServiceA.pollFilesystemChanges();
+    await waitFor(
+      () => baselineStorageB.text("Only-A/poll-without-event.md") === "poll detected",
+      "external write without a Vault event",
+      10_000,
+      50
+    );
     assert.equal([...baselineStorageA.files.keys(), ...baselineStorageB.files.keys()].some((path) => path.includes("LAN conflict")), false, "Baseline reconciliation created a renamed conflict copy");
   } finally {
     await Promise.all([baselineServiceA.stop(), baselineServiceB.stop()]);
