@@ -2050,14 +2050,27 @@ export class NtfyLanSync {
         ? Math.max(0, this.changePollLastMtime - CHANGE_POLL_OVERLAP_MS)
         : 0;
       const files = await listChangedSince.call(this.options.storage, since, true);
-      const nextSignatures = new Map(this.changePollSignatures);
+      // Seed the first poll from the last complete index instead of treating
+      // the current filesystem snapshot as a new baseline. A write that lands
+      // during plugin startup is then detected even if its Vault event was
+      // dropped before the observer became active.
+      const nextSignatures = this.changePollInitialized
+        ? new Map(this.changePollSignatures)
+        : new Map([...this.metadataIndex.entries()].map(([path, metadata]) => [
+          path,
+          `${Math.max(0, metadata.size)}:${Math.max(0, metadata.mtime)}`
+        ]));
       let maxMtime = this.changePollLastMtime;
       if (!this.changePollInitialized) {
         for (const file of files) {
           const path = this.normalizePath(file.path, true);
           if (path) {
-            nextSignatures.set(path, `${Math.max(0, file.size)}:${Math.max(0, file.mtime)}`);
+            const signature = `${Math.max(0, file.size)}:${Math.max(0, file.mtime)}`;
+            const previous = nextSignatures.get(path);
+            nextSignatures.set(path, signature);
             maxMtime = Math.max(maxMtime, Number(file.mtime) || 0);
+            if (previous !== undefined && previous === signature) continue;
+            this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
           }
         }
         this.changePollInitialized = true;

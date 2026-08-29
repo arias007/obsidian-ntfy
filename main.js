@@ -2143,14 +2143,21 @@ ${bodyHash}`;
       try {
         const since = this.changePollInitialized ? Math.max(0, this.changePollLastMtime - CHANGE_POLL_OVERLAP_MS) : 0;
         const files = await listChangedSince.call(this.options.storage, since, true);
-        const nextSignatures = new Map(this.changePollSignatures);
+        const nextSignatures = this.changePollInitialized ? new Map(this.changePollSignatures) : new Map([...this.metadataIndex.entries()].map(([path, metadata]) => [
+          path,
+          `${Math.max(0, metadata.size)}:${Math.max(0, metadata.mtime)}`
+        ]));
         let maxMtime = this.changePollLastMtime;
         if (!this.changePollInitialized) {
           for (const file of files) {
             const path = this.normalizePath(file.path, true);
             if (path) {
-              nextSignatures.set(path, `${Math.max(0, file.size)}:${Math.max(0, file.mtime)}`);
+              const signature = `${Math.max(0, file.size)}:${Math.max(0, file.mtime)}`;
+              const previous = nextSignatures.get(path);
+              nextSignatures.set(path, signature);
               maxMtime = Math.max(maxMtime, Number(file.mtime) || 0);
+              if (previous !== void 0 && previous === signature) continue;
+              this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
             }
           }
           this.changePollInitialized = true;
