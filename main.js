@@ -6231,6 +6231,7 @@ class NtfyLanSyncDetailsModal extends Modal {
       ? {
           stopped: "已停止",
           discovering: "正在检测设备",
+          scanning: "正在同步",
           "checking-peer": "正在检查手机版本",
           "requesting-peer-scan": "正在交换变化清单",
           "waiting-peer-scan": "等待新的变化文件",
@@ -6247,6 +6248,7 @@ class NtfyLanSyncDetailsModal extends Modal {
       : {
           stopped: "Stopped",
           discovering: "Finding devices",
+          scanning: "Syncing",
           "checking-peer": "Checking mobile version",
           "requesting-peer-scan": "Exchanging changed paths",
           "waiting-peer-scan": "Waiting for changed files",
@@ -6292,11 +6294,16 @@ class NtfyLanSyncDetailsModal extends Modal {
           error: progress.error ? `Error: ${progress.error}` : "Synchronization failed",
         };
     const scanFingerprinting = scan.phase === "scanning" && Array.isArray(scan.files) && scan.files.some((file) => file.state === "hashing");
-    const effectiveStage = progress.phase === "syncing"
-      ? "transferring"
-      : scan.phase === "scanning"
-        ? (scanFingerprinting ? "fingerprinting" : "enumerating")
-        : (progress.stage || progress.phase);
+    // Keep the two user-facing counters independent. The headline follows
+    // the scan/check stream, while the transfer section below follows actual
+    // file uploads/downloads. A transfer can run alongside scanning, so the
+    // old transfer-first mapping made "正在同步" look like a file transfer
+    // and obscured the scan denominator.
+    const scanStage = scan.phase === "scanning"
+      ? (scanFingerprinting ? "fingerprinting" : "enumerating")
+      : null;
+    const effectiveStage = scanStage || (progress.phase === "syncing" ? "transferring" : (progress.stage || progress.phase));
+    const headlineStage = scanStage ? "scanning" : effectiveStage;
     const stageSteps = {
       stopped: 0,
       discovering: 0,
@@ -6325,7 +6332,7 @@ class NtfyLanSyncDetailsModal extends Modal {
     const syncSpinner = summaryIcon.querySelector("svg.lucide-loader-circle");
     if (syncSpinner) syncSpinner.style.animationDelay = `-${Date.now() % 700}ms`;
     const summaryText = summary.createDiv({ cls: "obsidian-ntfy-lan-details-summary-text" });
-    summaryText.createEl("strong", { text: stageLabels[effectiveStage] || phaseLabels[progress.phase] || phaseLabels.stopped });
+    summaryText.createEl("strong", { text: stageLabels[headlineStage] || phaseLabels[progress.phase] || phaseLabels.stopped });
     if (stageDescriptions[effectiveStage]) summaryText.createDiv({ cls: "obsidian-ntfy-lan-details-stage-description", text: stageDescriptions[effectiveStage] });
     const stageProgress = summaryText.createEl("progress", {
       cls: "obsidian-ntfy-lan-stage-progress",
@@ -6491,11 +6498,11 @@ class NtfyLanSyncDetailsModal extends Modal {
       ? (stage === "peer-upgrade-required" ? "等待升级" : stage === "checking-peer" ? "检查版本" : stage === "requesting-peer-scan" ? "交换变化路径" : stage === "waiting-peer-scan" ? "等待变化文件" : stage === "complete" ? "已完成" : "尚未开始")
       : (stage === "peer-upgrade-required" ? "Update required" : stage === "checking-peer" ? "Checking version" : stage === "requesting-peer-scan" ? "Exchanging changed paths" : stage === "waiting-peer-scan" ? "Waiting for changed files" : stage === "complete" ? "Complete" : "Not started");
     const label = hasScanWork
-      ? `${chinese ? "本机已检查" : "Local checked"} ${scan.completed || 0} / ${chinese ? "本轮总检查" : "round total"} ${scan.total || 0}`
+      ? `${chinese ? "正在同步 · 本机已检查" : "Syncing · Local checked"} ${scan.completed || 0} / ${chinese ? "本轮总检查" : "round total"} ${scan.total || 0}`
       : hasRemoteScanWork
         ? (remote.scanTotalKnown === false
-          ? `${chinese ? "对端正在扫描" : "Peer scan"} ${remote.scanCompleted || 0}`
-          : `${chinese ? "对端扫描" : "Peer scan"} ${remote.scanCompleted || 0}/${remote.scanTotal}`)
+          ? `${chinese ? "正在同步 · 对端扫描" : "Syncing · Peer scan"} ${remote.scanCompleted || 0}`
+          : `${chinese ? "正在同步 · 对端扫描" : "Syncing · Peer scan"} ${remote.scanCompleted || 0}/${remote.scanTotal}`)
         : `${chinese ? "扫描" : "Scan"}：${idleLabel}`;
     summary.createSpan({ text: label });
     const candidateCount = Math.max(0, Number(scan.syncCandidatesTotal ?? scan.syncCandidates ?? progress.scanCandidates ?? 0) || 0);
@@ -6554,7 +6561,7 @@ class NtfyLanSyncDetailsModal extends Modal {
     const visibleDownloadCompleted = Math.max(Number(progress.downloadCompleted) || 0, groupTotals.downloadCompleted);
     const hasTransferWork = visibleTotal > 0;
     const label = hasTransferWork
-      ? `${chinese ? "本轮同步" : "Round sync"} ${visibleCompleted}/${visibleTotal}`
+      ? `${chinese ? "同步进度 · 本轮同步" : "Sync progress · Round sync"} ${visibleCompleted}/${visibleTotal}`
       : stage === "complete"
         ? (chinese ? "同步：无需传输" : "Sync: Nothing to transfer")
         : stage === "packaging-manifest"

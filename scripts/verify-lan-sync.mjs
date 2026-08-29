@@ -1574,6 +1574,10 @@ try {
   assert.match(stylesSource, /@media \(max-width: 520px\) \{[\s\S]*?\.obsidian-ntfy-lan-details-progress-stats \{[\s\S]*?flex-direction: column;/, "LAN history progress text cannot wrap into stable mobile rows");
   assert.match(source, /renderScanSection\(body, scan, remote, scanGroups, chinese, progress, effectiveStage, stageDescriptions\)/, "LAN scan section is missing local/peer stage context");
   assert.match(source, /renderTransferSection\(body, progress, files, transferGroups, chinese, effectiveStage, stageDescriptions\)/, "LAN transfer section is missing stage context");
+  assert.match(source, /const headlineStage = scanStage \? "scanning" : effectiveStage/, "LAN headline must follow the scan stream while scanning");
+  assert.match(source, /scanning: "正在同步"/, "LAN scan headline must use the syncing label");
+  assert.match(source, /正在同步 · 本机已检查/, "LAN scan section must identify its check progress");
+  assert.match(source, /同步进度 · 本轮同步/, "LAN transfer section must identify its transfer progress");
    assert.match(source, /"requesting-peer-scan": "正在交换变化清单"/, "LAN details do not show changed-path exchange");
    assert.match(source, /"waiting-peer-scan": "等待新的变化文件"/, "LAN details do not explain the idle incremental wait stage");
    assert.doesNotMatch(source, /电脑和手机都可主动发起|Both devices may initiate/, "LAN details still show non-actionable initiator text");
