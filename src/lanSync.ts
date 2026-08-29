@@ -380,6 +380,65 @@ type LanSyncPeerResult = {
   priorityYielded: boolean;
 };
 
+// Obsidian reloads a plugin without waiting for onunload() promises. Keep the
+// process-level listeners discoverable so the next plugin instance can take
+// them over instead of falling back to port+1 and stranding mobile peers on
+// the old endpoint.
+type LanSyncGlobalRegistry = typeof globalThis & {
+  __ntfyLanSyncServers?: Record<string, Server>;
+  __ntfyLanSyncDiscoverySockets?: Record<string, Socket>;
+  __ntfyLanSyncServer?: Server;
+  __ntfyLanSyncDiscoverySocket?: Socket;
+};
+
+function lanSyncGlobalRegistry(): LanSyncGlobalRegistry {
+  return globalThis as LanSyncGlobalRegistry;
+}
+
+async function closeLanSyncServer(server: Server | null | undefined): Promise<void> {
+  if (!server) return;
+  try {
+    server.closeIdleConnections?.();
+    server.closeAllConnections?.();
+  } catch {
+    // Best effort; close below still releases a listener without active APIs.
+  }
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    try {
+      server.close(() => finish());
+    } catch {
+      finish();
+      return;
+    }
+    setTimeout(finish, 500);
+  });
+}
+
+async function closeLanSyncDiscoverySocket(socket: Socket | null | undefined): Promise<void> {
+  if (!socket) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    try {
+      socket.close(() => finish());
+    } catch {
+      finish();
+      return;
+    }
+    setTimeout(finish, 150);
+  });
+}
+
 type LanSyncInboundSession = {
   id: string;
   deviceId: string;
@@ -423,6 +482,8 @@ const METADATA_PROTOCOLS = [
   { capability: "metadata-session-v4", routePrefix: "/metadata/v4" },
   { capability: "metadata-session-v3", routePrefix: "/metadata/v3" }
 ] as const;
+const REALTIME_WAKEUP_CAPABILITY = "realtime-wakeup-v1";
+const REALTIME_WAKEUP_TIMEOUT_MS = 20_000;
 const BOOTSTRAP_MTIME_TOLERANCE_MS = 2_000;
 const MULTICAST_ADDRESS = "239.255.67.19";
 const DISCOVERY_PORT = 43189;
@@ -430,6 +491,10 @@ const ANNOUNCE_INTERVAL_MS = 750;
 const PEER_SWEEP_INTERVAL_MS = 350;
 const PEER_PROBE_INTERVAL_MS = 900;
 const PEER_MIN_STABLE_GRACE_MS = 30_000;
+const PEER_LINK_IDLE_TIMEOUT_MS = 4_000;
+const PEER_PROBE_TIMEOUT_MS = 8_000;
+const PEER_RECONNECT_PROBE_TIMEOUT_MS = 2_500;
+const PEER_FAILURE_EVICTION_DELAY_MS = 1_800;
 // Keep one current LAN address plus one recent fallback. Retaining a long
 // stale address list made reconnect try dead endpoints serially and look stuck.
 const PEER_MAX_ADDRESS_HISTORY = 2;
@@ -468,7 +533,10 @@ const METADATA_INDEX_SAVE_DELAY_MS = 2_000;
 // the expected snapshot long enough for the whole batch and let expiry cleanup
 // keep memory finite.
 const APPLIED_MUTATION_EVENT_TTL_MS = 30 * 60_000;
-const HASH_CONCURRENCY = 12;
+// Metadata reads are independent and cheap on desktop/modern Android. Keep a
+// bounded pool so scanning advances in smooth batches without the old
+// twelve-worker bottleneck; transfer concurrency remains separately bounded.
+const HASH_CONCURRENCY = 24;
 const LARGE_TRANSFER_CONCURRENCY = 6;
 const MEDIUM_TRANSFER_CONCURRENCY = 8;
 const SMALL_TRANSFER_CONCURRENCY = 12;
@@ -581,6 +649,15 @@ function safeErrorCode(error: unknown): string {
   if (/precondition/i.test(value)) return "precondition_failed";
   if (/unreachable|fetch|connect|socket|network/i.test(value)) return "peer_unreachable";
   return "sync_failed";
+}
+
+function isTransientSyncError(error: unknown): boolean {
+  const code = safeErrorCode(error);
+  return code === "peer_unreachable"
+    || code === "timeout"
+    || code === "rate_limited"
+    || code === "busy"
+    || code === "sync_failed";
 }
 
 function normalizedPort(value: unknown, fallback = 43190): number {
@@ -731,6 +808,48 @@ export function classifyLanLinkType(name: string, address = ""): LanLinkType {
   if (/wi-?fi|wlan|wireless|802\.11/.test(value)) return "wifi";
   if (/ethernet|以太网|\beth\d*\b|en\d+/.test(value)) return "ethernet";
   return "lan";
+}
+
+const LAN_LINK_PRIORITY: Record<LanLinkType, number> = {
+  wifi: 0,
+  hotspot: 1,
+  usb: 2,
+  "bluetooth-pan": 3,
+  ethernet: 4,
+  lan: 5
+};
+
+function lanAddressPriority(address: string, interfaces: LanNetworkInterface[]): number {
+  const normalized = normalizeRemoteAddress(address);
+  const parts = normalized.split(".").map(Number);
+  // Link-local addresses are useful as a last-resort fallback but are not
+  // stable routes for a Wi-Fi peer and commonly belong to disconnected
+  // adapters.
+  if (parts.length === 4 && parts[0] === 169 && parts[1] === 254) return 100;
+  for (const item of interfaces) {
+    const localParts = item.address.split(".").map(Number);
+    const maskParts = item.netmask.split(".").map(Number);
+    if (
+      parts.length === 4
+      && maskParts.length === 4
+      && localParts.length === 4
+      && parts.every((part, index) => (part & maskParts[index]) === (localParts[index] & maskParts[index]))
+    ) {
+      return LAN_LINK_PRIORITY[item.linkType] ?? 50;
+    }
+  }
+  // A normal RFC1918 address on an unknown interface is still preferable to
+  // a virtual/link-local fallback, but should follow a directly matching
+  // Wi-Fi/hotspot/USB subnet.
+  return 40;
+}
+
+export function sortLanAddresses(addresses: Iterable<string>, interfaces: LanNetworkInterface[]): string[] {
+  return [...new Set([...addresses].map(normalizeRemoteAddress).filter(isPrivateLanAddress))]
+    .sort((left, right) => {
+      const priority = lanAddressPriority(left, interfaces) - lanAddressPriority(right, interfaces);
+      return priority || left.localeCompare(right);
+    });
 }
 
 export function ipv4BroadcastAddress(address: string, netmask: string): string | null {
@@ -1021,6 +1140,21 @@ function metadataMatches(
   return Boolean(entry && expected && entry.size === expected.size && entry.mtime === expected.mtime);
 }
 
+// Filesystems on Android and Windows can quantize mtimes differently. This
+// comparison is used only for persisted synchronization baselines; wire
+// preconditions continue to use the strict metadataMatches() check above.
+function metadataLedgerMatches(
+  entry: LanSyncMetadataEntry | LanSyncMetadataSnapshot | null | undefined,
+  expected: LanSyncMetadataEntry | LanSyncMetadataSnapshot | null | undefined
+): boolean {
+  return Boolean(
+    entry
+    && expected
+    && entry.size === expected.size
+    && Math.abs(entry.mtime - expected.mtime) <= BOOTSTRAP_MTIME_TOLERANCE_MS
+  );
+}
+
 function metadataBootstrapEquivalent(local: LanSyncMetadataEntry, remote: LanSyncMetadataEntry): boolean {
   return local.size === remote.size && Math.abs(local.mtime - remote.mtime) <= BOOTSTRAP_MTIME_TOLERANCE_MS;
 }
@@ -1052,9 +1186,9 @@ export function planLanSyncMetadataReconciliation(
     const remoteEntry = remote.get(path) ?? null;
     const baseline = ledger[path];
     if (localEntry && remoteEntry) {
-      if (metadataMatches(localEntry, remoteEntry)) continue;
-      const localChanged = !baseline || !metadataMatches(localEntry, baseline.local);
-      const remoteChanged = !baseline || !metadataMatches(remoteEntry, baseline.remote);
+      if (metadataLedgerMatches(localEntry, remoteEntry)) continue;
+      const localChanged = !baseline || !metadataLedgerMatches(localEntry, baseline.local);
+      const remoteChanged = !baseline || !metadataLedgerMatches(remoteEntry, baseline.remote);
       if (!localChanged && !remoteChanged) continue;
       if (!localChanged && remoteChanged) {
         if (canPull) actions.push({ kind: "pull", path, local: localEntry, remote: remoteEntry });
@@ -1071,11 +1205,11 @@ export function planLanSyncMetadataReconciliation(
     }
     if (baseline) {
       if (localEntry) {
-        const localChanged = !metadataMatches(localEntry, baseline.local);
+        const localChanged = !metadataLedgerMatches(localEntry, baseline.local);
         if (localChanged && canPush) actions.push({ kind: "push", path, local: localEntry, remote: null });
         else if (!localChanged && canDeleteLocal) actions.push({ kind: "delete-local", path, local: localEntry, remote: null });
       } else if (remoteEntry) {
-        const remoteChanged = !metadataMatches(remoteEntry, baseline.remote);
+        const remoteChanged = !metadataLedgerMatches(remoteEntry, baseline.remote);
         if (remoteChanged && canPull) actions.push({ kind: "pull", path, local: null, remote: remoteEntry });
         else if (!remoteChanged && canDeleteRemote) actions.push({ kind: "delete-remote", path, local: null, remote: remoteEntry });
       }
@@ -1395,6 +1529,9 @@ export class NtfyLanSync {
   private metadataIndexReady = false;
   private metadataIndexIncludesConfig = false;
   private metadataIndexMaxFileBytes = 0;
+  private metadataIndexMutationGeneration = 0;
+  private metadataIndexMutations = new Map<string, { generation: number; metadata: LanSyncMetadataSnapshot | null }>();
+  private metadataIndexReplaceBaselineGeneration = 0;
   private metadataIndexGeneration = 0;
   private backgroundReconciliation: Promise<void> | null = null;
   private reconciliationDirtyPaths = new Set<string>();
@@ -1427,6 +1564,13 @@ export class NtfyLanSync {
   private activeEditStartedAt = 0;
   private urgentProbePending = false;
   private urgentProbeTimer: ReturnType<typeof setTimeout> | null = null;
+  private realtimeWakeupPolls = new Map<string, Promise<void>>();
+  private realtimeWakeupRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private realtimeSignalWaiters = new Set<() => void>();
+  // Scan activity is streamed through the encrypted /events/wait channel.
+  // Keep the stream responsive without waking every waiter for every file in
+  // a large vault.
+  private lastRealtimeProgressSignalAt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private transferBackoff = new Map<string, { failures: number; nextAttemptAt: number }>();
   private syncRequestId = "";
@@ -1440,7 +1584,7 @@ export class NtfyLanSync {
   private dirtySequence = 0;
   private dirtyPaths = new Map<string, number>();
   private inboundSession: LanSyncInboundSession | null = null;
-  private appliedMutationEvents = new Map<string, { expected?: LanSyncMetadataSnapshot | null; expiresAt: number }>();
+  private appliedMutationEvents = new Map<string, { expected?: LanSyncMetadataSnapshot | null; expiresAt: number; appliedAt: number }>();
   private servedFilesystemScanRequests = new Map<string, string[]>();
   private pendingMessages = new Map<string, LanSyncIncomingMessage[]>();
   private receivedMessageIds = new Set<string>();
@@ -1456,6 +1600,9 @@ export class NtfyLanSync {
   private syncRoundId = "";
   private syncRoundCompleted = 0;
   private syncRoundTotal = 0;
+  // A round counts each path once, even when a transfer batch is retried or
+  // rebuilt while the filesystem scan is still running.
+  private syncRoundPaths = new Set<string>();
   private fullRoundScanVisible = false;
   // A round started by a full-vault request must not enter history until both
   // filesystem scans have reached their stable denominators. Incremental
@@ -1465,6 +1612,11 @@ export class NtfyLanSync {
   private roundHistory: LanSyncRoundHistory[] = [];
   private activityFiles: LanSyncFileActivity[] = [];
   private scanValue: LanSyncScanActivity = this.emptyScanActivity();
+  // Network peers need the scan that is actually running even when a
+  // concurrent inbound/background scan is intentionally hidden from the
+  // local panel. This signal snapshot is separate from the UI-owned scanValue
+  // so remote progress never rewinds the visible local denominator.
+  private scanSignalValue: LanSyncScanActivity | null = null;
   // Manifest work performed on behalf of a peer must never take over the
   // local scan counter. When it did, the status bar rewound ("3/3" back to
   // "0/3") in the middle of the user's own pass, which is what made a sync
@@ -1589,6 +1741,7 @@ export class NtfyLanSync {
       this.pendingMessages.set(deviceId, next);
       this.savePendingMessages();
       this.syncRequestId = randomId(18);
+      this.wakeRealtimeSignalWaiters();
       return { id: message.id };
     }
     const response = await this.callPeer(peer, "/message/send", message);
@@ -1635,7 +1788,11 @@ export class NtfyLanSync {
         expiresAt: new Date(this.now() + this.settings().inboxRetentionHours * 60 * 60_000).toISOString()
       };
     }
-    this.activityFiles = [{ path: `${LAN_INBOX_ROOT}/${attachmentId}/${name}`, action: "push", state: "syncing", size: bytes.byteLength }];
+    // Keep a stable key for this attachment. Other inbound/outbound work can
+    // replace `activityFiles` while this request is in flight; indexing
+    // element 0 after an await then races with that replacement.
+    const activityPath = `${LAN_INBOX_ROOT}/${attachmentId}/${name}`;
+    this.activityFiles = [{ path: activityPath, action: "push", state: "syncing", size: bytes.byteLength }];
     this.activityUpdatedAt = this.now();
     this.emit({
       ...defaultProgress("syncing"),
@@ -1655,8 +1812,11 @@ export class NtfyLanSync {
         data: bytesToBase64Url(bytes)
       }, fileTransferTimeoutMs(bytes.byteLength));
       const attachment = this.parseAttachment(response);
-      this.activityFiles[0].path = attachment.path;
-      this.activityFiles[0].state = "complete";
+      const activity = this.activityFiles.find((file) => file.path === activityPath);
+      if (activity) {
+        activity.path = attachment.path;
+        activity.state = "complete";
+      }
       this.emit({
         ...defaultProgress("complete"),
         active: true,
@@ -1671,7 +1831,8 @@ export class NtfyLanSync {
       });
       return attachment;
     } catch (error) {
-      this.activityFiles[0].state = "error";
+      const activity = this.activityFiles.find((file) => file.path === activityPath);
+      if (activity) activity.state = "error";
       this.emit({
         ...defaultProgress("error"),
         active: true,
@@ -1686,7 +1847,7 @@ export class NtfyLanSync {
     }
   }
 
-  status(): { running: boolean; port: number; peerCount: number; error: string; desktop: boolean; encrypted: boolean; sharedSecretConfigured: boolean } {
+  status(): { running: boolean; port: number; peerCount: number; error: string; desktop: boolean; encrypted: boolean; sharedSecretConfigured: boolean; dirtyCount: number; urgentCount: number; coordinator: boolean; targetCount: number } {
     return {
       running: this.runningValue,
       port: this.boundPort,
@@ -1694,7 +1855,11 @@ export class NtfyLanSync {
       error: this.lastErrorValue,
       desktop: this.options.desktop,
       encrypted: true,
-      sharedSecretConfigured: Boolean(String(this.settings().sharedSecret || "").trim())
+      sharedSecretConfigured: Boolean(String(this.settings().sharedSecret || "").trim()),
+      dirtyCount: this.dirtyPaths.size,
+      urgentCount: this.activeEditDirty.size,
+      coordinator: this.isCoordinator(),
+      targetCount: this.syncTargets().length
     };
   }
 
@@ -1762,6 +1927,10 @@ export class NtfyLanSync {
 
   async stop(): Promise<void> {
     this.runningValue = false;
+    this.wakeRealtimeSignalWaiters();
+    this.realtimeWakeupPolls.clear();
+    for (const timer of this.realtimeWakeupRetryTimers.values()) clearTimeout(timer);
+    this.realtimeWakeupRetryTimers.clear();
     this.syncQueued = false;
     this.syncForced = false;
     if (this.syncTimer) {
@@ -1788,19 +1957,20 @@ export class NtfyLanSync {
       } catch {
         // Already closed.
       }
+      const registry = lanSyncGlobalRegistry();
+      const sockets = registry.__ntfyLanSyncDiscoverySockets;
+      const key = `${this.identity?.vaultId ?? "unknown"}:${DISCOVERY_PORT}`;
+      if (sockets?.[key] === socket) delete sockets[key];
     }
     const server = this.server;
     this.server = null;
     this.boundPort = 0;
     if (server) {
-      server.closeIdleConnections?.();
-      await Promise.race([
-        new Promise<void>((resolve) => server.close(() => resolve())),
-        new Promise<void>((resolve) => setTimeout(() => {
-          server.closeAllConnections?.();
-          resolve();
-        }, 250))
-      ]);
+      const registry = lanSyncGlobalRegistry();
+      const servers = registry.__ntfyLanSyncServers;
+      const key = `${this.identity?.vaultId ?? "unknown"}:${this.settings().port}`;
+      if (servers?.[key] === server) delete servers[key];
+      await closeLanSyncServer(server);
     }
     if (this.backgroundReconciliation) {
       await this.backgroundReconciliation.catch(() => undefined);
@@ -1833,11 +2003,13 @@ export class NtfyLanSync {
     this.servedFilesystemScanRequests.clear();
     this.activityFiles = [];
     this.scanValue = this.emptyScanActivity();
+    this.scanSignalValue = null;
     this.fullRoundScanVisible = false;
     this.roundRequiresScanCompletion = false;
     this.syncRoundId = "";
     this.syncRoundCompleted = 0;
     this.syncRoundTotal = 0;
+    this.syncRoundPaths.clear();
     this.activityUpdatedAt = this.now();
     this.emit(defaultProgress("stopped"));
   }
@@ -1864,8 +2036,12 @@ export class NtfyLanSync {
         this.appliedMutationEvents.delete(oldest);
       }
     }
+    const appliedAt = this.now();
     this.appliedMutationEvents.set(path, {
-      expiresAt: this.now() + APPLIED_MUTATION_EVENT_TTL_MS
+      appliedAt,
+      // Keep the durable entry for cleanup, but only suppress an Obsidian
+      // event during the short post-write echo window below.
+      expiresAt: appliedAt + APPLIED_MUTATION_EVENT_TTL_MS
     });
   }
 
@@ -1907,8 +2083,14 @@ export class NtfyLanSync {
       return;
     }
     const current = await this.options.storage.statFile(path).catch(() => null);
+    // Obsidian adapters can deliver modify/raw events late. A long-lived
+    // suppression token must never hide a real user edit; only an event that
+    // arrives immediately after our own LAN write can be treated as a write
+    // echo. After the short window, the path is always dirty even when the
+    // adapter reports coarse timestamp precision.
+    const echoWindowActive = this.now() - token.appliedAt <= 2_000;
     const unchanged = token.expected === null ? current === null : Boolean(current && metadataMatches(current, token.expected));
-    if (unchanged) return;
+    if (unchanged && echoWindowActive) return;
     this.appliedMutationEvents.delete(path);
     this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
   }
@@ -1942,8 +2124,15 @@ export class NtfyLanSync {
       this.activeEditingPath = null;
     }
     // Make sure the last contents are picked up by the normal path if the
-    // dedicated lane has not already synced them.
-    if (normalized) this.markDirtyPath(normalized, URGENT_SYNC_DELAY_MS, true);
+    // dedicated lane has not already synced them. A completed fast-lane pass
+    // removes both queues; re-marking an already settled path here would open
+    // a duplicate one-path manifest immediately after the successful transfer.
+    if (
+      normalized
+      && (this.dirtyPaths.has(normalized) || this.activeEditDirty.has(normalized))
+    ) {
+      this.markDirtyPath(normalized, URGENT_SYNC_DELAY_MS, true);
+    }
   }
 
   private markDirtyPath(path: string, delay = QUEUED_SYNC_DELAY_MS, urgent = false): void {
@@ -1952,6 +2141,9 @@ export class NtfyLanSync {
     // so a setting toggle cannot erase an edit before the next sync pass.
     const normalized = this.normalizePath(path, true);
     if (!normalized) return;
+    // Reflect the Vault event in the transfer panel immediately. The actual
+    // action (push/pull/delete) is resolved by the metadata planner later.
+    this.ensurePendingActivityPath(normalized, "push");
     this.notePathChangedDuringFullScan(normalized);
     this.hashCache.delete(normalized);
     this.queueHashCacheSave();
@@ -1973,6 +2165,7 @@ export class NtfyLanSync {
     if (this.backgroundReconciliation) this.reconciliationDirtyPaths.add(normalized);
     this.queueChangeJournalSave();
     this.syncRequestId = randomId(18);
+    this.wakeRealtimeSignalWaiters();
     this.announce();
     if (urgent) {
       // A non-coordinator cannot open the transfer session itself. Push its
@@ -1981,8 +2174,31 @@ export class NtfyLanSync {
       // another batch is finishing).
       this.scheduleUrgentProbe();
       this.scheduleActiveEditSync(REALTIME_DIRTY_DELAY_MS);
+      // Start the priority lane in the same turn. The timer remains as a
+      // fallback, but this direct call prevents a full-vault scan from delaying
+      // the first changed file behind scheduler ordering.
+      if (this.isCoordinator() && !this.activeEditSyncRunning) {
+        // The urgent lane owns this dirty batch immediately. A generic timer
+        // left by the same event would wake during the transfer, set
+        // prioritySyncPending, and force an unnecessary second manifest pass.
+        if (this.syncTimer) {
+          clearTimeout(this.syncTimer);
+          this.syncTimer = null;
+        }
+        if (this.activeEditTimer) {
+          clearTimeout(this.activeEditTimer);
+          this.activeEditTimer = null;
+          this.activeEditTimerDueAt = 0;
+        }
+        void this.runActiveEditSync();
+      }
     }
-    this.scheduleSync(delay, true);
+    // If the coordinator successfully entered the dedicated lane above, that
+    // lane is already the scheduler for this event. Scheduling the generic
+    // pass as well would mark the active transfer for a priority yield and
+    // immediately retry the same manifest. Keep the generic fallback only
+    // when the priority lane could not start (for example, no peer yet).
+    if (!urgent || !this.activeEditSyncRunning) this.scheduleSync(delay, true);
   }
 
   private scheduleUrgentProbe(): void {
@@ -2017,7 +2233,15 @@ export class NtfyLanSync {
       // four-thousand-file full-vault denominator mid-round.
       if (!this.fullRoundScanVisible) {
         this.fullRoundScanVisible = true;
-        this.scanValue = this.emptyScanActivity();
+        // Keep the last completed round visible while the new filesystem
+        // snapshot is being enumerated. Clearing it here made every manual
+        // round flash back to 0/0 even though the metadata index already knew
+        // most files were unchanged.
+        if (this.scanValue.total > 0) {
+          this.scanValue = { ...this.scanValue, phase: "scanning", error: "" };
+        } else {
+          this.scanValue = this.emptyScanActivity();
+        }
       }
     }
     // Normal wakeups consume only paths already discovered by Vault events or
@@ -2030,6 +2254,7 @@ export class NtfyLanSync {
       if (!options.strict) this.startBackgroundFilesystemReconciliation();
     }
     this.syncRequestId = randomId(18);
+    this.wakeRealtimeSignalWaiters();
     const passivePeer = this.activePeers().find((peer) => !peer.canHost);
     if (passivePeer && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing") {
       this.emit({
@@ -2111,7 +2336,9 @@ export class NtfyLanSync {
   private requestPeriodicSync(): void {
     this.recoverFromStalledSync();
     if (!this.runningValue || this.syncRunning || this.inboundSession || this.metadataManifestBuild || this.manifestBuild) return;
-    if (this.fullSyncOnlyPending && this.backgroundReconciliation) return;
+    // Full-vault enumeration and incremental transfer intentionally overlap;
+    // newly discovered paths are queued by the scanner and must not wait for
+    // the complete manifest to finish.
     // Never start a periodic tick while the dedicated active-edit lane holds the
     // peer; the lane finishes first and the bulk round yields to it.
     if (this.activeEditSyncRunning) return;
@@ -2131,7 +2358,9 @@ export class NtfyLanSync {
 
   private startBackgroundFilesystemReconciliation(): void {
     if (!this.runningValue || this.backgroundReconciliation) return;
-    const includeConfigFolder = this.settings().syncConfigFolder;
+    // A full-vault round always covers the safe configuration files as well;
+    // the setting only controls optional policy filtering, never discovery.
+    const includeConfigFolder = true;
     this.reconciliationDirtyPaths.clear();
     const startedAt = this.now();
     const generationAtStart = this.dirtySequence;
@@ -2345,8 +2574,20 @@ export class NtfyLanSync {
     }
   }
 
-  private replaceMetadataIndex(entries: LanSyncMetadataEntry[], includeConfigFolder: boolean): void {
-    this.metadataIndex = new Map(entries.map((entry) => [entry.path, metadataSnapshot(entry)]));
+  private replaceMetadataIndex(
+    entries: LanSyncMetadataEntry[],
+    includeConfigFolder: boolean,
+    preserveMutationsAfter = this.metadataIndexReplaceBaselineGeneration
+  ): void {
+    const next = new Map(entries.map((entry) => [entry.path, metadataSnapshot(entry)]));
+    // A filesystem walk can overlap an inbound transfer. Do not let its
+    // older snapshot erase a file written or deleted after enumeration began.
+    for (const [path, mutation] of this.metadataIndexMutations) {
+      if (mutation.generation <= preserveMutationsAfter) continue;
+      if (mutation.metadata) next.set(path, mutation.metadata);
+      else next.delete(path);
+    }
+    this.metadataIndex = next;
     this.metadataIndexReady = true;
     this.metadataIndexIncludesConfig = includeConfigFolder;
     this.metadataIndexMaxFileBytes = this.settings().maxFileBytes;
@@ -2590,11 +2831,44 @@ export class NtfyLanSync {
     }
   }
 
+  /**
+   * Publish a changed path to the transfer panel before manifest exchange.
+   * Vault events are synchronous from the UI's point of view, while the
+   * metadata request is asynchronous; keeping a pending row here makes that
+   * gap visible without claiming that a transfer direction has been planned.
+   */
+  private ensurePendingActivityPath(path: string, action: LanSyncFileAction): void {
+    // Startup catch-up and late Vault callbacks can arrive while the service
+    // is stopped. Do not turn those durable journal entries into thousands of
+    // visible transfer rows before LAN sync is actually running.
+    if (!this.runningValue && !this.syncRunning && !this.activeEditSyncRunning && !this.inboundSession) return;
+    const normalized = this.normalizePath(path, true);
+    if (!normalized) return;
+    const existing = this.activityFiles.find((file) => file.path === normalized);
+    if (existing) {
+      // A completed row is historical. A fresh event reopens it so the new
+      // edit is visible immediately, while an active transfer keeps its
+      // authoritative direction/state until the next plan is installed.
+      if (existing.state === "complete" || existing.state === "deferred" || existing.state === "error") {
+        existing.action = action;
+        existing.state = "pending";
+        existing.size = 0;
+        this.activityUpdatedAt = this.now();
+        this.emitActivityChanged();
+      }
+      return;
+    }
+    this.activityFiles.push({ path: normalized, action, state: "pending", size: 0 });
+    this.activityUpdatedAt = this.now();
+    this.emitActivityChanged();
+  }
+
   private beginSyncRound(): void {
     if (this.syncRoundId) return;
     this.syncRoundId = randomId(12);
     this.syncRoundCompleted = 0;
     this.syncRoundTotal = 0;
+    this.syncRoundPaths.clear();
     this.roundStartedAt = this.now();
   }
 
@@ -2680,6 +2954,15 @@ export class NtfyLanSync {
     } catch {
       this.roundHistory = [];
     }
+  }
+
+  private publishScanSignal(scan: LanSyncScanActivity, force = false): void {
+    const current = this.scanSignalValue;
+    // Keep a foreground/full scan authoritative while a small path manifest
+    // runs alongside it. Once the current signal is complete, the next scan
+    // may take over and its own denominator is sent to the peer.
+    if (!force && current && current !== scan && current.phase === "scanning") return;
+    this.scanSignalValue = scan;
   }
 
   private saveRoundHistory(): void {
@@ -2796,7 +3079,10 @@ export class NtfyLanSync {
         });
       }
     }
-    return interfaces.sort((left, right) => left.address.localeCompare(right.address));
+    return interfaces.sort((left, right) => {
+      const priority = (LAN_LINK_PRIORITY[left.linkType] ?? 50) - (LAN_LINK_PRIORITY[right.linkType] ?? 50);
+      return priority || left.address.localeCompare(right.address);
+    });
   }
 
   private localAddresses(): string[] {
@@ -2914,10 +3200,21 @@ export class NtfyLanSync {
   private async startServer(): Promise<void> {
     const http = nodeRequire<NodeHttp>("node:http") ?? nodeRequire<NodeHttp>("http");
     if (!http) throw new Error("node_http_unavailable");
+    const registry = lanSyncGlobalRegistry();
+    if (registry.__ntfyLanSyncServer) {
+      await closeLanSyncServer(registry.__ntfyLanSyncServer);
+      delete registry.__ntfyLanSyncServer;
+    }
+    const registryKey = `${this.identity?.vaultId ?? "unknown"}:${this.settings().port}`;
+    const servers = registry.__ntfyLanSyncServers ?? (registry.__ntfyLanSyncServers = {});
+    if (servers[registryKey] && servers[registryKey] !== this.server) {
+      await closeLanSyncServer(servers[registryKey]);
+      delete servers[registryKey];
+    }
     let latestError: unknown = null;
     for (let offset = 0; offset <= 8; offset += 1) {
       const port = this.settings().port + offset;
-      try {
+      for (let attempt = 0; attempt < (offset === 0 ? 4 : 1); attempt += 1) try {
         const server = http.createServer((request, response) => void this.handleServerRequest(request, response));
         server.requestTimeout = 10 * 60_000;
         server.headersTimeout = 10_000;
@@ -2932,9 +3229,11 @@ export class NtfyLanSync {
         });
         this.server = server;
         this.boundPort = port;
+        servers[registryKey] = server;
         return;
       } catch (error) {
         latestError = error;
+        if (offset === 0 && attempt < 3) await new Promise((resolve) => setTimeout(resolve, 75));
       }
     }
     throw new Error(`lan_server_bind_failed:${safeErrorCode(latestError)}`);
@@ -2943,6 +3242,17 @@ export class NtfyLanSync {
   private async startDiscoverySocket(): Promise<void> {
     const dgram = nodeRequire<NodeDgram>("node:dgram") ?? nodeRequire<NodeDgram>("dgram");
     if (!dgram) return;
+    const registry = lanSyncGlobalRegistry();
+    if (registry.__ntfyLanSyncDiscoverySocket) {
+      await closeLanSyncDiscoverySocket(registry.__ntfyLanSyncDiscoverySocket);
+      delete registry.__ntfyLanSyncDiscoverySocket;
+    }
+    const registryKey = `${this.identity?.vaultId ?? "unknown"}:${DISCOVERY_PORT}`;
+    const sockets = registry.__ntfyLanSyncDiscoverySockets ?? (registry.__ntfyLanSyncDiscoverySockets = {});
+    if (sockets[registryKey] && sockets[registryKey] !== this.socket) {
+      await closeLanSyncDiscoverySocket(sockets[registryKey]);
+      delete sockets[registryKey];
+    }
     const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
     socket.on("message", (message, remote) => this.handleAnnouncement(message, remote));
     socket.on("error", () => {
@@ -2971,6 +3281,7 @@ export class NtfyLanSync {
       });
     });
     this.socket = socket;
+    sockets[registryKey] = socket;
   }
 
   private announce(): void {
@@ -2981,7 +3292,13 @@ export class NtfyLanSync {
       vaultId: this.identity.vaultId,
       deviceId: this.deviceId,
       port: this.boundPort,
-      timestamp: this.now()
+      timestamp: this.now(),
+      // Discovery is intentionally unauthenticated and carries only a
+      // monotonic-looking wake token. The receiver still performs the normal
+      // encrypted /ping before accepting any paths. Including the token here
+      // lets a mobile peer wake immediately when its long-poll request was
+      // suspended, instead of waiting for the next 900 ms probe.
+      syncRequestId: this.syncRequestId
     }), "utf8");
     if (packet.byteLength > 1024) return;
     this.socket.send(packet, DISCOVERY_PORT, MULTICAST_ADDRESS, () => undefined);
@@ -3000,8 +3317,25 @@ export class NtfyLanSync {
       const port = normalizedPort(raw.port, 0);
       const address = normalizeRemoteAddress(remote.address);
       if (!port || !isPrivateLanAddress(address)) return;
+      const existing = this.peers.get(raw.deviceId);
+      const wasInactive = !existing || !this.isPeerActive(existing);
+      const announcedSyncRequestId = typeof raw.syncRequestId === "string"
+        && /^[A-Za-z0-9_-]{12,96}$/.test(raw.syncRequestId)
+        ? raw.syncRequestId
+        : "";
+      // A changed token means the peer has new dirty paths. Force an
+      // authenticated probe even when the peer was already considered
+      // healthy; this is the fast path for desktop -> mobile edits when the
+      // mobile long-poll was paused by the OS or WebView.
+      const hasFreshSyncSignal = Boolean(
+        announcedSyncRequestId
+        && announcedSyncRequestId !== existing?.lastRemoteSyncRequestId
+      );
       const peer = this.upsertPeer(raw.deviceId, port, [address], this.now(), true, false);
-      void this.verifyPeer(peer);
+      // A fresh announcement is the fastest signal that two devices are back
+      // on the same Wi-Fi. Probe immediately when the previous connection was
+      // stale/failed; healthy peers still use the normal 900 ms cadence.
+      void this.verifyPeer(peer, wasInactive || peer.consecutiveFailures > 0 || hasFreshSyncSignal);
     } catch {
       // Discovery packets are untrusted and intentionally ignored on failure.
     }
@@ -3066,7 +3400,10 @@ export class NtfyLanSync {
       peer.compatibilityPendingSince = 0;
       if (this.lastErrorValue === "peer_upgrade_required") this.lastErrorValue = "";
     }
-    if (firstVerifiedConnection && route.endsWith("/ping")) this.syncRequestId = randomId(18);
+    if (firstVerifiedConnection && route.endsWith("/ping")) {
+      this.syncRequestId = randomId(18);
+      this.wakeRealtimeSignalWaiters();
+    }
     const transfer = route.includes("/file/") || route.includes("/attachment/");
     if (transfer) this.lastTransferAt = this.now();
     if (
@@ -3334,8 +3671,18 @@ export class NtfyLanSync {
 
   private syncSignalPayload(): Record<string, unknown> {
     return {
-      capabilities: METADATA_PROTOCOLS.map((protocol) => protocol.capability),
+      capabilities: [
+        ...METADATA_PROTOCOLS.map((protocol) => protocol.capability),
+        REALTIME_WAKEUP_CAPABILITY
+      ],
       syncRequestId: this.syncRequestId,
+      // Include the current authenticated endpoint in every response. Mobile
+      // peers may have a stale descriptor after a DHCP/adapter change; the
+      // next request then repairs the endpoint without waiting for discovery.
+      endpoint: {
+        port: this.boundPort || this.settings().port,
+        addresses: this.localAddresses()
+      },
       fullSyncRequestId: this.fullSyncRequested ? this.fullSyncRequestId : "",
       forceFilesystemScan: this.fullSyncRequested && this.forceFilesystemScanRequested,
       dirtyPaths: this.dirtySnapshot(),
@@ -3349,6 +3696,7 @@ export class NtfyLanSync {
     // other end can mirror it. Previously a passive peer showed nothing at all
     // while the coordinator scanned, which read as "stuck" on one side and
     // "working" on the other.
+    const scan = this.scanSignalValue ?? this.scanValue;
     return {
       phase: this.progressValue.phase,
       sessionId: this.progressValue.sessionId,
@@ -3361,14 +3709,14 @@ export class NtfyLanSync {
       uploadCompleted: Math.max(0, Math.floor(this.progressValue.uploadCompleted)),
       downloads: Math.max(0, Math.floor(this.progressValue.downloads)),
       downloadCompleted: Math.max(0, Math.floor(this.progressValue.downloadCompleted)),
-      scanPhase: this.scanValue.phase,
-      scanTotalKnown: this.scanValue.totalKnown !== false,
-      scanCompleted: Math.max(0, Math.floor(this.scanValue.completed)),
-      scanTotal: Math.max(0, Math.floor(this.scanValue.total)),
+      scanPhase: scan.phase,
+      scanTotalKnown: scan.totalKnown !== false,
+      scanCompleted: Math.max(0, Math.floor(scan.completed)),
+      scanTotal: Math.max(0, Math.floor(scan.total)),
       roundId: this.syncRoundId,
       roundCompleted: Math.max(0, Math.floor(this.syncRoundCompleted)),
       roundTotal: Math.max(0, Math.floor(this.syncRoundTotal)),
-      scanCandidates: Math.max(0, Math.floor(this.scanValue.syncCandidatesTotal ?? this.scanValue.syncCandidates ?? 0)),
+      scanCandidates: Math.max(0, Math.floor(scan.syncCandidatesTotal ?? scan.syncCandidates ?? 0)),
       updatedAt: this.progressUpdatedAt
     };
   }
@@ -3409,6 +3757,18 @@ export class NtfyLanSync {
   }
 
   private applyRemoteSyncSignal(peer: LanSyncPeer, payload: Record<string, unknown>): boolean {
+    const endpoint = isRecord(payload.endpoint) ? payload.endpoint : null;
+    if (endpoint) {
+      const remotePort = normalizedPort(endpoint.port, 0);
+      const remoteAddresses = Array.isArray(endpoint.addresses)
+        ? endpoint.addresses.filter((value): value is string => typeof value === "string" && isPrivateLanAddress(value))
+        : [];
+      if (remotePort) peer.port = remotePort;
+      if (remoteAddresses.length && !peer.manual) {
+        const preferred = sortLanAddresses(remoteAddresses, this.localInterfaces());
+        peer.addresses = new Set([...preferred, ...peer.addresses].slice(0, PEER_MAX_ADDRESS_HISTORY));
+      }
+    }
     const capabilities = (Array.isArray(payload.capabilities) ? payload.capabilities : [])
       .filter((value): value is string => typeof value === "string" && value.length <= 64);
     const compatibleCapabilities = METADATA_PROTOCOLS
@@ -3420,6 +3780,10 @@ export class NtfyLanSync {
       if (this.lastErrorValue === "peer_upgrade_required") this.lastErrorValue = "";
     } else if (!this.metadataProtocol(peer) && peer.compatibilityPendingSince <= 0) {
       peer.compatibilityPendingSince = this.now();
+    }
+    if (capabilities.includes(REALTIME_WAKEUP_CAPABILITY)) {
+      peer.capabilities.add(REALTIME_WAKEUP_CAPABILITY);
+      this.ensureRealtimeWakeupPoll(peer);
     }
     const requestId = typeof payload.syncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.syncRequestId)
       ? payload.syncRequestId
@@ -3446,6 +3810,9 @@ export class NtfyLanSync {
     for (const [path, generation] of incomingRemoteDirty) {
       if (generation <= (previousRemoteDirty.get(path) ?? 0)) continue;
       peer.remotePriorityDirtyPaths.set(path, generation);
+      // The remote heartbeat is the first signal a passive device receives;
+      // show the path right away instead of waiting for /manifest/paths.
+      this.ensurePendingActivityPath(path, "pull");
       receivedPriorityPath = true;
     }
     peer.remoteDirtyPaths = incomingRemoteDirty;
@@ -3542,7 +3909,12 @@ export class NtfyLanSync {
   private async verifyPeer(peer: LanSyncPeer, force = false): Promise<void> {
     const now = this.now();
     const minimumProbeInterval = Math.max(300, PEER_PROBE_INTERVAL_MS - 100);
-    if (!this.runningValue || !peer.canHost || !peer.addresses.size) return;
+    // A passive mobile peer can still be the recipient of a desktop edit. If
+    // its realtime-wakeup channel is already negotiated, that long poll is
+    // the lower-latency path and an extra forced ping only competes with it;
+    // older peers without the capability still get the direct probe.
+    if (!this.runningValue || !peer.addresses.size) return;
+    if (!peer.canHost && peer.capabilities.has(REALTIME_WAKEUP_CAPABILITY)) return;
     if (peer.probing) {
       if (force) this.urgentProbePending = true;
       return;
@@ -3550,9 +3922,11 @@ export class NtfyLanSync {
     if (!force && now - peer.lastProbeAt < minimumProbeInterval) return;
     peer.probing = true;
     peer.lastProbeAt = now;
+    const wasActiveBeforeProbe = this.isPeerActive(peer, now);
     const firstVerifiedConnection = peer.verifiedAt <= 0;
     try {
-      const response = await this.callPeer(peer, "/ping", this.syncSignalPayload());
+      const probeTimeout = peer.consecutiveFailures > 0 ? PEER_RECONNECT_PROBE_TIMEOUT_MS : PEER_PROBE_TIMEOUT_MS;
+      const response = await this.callPeer(peer, "/ping", this.syncSignalPayload(), probeTimeout);
       const responseDeviceId = typeof response.deviceId === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(response.deviceId) ? response.deviceId : "";
       if (response.protocolVersion !== PROTOCOL_VERSION || !responseDeviceId) throw new Error("peer_identity_mismatch");
       if (responseDeviceId !== peer.deviceId) {
@@ -3591,7 +3965,23 @@ export class NtfyLanSync {
       }
       this.emitPeersChanged();
       await this.receiveQueuedMessages(peer, response.messages);
-      if (firstVerifiedConnection || remoteRequestedSync) this.scheduleSync(remoteRequestedSync ? 0 : 20, true);
+      this.ensureRealtimeWakeupPoll(peer);
+      // A probe can be the first successful request after a short Wi-Fi
+      // interruption. In that case the peer is no longer considered active
+      // when the Vault event was raised, so the event's immediate scheduler
+      // had no target and returned. Do not leave that durable dirty journal
+      // waiting for the next periodic tick; the successful probe itself is
+      // the hand-off point and should start the transfer now.
+      if (
+        firstVerifiedConnection
+        || remoteRequestedSync
+        || (!wasActiveBeforeProbe && (
+          this.hasPrioritySyncWork()
+          || this.dirtyPaths.size > 0
+          || this.fullSyncRequested
+          || this.syncQueued
+        ))
+      ) this.scheduleSync(0, true);
     } catch (error) {
       const code = safeErrorCode(error);
       if (code === "invalid_auth" || code === "peer_rejected" || code === "peer_unreachable") this.lastErrorValue = code;
@@ -3632,6 +4022,13 @@ export class NtfyLanSync {
 
   private isPeerActive(peer: LanSyncPeer, now = this.now()): boolean {
     if (peer.verifiedAt <= 0) return false;
+    // Discovery packets are not a connection. A peer that has stopped sending
+    // authenticated heartbeats/probe responses must leave the active set
+    // quickly, otherwise a disconnected Wi-Fi link remains displayed for the
+    // whole grace window and blocks a fresh connection from taking over.
+    const lastSignalAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
+    if (peer.consecutiveFailures >= 3 && lastSignalAt > 0 && now - lastSignalAt > PEER_LINK_IDLE_TIMEOUT_MS) return false;
+    if (peer.lastFailureAt > lastSignalAt && now - peer.lastFailureAt > PEER_FAILURE_EVICTION_DELAY_MS) return false;
     const stableGraceMs = Math.max(PEER_MIN_STABLE_GRACE_MS, PEER_PROBE_INTERVAL_MS * 12);
     return now - peer.verifiedAt <= stableGraceMs;
   }
@@ -3698,6 +4095,99 @@ export class NtfyLanSync {
     return this.activePeers().filter((peer) => peer.canHost);
   }
 
+  private ensureRealtimeWakeupPoll(peer: LanSyncPeer): void {
+    if (
+      this.options.desktop
+      || !this.runningValue
+      || !peer.canHost
+      || !peer.capabilities.has(REALTIME_WAKEUP_CAPABILITY)
+      || this.realtimeWakeupPolls.has(peer.deviceId)
+    ) return;
+
+    const deviceId = peer.deviceId;
+    const poll = this.runRealtimeWakeupPoll(peer).finally(() => {
+      if (this.realtimeWakeupPolls.get(deviceId) === poll) {
+        this.realtimeWakeupPolls.delete(deviceId);
+      }
+      if (
+        this.runningValue
+        && peer.canHost
+        && peer.capabilities.has(REALTIME_WAKEUP_CAPABILITY)
+        && !this.realtimeWakeupRetryTimers.has(deviceId)
+      ) {
+        const retry = setTimeout(() => {
+          this.realtimeWakeupRetryTimers.delete(deviceId);
+          this.ensureRealtimeWakeupPoll(peer);
+        }, RECONNECT_REPROBE_DELAY_MS);
+        this.realtimeWakeupRetryTimers.set(deviceId, retry);
+      }
+    });
+    this.realtimeWakeupPolls.set(deviceId, poll);
+  }
+
+  private async runRealtimeWakeupPoll(peer: LanSyncPeer): Promise<void> {
+    while (
+      this.runningValue
+      && this.peers.get(peer.deviceId) === peer
+      && peer.capabilities.has(REALTIME_WAKEUP_CAPABILITY)
+    ) {
+      try {
+        const response = await this.callPeer(
+          peer,
+          "/events/wait",
+          { sinceSyncRequestId: peer.lastRemoteSyncRequestId },
+          REALTIME_WAKEUP_TIMEOUT_MS + 5_000
+        );
+        const remoteRequestedSync = this.applyRemoteSyncSignal(peer, response);
+        peer.policy = policyFromRaw(response.policy);
+        await this.receiveQueuedMessages(peer, response.messages);
+        if (remoteRequestedSync || peer.remoteDirtyPaths.size > 0) {
+          this.scheduleSync(0, true);
+        }
+    } catch {
+      // A transient Wi-Fi failure must not permanently kill the realtime
+      // channel. The finally block schedules a fresh long-poll attempt.
+      // Mark the authenticated peer stale immediately. Otherwise the mobile
+      // UI could keep showing a connected Wi-Fi icon for the full grace
+      // window after the desktop disappeared.
+      peer.consecutiveFailures = Math.max(3, peer.consecutiveFailures + 1);
+      peer.lastFailureAt = this.now();
+      this.emitPeersChanged();
+      break;
+      }
+      await yieldToLanEventLoop();
+    }
+  }
+
+  private wakeRealtimeSignalWaiters(): void {
+    const waiters = [...this.realtimeSignalWaiters];
+    this.realtimeSignalWaiters.clear();
+    for (const resolve of waiters) resolve();
+  }
+
+  private wakeRealtimeProgressSignal(): void {
+    const now = this.now();
+    if (now - this.lastRealtimeProgressSignalAt < 80) return;
+    this.lastRealtimeProgressSignalAt = now;
+    this.wakeRealtimeSignalWaiters();
+  }
+
+  private async waitForRealtimeSignal(sinceSyncRequestId: string): Promise<void> {
+    if (!this.runningValue || sinceSyncRequestId !== this.syncRequestId) return;
+    await new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const finish = (): void => {
+        if (timer) clearTimeout(timer);
+        timer = null;
+        this.realtimeSignalWaiters.delete(finish);
+        resolve();
+      };
+      timer = setTimeout(finish, REALTIME_WAKEUP_TIMEOUT_MS);
+      this.realtimeSignalWaiters.add(finish);
+      if (!this.runningValue || sinceSyncRequestId !== this.syncRequestId) finish();
+    });
+  }
+
   private hasPrioritySyncWork(): boolean {
     return this.activeEditDirty.size > 0
       || this.syncTargets().some((peer) => peer.remotePriorityDirtyPaths.size > 0);
@@ -3722,7 +4212,9 @@ export class NtfyLanSync {
       // make the next progress pass appear to restart from zero.
       return;
     }
-    if (this.fullSyncOnlyPending && this.backgroundReconciliation) return;
+    // Do not gate the transfer scheduler on the background scanner. The scanner
+    // feeds dirty paths incrementally and the coordinator can transfer them
+    // while the rest of the vault is still being enumerated.
     const peers = this.syncTargets();
     if (!peers.length) return;
     const hasRemoteDirty = peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0);
@@ -3815,11 +4307,18 @@ export class NtfyLanSync {
           || this.fullSyncRequested
           || peers.some((peer) => (peer.remoteDirtyPaths?.size ?? 0) > 0 || Boolean(peer.remoteFullSyncRequestId));
         if (this.syncRoundId && !priorityYieldedAcrossPeers) {
-          const roundFinished = this.finishSyncRound(peers[0], fullSyncCompletedEverywhere ? "complete" : (pendingAfterRound ? "partial" : "complete"));
+          // A round stays open while any dirty path or full-scan request is
+          // pending. New edits discovered during enumeration are merged into
+          // this same round instead of being recorded as a separate partial
+          // history item.
+          const roundFinished = !pendingAfterRound
+            ? this.finishSyncRound(peers[0], "complete")
+            : false;
           if (roundFinished) {
             this.syncRoundId = "";
             this.syncRoundCompleted = 0;
             this.syncRoundTotal = 0;
+            this.syncRoundPaths.clear();
             this.roundRequiresScanCompletion = false;
             this.fullRoundScanVisible = false;
           }
@@ -3828,21 +4327,39 @@ export class NtfyLanSync {
       }
     } catch (error) {
       this.lastErrorValue = safeErrorCode(error);
-      if (this.syncRoundId && peers.length) {
+      // A temporary disconnect is part of the same round. Keep its id and
+      // cumulative counters so reconnecting resumes the in-flight work instead
+      // of creating a stream of zero-file error history entries.
+      if (this.syncRoundId && peers.length && !isTransientSyncError(error)) {
         this.finishSyncRound(peers[0], "error");
         this.syncRoundId = "";
         this.syncRoundCompleted = 0;
         this.syncRoundTotal = 0;
+        this.syncRoundPaths.clear();
       }
       this.syncQueued = true;
       const peer = peers[0];
-      this.emit({
-        ...defaultProgress("error"),
-        stage: this.lastErrorValue === "peer_upgrade_required" ? "peer-upgrade-required" : "error",
-        active: Boolean(peer),
-        peerId: peer?.deviceId ?? "",
-        error: this.lastErrorValue
-      });
+      if (isTransientSyncError(error)) {
+        // Preserve the current batch counters while the peer is reconnecting;
+        // replacing them with defaultProgress(error) made a healthy in-flight
+        // round visibly jump back to 0/0.
+        this.emit({
+          ...this.progressValue,
+          phase: "connected",
+          stage: "checking-peer",
+          active: Boolean(peer),
+          peerId: peer?.deviceId ?? "",
+          error: this.lastErrorValue
+        });
+      } else {
+        this.emit({
+          ...defaultProgress("error"),
+          stage: this.lastErrorValue === "peer_upgrade_required" ? "peer-upgrade-required" : "error",
+          active: Boolean(peer),
+          peerId: peer?.deviceId ?? "",
+          error: this.lastErrorValue
+        });
+      }
     } finally {
       this.syncRunning = false;
       this.syncStartedAt = 0;
@@ -3987,6 +4504,7 @@ export class NtfyLanSync {
             this.syncRoundId = "";
             this.syncRoundCompleted = 0;
             this.syncRoundTotal = 0;
+            this.syncRoundPaths.clear();
             this.roundRequiresScanCompletion = false;
             this.fullRoundScanVisible = false;
           }
@@ -4120,6 +4638,10 @@ export class NtfyLanSync {
     ]);
     const manifestProgress = this.parseRemoteProgress(remoteResponse.progress);
     if (manifestProgress) peer.remoteProgress = manifestProgress;
+    // A manifest response is also a live authenticated heartbeat. Apply its
+    // endpoint and dirty signal so a stale descriptor is repaired during the
+    // very request that discovered the peer, before planning transfers.
+    this.applyRemoteSyncSignal(peer, remoteResponse);
     this.mergeRemoteRoundHistory(remoteResponse.roundHistory);
     this.emit({
       ...defaultProgress("connected"),
@@ -4152,7 +4674,7 @@ export class NtfyLanSync {
     for (const path of [...new Set([...localMap.keys(), ...remoteMap.keys()])]) {
       const local = localMap.get(path);
       const remote = remoteMap.get(path);
-      if (local && remote && (metadataMatches(local, remote) || (!ledger.entries[path] && metadataBootstrapEquivalent(local, remote)))) {
+      if (local && remote && (metadataLedgerMatches(local, remote) || (!ledger.entries[path] && metadataBootstrapEquivalent(local, remote)))) {
         ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
       }
     }
@@ -4211,6 +4733,7 @@ export class NtfyLanSync {
           const now = this.now();
           if (verified < bootstrapCandidates.length && now - lastBootstrapProgressAt < 40) return;
           lastBootstrapProgressAt = now;
+          this.wakeRealtimeProgressSignal();
           this.emitActivityChanged();
         }
       );
@@ -4241,12 +4764,18 @@ export class NtfyLanSync {
     // authoritative even when size/mtime happen to match the peer; otherwise
     // an editor change (including .obsidian changes) can be treated as synced.
     const plannedPathSet = new Set(plannedActions.map((action) => action.path));
-    for (const path of request.localDirty.keys()) {
+    // Dirty journals are authoritative even when the two files have only a
+    // small mtime delta. Iterate both sides so a remote edit is not hidden by
+    // the baseline mtime tolerance used to suppress false whole-vault plans.
+    for (const path of new Set([...request.localDirty.keys(), ...request.remoteDirty.keys()])) {
       if (plannedPathSet.has(path)) continue;
       const local = localMap.get(path);
       const remote = remoteMap.get(path);
-      if (!local || !remote || !metadataMatches(local, remote)) continue;
-      if (!request.remoteDirty.has(path) && (localPolicy.incrementalPush || remotePolicy.incrementalPull)) {
+      if (!local || !remote) continue;
+      if (request.localDirty.has(path) && request.remoteDirty.has(path) && (localPolicy.incrementalPush || remotePolicy.incrementalPull) && (localPolicy.incrementalPull || remotePolicy.incrementalPush)) {
+        plannedActions.push({ kind: metadataWinner(local, remote, localPolicy.conflictRule) === "local" ? "push" : "pull", path, local, remote });
+        plannedPathSet.add(path);
+      } else if (request.localDirty.has(path) && (localPolicy.incrementalPush || remotePolicy.incrementalPull)) {
         plannedActions.push({ kind: "push", path, local, remote });
         plannedPathSet.add(path);
       } else if (request.remoteDirty.has(path) && (localPolicy.incrementalPull || remotePolicy.incrementalPush)) {
@@ -4265,14 +4794,21 @@ export class NtfyLanSync {
       remoteDirty: request.remoteDirty
     });
     if (!this.syncRoundId) this.beginSyncRound();
-    this.syncRoundTotal += actions.length;
+    // The round denominator is cumulative and path-based. A retry, a yielded
+    // priority batch, or a second peer manifest must not count the same file
+    // again and make the two devices report different totals.
+    for (const action of actions) {
+      if (this.syncRoundPaths.has(action.path)) continue;
+      this.syncRoundPaths.add(action.path);
+      this.syncRoundTotal += 1;
+    }
     const settledPaths = new Set([...selectedPaths].filter((path) => !actionPaths.has(path)));
     const commits: LanSyncMetadataCommit[] = [];
     for (const path of settledPaths) {
       const local = localMap.get(path);
       const remote = remoteMap.get(path);
       const baseline = ledger.entries[path];
-      if (local && remote && (metadataMatches(local, remote) || (baseline && metadataMatches(local, baseline.local) && metadataMatches(remote, baseline.remote)))) {
+      if (local && remote && (metadataLedgerMatches(local, remote) || (baseline && metadataLedgerMatches(local, baseline.local) && metadataLedgerMatches(remote, baseline.remote)))) {
         commits.push({ path, coordinator: metadataSnapshot(local), peer: metadataSnapshot(remote) });
       } else if (!local && !remote) {
         commits.push({ path, coordinator: null, peer: null });
@@ -4558,8 +5094,8 @@ export class NtfyLanSync {
     this.emitActivityChanged();
     const localPolicy = this.policy();
     const [localEntries, remoteResponse, ledger] = await Promise.all([
-      this.buildManifest(localPolicy.syncConfigFolder),
-      this.callPeer(peer, "/manifest", { syncConfigFolder: localPolicy.syncConfigFolder }),
+      this.buildManifest(true),
+      this.callPeer(peer, "/manifest", { syncConfigFolder: true }),
       Promise.resolve(this.loadLedger(peer.deviceId))
     ]);
     this.mergeRemoteRoundHistory(remoteResponse.roundHistory);
@@ -4834,6 +5370,7 @@ export class NtfyLanSync {
       const now = this.now();
       if (verified < expectedEntries.length && now - lastReportedAt < 40) return;
       lastReportedAt = now;
+      this.wakeRealtimeProgressSignal();
       this.emitActivityChanged();
     });
     scan.phase = "complete";
@@ -4859,7 +5396,7 @@ export class NtfyLanSync {
     // status bar made an otherwise-idle device look like it was endlessly
     // re-scanning ("反复扫描") and tangled the scan counter with the active
     // sync bar, so it never takes over the visible counter.
-    if (this.backgroundReconciliation) return false;
+    if (this.backgroundReconciliation && !this.fullRoundScanVisible) return false;
     if (this.inboundManifestDepth === 0) return true;
     // A manifest built on behalf of a peer is this side's own enumerating phase
     // (the passive end of a sync) and may show — but it must not clobber a
@@ -4912,6 +5449,7 @@ export class NtfyLanSync {
       error: "",
       files: unique.map((path) => ({ path, state: "pending", size: 0, reason: "" }))
     };
+    this.publishScanSignal(scan);
     // Keep cumulative fingerprint activity visible when a tiny realtime scan
     // follows a completed full scan. The new path scan still owns its own
     // denominator, but the panel does not appear to lose all prior work.
@@ -4930,6 +5468,7 @@ export class NtfyLanSync {
     const exposeScanProgress = !scanLocked && this.canExposeScanProgress();
     if (!scanLocked && this.canClaimScanValue()) this.scanValue = scan;
     const report = (): void => {
+      this.wakeRealtimeProgressSignal();
       if (!exposeScanProgress || this.scanValue !== scan) return;
       this.emitActivityChanged();
     };
@@ -5054,35 +5593,52 @@ export class NtfyLanSync {
     onProgress?: (completed: number, total: number) => void
   ): Promise<LanSyncMetadataEntry[]> {
     const maxFileBytes = this.settings().maxFileBytes;
+    const metadataMutationGenerationAtStart = this.metadataIndexMutationGeneration;
+    this.metadataIndexReplaceBaselineGeneration = metadataMutationGenerationAtStart;
     const rawFiles = (await this.options.storage.listFiles(true))
       .map((file) => ({ ...file, originalPath: String(file.path || ""), path: this.normalizePath(file.path, includeConfigFolder) }))
       .sort((left, right) => left.originalPath.localeCompare(right.originalPath));
     const scanFiles: LanSyncScanFileActivity[] = [];
     const candidates: Array<Omit<LanSyncFileStat, "path"> & { path: string; scanIndex: number }> = [];
+    const baseEntries: LanSyncMetadataEntry[] = [];
+    const seenPaths = new Set<string>();
+    const establishedBaseline = this.metadataIndexReady || this.lastFullScanAt > 0;
     for (const file of rawFiles) {
       let reason = "";
       if (!file.path || !Number.isFinite(file.size) || file.size < 0 || !Number.isFinite(file.mtime) || file.mtime < 0) reason = "unsafe-path";
       else if (file.size > maxFileBytes) reason = "too-large";
       else if (candidates.length >= MAX_MANIFEST_FILES) reason = "manifest-limit";
+      const unchanged = Boolean(
+        !reason
+        && file.path
+        && establishedBaseline
+        && this.metadataIndex.get(file.path)?.size === file.size
+        && this.metadataIndex.get(file.path)?.mtime === file.mtime
+      );
       const scanIndex = scanFiles.push({
         path: file.path || file.originalPath,
-        state: reason ? "skipped" : "pending",
+        state: reason ? "skipped" : unchanged ? "cached" : "pending",
         size: Math.max(0, Number(file.size) || 0),
-        reason
+        reason: reason || (unchanged ? "metadata-cache" : "")
       }) - 1;
-      if (!reason && file.path) candidates.push({ path: file.path, size: file.size, mtime: file.mtime, scanIndex });
+      if (!reason && file.path) {
+        seenPaths.add(file.path);
+        baseEntries.push({ path: file.path, size: file.size, mtime: file.mtime });
+        if (!unchanged) candidates.push({ path: file.path, size: file.size, mtime: file.mtime, scanIndex });
+      }
     }
     const skipped = scanFiles.filter((file) => file.state === "skipped").length;
+    const cached = scanFiles.filter((file) => file.state === "cached").length;
     const scan: LanSyncScanActivity = {
       id: randomId(12),
       phase: "scanning",
-      completed: skipped,
+      completed: skipped + cached,
       total: scanFiles.length,
       // listFiles() has already returned the current device snapshot before
       // the per-file loop starts, so the local total is known even while the
       // background producer is feeding the priority transfer queue.
       totalKnown: true,
-      cached: 0,
+      cached,
       hashed: 0,
       skipped,
       error: "",
@@ -5090,6 +5646,7 @@ export class NtfyLanSync {
       syncCandidatesTotal: 0,
       files: scanFiles
     };
+    this.publishScanSignal(scan, this.fullRoundScanVisible && this.fullSyncRequested);
     // Background reconciliation and manifests served on behalf of a peer are
     // secondary work: neither may repaint the counter the user's own pass is
     // showing. Letting them do it rewound the status bar mid-pass ("3/3" back
@@ -5097,7 +5654,7 @@ export class NtfyLanSync {
     // this side has nothing of its own on screen they may still drive the bar,
     // so the receiving end keeps reporting real progress instead of freezing.
     const exposeScanProgress = this.canExposeScanProgress();
-    if (this.fullRoundScanVisible && this.scanValue.total === 0) {
+    if (this.fullRoundScanVisible && this.fullSyncRequested) {
       // The deep round reserved the display before enumeration began. The
       // first full manifest fills that reserved slot; all path manifests stay
       // out of it until the round finishes.
@@ -5109,10 +5666,10 @@ export class NtfyLanSync {
     const candidatePaths = new Set<string>();
     const queueScanCandidate = (path: string): void => {
       // A candidate discovered by the background filesystem walk is already
-      // part of the active round. Keep it in the durable dirty queue and let
-      // the current transfer planner pick it up; only direct Vault/editor
-      // events enter the single-file realtime lane.
-      this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, false);
+      // part of the active round. Put it in the same zero-delay priority lane
+      // as a live Vault event so scanning and transfer advance concurrently;
+      // the full scan counter remains owned by `scan` below.
+      this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
       if (candidatePaths.has(path)) return;
       candidatePaths.add(path);
       // These counters are deliberately independent from raw filesystem
@@ -5131,28 +5688,42 @@ export class NtfyLanSync {
       if (!force && scan.completed !== scan.total && now - lastReportedAt < 40) return;
       lastReportedAt = now;
       onProgress?.(scan.completed, scan.total);
-      if (exposeScanProgress && this.scanValue === scan) this.emitActivityChanged();
+      this.wakeRealtimeProgressSignal();
+      // A passive device still needs to expose its own scan while answering
+      // the coordinator's manifest request. `canExposeScanProgress()` keeps
+      // that scan out of the compact transfer status bar when a session is
+      // active, but suppressing the activity event altogether made the panel
+      // show only the peer's 9432/24231 counters and look idle locally.
+      if (this.scanValue === scan && (exposeScanProgress || this.inboundManifestDepth > 0)) {
+        this.emitActivityChanged();
+      }
     };
     report(true);
     try {
-      const entries: LanSyncMetadataEntry[] = [];
-      const seenPaths = new Set<string>();
-      for (let index = 0; index < candidates.length; index += 1) {
-        const file = candidates[index];
+      const scanFeedsRealtimeQueue = this.backgroundReconciliation
+        || this.fullRoundScanVisible
+        || this.fullSyncRequested;
+      // Stat/hash metadata concurrently. Each completed item immediately feeds
+      // the realtime queue, so a large vault never has to wait for the final
+      // manifest before its first changed file can transfer.
+      const changedEntries = (await mapWithConcurrency(candidates, HASH_CONCURRENCY, async (file) => {
         seenPaths.add(file.path);
         const previous = this.metadataIndex.get(file.path);
-        if (this.backgroundReconciliation && (!previous || previous.size !== file.size || previous.mtime !== file.mtime)) queueScanCandidate(file.path);
+        if (
+          scanFeedsRealtimeQueue
+          && establishedBaseline
+          && (!previous || previous.size !== file.size || previous.mtime !== file.mtime)
+        ) queueScanCandidate(file.path);
         const activity = scan.files[file.scanIndex];
         activity.state = "cached";
         activity.reason = "metadata";
         scan.cached += 1;
         scan.completed += 1;
-        entries.push({ path: file.path, size: file.size, mtime: file.mtime });
         report();
-        if ((index + 1) % 256 === 0 && index + 1 < candidates.length) await yieldToLanEventLoop();
-      }
+        return { path: file.path, size: file.size, mtime: file.mtime };
+      })).sort((left, right) => left.path.localeCompare(right.path));
       for (const path of this.metadataIndex.keys()) {
-        if (this.backgroundReconciliation && !seenPaths.has(path) && this.normalizePath(path, includeConfigFolder)) {
+        if (scanFeedsRealtimeQueue && establishedBaseline && !seenPaths.has(path) && this.normalizePath(path, includeConfigFolder)) {
           queueScanCandidate(path);
         }
       }
@@ -5160,6 +5731,8 @@ export class NtfyLanSync {
       scan.completed = scan.total;
       if (scan.hashed === 0 && candidates.length > 0) scan.hashed = 1;
       report(true);
+      const entries = [...new Map([...baseEntries, ...changedEntries].map((entry) => [entry.path, entry] as const)).values()]
+        .sort((left, right) => left.path.localeCompare(right.path));
       this.replaceMetadataIndex(entries, includeConfigFolder);
       this.recordFullScan();
       return entries;
@@ -5292,6 +5865,8 @@ export class NtfyLanSync {
     const writtenMetadata = metadataSnapshot(written);
     this.confirmAppliedMutation(normalized, writtenMetadata);
     this.metadataIndex.set(normalized, writtenMetadata);
+    const generation = ++this.metadataIndexMutationGeneration;
+    this.metadataIndexMutations.set(normalized, { generation, metadata: writtenMetadata });
     this.queueMetadataIndexSave();
     return writtenMetadata;
   }
@@ -5312,6 +5887,8 @@ export class NtfyLanSync {
     this.queueHashCacheSave();
     this.confirmAppliedMutation(normalized, null);
     this.metadataIndex.delete(normalized);
+    const generation = ++this.metadataIndexMutationGeneration;
+    this.metadataIndexMutations.set(normalized, { generation, metadata: null });
     this.queueMetadataIndexSave();
     if (await this.options.storage.statFile(normalized)) throw new LanSyncProtocolError("precondition_failed", 409);
   }
@@ -5408,6 +5985,7 @@ export class NtfyLanSync {
       error: "",
       files: scanFiles
     };
+    this.publishScanSignal(scan);
     scan.hashed = Math.max(this.scanValue.hashed, candidates.length > 0 ? 1 : 0);
     scan.cached = this.scanValue.cached;
     const ownsScanDisplay = (this.fullRoundScanVisible && this.scanValue.total === 0) || this.canClaimScanValue();
@@ -5418,6 +5996,7 @@ export class NtfyLanSync {
       if (!force && scan.completed !== scan.total && now - lastReportedAt < 60) return;
       lastReportedAt = now;
       onProgress?.(scan.completed, scan.total);
+      this.wakeRealtimeProgressSignal();
       if (ownsScanDisplay && this.scanValue === scan) this.emitActivityChanged();
     };
     report(true);
@@ -5642,7 +6221,8 @@ export class NtfyLanSync {
     const body = await encryptLanSyncPayload(secret, payload);
     const headers = await authHeaders({ ...this.identity, secret }, this.deviceId, "POST", path, body, this.now());
     let lastError: unknown = null;
-    for (const address of peer.addresses) {
+    const addresses = sortLanAddresses(peer.addresses, this.localInterfaces());
+    for (const address of addresses) {
       if (!isPrivateLanAddress(address)) continue;
       const host = address.includes(":") ? `[${address}]` : address;
       try {
@@ -5764,6 +6344,19 @@ export class NtfyLanSync {
         if (peer && (remoteRequestedSync || (peer.remoteDirtyPaths?.size ?? 0) > 0)) {
           this.scheduleSync(0, true);
         }
+      } else if (path === `${API_PREFIX}/events/wait`) {
+        const sinceSyncRequestId = typeof payload.sinceSyncRequestId === "string"
+          ? payload.sinceSyncRequestId
+          : "";
+        await this.waitForRealtimeSignal(sinceSyncRequestId);
+        result = {
+          ok: true,
+          protocolVersion: PROTOCOL_VERSION,
+          deviceId: this.deviceId,
+          policy: this.policy(),
+          messages: this.pendingMessagesFor(deviceId),
+          ...this.syncSignalPayload()
+        };
       } else if (metadataRoute === "/manifest") {
         const policy = this.policy();
         const scanRequestIds = this.parseScanRequestIds(payload.scanRequestIds);
@@ -5792,7 +6385,8 @@ export class NtfyLanSync {
           files,
           policy,
           progress: this.progressSignal(),
-          roundHistory: this.roundHistory.slice(-20)
+          roundHistory: this.roundHistory.slice(-20),
+          ...this.syncSignalPayload()
         };
       } else if (metadataRoute === "/manifest/paths") {
         const policy = this.policy();
@@ -5806,7 +6400,8 @@ export class NtfyLanSync {
         result = {
           files,
           policy,
-          roundHistory: this.roundHistory.slice(-20)
+          roundHistory: this.roundHistory.slice(-20),
+          ...this.syncSignalPayload()
         };
       } else if (metadataRoute === "/bootstrap/hashes") {
         const policy = this.policy();
