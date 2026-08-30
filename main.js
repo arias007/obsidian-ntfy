@@ -4375,10 +4375,15 @@ ${bodyHash}`;
           ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
         }
       }
+      const dirtyFingerprintPaths = /* @__PURE__ */ new Set([...request.localDirty.keys(), ...request.remoteDirty.keys()]);
+      const fingerprintEqualPaths = /* @__PURE__ */ new Set();
+      const fingerprintDifferentPaths = /* @__PURE__ */ new Set();
       const bootstrapCandidates = [...localMap.keys()].map((path) => ({ path, local: localMap.get(path), remote: remoteMap.get(path) })).filter((item) => Boolean(
-        !ledger.entries[item.path] && item.local && item.remote && item.local.size === item.remote.size
+        item.local && item.remote && item.local.size === item.remote.size && (!ledger.entries[item.path] || dirtyFingerprintPaths.has(item.path))
       ));
       if (bootstrapCandidates.length) {
+        for (const candidate of bootstrapCandidates) this.hashCache.delete(candidate.path);
+        this.queueHashCacheSave();
         const scan = this.scanValue;
         const scanFiles = new Map(scan.files.map((file) => [file.path, file]));
         const completedBeforeHashes = scan.completed;
@@ -4433,9 +4438,16 @@ ${bodyHash}`;
         for (const item of bootstrapCandidates) {
           const localHash = localHashMap.get(item.path);
           const remoteHash = remoteHashMap.get(item.path);
-          if (!localHash || !remoteHash || localHash.hash !== remoteHash.hash) continue;
-          if (!metadataMatches(localHash, item.local) || !metadataMatches(remoteHash, item.remote)) continue;
-          ledger.entries[item.path] = { local: metadataSnapshot(item.local), remote: metadataSnapshot(item.remote) };
+          if (!localHash || !remoteHash || !metadataMatches(localHash, item.local) || !metadataMatches(remoteHash, item.remote)) {
+            fingerprintDifferentPaths.add(item.path);
+            continue;
+          }
+          if (localHash.hash === remoteHash.hash) {
+            fingerprintEqualPaths.add(item.path);
+            ledger.entries[item.path] = { local: metadataSnapshot(item.local), remote: metadataSnapshot(item.remote) };
+          } else {
+            fingerprintDifferentPaths.add(item.path);
+          }
         }
         scan.phase = "complete";
         scan.completed = scan.total;
@@ -4448,6 +4460,14 @@ ${bodyHash}`;
         const local = localMap.get(path);
         const remote = remoteMap.get(path);
         if (!local || !remote) continue;
+        if (fingerprintEqualPaths.has(path)) {
+          ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
+          continue;
+        }
+        if (metadataMatches(local, remote) && !request.localDirty.has(path) && !fingerprintDifferentPaths.has(path)) {
+          ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
+          continue;
+        }
         if (request.localDirty.has(path) && request.remoteDirty.has(path) && (localPolicy.incrementalPush || remotePolicy.incrementalPull) && (localPolicy.incrementalPull || remotePolicy.incrementalPush)) {
           plannedActions.push({ kind: metadataWinner(local, remote, localPolicy.conflictRule) === "local" ? "push" : "pull", path, local, remote });
           plannedPathSet.add(path);

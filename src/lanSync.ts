@@ -4893,15 +4893,25 @@ export class NtfyLanSync {
         ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
       }
     }
+    // Dirty signals are hints, not proof that a file's bytes differ. Always
+    // fingerprint same-sized dirty paths (even when an older ledger exists)
+    // so stale journals and cross-device mtime drift cannot create thousands
+    // of false transfers. The hash cache is invalidated for these paths since
+    // same-size/same-mtime edits are possible on mobile filesystems.
+    const dirtyFingerprintPaths = new Set([...request.localDirty.keys(), ...request.remoteDirty.keys()]);
+    const fingerprintEqualPaths = new Set<string>();
+    const fingerprintDifferentPaths = new Set<string>();
     const bootstrapCandidates = [...localMap.keys()]
       .map((path) => ({ path, local: localMap.get(path), remote: remoteMap.get(path) }))
       .filter((item): item is { path: string; local: LanSyncMetadataEntry; remote: LanSyncMetadataEntry } => Boolean(
-        !ledger.entries[item.path]
-        && item.local
+        item.local
         && item.remote
         && item.local.size === item.remote.size
+        && (!ledger.entries[item.path] || dirtyFingerprintPaths.has(item.path))
       ));
     if (bootstrapCandidates.length) {
+      for (const candidate of bootstrapCandidates) this.hashCache.delete(candidate.path);
+      this.queueHashCacheSave();
       const scan = this.scanValue;
       const scanFiles = new Map(scan.files.map((file) => [file.path, file]));
       const completedBeforeHashes = scan.completed;
@@ -4962,9 +4972,16 @@ export class NtfyLanSync {
       for (const item of bootstrapCandidates) {
         const localHash = localHashMap.get(item.path);
         const remoteHash = remoteHashMap.get(item.path);
-        if (!localHash || !remoteHash || localHash.hash !== remoteHash.hash) continue;
-        if (!metadataMatches(localHash, item.local) || !metadataMatches(remoteHash, item.remote)) continue;
-        ledger.entries[item.path] = { local: metadataSnapshot(item.local), remote: metadataSnapshot(item.remote) };
+        if (!localHash || !remoteHash || !metadataMatches(localHash, item.local) || !metadataMatches(remoteHash, item.remote)) {
+          fingerprintDifferentPaths.add(item.path);
+          continue;
+        }
+        if (localHash.hash === remoteHash.hash) {
+          fingerprintEqualPaths.add(item.path);
+          ledger.entries[item.path] = { local: metadataSnapshot(item.local), remote: metadataSnapshot(item.remote) };
+        } else {
+          fingerprintDifferentPaths.add(item.path);
+        }
       }
       scan.phase = "complete";
       scan.completed = scan.total;
@@ -4987,6 +5004,20 @@ export class NtfyLanSync {
       const local = localMap.get(path);
       const remote = remoteMap.get(path);
       if (!local || !remote) continue;
+      // A remote dirty journal can survive an interrupted/old session. If
+      // both sides now expose the exact same metadata and only the remote
+      // journal is dirty, do not turn that stale signal into a giant download
+      // plan. Local edits remain authoritative and still enter the fast lane;
+      // genuine metadata differences continue through the normal conflict
+      // rules below.
+      if (fingerprintEqualPaths.has(path)) {
+        ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
+        continue;
+      }
+      if (metadataMatches(local, remote) && !request.localDirty.has(path) && !fingerprintDifferentPaths.has(path)) {
+        ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
+        continue;
+      }
       if (request.localDirty.has(path) && request.remoteDirty.has(path) && (localPolicy.incrementalPush || remotePolicy.incrementalPull) && (localPolicy.incrementalPull || remotePolicy.incrementalPush)) {
         plannedActions.push({ kind: metadataWinner(local, remote, localPolicy.conflictRule) === "local" ? "push" : "pull", path, local, remote });
         plannedPathSet.add(path);
