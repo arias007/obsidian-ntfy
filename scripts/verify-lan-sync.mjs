@@ -569,6 +569,9 @@ try {
   assert.equal(stabilityService.progress().stage, "waiting-peer-scan", "A compatible peer incorrectly resumed a full-scan stage without discovered changes");
   assert.ok(stabilityProgress.some((value) => value.stage === "checking-peer" || value.stage === "peer-upgrade-required"), "Peer compatibility stages were not emitted");
   stabilityPeer.consecutiveFailures = 3;
+  // Discovery packets may continue after a TCP service disappears; they must
+  // not keep a failed peer visible or make manual sync look idle.
+  stabilityPeer.lastSeenAt = 100_000;
   stabilityClock = 31_500;
   assert.equal(stabilityService.listPeers().length, 0, "A peer should leave the list only after the stable grace window");
 

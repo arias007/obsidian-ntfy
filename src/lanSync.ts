@@ -4228,7 +4228,14 @@ export class NtfyLanSync {
     // authenticated heartbeats/probe responses must leave the active set
     // quickly, otherwise a disconnected Wi-Fi link remains displayed for the
     // whole grace window and blocks a fresh connection from taking over.
-    const lastSignalAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
+    // Discovery announcements are unauthenticated liveness hints and may
+    // continue after the peer's TCP service has stopped. Once probes have
+    // failed repeatedly, only the last authenticated response can keep the
+    // peer active; otherwise manual sync is queued against a dead endpoint
+    // and appears to do nothing indefinitely.
+    const lastSignalAt = peer.consecutiveFailures >= 3
+      ? peer.verifiedAt
+      : Math.max(peer.lastSeenAt, peer.verifiedAt);
     if (peer.consecutiveFailures >= 3 && lastSignalAt > 0 && now - lastSignalAt > PEER_LINK_IDLE_TIMEOUT_MS) return false;
     if (peer.lastFailureAt > lastSignalAt && now - peer.lastFailureAt > PEER_FAILURE_EVICTION_DELAY_MS) return false;
     const stableGraceMs = Math.max(PEER_MIN_STABLE_GRACE_MS, PEER_PROBE_INTERVAL_MS * 12);

@@ -3899,7 +3899,7 @@ ${bodyHash}`;
     }
     isPeerActive(peer, now = this.now()) {
       if (peer.verifiedAt <= 0) return false;
-      const lastSignalAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
+      const lastSignalAt = peer.consecutiveFailures >= 3 ? peer.verifiedAt : Math.max(peer.lastSeenAt, peer.verifiedAt);
       if (peer.consecutiveFailures >= 3 && lastSignalAt > 0 && now - lastSignalAt > PEER_LINK_IDLE_TIMEOUT_MS) return false;
       if (peer.lastFailureAt > lastSignalAt && now - peer.lastFailureAt > PEER_FAILURE_EVICTION_DELAY_MS) return false;
       const stableGraceMs = Math.max(PEER_MIN_STABLE_GRACE_MS, PEER_PROBE_INTERVAL_MS * 12);
