@@ -1636,7 +1636,7 @@ try {
   assert.match(lanSource, /const files = new Map<string, LanSyncFileStat>\(\)/, "Current-file snapshot does not deduplicate normalized paths");
   assert.match(lanSource, /scan\.completed = Math\.min\(Math\.max\(0, scan\.completed\), Math\.max\(0, scan\.total\)\)/, "Scan completion is not clamped to the live denominator");
   assert.match(lanSource, /missing-during-scan/, "Deletes racing a scan are not represented in the live scan counters");
-  assert.match(source, /发现待同步/, "LAN details do not show discovered-vs-completed counters");
+  assert.match(source, /需要同步/, "LAN details do not show planner-confirmed sync counters");
    assert.doesNotMatch(lanSource, /MAX_DIRTY_PATHS|4096/, "LAN runtime still contains the obsolete fixed dirty-path ceiling");
     assert.match(lanSource, /fullSyncOnlyPending/, "Manual full scan state is missing");
     assert.doesNotMatch(lanSource, /if \(this\.fullSyncOnlyPending && this\.backgroundReconciliation\) return;/, "A manual full scan still blocks incremental transfer during enumeration");

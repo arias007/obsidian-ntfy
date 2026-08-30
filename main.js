@@ -6438,13 +6438,12 @@ class NtfyLanSyncDetailsModal extends Modal {
         : `Peer found ${remoteFound} · completed ${remoteDone}`);
     }
     if (progress.total > 0) progressParts.push(`${chinese ? "当前批次" : "Current batch"} ${progress.completed}/${progress.total}`);
-    const discoveredCandidates = Math.max(0, Number(scan.syncCandidatesTotal ?? scan.syncCandidates ?? progress.scanCandidates ?? 0) || 0);
     const roundCompleted = Math.max(0, Number(progress.roundCompleted ?? 0) || 0);
-    const roundTotal = Math.max(0, Number(progress.roundTotal ?? 0) || 0, Number(progress.scanCandidates ?? 0) || 0);
-    if (discoveredCandidates > 0 || roundCompleted > 0 || roundTotal > 0) {
+    const roundTotal = Math.max(0, Number(progress.roundTotal ?? 0) || 0);
+    if (roundCompleted > 0 || roundTotal > 0) {
       progressParts.push(chinese
-        ? `发现待同步 ${discoveredCandidates} · 已完成 ${roundCompleted}${roundTotal > 0 ? `/${roundTotal}` : ""}`
-        : `Found ${discoveredCandidates} · Completed ${roundCompleted}${roundTotal > 0 ? `/${roundTotal}` : ""}`);
+        ? `需要同步 ${roundTotal} · 已完成 ${roundCompleted}/${roundTotal}`
+        : `Need sync ${roundTotal} · Completed ${roundCompleted}/${roundTotal}`);
     }
     if (progress.uploads > 0 || progress.downloads > 0) {
       progressParts.push(chinese
@@ -6591,7 +6590,7 @@ class NtfyLanSyncDetailsModal extends Modal {
           : `${chinese ? "正在同步 · 对端扫描" : "Syncing · Peer scan"} ${remote.scanCompleted || 0}/${remote.scanTotal}`)
         : `${chinese ? "扫描" : "Scan"}：${idleLabel}`;
     summary.createSpan({ text: label });
-    const candidateCount = Math.max(0, Number(scan.syncCandidatesTotal ?? scan.syncCandidates ?? progress.scanCandidates ?? 0) || 0);
+    const candidateCount = Math.max(0, Number(progress.roundTotal ?? 0) || 0);
     if (candidateCount > 0) summary.createSpan({ cls: "obsidian-ntfy-lan-details-section-meta", text: chinese ? `待同步 ${candidateCount}` : `Need sync ${candidateCount}` });
     // Keep the collapsed summary limited to user-facing progress. Internal
     // cache/fingerprint counters made the panel look like diagnostic output
@@ -6627,7 +6626,7 @@ class NtfyLanSyncDetailsModal extends Modal {
     });
     const summary = details.createEl("summary");
     const roundCompleted = Math.max(0, Number(progress.roundCompleted ?? 0) || 0);
-    const roundTotal = Math.max(0, Number(progress.roundTotal ?? 0) || 0, Number(progress.scanCandidates ?? 0) || 0);
+    const roundTotal = Math.max(0, Number(progress.roundTotal ?? 0) || 0);
     // A Vault event can be present in activity groups before the metadata
     // planner has emitted its first transfer progress snapshot. Include those
     // pending rows so the collapsed sync section immediately shows 0/N.
@@ -6639,12 +6638,15 @@ class NtfyLanSyncDetailsModal extends Modal {
       downloads: totals.downloads + Math.max(0, Number(group.downloads) || 0),
       downloadCompleted: totals.downloadCompleted + Math.max(0, Number(group.downloadCompleted) || 0),
     }), { total: 0, completed: 0, uploads: 0, uploadCompleted: 0, downloads: 0, downloadCompleted: 0 });
-    const visibleTotal = Math.max(roundTotal, Number(progress.total) || 0, groupTotals.total);
-    const visibleCompleted = Math.max(roundCompleted, Number(progress.completed) || 0, groupTotals.completed);
-    const visibleUploads = Math.max(Number(progress.uploads) || 0, groupTotals.uploads);
-    const visibleUploadCompleted = Math.max(Number(progress.uploadCompleted) || 0, groupTotals.uploadCompleted);
-    const visibleDownloads = Math.max(Number(progress.downloads) || 0, groupTotals.downloads);
-    const visibleDownloadCompleted = Math.max(Number(progress.downloadCompleted) || 0, groupTotals.downloadCompleted);
+    // Pending rows are wake-up hints discovered during scanning. They are not
+    // confirmed transfer actions until the metadata planner creates a session;
+    // never let those rows inflate the synchronized denominator.
+    const visibleTotal = Math.max(roundTotal, Number(progress.total) || 0);
+    const visibleCompleted = Math.max(roundCompleted, Number(progress.completed) || 0);
+    const visibleUploads = Math.max(Number(progress.uploads) || 0, roundTotal > 0 ? groupTotals.uploads : 0);
+    const visibleUploadCompleted = Math.max(Number(progress.uploadCompleted) || 0, roundTotal > 0 ? groupTotals.uploadCompleted : 0);
+    const visibleDownloads = Math.max(Number(progress.downloads) || 0, roundTotal > 0 ? groupTotals.downloads : 0);
+    const visibleDownloadCompleted = Math.max(Number(progress.downloadCompleted) || 0, roundTotal > 0 ? groupTotals.downloadCompleted : 0);
     const hasTransferWork = visibleTotal > 0;
     const label = hasTransferWork
       ? `${chinese ? "同步进度 · 本轮同步" : "Sync progress · Round sync"} ${visibleCompleted}/${visibleTotal}`
@@ -7688,8 +7690,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const progress = this.lanSyncProgress;
     const scan = this.lanSync?.scanProgress?.();
     const syncCompleted = Math.max(0, Number(progress.roundCompleted ?? 0) || 0);
-    const discovered = Math.max(0, Number(scan?.syncCandidatesTotal ?? scan?.syncCandidates ?? progress.scanCandidates ?? 0) || 0);
-    const syncTotal = Math.max(0, Number(progress.roundTotal ?? 0) || 0, discovered);
+    const syncTotal = Math.max(0, Number(progress.roundTotal ?? 0) || 0);
     // The status bar intentionally exposes only transfer progress. Scan
     // inspection counts belong in the LAN panel, where local and peer scans
     // can be shown without competing with the compact Wi-Fi indicator.
