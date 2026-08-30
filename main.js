@@ -1086,6 +1086,7 @@ var NtfyLanSyncRuntime = (() => {
     const lower = normalized.toLocaleLowerCase();
     const identityRoot = typeof options.identityRoot === "string" ? options.identityRoot.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").toLocaleLowerCase() : "";
     if (identityRoot && (lower === identityRoot || lower.startsWith(`${identityRoot}/`))) return null;
+    if (lower.startsWith(`${configRoot}/plugin-backups/`) || lower.includes("/plugins/") && (lower.includes("/.local-backups/") || lower.includes("/lan-sync/") || lower.includes("/obsidian-lan-sync/")) || /(?:\.bak[-.]|\.tmp(?:dir)?$|\.tmp$)/i.test(segments[segments.length - 1])) return null;
     if (lower === `${configRoot}/workspace.json` || lower === `${configRoot}/workspace-mobile.json`) return null;
     if (lower.startsWith(`${configRoot}/cache/`) || lower.startsWith(`${configRoot}/.cache/`)) return null;
     if (lower === `${configRoot}/plugins/remotely-save` || lower.startsWith(`${configRoot}/plugins/remotely-save/`)) return null;
@@ -5044,10 +5045,10 @@ ${bodyHash}`;
         error: "",
         files: unique.map((path) => ({ path, state: "pending", size: 0, reason: "" }))
       };
-      this.publishScanSignal(scan);
       scan.hashed = Math.max(this.scanValue.hashed, unique.length > 0 ? 1 : 0);
       scan.cached = this.scanValue.cached;
       const scanLocked = this.fullRoundScanVisible || this.fullSyncRequested || this.scanValue.total > 0 || Boolean(this.syncRoundId && this.scanValue.total > 1);
+      if (!scanLocked) this.publishScanSignal(scan);
       const exposeScanProgress = !scanLocked && this.canExposeScanProgress();
       if (!scanLocked && this.canClaimScanValue()) this.scanValue = scan;
       const report = () => {
@@ -5232,16 +5233,6 @@ ${bodyHash}`;
           if (scanFeedsRealtimeQueue && establishedBaseline && (!previous || previous.size !== file.size || previous.mtime !== file.mtime)) queueScanCandidate(file.path);
           const activity = scan.files[file.scanIndex];
           if (!activity || activity.reason === "missing-during-scan") return null;
-          const current = await this.options.storage.statFile(file.path).catch(() => null);
-          if (!current) {
-            await this.reconcilePathInActiveScan(scan, file.path);
-            return null;
-          }
-          if (current.size !== file.size || current.mtime !== file.mtime) {
-            file.size = current.size;
-            file.mtime = current.mtime;
-            this.markDirtyPath(file.path, REALTIME_DIRTY_DELAY_MS, true);
-          }
           activity.state = "cached";
           activity.reason = "metadata";
           scan.cached += 1;
@@ -6768,8 +6759,11 @@ async function listNtfyLanConfigFiles(adapter, configDir, identityRoot) {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
   const files = [];
-  for (let index = 0; index < paths.length; index += 32) {
-    const stats = await Promise.all(paths.slice(index, index + 32).map(async (path) => ({ path, stat: await adapter.stat(path).catch(() => null) })));
+  // Metadata-only scans should spend almost no time waiting on adapter round
+  // trips. Keep a bounded batch for mobile adapters, but avoid the old 32-file
+  // throttle that made a 10k-file config tree look stuck.
+  for (let index = 0; index < paths.length; index += 128) {
+    const stats = await Promise.all(paths.slice(index, index + 128).map(async (path) => ({ path, stat: await adapter.stat(path).catch(() => null) })));
     for (const { path, stat } of stats) {
       if (stat?.type === "file") files.push({ path, size: stat.size, mtime: stat.mtime });
     }

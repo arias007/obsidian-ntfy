@@ -826,6 +826,13 @@ export function normalizeLanSyncPath(value: unknown, options: LanSyncPathOptions
     ? options.identityRoot.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").toLocaleLowerCase()
     : "";
   if (identityRoot && (lower === identityRoot || lower.startsWith(`${identityRoot}/`))) return null;
+  // Plugin backups, temporary extraction trees, and per-plugin runtime state
+  // are local implementation artifacts rather than Vault content. Including
+  // them made a plugin reload look like thousands of user-file changes and
+  // could never converge because each side keeps its own backup history.
+  if (lower.startsWith(`${configRoot}/plugin-backups/`)
+    || lower.includes("/plugins/") && (lower.includes("/.local-backups/") || lower.includes("/lan-sync/") || lower.includes("/obsidian-lan-sync/"))
+    || /(?:\.bak[-.]|\.tmp(?:dir)?$|\.tmp$)/i.test(segments[segments.length - 1])) return null;
   if (lower === `${configRoot}/workspace.json` || lower === `${configRoot}/workspace-mobile.json`) return null;
   if (lower.startsWith(`${configRoot}/cache/`) || lower.startsWith(`${configRoot}/.cache/`)) return null;
   if (lower === `${configRoot}/plugins/remotely-save` || lower.startsWith(`${configRoot}/plugins/remotely-save/`)) return null;
@@ -5675,7 +5682,6 @@ export class NtfyLanSync {
       error: "",
       files: unique.map((path) => ({ path, state: "pending", size: 0, reason: "" }))
     };
-    this.publishScanSignal(scan);
     // Keep cumulative fingerprint activity visible when a tiny realtime scan
     // follows a completed full scan. The new path scan still owns its own
     // denominator, but the panel does not appear to lose all prior work.
@@ -5691,6 +5697,12 @@ export class NtfyLanSync {
       || this.fullSyncRequested
       || this.scanValue.total > 0
       || Boolean(this.syncRoundId && this.scanValue.total > 1);
+    // A path manifest is a transfer input, not a new scan round. Do not let it
+    // replace the authenticated full-vault scan signal while that scan is
+    // still running; otherwise the next heartbeat advertises 0/1 (or another
+    // tiny denominator) and the peer appears to restart the scan. When there
+    // is no foreground round, it may become the visible scan signal normally.
+    if (!scanLocked) this.publishScanSignal(scan);
     const exposeScanProgress = !scanLocked && this.canExposeScanProgress();
     if (!scanLocked && this.canClaimScanValue()) this.scanValue = scan;
     const report = (): void => {
@@ -5938,19 +5950,6 @@ export class NtfyLanSync {
         ) queueScanCandidate(file.path);
         const activity = scan.files[file.scanIndex];
         if (!activity || activity.reason === "missing-during-scan") return null;
-        // A file may be deleted or replaced between listFiles() and this
-        // metadata callback. Re-stat so the manifest and scan counters reflect
-        // the current device, never a stale snapshot entry.
-        const current = await this.options.storage.statFile(file.path).catch(() => null);
-        if (!current) {
-          await this.reconcilePathInActiveScan(scan, file.path);
-          return null;
-        }
-        if (current.size !== file.size || current.mtime !== file.mtime) {
-          file.size = current.size;
-          file.mtime = current.mtime;
-          this.markDirtyPath(file.path, REALTIME_DIRTY_DELAY_MS, true);
-        }
         activity.state = "cached";
         activity.reason = "metadata";
         scan.cached += 1;
