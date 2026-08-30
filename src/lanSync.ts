@@ -471,6 +471,10 @@ type LanSyncInboundSession = {
   bytesTotal: number;
   uploads: number;
   downloads: number;
+  /** Shared round counters announced by the coordinator. */
+  roundId: string;
+  roundCompleted: number;
+  roundTotal: number;
 };
 
 type LanNetworkInterface = {
@@ -3599,6 +3603,11 @@ export class NtfyLanSync {
     // only locally observed files made the two ends display different
     // denominators for the very same transfer.
     const session = this.inboundSession?.deviceId === deviceId ? this.inboundSession : null;
+    if (session) {
+      this.syncRoundId = session.roundId || this.syncRoundId;
+      this.syncRoundCompleted = Math.max(this.syncRoundCompleted, session.roundCompleted + completed);
+      this.syncRoundTotal = Math.max(this.syncRoundTotal, session.roundTotal);
+    }
     this.emit({
       ...defaultProgress(phase),
       active: true,
@@ -5055,6 +5064,11 @@ export class NtfyLanSync {
         bytesTotal,
         uploads,
         downloads,
+        // The transfer denominator is shared by both devices. Scan totals
+        // remain device-local and are shown only in the check section.
+        roundId: this.syncRoundId,
+        roundCompleted: this.syncRoundCompleted,
+        roundTotal: this.syncRoundTotal,
         files: this.activityFiles.map((file) => ({ path: file.path, action: file.action, size: file.size }))
       }, SESSION_TIMEOUT_MS);
     } catch (error) {
@@ -6678,10 +6692,17 @@ export class NtfyLanSync {
     const bytesTotal = Number(payload.bytesTotal);
     const coordinatorUploads = Number(payload.uploads);
     const coordinatorDownloads = Number(payload.downloads);
+    const roundId = typeof payload.roundId === "string" && /^[A-Za-z0-9_-]{8,96}$/.test(payload.roundId)
+      ? payload.roundId
+      : "";
+    const roundCompleted = Number(payload.roundCompleted ?? 0);
+    const roundTotal = Number(payload.roundTotal ?? total);
     if (!sessionId || !Number.isSafeInteger(total) || total < 0 || total !== rawFiles.length || total > MAX_MANIFEST_FILES
       || !Number.isSafeInteger(bytesTotal) || bytesTotal < 0
       || !Number.isSafeInteger(coordinatorUploads) || coordinatorUploads < 0
-      || !Number.isSafeInteger(coordinatorDownloads) || coordinatorDownloads < 0) {
+      || !Number.isSafeInteger(coordinatorDownloads) || coordinatorDownloads < 0
+      || !Number.isSafeInteger(roundCompleted) || roundCompleted < 0
+      || !Number.isSafeInteger(roundTotal) || roundTotal < total || roundTotal > MAX_MANIFEST_FILES) {
       throw new LanSyncProtocolError("invalid_sync_session");
     }
     const mirrorAction = (action: unknown): LanSyncFileAction | null => {
@@ -6740,8 +6761,17 @@ export class NtfyLanSync {
       total,
       bytesTotal,
       uploads: coordinatorDownloads,
-      downloads: coordinatorUploads
+      downloads: coordinatorUploads,
+      roundId,
+      roundCompleted,
+      roundTotal
     };
+    // Adopt the coordinator's shared transfer counters before emitting any
+    // receiver progress. This prevents the phone and desktop from displaying
+    // different denominators for the same transfer plan.
+    if (roundId) this.syncRoundId = roundId;
+    this.syncRoundCompleted = Math.max(this.syncRoundCompleted, roundCompleted);
+    this.syncRoundTotal = Math.max(this.syncRoundTotal, roundTotal);
     this.currentTransferSessionId = sessionId;
     this.activityFiles = files;
     this.activityUpdatedAt = this.now();
@@ -6815,9 +6845,20 @@ export class NtfyLanSync {
       for (const file of this.activityFiles) if (file.state === "pending" || file.state === "syncing") file.state = "error";
     }
     const completed = this.activityFiles.filter((file) => file.state === "complete" || file.state === "deferred").length;
+    const completedForRound = this.activityFiles.filter((file) => file.state === "complete").length;
     const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
     const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
     const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
+    if (session) {
+      // Keep the receiver's round counters aligned with the coordinator's
+      // cumulative plan. A session may be only one batch of a larger round.
+      this.syncRoundId = session.roundId || this.syncRoundId;
+      // Deferred/retry files are not synchronized yet and must not advance
+      // the shared round counter. They remain visible in the batch as
+      // deferred until the next session completes them.
+      this.syncRoundCompleted = Math.max(this.syncRoundCompleted, session.roundCompleted + completedForRound);
+      this.syncRoundTotal = Math.max(this.syncRoundTotal, session.roundTotal);
+    }
     this.emit({
       ...defaultProgress(success ? (partial ? "syncing" : "complete") : "error"),
       active: true,

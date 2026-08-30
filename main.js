@@ -3389,6 +3389,11 @@ ${bodyHash}`;
       const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
       const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
       const session = this.inboundSession?.deviceId === deviceId ? this.inboundSession : null;
+      if (session) {
+        this.syncRoundId = session.roundId || this.syncRoundId;
+        this.syncRoundCompleted = Math.max(this.syncRoundCompleted, session.roundCompleted + completed);
+        this.syncRoundTotal = Math.max(this.syncRoundTotal, session.roundTotal);
+      }
       this.emit({
         ...defaultProgress(phase),
         active: true,
@@ -4508,6 +4513,11 @@ ${bodyHash}`;
           bytesTotal,
           uploads,
           downloads,
+          // The transfer denominator is shared by both devices. Scan totals
+          // remain device-local and are shown only in the check section.
+          roundId: this.syncRoundId,
+          roundCompleted: this.syncRoundCompleted,
+          roundTotal: this.syncRoundTotal,
           files: this.activityFiles.map((file) => ({ path: file.path, action: file.action, size: file.size }))
         }, SESSION_TIMEOUT_MS);
       } catch (error) {
@@ -5912,7 +5922,10 @@ ${bodyHash}`;
       const bytesTotal = Number(payload.bytesTotal);
       const coordinatorUploads = Number(payload.uploads);
       const coordinatorDownloads = Number(payload.downloads);
-      if (!sessionId || !Number.isSafeInteger(total) || total < 0 || total !== rawFiles.length || total > MAX_MANIFEST_FILES || !Number.isSafeInteger(bytesTotal) || bytesTotal < 0 || !Number.isSafeInteger(coordinatorUploads) || coordinatorUploads < 0 || !Number.isSafeInteger(coordinatorDownloads) || coordinatorDownloads < 0) {
+      const roundId = typeof payload.roundId === "string" && /^[A-Za-z0-9_-]{8,96}$/.test(payload.roundId) ? payload.roundId : "";
+      const roundCompleted = Number(payload.roundCompleted ?? 0);
+      const roundTotal = Number(payload.roundTotal ?? total);
+      if (!sessionId || !Number.isSafeInteger(total) || total < 0 || total !== rawFiles.length || total > MAX_MANIFEST_FILES || !Number.isSafeInteger(bytesTotal) || bytesTotal < 0 || !Number.isSafeInteger(coordinatorUploads) || coordinatorUploads < 0 || !Number.isSafeInteger(coordinatorDownloads) || coordinatorDownloads < 0 || !Number.isSafeInteger(roundCompleted) || roundCompleted < 0 || !Number.isSafeInteger(roundTotal) || roundTotal < total || roundTotal > MAX_MANIFEST_FILES) {
         throw new LanSyncProtocolError("invalid_sync_session");
       }
       const mirrorAction = (action) => {
@@ -5959,8 +5972,14 @@ ${bodyHash}`;
         total,
         bytesTotal,
         uploads: coordinatorDownloads,
-        downloads: coordinatorUploads
+        downloads: coordinatorUploads,
+        roundId,
+        roundCompleted,
+        roundTotal
       };
+      if (roundId) this.syncRoundId = roundId;
+      this.syncRoundCompleted = Math.max(this.syncRoundCompleted, roundCompleted);
+      this.syncRoundTotal = Math.max(this.syncRoundTotal, roundTotal);
       this.currentTransferSessionId = sessionId;
       this.activityFiles = files;
       this.activityUpdatedAt = this.now();
@@ -6030,9 +6049,15 @@ ${bodyHash}`;
         for (const file of this.activityFiles) if (file.state === "pending" || file.state === "syncing") file.state = "error";
       }
       const completed = this.activityFiles.filter((file) => file.state === "complete" || file.state === "deferred").length;
+      const completedForRound = this.activityFiles.filter((file) => file.state === "complete").length;
       const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
       const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
       const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
+      if (session) {
+        this.syncRoundId = session.roundId || this.syncRoundId;
+        this.syncRoundCompleted = Math.max(this.syncRoundCompleted, session.roundCompleted + completedForRound);
+        this.syncRoundTotal = Math.max(this.syncRoundTotal, session.roundTotal);
+      }
       this.emit({
         ...defaultProgress(success ? partial ? "syncing" : "complete" : "error"),
         active: true,
