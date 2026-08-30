@@ -337,6 +337,11 @@ type LanSyncPeer = {
   canHost: boolean;
   lastSeenAt: number;
   verifiedAt: number;
+  lastInboundAt: number;
+  lastOutboundAt: number;
+  peerAckAt: number;
+  remoteConnectionToken: string;
+  legacyHandshake: boolean;
   lastProbeAt: number;
   lastSyncAt: number;
   consecutiveFailures: number;
@@ -1541,6 +1546,9 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
 export class NtfyLanSync {
   private identity: LanSyncIdentity | null = null;
   private deviceId = "";
+  // Opaque per-runtime value used to prove both halves of an authenticated
+  // request/response exchange. It is not a secret or an authorization token.
+  private readonly connectionToken = randomId(24);
   private server: Server | null = null;
   private socket: Socket | null = null;
   private boundPort = 0;
@@ -1677,13 +1685,29 @@ export class NtfyLanSync {
   }
 
   progress(): LanSyncProgress {
-    return { ...this.progressValue };
+    const value = { ...this.progressValue };
+    if (!this.activePeers().length) {
+      value.changed = 0;
+      value.roundCompleted = 0;
+      value.roundTotal = 0;
+      value.scanCandidates = 0;
+      value.uploads = 0;
+      value.downloads = 0;
+    }
+    return value;
   }
 
   scanProgress(): Omit<LanSyncScanActivity, "files"> {
     const { files: _files, ...scan } = this.scanValue;
     const total = Math.max(0, Math.floor(scan.total));
-    return { ...scan, total, completed: Math.min(Math.max(0, Math.floor(scan.completed)), total) };
+    const connected = this.activePeers().length > 0;
+    return {
+      ...scan,
+      total,
+      completed: Math.min(Math.max(0, Math.floor(scan.completed)), total),
+      syncCandidates: connected ? scan.syncCandidates : 0,
+      syncCandidatesTotal: connected ? scan.syncCandidatesTotal : 0
+    };
   }
 
   activity(options: {
@@ -1702,13 +1726,24 @@ export class NtfyLanSync {
     const transferFiles = transferGroups
       ? this.activityFiles.filter((file) => transferGroups.has(lanSyncTopLevelGroup(file.path)))
       : this.activityFiles;
+    const connected = this.activePeers().length > 0;
     return {
-      progress: { ...this.progressValue },
+      progress: connected ? { ...this.progressValue } : {
+        ...this.progressValue,
+        changed: 0,
+        roundCompleted: 0,
+        roundTotal: 0,
+        scanCandidates: 0,
+        uploads: 0,
+        downloads: 0
+      },
       files: includeTransferFiles ? transferFiles.map((file) => ({ ...file })) : [],
       scan: {
         ...this.scanValue,
         total: Math.max(0, Math.floor(this.scanValue.total)),
         completed: Math.min(Math.max(0, Math.floor(this.scanValue.completed)), Math.max(0, Math.floor(this.scanValue.total))),
+        syncCandidates: connected ? this.scanValue.syncCandidates : 0,
+        syncCandidatesTotal: connected ? this.scanValue.syncCandidatesTotal : 0,
         files: includeScanFiles ? scanFiles.map((file) => ({ ...file })) : []
       },
       remote: this.remoteActivity(),
@@ -1886,6 +1921,7 @@ export class NtfyLanSync {
   }
 
   status(): { running: boolean; port: number; peerCount: number; error: string; desktop: boolean; encrypted: boolean; sharedSecretConfigured: boolean; dirtyCount: number; urgentCount: number; coordinator: boolean; targetCount: number } {
+    const connected = this.activePeers().length > 0;
     return {
       running: this.runningValue,
       port: this.boundPort,
@@ -1894,8 +1930,10 @@ export class NtfyLanSync {
       desktop: this.options.desktop,
       encrypted: true,
       sharedSecretConfigured: Boolean(String(this.settings().sharedSecret || "").trim()),
-      dirtyCount: this.dirtyPaths.size,
-      urgentCount: this.activeEditDirty.size,
+      // The journal remains durable while offline, but it is not an active
+      // transfer queue until a mutually acknowledged link exists.
+      dirtyCount: connected ? this.dirtyPaths.size : 0,
+      urgentCount: connected ? this.activeEditDirty.size : 0,
       coordinator: this.isCoordinator(),
       targetCount: this.syncTargets().length
     };
@@ -3543,6 +3581,11 @@ export class NtfyLanSync {
         canHost,
         lastSeenAt: seenAt,
         verifiedAt: 0,
+        lastInboundAt: 0,
+        lastOutboundAt: 0,
+        peerAckAt: 0,
+        remoteConnectionToken: "",
+        legacyHandshake: false,
         lastProbeAt: 0,
         lastSyncAt: 0,
         consecutiveFailures: 0,
@@ -3573,7 +3616,7 @@ export class NtfyLanSync {
     return peer;
   }
 
-  private markInboundPeer(deviceId: string, address: string, route: string): void {
+  private markInboundPeer(deviceId: string, address: string, route: string, payload: Record<string, unknown> = {}): void {
     if (deviceId === this.deviceId) return;
     const peer = this.upsertPeer(
       deviceId,
@@ -3583,8 +3626,25 @@ export class NtfyLanSync {
       this.peers.get(deviceId)?.canHost === true,
       false
     );
+    const now = this.now();
     const firstVerifiedConnection = peer.verifiedAt <= 0;
-    peer.verifiedAt = this.now();
+    peer.lastInboundAt = now;
+    const ackToken = typeof payload.connectionAckToken === "string" ? payload.connectionAckToken : "";
+    const remoteToken = typeof payload.connectionToken === "string" ? payload.connectionToken : "";
+    if (!remoteToken) {
+      // Rolling upgrade compatibility: pre-1.0.101 peers have no token field,
+      // so their authenticated heartbeat remains the best available proof.
+      peer.legacyHandshake = true;
+      peer.verifiedAt = now;
+    } else {
+      peer.legacyHandshake = false;
+    }
+    if (ackToken && ackToken === this.connectionToken) {
+      // The remote side received one of our encrypted responses and echoed
+      // its token back. This is the reciprocal half of the link proof.
+      peer.peerAckAt = now;
+      peer.verifiedAt = now;
+    }
     peer.consecutiveFailures = 0;
     peer.lastFailureAt = 0;
     const metadataProtocol = METADATA_PROTOCOLS.find((protocol) => route.startsWith(`${API_PREFIX}${protocol.routePrefix}/`));
@@ -3600,7 +3660,8 @@ export class NtfyLanSync {
     const transfer = route.includes("/file/") || route.includes("/attachment/");
     if (transfer) this.lastTransferAt = this.now();
     if (
-      !transfer
+      this.isPeerActive(peer, now)
+      && !transfer
       && !(this.progressValue.active && ["enumerating", "fingerprinting", "packaging-manifest", "planning", "waiting-plan", "transferring"].includes(this.progressValue.stage))
       && this.progressValue.phase !== "scanning"
       && this.progressValue.phase !== "syncing"
@@ -3946,6 +4007,7 @@ export class NtfyLanSync {
       ],
       testBuild: testEnabled ? this.localTestBuild : null,
       syncRequestId: this.syncRequestId,
+      connectionToken: this.connectionToken,
       // Include the current authenticated endpoint in every response. Mobile
       // peers may have a stale descriptor after a DHCP/adapter change; the
       // next request then repairs the endpoint without waiting for discovery.
@@ -4310,6 +4372,13 @@ export class NtfyLanSync {
 
   private isPeerActive(peer: LanSyncPeer, now = this.now()): boolean {
     if (peer.verifiedAt <= 0) return false;
+    // A single authenticated inbound request is not enough to show a link.
+    // The peer must have acknowledged a response carrying our runtime token;
+    // this makes the Wi-Fi indicator converge on both devices.
+    // Peers created by pre-handshake builds (or restored test fixtures) do not
+    // have the new field; keep their existing grace-window semantics.
+    const hasHandshakeState = typeof peer.peerAckAt === "number";
+    if (hasHandshakeState && peer.peerAckAt <= 0 && !peer.legacyHandshake) return false;
     // Discovery packets are not a connection. A peer that has stopped sending
     // authenticated heartbeats/probe responses must leave the active set
     // quickly, otherwise a disconnected Wi-Fi link remains displayed for the
@@ -4325,7 +4394,10 @@ export class NtfyLanSync {
     if (peer.consecutiveFailures >= 3 && lastSignalAt > 0 && now - lastSignalAt > PEER_LINK_IDLE_TIMEOUT_MS) return false;
     if (peer.lastFailureAt > lastSignalAt && now - peer.lastFailureAt > PEER_FAILURE_EVICTION_DELAY_MS) return false;
     const stableGraceMs = Math.max(PEER_MIN_STABLE_GRACE_MS, PEER_PROBE_INTERVAL_MS * 12);
-    return now - peer.verifiedAt <= stableGraceMs;
+    const lastMutualSignal = hasHandshakeState
+      ? Math.max(peer.peerAckAt, peer.lastInboundAt || 0, peer.lastOutboundAt || 0, peer.verifiedAt)
+      : Math.max(peer.lastSeenAt, peer.verifiedAt);
+    return now - lastMutualSignal <= stableGraceMs;
   }
 
   private sweepPeers(): void {
@@ -6451,7 +6523,12 @@ export class NtfyLanSync {
     if (!this.identity) throw new Error("identity_unavailable");
     const path = `${API_PREFIX}${route}`;
     const secret = this.activeSecret();
-    const body = await encryptLanSyncPayload(secret, payload);
+    // Echo the remote runtime token on the next request. The server can then
+    // prove that this client actually received its previous encrypted reply.
+    const requestPayload = peer.remoteConnectionToken
+      ? { ...payload, connectionAckToken: peer.remoteConnectionToken, connectionToken: this.connectionToken }
+      : { ...payload, connectionToken: this.connectionToken };
+    const body = await encryptLanSyncPayload(secret, requestPayload);
     const headers = await authHeaders({ ...this.identity, secret }, this.deviceId, "POST", path, body, this.now());
     let lastError: unknown = null;
     const addresses = sortLanAddresses(peer.addresses, this.localInterfaces());
@@ -6477,7 +6554,20 @@ export class NtfyLanSync {
           throw new LanSyncProtocolError(code, response.status);
         }
         const decrypted = await decryptLanSyncPayload(secret, response.text);
-        peer.verifiedAt = this.now();
+        const now = this.now();
+        peer.lastOutboundAt = now;
+        peer.verifiedAt = now;
+        const remoteToken = typeof decrypted.connectionToken === "string" ? decrypted.connectionToken : "";
+        if (remoteToken) {
+          peer.remoteConnectionToken = remoteToken;
+          peer.legacyHandshake = false;
+        } else {
+          // Keep old peers usable during a rolling upgrade.
+          peer.legacyHandshake = true;
+          peer.peerAckAt = now;
+        }
+        const acknowledged = typeof decrypted.connectionAckToken === "string" && decrypted.connectionAckToken === this.connectionToken;
+        if (acknowledged) peer.peerAckAt = now;
         peer.consecutiveFailures = 0;
         peer.lastFailureAt = 0;
         peer.addresses = new Set([address, ...peer.addresses].slice(0, PEER_MAX_ADDRESS_HISTORY));
@@ -6556,7 +6646,7 @@ export class NtfyLanSync {
       ) {
         throw new LanSyncProtocolError("peer_upgrade_required", 426);
       }
-      this.markInboundPeer(deviceId, remoteAddress, path);
+      this.markInboundPeer(deviceId, remoteAddress, path, payload);
       inboundDeviceId = deviceId;
       inboundActivityIndex = this.beginInboundFileActivity(deviceId, path, payload);
       let result: Record<string, unknown>;
@@ -6680,6 +6770,11 @@ export class NtfyLanSync {
       } else {
         throw new LanSyncProtocolError("not_found", 404);
       }
+      // Return the caller's token so it can acknowledge receipt on its next
+      // authenticated request. This keeps connection state symmetric without
+      // adding a new endpoint or breaking older peers.
+      const callerToken = typeof payload.connectionToken === "string" ? payload.connectionToken : "";
+      if (callerToken) result.connectionAckToken = callerToken;
       this.finishInboundFileActivity(deviceId, inboundActivityIndex, true);
       const encryptedResult = await encryptLanSyncPayload(secret, result);
       sendText(response, 200, encryptedResult);

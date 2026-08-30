@@ -1666,6 +1666,9 @@ ${bodyHash}`;
     }
     identity = null;
     deviceId = "";
+    // Opaque per-runtime value used to prove both halves of an authenticated
+    // request/response exchange. It is not a secret or an authorization token.
+    connectionToken = randomId(24);
     server = null;
     socket = null;
     boundPort = 0;
@@ -1792,12 +1795,28 @@ ${bodyHash}`;
       return this.boundPort;
     }
     progress() {
-      return { ...this.progressValue };
+      const value = { ...this.progressValue };
+      if (!this.activePeers().length) {
+        value.changed = 0;
+        value.roundCompleted = 0;
+        value.roundTotal = 0;
+        value.scanCandidates = 0;
+        value.uploads = 0;
+        value.downloads = 0;
+      }
+      return value;
     }
     scanProgress() {
       const { files: _files, ...scan } = this.scanValue;
       const total = Math.max(0, Math.floor(scan.total));
-      return { ...scan, total, completed: Math.min(Math.max(0, Math.floor(scan.completed)), total) };
+      const connected = this.activePeers().length > 0;
+      return {
+        ...scan,
+        total,
+        completed: Math.min(Math.max(0, Math.floor(scan.completed)), total),
+        syncCandidates: connected ? scan.syncCandidates : 0,
+        syncCandidatesTotal: connected ? scan.syncCandidatesTotal : 0
+      };
     }
     activity(options = {}) {
       const includeScanFiles = options.includeScanFiles !== false;
@@ -1806,13 +1825,24 @@ ${bodyHash}`;
       const transferGroups = Array.isArray(options.transferGroups) ? new Set(options.transferGroups.map(String)) : null;
       const scanFiles = scanGroups ? this.scanValue.files.filter((file) => scanGroups.has(lanSyncTopLevelGroup(file.path))) : this.scanValue.files;
       const transferFiles = transferGroups ? this.activityFiles.filter((file) => transferGroups.has(lanSyncTopLevelGroup(file.path))) : this.activityFiles;
+      const connected = this.activePeers().length > 0;
       return {
-        progress: { ...this.progressValue },
+        progress: connected ? { ...this.progressValue } : {
+          ...this.progressValue,
+          changed: 0,
+          roundCompleted: 0,
+          roundTotal: 0,
+          scanCandidates: 0,
+          uploads: 0,
+          downloads: 0
+        },
         files: includeTransferFiles ? transferFiles.map((file) => ({ ...file })) : [],
         scan: {
           ...this.scanValue,
           total: Math.max(0, Math.floor(this.scanValue.total)),
           completed: Math.min(Math.max(0, Math.floor(this.scanValue.completed)), Math.max(0, Math.floor(this.scanValue.total))),
+          syncCandidates: connected ? this.scanValue.syncCandidates : 0,
+          syncCandidatesTotal: connected ? this.scanValue.syncCandidatesTotal : 0,
           files: includeScanFiles ? scanFiles.map((file) => ({ ...file })) : []
         },
         remote: this.remoteActivity(),
@@ -1975,6 +2005,7 @@ ${bodyHash}`;
       }
     }
     status() {
+      const connected = this.activePeers().length > 0;
       return {
         running: this.runningValue,
         port: this.boundPort,
@@ -1983,8 +2014,10 @@ ${bodyHash}`;
         desktop: this.options.desktop,
         encrypted: true,
         sharedSecretConfigured: Boolean(String(this.settings().sharedSecret || "").trim()),
-        dirtyCount: this.dirtyPaths.size,
-        urgentCount: this.activeEditDirty.size,
+        // The journal remains durable while offline, but it is not an active
+        // transfer queue until a mutually acknowledged link exists.
+        dirtyCount: connected ? this.dirtyPaths.size : 0,
+        urgentCount: connected ? this.activeEditDirty.size : 0,
         coordinator: this.isCoordinator(),
         targetCount: this.syncTargets().length
       };
@@ -3327,6 +3360,11 @@ ${bodyHash}`;
           canHost,
           lastSeenAt: seenAt,
           verifiedAt: 0,
+          lastInboundAt: 0,
+          lastOutboundAt: 0,
+          peerAckAt: 0,
+          remoteConnectionToken: "",
+          legacyHandshake: false,
           lastProbeAt: 0,
           lastSyncAt: 0,
           consecutiveFailures: 0,
@@ -3354,7 +3392,7 @@ ${bodyHash}`;
       peer.addresses = new Set([...nextAddresses, ...peer.addresses].slice(0, PEER_MAX_ADDRESS_HISTORY));
       return peer;
     }
-    markInboundPeer(deviceId, address, route) {
+    markInboundPeer(deviceId, address, route, payload = {}) {
       if (deviceId === this.deviceId) return;
       const peer = this.upsertPeer(
         deviceId,
@@ -3364,8 +3402,21 @@ ${bodyHash}`;
         this.peers.get(deviceId)?.canHost === true,
         false
       );
+      const now = this.now();
       const firstVerifiedConnection = peer.verifiedAt <= 0;
-      peer.verifiedAt = this.now();
+      peer.lastInboundAt = now;
+      const ackToken = typeof payload.connectionAckToken === "string" ? payload.connectionAckToken : "";
+      const remoteToken = typeof payload.connectionToken === "string" ? payload.connectionToken : "";
+      if (!remoteToken) {
+        peer.legacyHandshake = true;
+        peer.verifiedAt = now;
+      } else {
+        peer.legacyHandshake = false;
+      }
+      if (ackToken && ackToken === this.connectionToken) {
+        peer.peerAckAt = now;
+        peer.verifiedAt = now;
+      }
       peer.consecutiveFailures = 0;
       peer.lastFailureAt = 0;
       const metadataProtocol = METADATA_PROTOCOLS.find((protocol) => route.startsWith(`${API_PREFIX}${protocol.routePrefix}/`));
@@ -3380,7 +3431,7 @@ ${bodyHash}`;
       }
       const transfer = route.includes("/file/") || route.includes("/attachment/");
       if (transfer) this.lastTransferAt = this.now();
-      if (!transfer && !(this.progressValue.active && ["enumerating", "fingerprinting", "packaging-manifest", "planning", "waiting-plan", "transferring"].includes(this.progressValue.stage)) && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
+      if (this.isPeerActive(peer, now) && !transfer && !(this.progressValue.active && ["enumerating", "fingerprinting", "packaging-manifest", "planning", "waiting-plan", "transferring"].includes(this.progressValue.stage)) && this.progressValue.phase !== "scanning" && this.progressValue.phase !== "syncing" && this.progressValue.phase !== "complete") {
         this.emit({
           ...defaultProgress("connected"),
           stage: this.metadataProtocol(peer) ? "waiting-peer-scan" : "checking-peer",
@@ -3681,6 +3732,7 @@ ${bodyHash}`;
         ],
         testBuild: testEnabled ? this.localTestBuild : null,
         syncRequestId: this.syncRequestId,
+        connectionToken: this.connectionToken,
         // Include the current authenticated endpoint in every response. Mobile
         // peers may have a stale descriptor after a DHCP/adapter change; the
         // next request then repairs the endpoint without waiting for discovery.
@@ -3953,11 +4005,14 @@ ${bodyHash}`;
     }
     isPeerActive(peer, now = this.now()) {
       if (peer.verifiedAt <= 0) return false;
+      const hasHandshakeState = typeof peer.peerAckAt === "number";
+      if (hasHandshakeState && peer.peerAckAt <= 0 && !peer.legacyHandshake) return false;
       const lastSignalAt = peer.consecutiveFailures >= 3 ? peer.verifiedAt : Math.max(peer.lastSeenAt, peer.verifiedAt);
       if (peer.consecutiveFailures >= 3 && lastSignalAt > 0 && now - lastSignalAt > PEER_LINK_IDLE_TIMEOUT_MS) return false;
       if (peer.lastFailureAt > lastSignalAt && now - peer.lastFailureAt > PEER_FAILURE_EVICTION_DELAY_MS) return false;
       const stableGraceMs = Math.max(PEER_MIN_STABLE_GRACE_MS, PEER_PROBE_INTERVAL_MS * 12);
-      return now - peer.verifiedAt <= stableGraceMs;
+      const lastMutualSignal = hasHandshakeState ? Math.max(peer.peerAckAt, peer.lastInboundAt || 0, peer.lastOutboundAt || 0, peer.verifiedAt) : Math.max(peer.lastSeenAt, peer.verifiedAt);
+      return now - lastMutualSignal <= stableGraceMs;
     }
     sweepPeers() {
       this.recoverFromStalledSync();
@@ -5669,7 +5724,8 @@ ${bodyHash}`;
       if (!this.identity) throw new Error("identity_unavailable");
       const path = `${API_PREFIX}${route}`;
       const secret = this.activeSecret();
-      const body = await encryptLanSyncPayload(secret, payload);
+      const requestPayload = peer.remoteConnectionToken ? { ...payload, connectionAckToken: peer.remoteConnectionToken, connectionToken: this.connectionToken } : { ...payload, connectionToken: this.connectionToken };
+      const body = await encryptLanSyncPayload(secret, requestPayload);
       const headers = await authHeaders({ ...this.identity, secret }, this.deviceId, "POST", path, body, this.now());
       let lastError = null;
       const addresses = sortLanAddresses(peer.addresses, this.localInterfaces());
@@ -5694,7 +5750,19 @@ ${bodyHash}`;
             throw new LanSyncProtocolError(code, response.status);
           }
           const decrypted = await decryptLanSyncPayload(secret, response.text);
-          peer.verifiedAt = this.now();
+          const now = this.now();
+          peer.lastOutboundAt = now;
+          peer.verifiedAt = now;
+          const remoteToken = typeof decrypted.connectionToken === "string" ? decrypted.connectionToken : "";
+          if (remoteToken) {
+            peer.remoteConnectionToken = remoteToken;
+            peer.legacyHandshake = false;
+          } else {
+            peer.legacyHandshake = true;
+            peer.peerAckAt = now;
+          }
+          const acknowledged = typeof decrypted.connectionAckToken === "string" && decrypted.connectionAckToken === this.connectionToken;
+          if (acknowledged) peer.peerAckAt = now;
           peer.consecutiveFailures = 0;
           peer.lastFailureAt = 0;
           peer.addresses = new Set([address, ...peer.addresses].slice(0, PEER_MAX_ADDRESS_HISTORY));
@@ -5756,7 +5824,7 @@ ${bodyHash}`;
         if (path === `${API_PREFIX}/manifest` || path === `${API_PREFIX}/file/read` || path === `${API_PREFIX}/file/write` || path === `${API_PREFIX}/file/delete` || path === `${API_PREFIX}/manifest/metadata` || path === `${API_PREFIX}/manifest/metadata/paths` || path === `${API_PREFIX}/metadata/session/start` || path === `${API_PREFIX}/metadata/session/finish` || path === `${API_PREFIX}/metadata/file/read` || path === `${API_PREFIX}/metadata/file/write` || path === `${API_PREFIX}/metadata/file/delete` || path.startsWith(`${API_PREFIX}/metadata/v2/`)) {
           throw new LanSyncProtocolError("peer_upgrade_required", 426);
         }
-        this.markInboundPeer(deviceId, remoteAddress, path);
+        this.markInboundPeer(deviceId, remoteAddress, path, payload);
         inboundDeviceId = deviceId;
         inboundActivityIndex = this.beginInboundFileActivity(deviceId, path, payload);
         let result;
@@ -5877,6 +5945,8 @@ ${bodyHash}`;
         } else {
           throw new LanSyncProtocolError("not_found", 404);
         }
+        const callerToken = typeof payload.connectionToken === "string" ? payload.connectionToken : "";
+        if (callerToken) result.connectionAckToken = callerToken;
         this.finishInboundFileActivity(deviceId, inboundActivityIndex, true);
         const encryptedResult = await encryptLanSyncPayload(secret, result);
         sendText(response, 200, encryptedResult);
