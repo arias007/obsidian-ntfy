@@ -4271,6 +4271,7 @@ export class NtfyLanSync {
     const firstVerifiedConnection = peer.verifiedAt <= 0;
     try {
       const probeTimeout = peer.consecutiveFailures > 0 ? PEER_RECONNECT_PROBE_TIMEOUT_MS : PEER_PROBE_TIMEOUT_MS;
+      const hadRemoteToken = Boolean(peer.remoteConnectionToken);
       const response = await this.callPeer(peer, "/ping", this.syncSignalPayload(), probeTimeout);
       const responseDeviceId = typeof response.deviceId === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(response.deviceId) ? response.deviceId : "";
       if (response.protocolVersion !== PROTOCOL_VERSION || !responseDeviceId) throw new Error("peer_identity_mismatch");
@@ -4300,6 +4301,7 @@ export class NtfyLanSync {
           .filter((value): value is string => typeof value === "string" && value.length <= 64)
       );
       const remoteRequestedSync = this.applyRemoteSyncSignal(peer, response);
+      const needsRemoteAck = !hadRemoteToken && typeof response.connectionToken === "string" && response.connectionToken.length > 0;
       peer.verifiedAt = this.now();
       peer.lastSeenAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
       peer.consecutiveFailures = 0;
@@ -4315,6 +4317,7 @@ export class NtfyLanSync {
       }
       this.emitPeersChanged();
       await this.receiveQueuedMessages(peer, response.messages);
+      if (needsRemoteAck) await this.acknowledgePeer(peer);
       this.ensureRealtimeWakeupPoll(peer);
       // A probe can be the first successful request after a short Wi-Fi
       // interruption. In that case the peer is no longer considered active
@@ -4492,6 +4495,15 @@ export class NtfyLanSync {
     this.realtimeWakeupPolls.set(deviceId, poll);
   }
 
+  private async acknowledgePeer(peer: LanSyncPeer): Promise<void> {
+    if (!peer.remoteConnectionToken || !this.runningValue) return;
+    try {
+      await this.callPeer(peer, "/ping", { connectionAckOnly: true }, PEER_RECONNECT_PROBE_TIMEOUT_MS);
+    } catch {
+      // Reconnect probing will retry; acknowledgement must never block sync.
+    }
+  }
+
   private async runRealtimeWakeupPoll(peer: LanSyncPeer): Promise<void> {
     while (
       this.runningValue
@@ -4499,6 +4511,7 @@ export class NtfyLanSync {
       && peer.capabilities.has(REALTIME_WAKEUP_CAPABILITY)
     ) {
       try {
+        const hadRemoteToken = Boolean(peer.remoteConnectionToken);
         const response = await this.callPeer(
           peer,
           "/events/wait",
@@ -4506,6 +4519,7 @@ export class NtfyLanSync {
           REALTIME_WAKEUP_TIMEOUT_MS + 5_000
         );
         const remoteRequestedSync = this.applyRemoteSyncSignal(peer, response);
+        if (!hadRemoteToken) await this.acknowledgePeer(peer);
         peer.policy = policyFromRaw(response.policy);
         await this.receiveQueuedMessages(peer, response.messages);
         if (remoteRequestedSync || peer.remoteDirtyPaths.size > 0) {

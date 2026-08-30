@@ -3938,6 +3938,7 @@ ${bodyHash}`;
       const firstVerifiedConnection = peer.verifiedAt <= 0;
       try {
         const probeTimeout = peer.consecutiveFailures > 0 ? PEER_RECONNECT_PROBE_TIMEOUT_MS : PEER_PROBE_TIMEOUT_MS;
+        const hadRemoteToken = Boolean(peer.remoteConnectionToken);
         const response = await this.callPeer(peer, "/ping", this.syncSignalPayload(), probeTimeout);
         const responseDeviceId = typeof response.deviceId === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(response.deviceId) ? response.deviceId : "";
         if (response.protocolVersion !== PROTOCOL_VERSION || !responseDeviceId) throw new Error("peer_identity_mismatch");
@@ -3962,6 +3963,7 @@ ${bodyHash}`;
           (Array.isArray(response.capabilities) ? response.capabilities : []).filter((value) => typeof value === "string" && value.length <= 64)
         );
         const remoteRequestedSync = this.applyRemoteSyncSignal(peer, response);
+        const needsRemoteAck = !hadRemoteToken && typeof response.connectionToken === "string" && response.connectionToken.length > 0;
         peer.verifiedAt = this.now();
         peer.lastSeenAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
         peer.consecutiveFailures = 0;
@@ -3972,6 +3974,7 @@ ${bodyHash}`;
         }
         this.emitPeersChanged();
         await this.receiveQueuedMessages(peer, response.messages);
+        if (needsRemoteAck) await this.acknowledgePeer(peer);
         this.ensureRealtimeWakeupPoll(peer);
         if (firstVerifiedConnection || remoteRequestedSync || !wasActiveBeforeProbe && (this.hasPrioritySyncWork() || this.dirtyPaths.size > 0 || this.fullSyncRequested || this.syncQueued)) this.scheduleSync(0, true);
       } catch (error) {
@@ -4073,9 +4076,17 @@ ${bodyHash}`;
       });
       this.realtimeWakeupPolls.set(deviceId, poll);
     }
+    async acknowledgePeer(peer) {
+      if (!peer.remoteConnectionToken || !this.runningValue) return;
+      try {
+        await this.callPeer(peer, "/ping", { connectionAckOnly: true }, PEER_RECONNECT_PROBE_TIMEOUT_MS);
+      } catch {
+      }
+    }
     async runRealtimeWakeupPoll(peer) {
       while (this.runningValue && this.peers.get(peer.deviceId) === peer && peer.capabilities.has(REALTIME_WAKEUP_CAPABILITY)) {
         try {
+          const hadRemoteToken = Boolean(peer.remoteConnectionToken);
           const response = await this.callPeer(
             peer,
             "/events/wait",
@@ -4083,6 +4094,7 @@ ${bodyHash}`;
             REALTIME_WAKEUP_TIMEOUT_MS + 5e3
           );
           const remoteRequestedSync = this.applyRemoteSyncSignal(peer, response);
+          if (!hadRemoteToken) await this.acknowledgePeer(peer);
           peer.policy = policyFromRaw(response.policy);
           await this.receiveQueuedMessages(peer, response.messages);
           if (remoteRequestedSync || peer.remoteDirtyPaths.size > 0) {
