@@ -846,7 +846,6 @@ var NtfyLanSyncRuntime = (() => {
   var TEST_DEBUG_CAPABILITY = "test-debug-v1";
   var TEST_BUILD_FILE_NAMES = ["main.js", "manifest.json", "styles.css"];
   var REALTIME_WAKEUP_TIMEOUT_MS = 2e4;
-  var BOOTSTRAP_MTIME_TOLERANCE_MS = 2e3;
   var MULTICAST_ADDRESS = "239.255.67.19";
   var DISCOVERY_PORT = 43189;
   var ANNOUNCE_INTERVAL_MS = 750;
@@ -1370,12 +1369,7 @@ ${bodyHash}`;
     return Boolean(entry && expected && entry.size === expected.size && entry.mtime === expected.mtime);
   }
   function metadataLedgerMatches(entry, expected) {
-    return Boolean(
-      entry && expected && entry.size === expected.size && Math.abs(entry.mtime - expected.mtime) <= BOOTSTRAP_MTIME_TOLERANCE_MS
-    );
-  }
-  function metadataBootstrapEquivalent(local, remote) {
-    return local.size === remote.size && Math.abs(local.mtime - remote.mtime) <= BOOTSTRAP_MTIME_TOLERANCE_MS;
+    return metadataMatches(entry, expected);
   }
   function metadataWinner(local, remote, rule) {
     if (rule === "larger" && local.size !== remote.size) return local.size > remote.size ? "local" : "remote";
@@ -4371,86 +4365,9 @@ ${bodyHash}`;
       for (const path of [.../* @__PURE__ */ new Set([...localMap.keys(), ...remoteMap.keys()])]) {
         const local = localMap.get(path);
         const remote = remoteMap.get(path);
-        if (local && remote && (metadataLedgerMatches(local, remote) || !ledger.entries[path] && metadataBootstrapEquivalent(local, remote))) {
+        if (local && remote && metadataMatches(local, remote)) {
           ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
         }
-      }
-      const dirtyFingerprintPaths = /* @__PURE__ */ new Set([...request.localDirty.keys(), ...request.remoteDirty.keys()]);
-      const fingerprintEqualPaths = /* @__PURE__ */ new Set();
-      const fingerprintDifferentPaths = /* @__PURE__ */ new Set();
-      const bootstrapCandidates = [...localMap.keys()].map((path) => ({ path, local: localMap.get(path), remote: remoteMap.get(path) })).filter((item) => Boolean(
-        item.local && item.remote && item.local.size === item.remote.size && (!ledger.entries[item.path] || dirtyFingerprintPaths.has(item.path))
-      ));
-      if (bootstrapCandidates.length) {
-        for (const candidate of bootstrapCandidates) this.hashCache.delete(candidate.path);
-        this.queueHashCacheSave();
-        const scan = this.scanValue;
-        const scanFiles = new Map(scan.files.map((file) => [file.path, file]));
-        const completedBeforeHashes = scan.completed;
-        scan.phase = "scanning";
-        const hashOnlyPaths = /* @__PURE__ */ new Set();
-        for (const candidate of bootstrapCandidates) {
-          let activity = scanFiles.get(candidate.path);
-          if (!activity) {
-            activity = { path: candidate.path, state: "pending", size: candidate.local.size, reason: "fingerprint" };
-            scan.files.push(activity);
-            scanFiles.set(candidate.path, activity);
-            scan.total += 1;
-            hashOnlyPaths.add(candidate.path);
-          }
-          activity.state = "hashing";
-          activity.reason = "fingerprint";
-        }
-        this.emitActivityChanged();
-        let verified = 0;
-        let hashOnlyCompleted = 0;
-        let lastBootstrapProgressAt = 0;
-        const localHashesPromise = this.buildMetadataHashManifest(
-          bootstrapCandidates.map((item) => item.local),
-          shareConfig,
-          (path, cached) => {
-            verified += 1;
-            if (hashOnlyPaths.has(path)) {
-              hashOnlyCompleted += 1;
-              scan.completed = Math.min(scan.total, completedBeforeHashes + hashOnlyCompleted);
-            }
-            scan.hashed += 1;
-            if (cached) scan.cached += 1;
-            const activity = scanFiles.get(path);
-            if (activity) {
-              activity.state = cached ? "cached" : "complete";
-              activity.reason = cached ? "fingerprint-cache" : "fingerprint";
-            }
-            const now = this.now();
-            if (verified < bootstrapCandidates.length && now - lastBootstrapProgressAt < 40) return;
-            lastBootstrapProgressAt = now;
-            this.wakeRealtimeProgressSignal();
-            this.emitActivityChanged();
-          }
-        );
-        const remoteHashesPromise = this.callPeer(peer, this.metadataRoute(peer, "/bootstrap/hashes"), {
-          syncConfigFolder: localPolicy.syncConfigFolder,
-          files: bootstrapCandidates.map((item) => item.remote)
-        }, 10 * 6e4);
-        const [localHashes, remoteHashesResponse] = await Promise.all([localHashesPromise, remoteHashesPromise]);
-        const localHashMap = new Map(localHashes.map((entry) => [entry.path, entry]));
-        const remoteHashMap = new Map(this.parseManifest(remoteHashesResponse.files, shareConfig).map((entry) => [entry.path, entry]));
-        for (const item of bootstrapCandidates) {
-          const localHash = localHashMap.get(item.path);
-          const remoteHash = remoteHashMap.get(item.path);
-          if (!localHash || !remoteHash || !metadataMatches(localHash, item.local) || !metadataMatches(remoteHash, item.remote)) {
-            fingerprintDifferentPaths.add(item.path);
-            continue;
-          }
-          if (localHash.hash === remoteHash.hash) {
-            fingerprintEqualPaths.add(item.path);
-            ledger.entries[item.path] = { local: metadataSnapshot(item.local), remote: metadataSnapshot(item.remote) };
-          } else {
-            fingerprintDifferentPaths.add(item.path);
-          }
-        }
-        scan.phase = "complete";
-        scan.completed = scan.total;
       }
       this.emitActivityChanged();
       const plannedActions = planLanSyncMetadataReconciliation(filteredLocalEntries, remoteEntries, ledger.entries, localPolicy, remotePolicy);
@@ -4460,11 +4377,7 @@ ${bodyHash}`;
         const local = localMap.get(path);
         const remote = remoteMap.get(path);
         if (!local || !remote) continue;
-        if (fingerprintEqualPaths.has(path)) {
-          ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
-          continue;
-        }
-        if (metadataMatches(local, remote) && !request.localDirty.has(path) && !fingerprintDifferentPaths.has(path)) {
+        if (metadataMatches(local, remote)) {
           ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
           continue;
         }
@@ -5360,14 +5273,8 @@ ${bodyHash}`;
     }
     async existingContentMatches(path, expected, bytes) {
       const before = await this.options.storage.statFile(path);
-      if (!before || before.size !== bytes.byteLength || before.size !== expected.size) return null;
-      const current = new Uint8Array(await this.options.storage.readBinary(path));
-      const after = await this.options.storage.statFile(path);
-      if (!after || !metadataMatches(before, after) || current.byteLength !== bytes.byteLength) return null;
-      for (let index = 0; index < bytes.byteLength; index += 1) {
-        if (current[index] !== bytes[index]) return null;
-      }
-      return metadataSnapshot(after);
+      if (!before || bytes.byteLength !== expected.size || !metadataMatches(before, expected)) return null;
+      return metadataSnapshot(before);
     }
     async writeLocalMetadata(path, bytes, expected, source, allowExistingSame = false) {
       const normalized = this.normalizePath(path, true);

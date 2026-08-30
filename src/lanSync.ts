@@ -513,7 +513,6 @@ const TEST_UPDATE_CAPABILITY = "test-update-v1";
 const TEST_DEBUG_CAPABILITY = "test-debug-v1";
 const TEST_BUILD_FILE_NAMES = ["main.js", "manifest.json", "styles.css"] as const;
 const REALTIME_WAKEUP_TIMEOUT_MS = 20_000;
-const BOOTSTRAP_MTIME_TOLERANCE_MS = 2_000;
 const MULTICAST_ADDRESS = "239.255.67.19";
 const DISCOVERY_PORT = 43189;
 const ANNOUNCE_INTERVAL_MS = 750;
@@ -1174,23 +1173,11 @@ function metadataMatches(
   return Boolean(entry && expected && entry.size === expected.size && entry.mtime === expected.mtime);
 }
 
-// Filesystems on Android and Windows can quantize mtimes differently. This
-// comparison is used only for persisted synchronization baselines; wire
-// preconditions continue to use the strict metadataMatches() check above.
 function metadataLedgerMatches(
   entry: LanSyncMetadataEntry | LanSyncMetadataSnapshot | null | undefined,
   expected: LanSyncMetadataEntry | LanSyncMetadataSnapshot | null | undefined
 ): boolean {
-  return Boolean(
-    entry
-    && expected
-    && entry.size === expected.size
-    && Math.abs(entry.mtime - expected.mtime) <= BOOTSTRAP_MTIME_TOLERANCE_MS
-  );
-}
-
-function metadataBootstrapEquivalent(local: LanSyncMetadataEntry, remote: LanSyncMetadataEntry): boolean {
-  return local.size === remote.size && Math.abs(local.mtime - remote.mtime) <= BOOTSTRAP_MTIME_TOLERANCE_MS;
+  return metadataMatches(entry, expected);
 }
 
 function metadataWinner(local: LanSyncMetadataEntry, remote: LanSyncMetadataEntry, rule: LanSyncConflictRule): "local" | "remote" {
@@ -4886,105 +4873,15 @@ export class NtfyLanSync {
         if (!localMap.has(path) && !remoteMap.has(path)) delete ledger.entries[path];
       }
     }
+    // Metadata is the sole synchronization authority: a path is equal only
+    // when both sides report the exact same size and modification time. Do
+    // not hash same-sized files here; hashing is reserved for wire integrity.
     for (const path of [...new Set([...localMap.keys(), ...remoteMap.keys()])]) {
       const local = localMap.get(path);
       const remote = remoteMap.get(path);
-      if (local && remote && (metadataLedgerMatches(local, remote) || (!ledger.entries[path] && metadataBootstrapEquivalent(local, remote)))) {
+      if (local && remote && metadataMatches(local, remote)) {
         ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
       }
-    }
-    // Dirty signals are hints, not proof that a file's bytes differ. Always
-    // fingerprint same-sized dirty paths (even when an older ledger exists)
-    // so stale journals and cross-device mtime drift cannot create thousands
-    // of false transfers. The hash cache is invalidated for these paths since
-    // same-size/same-mtime edits are possible on mobile filesystems.
-    const dirtyFingerprintPaths = new Set([...request.localDirty.keys(), ...request.remoteDirty.keys()]);
-    const fingerprintEqualPaths = new Set<string>();
-    const fingerprintDifferentPaths = new Set<string>();
-    const bootstrapCandidates = [...localMap.keys()]
-      .map((path) => ({ path, local: localMap.get(path), remote: remoteMap.get(path) }))
-      .filter((item): item is { path: string; local: LanSyncMetadataEntry; remote: LanSyncMetadataEntry } => Boolean(
-        item.local
-        && item.remote
-        && item.local.size === item.remote.size
-        && (!ledger.entries[item.path] || dirtyFingerprintPaths.has(item.path))
-      ));
-    if (bootstrapCandidates.length) {
-      for (const candidate of bootstrapCandidates) this.hashCache.delete(candidate.path);
-      this.queueHashCacheSave();
-      const scan = this.scanValue;
-      const scanFiles = new Map(scan.files.map((file) => [file.path, file]));
-      const completedBeforeHashes = scan.completed;
-      scan.phase = "scanning";
-      // Fingerprint verification is part of this round, not a new scan. Only
-      // paths absent from the current snapshot reserve new denominator slots;
-      // a repeated hash batch must never make the total climb by 12 again.
-      const hashOnlyPaths = new Set<string>();
-      for (const candidate of bootstrapCandidates) {
-        let activity = scanFiles.get(candidate.path);
-        if (!activity) {
-          activity = { path: candidate.path, state: "pending", size: candidate.local.size, reason: "fingerprint" };
-          scan.files.push(activity);
-          scanFiles.set(candidate.path, activity);
-          scan.total += 1;
-          hashOnlyPaths.add(candidate.path);
-        }
-        activity.state = "hashing";
-        activity.reason = "fingerprint";
-      }
-      this.emitActivityChanged();
-      let verified = 0;
-      let hashOnlyCompleted = 0;
-      let lastBootstrapProgressAt = 0;
-      const localHashesPromise = this.buildMetadataHashManifest(
-        bootstrapCandidates.map((item) => item.local),
-        shareConfig,
-        (path, cached) => {
-          verified += 1;
-          if (hashOnlyPaths.has(path)) {
-            hashOnlyCompleted += 1;
-            scan.completed = Math.min(scan.total, completedBeforeHashes + hashOnlyCompleted);
-          }
-          // Count every verified fingerprint in the scan activity. Cached
-          // fingerprints are still checks performed in this round; reporting
-          // them only as "cached" made the independent scan look empty.
-          scan.hashed += 1;
-          if (cached) scan.cached += 1;
-          const activity = scanFiles.get(path);
-          if (activity) {
-            activity.state = cached ? "cached" : "complete";
-            activity.reason = cached ? "fingerprint-cache" : "fingerprint";
-          }
-          const now = this.now();
-          if (verified < bootstrapCandidates.length && now - lastBootstrapProgressAt < 40) return;
-          lastBootstrapProgressAt = now;
-          this.wakeRealtimeProgressSignal();
-          this.emitActivityChanged();
-        }
-      );
-      const remoteHashesPromise = this.callPeer(peer, this.metadataRoute(peer, "/bootstrap/hashes"), {
-        syncConfigFolder: localPolicy.syncConfigFolder,
-        files: bootstrapCandidates.map((item) => item.remote)
-      }, 10 * 60_000);
-      const [localHashes, remoteHashesResponse] = await Promise.all([localHashesPromise, remoteHashesPromise]);
-      const localHashMap = new Map(localHashes.map((entry) => [entry.path, entry]));
-      const remoteHashMap = new Map(this.parseManifest(remoteHashesResponse.files, shareConfig).map((entry) => [entry.path, entry]));
-      for (const item of bootstrapCandidates) {
-        const localHash = localHashMap.get(item.path);
-        const remoteHash = remoteHashMap.get(item.path);
-        if (!localHash || !remoteHash || !metadataMatches(localHash, item.local) || !metadataMatches(remoteHash, item.remote)) {
-          fingerprintDifferentPaths.add(item.path);
-          continue;
-        }
-        if (localHash.hash === remoteHash.hash) {
-          fingerprintEqualPaths.add(item.path);
-          ledger.entries[item.path] = { local: metadataSnapshot(item.local), remote: metadataSnapshot(item.remote) };
-        } else {
-          fingerprintDifferentPaths.add(item.path);
-        }
-      }
-      scan.phase = "complete";
-      scan.completed = scan.total;
     }
     // The scan is finished here — hand the status bar off to the sync/prep
     // phase instead of re-showing the completed scan total (which read as
@@ -4992,29 +4889,21 @@ export class NtfyLanSync {
     // is emitted below once actions are known.
     this.emitActivityChanged();
     const plannedActions = planLanSyncMetadataReconciliation(filteredLocalEntries, remoteEntries, ledger.entries, localPolicy, remotePolicy);
-    // Some mobile filesystems expose coarse mtimes. A live dirty signal is
-    // authoritative even when size/mtime happen to match the peer; otherwise
-    // an editor change (including .obsidian changes) can be treated as synced.
+    // Dirty journal entries are wake-up hints. Metadata remains authoritative,
+    // so stale journal entries cannot create false transfers.
     const plannedPathSet = new Set(plannedActions.map((action) => action.path));
-    // Dirty journals are authoritative even when the two files have only a
-    // small mtime delta. Iterate both sides so a remote edit is not hidden by
-    // the baseline mtime tolerance used to suppress false whole-vault plans.
+    // Re-check dirty paths after planning so a just-arrived metadata change is
+    // included without waiting for another full scan.
     for (const path of new Set([...request.localDirty.keys(), ...request.remoteDirty.keys()])) {
       if (plannedPathSet.has(path)) continue;
       const local = localMap.get(path);
       const remote = remoteMap.get(path);
       if (!local || !remote) continue;
-      // A remote dirty journal can survive an interrupted/old session. If
-      // both sides now expose the exact same metadata and only the remote
-      // journal is dirty, do not turn that stale signal into a giant download
-      // plan. Local edits remain authoritative and still enter the fast lane;
-      // genuine metadata differences continue through the normal conflict
-      // rules below.
-      if (fingerprintEqualPaths.has(path)) {
-        ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
-        continue;
-      }
-      if (metadataMatches(local, remote) && !request.localDirty.has(path) && !fingerprintDifferentPaths.has(path)) {
+      // A dirty journal can survive an interrupted or older session. If both
+      // sides now expose the exact same metadata, clear the stale signal
+      // without creating a transfer. Only an actual size/mtime difference
+      // enters the normal conflict rules below.
+      if (metadataMatches(local, remote)) {
         ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
         continue;
       }
@@ -6070,14 +5959,11 @@ export class NtfyLanSync {
 
   private async existingContentMatches(path: string, expected: LanSyncMetadataSnapshot, bytes: Uint8Array): Promise<LanSyncMetadataSnapshot | null> {
     const before = await this.options.storage.statFile(path);
-    if (!before || before.size !== bytes.byteLength || before.size !== expected.size) return null;
-    const current = new Uint8Array(await this.options.storage.readBinary(path));
-    const after = await this.options.storage.statFile(path);
-    if (!after || !metadataMatches(before, after) || current.byteLength !== bytes.byteLength) return null;
-    for (let index = 0; index < bytes.byteLength; index += 1) {
-      if (current[index] !== bytes[index]) return null;
-    }
-    return metadataSnapshot(after);
+    // Metadata is the synchronization contract. If an idempotent retry finds
+    // the exact source size and mtime already present, it is complete; do not
+    // reread or hash the file merely to compare content.
+    if (!before || bytes.byteLength !== expected.size || !metadataMatches(before, expected)) return null;
+    return metadataSnapshot(before);
   }
 
   private async writeLocalMetadata(

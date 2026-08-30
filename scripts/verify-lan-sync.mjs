@@ -334,14 +334,14 @@ try {
   assert.equal(planLanSyncMetadataReconciliation([localMetadata], [remoteMetadata], { "Note.md": metadataBaseline })[0].kind, "pull");
   assert.equal(planLanSyncMetadataReconciliation([{ ...localMetadata, mtime: 3_000 }], [localMetadata], { "Note.md": metadataBaseline })[0].kind, "push");
   assert.equal(planLanSyncMetadataReconciliation([localMetadata], [remoteMetadata], {})[0].kind, "pull");
-  assert.deepEqual(
+  assert.equal(
     planLanSyncMetadataReconciliation(
       [{ ...localMetadata, mtime: 1_000 }],
       [{ ...localMetadata, mtime: 2_500 }],
       { "Note.md": { local: localMetadata, remote: localMetadata } }
-    ),
-    [],
-    "Small cross-device mtime quantization created a false transfer"
+    )[0].kind,
+    "pull",
+    "Exact mtime differences must be synchronized"
   );
   assert.equal(
     planLanSyncMetadataReconciliation([localMetadata], [], { "Note.md": metadataBaseline }, contentBidirectionalPolicy, passivePolicy)[0].kind,
@@ -1190,7 +1190,7 @@ try {
     const path = `Bulk/f-${String(index).padStart(4, "0")}.bin`;
     const content = `same-${String(index).padStart(4, "0")}`;
     baselineFilesA[path] = { content, mtime: 10_000 + index };
-    baselineFilesB[path] = { content, mtime: 90_000_000 + index };
+    baselineFilesB[path] = { content, mtime: 10_000 + index };
   }
   baselineFilesA["Bulk/rounded.bin"] = { content: "rounded", mtime: 123_000 };
   baselineFilesB["Bulk/rounded.bin"] = { content: "rounded", mtime: 124_500 };
@@ -1220,23 +1220,19 @@ try {
     const firstBaselineProgress = baselineProgressA.length;
     baselineServiceA.requestSync({ deep: true });
     await waitFor(
-      () => baselineProgressA.slice(firstBaselineProgress).some((value) => value.phase === "complete" && value.total === 3),
+      () => baselineProgressA.slice(firstBaselineProgress).some((value) => value.phase === "complete" && value.total === 4),
       "large Remotely Save baseline",
       30_000
     );
     const firstBaseline = baselineProgressA.slice(firstBaselineProgress).filter((value) => value.phase === "complete").at(-1);
-    assert.equal(firstBaseline.total, 3, "Thousands of metadata-only mtime differences entered the transfer plan");
+    assert.equal(firstBaseline.total, 4, "Metadata differences were not planned from exact size/mtime");
     assert.equal(firstBaseline.uploads, 1, "Large baseline upload count included metadata-equivalent files");
-    assert.equal(firstBaseline.downloads, 2, "Large baseline download count included metadata-equivalent files");
-    assert.ok(baselineServiceA.activity().scan.hashed > 0, "Ambiguous baseline hashing did not expose independent scan activity");
+    assert.equal(firstBaseline.downloads, 3, "Metadata-only differences were not downloaded");
     assert.equal(baselineProgressA.some((value) => value.phase === "scanning"), false, "Large-vault scanning leaked into transfer progress");
     assert.equal(baselineStorageA.text("Bulk/changed.bin"), "remote-x", "A real same-size content change was not reconciled");
     assert.equal(baselineStorageB.text("Only-A/new.md"), "from A", "A unique local file was not uploaded");
     assert.equal(baselineStorageA.text("Only-B/new.md"), "from B", "A unique remote file was not downloaded");
-    assert.equal(baselineStorageA.readCount("Bulk/rounded.bin"), 0, "Small filesystem mtime rounding triggered a content read");
-    assert.equal(baselineStorageB.readCount("Bulk/rounded.bin"), 0, "Remote small mtime rounding triggered a content read");
-    assert.ok(requestedRoutes.includes("/cancip-lan/v1/metadata/v4/bootstrap/hashes"), "Ambiguous first-baseline metadata was not fingerprinted");
-    assert.equal(baselineServiceA.activity().files.length, 3, "The transfer list exposed baseline-only files");
+    assert.equal(baselineServiceA.activity().files.length, 4, "The transfer list did not expose exact metadata differences");
 
     const beforeIncrementalProgress = baselineProgressA.length;
     baselineOptionsA.runtimeSettings.mode = "delete-push";
