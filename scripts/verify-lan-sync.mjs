@@ -575,6 +575,30 @@ try {
   stabilityClock = 31_500;
   assert.equal(stabilityService.listPeers().length, 0, "A peer should leave the list only after the stable grace window");
 
+  const mutualPeer = {
+    ...stabilityPeer,
+    deviceId: "MUTUALHANDSHAKE12345",
+    lastSeenAt: stabilityClock,
+    verifiedAt: stabilityClock,
+    lastInboundAt: stabilityClock,
+    lastOutboundAt: 0,
+    peerAckAt: 0,
+    remoteConnectionToken: "REMOTE_RUNTIME_TOKEN",
+    legacyHandshake: false,
+    consecutiveFailures: 0,
+    lastFailureAt: 0
+  };
+  stabilityService.peers.clear();
+  stabilityService.peers.set(mutualPeer.deviceId, mutualPeer);
+  stabilityService.dirtyPaths.set("Notes/offline-edit.md", 1);
+  assert.equal(stabilityService.listPeers().length, 0, "An authenticated inbound request alone must not display a connected peer");
+  assert.equal(stabilityService.status().dirtyCount, 0, "Offline journal entries must not appear as confirmed sync work");
+  assert.equal(stabilityService.activity().scan.syncCandidatesTotal, 0, "Offline scan candidates must not inflate sync progress");
+  mutualPeer.peerAckAt = stabilityClock;
+  mutualPeer.lastOutboundAt = stabilityClock;
+  assert.equal(stabilityService.listPeers().length, 1, "A mutually acknowledged peer should become connected");
+  assert.equal(stabilityService.status().dirtyCount, 1, "The durable journal should become visible after mutual connection");
+
   const journalPort = await freePort();
   const journalDevice = "JOURNALCHECKPOINT123456";
   const journalStore = memoryLocalStore(journalDevice);
