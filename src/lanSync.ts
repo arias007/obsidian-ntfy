@@ -1675,7 +1675,8 @@ export class NtfyLanSync {
 
   scanProgress(): Omit<LanSyncScanActivity, "files"> {
     const { files: _files, ...scan } = this.scanValue;
-    return { ...scan };
+    const total = Math.max(0, Math.floor(scan.total));
+    return { ...scan, total, completed: Math.min(Math.max(0, Math.floor(scan.completed)), total) };
   }
 
   activity(options: {
@@ -1699,6 +1700,8 @@ export class NtfyLanSync {
       files: includeTransferFiles ? transferFiles.map((file) => ({ ...file })) : [],
       scan: {
         ...this.scanValue,
+        total: Math.max(0, Math.floor(this.scanValue.total)),
+        completed: Math.min(Math.max(0, Math.floor(this.scanValue.completed)), Math.max(0, Math.floor(this.scanValue.total))),
         files: includeScanFiles ? scanFiles.map((file) => ({ ...file })) : []
       },
       remote: this.remoteActivity(),
@@ -2163,15 +2166,83 @@ export class NtfyLanSync {
 
   private notePathChangedDuringFullScan(path: string): void {
     const scan = this.scanValue;
-    if (!this.fullRoundScanVisible || scan.phase !== "scanning") return;
-    if (scan.files.some((file) => file.path === path)) return;
-    // The Vault event itself is a valid observation of a changed path. Add it
-    // to the current device total immediately so a create/delete during the
-    // walk cannot make the displayed denominator stale or reset the round.
-    scan.files.push({ path, state: "complete", size: 0, reason: "changed-during-scan" });
-    scan.total += 1;
-    scan.completed += 1;
+    if (!this.fullRoundScanVisible || (scan.phase !== "scanning" && scan.phase !== "complete")) return;
+    // A Vault event is only a hint: it may represent a modify, create, or
+    // delete. Re-stat the path before changing the denominator so a deleted
+    // file is removed instead of being counted forever, and a duplicate event
+    // cannot inflate the current-round total.
+    void this.reconcilePathInActiveScan(scan, path);
+  }
+
+  private async reconcilePathInActiveScan(scan: LanSyncScanActivity, path: string): Promise<void> {
+    if (this.scanValue !== scan || !this.fullRoundScanVisible || (scan.phase !== "scanning" && scan.phase !== "complete")) return;
+    const normalized = this.normalizePath(path, true);
+    const stat = normalized ? await this.options.storage.statFile(normalized).catch(() => null) : null;
+    const valid = Boolean(
+      normalized
+      && stat
+      && Number.isSafeInteger(stat.size)
+      && stat.size >= 0
+      && stat.size <= this.settings().maxFileBytes
+      && Number.isFinite(stat.mtime)
+      && stat.mtime >= 0
+    );
+    const index = normalized ? scan.files.findIndex((file) => file.path === normalized) : -1;
+    if (valid && normalized && stat) {
+      if (index < 0) {
+        scan.files.push({ path: normalized, state: "complete", size: stat.size, reason: "changed-during-scan" });
+        scan.total += 1;
+        scan.completed += 1;
+      } else {
+        const activity = scan.files[index];
+        activity.size = stat.size;
+        if (activity.state === "skipped") {
+          activity.state = "complete";
+          activity.reason = "changed-during-scan";
+          scan.skipped = Math.max(0, scan.skipped - 1);
+          scan.completed += 1;
+        }
+      }
+    } else if (index >= 0) {
+      // Keep the row in place while the concurrent scanner is using its
+      // scanIndex. Removing it would shift every later index and make a
+      // callback update the wrong file, which is how completed could exceed
+      // total. Mark it missing and adjust only the counters.
+      const removed = scan.files[index];
+      if (removed.reason !== "missing-during-scan") {
+        if (removed.state === "cached" || removed.state === "complete" || removed.state === "skipped") {
+          scan.completed = Math.max(0, scan.completed - 1);
+        }
+        if (removed.state === "cached") scan.cached = Math.max(0, scan.cached - 1);
+        if (removed.state === "skipped") scan.skipped = Math.max(0, scan.skipped - 1);
+        scan.total = Math.max(0, scan.total - 1);
+        removed.state = "skipped";
+        removed.reason = "missing-during-scan";
+      }
+    }
+    // The invariant is user-visible and must hold after every event, including
+    // a delete racing the final scanner callback.
+    scan.completed = Math.min(Math.max(0, scan.completed), Math.max(0, scan.total));
     if (this.scanValue === scan) this.emitActivityChanged();
+  }
+
+  private async listCurrentSyncFiles(includeConfigFolder: boolean): Promise<LanSyncFileStat[]> {
+    const files = new Map<string, LanSyncFileStat>();
+    for (const raw of await this.options.storage.listFiles(true)) {
+      const path = this.normalizePath(raw.path, includeConfigFolder);
+      // The scan denominator represents the complete current device file set.
+      // Size policy is applied later to synchronization eligibility, never to
+      // the device-total counter; otherwise a large file silently disappears
+      // from "本轮总检查" and the two sides report incomparable totals.
+      if (!path || !Number.isSafeInteger(raw.size) || raw.size < 0 || !Number.isFinite(raw.mtime) || raw.mtime < 0) continue;
+      const entry = { path, size: raw.size, mtime: raw.mtime };
+      const previous = files.get(path);
+      // Adapters can expose the same normalized path twice (for example a
+      // Vault listing plus a config-folder listing). Keep one deterministic
+      // record, preferring the newest metadata observation.
+      if (!previous || entry.mtime > previous.mtime || (entry.mtime === previous.mtime && entry.size >= previous.size)) files.set(path, entry);
+    }
+    return [...files.values()].sort((left, right) => left.path.localeCompare(right.path));
   }
 
   private async classifyAppliedMutationEvent(path: string): Promise<void> {
@@ -3885,6 +3956,8 @@ export class NtfyLanSync {
     // while the coordinator scanned, which read as "stuck" on one side and
     // "working" on the other.
     const scan = this.scanSignalValue ?? this.scanValue;
+    const scanTotal = Math.max(0, Math.floor(scan.total));
+    const scanCompleted = Math.min(Math.max(0, Math.floor(scan.completed)), scanTotal);
     return {
       phase: this.progressValue.phase,
       sessionId: this.progressValue.sessionId,
@@ -3899,8 +3972,8 @@ export class NtfyLanSync {
       downloadCompleted: Math.max(0, Math.floor(this.progressValue.downloadCompleted)),
       scanPhase: scan.phase,
       scanTotalKnown: scan.totalKnown !== false,
-      scanCompleted: Math.max(0, Math.floor(scan.completed)),
-      scanTotal: Math.max(0, Math.floor(scan.total)),
+      scanCompleted,
+      scanTotal,
       roundId: this.syncRoundId,
       roundCompleted: Math.max(0, Math.floor(this.syncRoundCompleted)),
       roundTotal: Math.max(0, Math.floor(this.syncRoundTotal)),
@@ -3918,6 +3991,8 @@ export class NtfyLanSync {
       const parsed = Number(input);
       return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 0;
     };
+    const scanTotal = count(value.scanTotal);
+    const scanCompleted = Math.min(count(value.scanCompleted), scanTotal);
     return {
       sessionId: typeof value.sessionId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(value.sessionId) ? value.sessionId : "",
       phase,
@@ -3934,8 +4009,8 @@ export class NtfyLanSync {
         ? value.scanPhase
         : "idle",
       scanTotalKnown: value.scanTotalKnown !== false,
-      scanCompleted: count(value.scanCompleted),
-      scanTotal: count(value.scanTotal),
+      scanCompleted,
+      scanTotal,
       roundId: typeof value.roundId === "string" && /^[A-Za-z0-9_-]{8,96}$/.test(value.roundId) ? value.roundId : "",
       roundCompleted: count(value.roundCompleted),
       roundTotal: count(value.roundTotal),
@@ -5743,12 +5818,9 @@ export class NtfyLanSync {
     includeConfigFolder: boolean,
     onProgress?: (completed: number, total: number) => void
   ): Promise<LanSyncMetadataEntry[]> {
-    const maxFileBytes = this.settings().maxFileBytes;
     const metadataMutationGenerationAtStart = this.metadataIndexMutationGeneration;
     this.metadataIndexReplaceBaselineGeneration = metadataMutationGenerationAtStart;
-    const rawFiles = (await this.options.storage.listFiles(true))
-      .map((file) => ({ ...file, originalPath: String(file.path || ""), path: this.normalizePath(file.path, includeConfigFolder) }))
-      .sort((left, right) => left.originalPath.localeCompare(right.originalPath));
+    const rawFiles = await this.listCurrentSyncFiles(includeConfigFolder);
     const scanFiles: LanSyncScanFileActivity[] = [];
     const candidates: Array<Omit<LanSyncFileStat, "path"> & { path: string; scanIndex: number }> = [];
     const baseEntries: LanSyncMetadataEntry[] = [];
@@ -5756,8 +5828,7 @@ export class NtfyLanSync {
     const establishedBaseline = this.metadataIndexReady || this.lastFullScanAt > 0;
     for (const file of rawFiles) {
       let reason = "";
-      if (!file.path || !Number.isFinite(file.size) || file.size < 0 || !Number.isFinite(file.mtime) || file.mtime < 0) reason = "unsafe-path";
-      else if (file.size > maxFileBytes) reason = "too-large";
+      if (file.size > this.settings().maxFileBytes) reason = "too-large";
       else if (candidates.length >= MAX_MANIFEST_FILES) reason = "manifest-limit";
       const unchanged = Boolean(
         !reason
@@ -5767,12 +5838,12 @@ export class NtfyLanSync {
         && this.metadataIndex.get(file.path)?.mtime === file.mtime
       );
       const scanIndex = scanFiles.push({
-        path: file.path || file.originalPath,
+        path: file.path,
         state: reason ? "skipped" : unchanged ? "cached" : "pending",
         size: Math.max(0, Number(file.size) || 0),
         reason: reason || (unchanged ? "metadata-cache" : "")
       }) - 1;
-      if (!reason && file.path) {
+      if (!reason) {
         seenPaths.add(file.path);
         baseEntries.push({ path: file.path, size: file.size, mtime: file.mtime });
         if (!unchanged) candidates.push({ path: file.path, size: file.size, mtime: file.mtime, scanIndex });
@@ -5866,6 +5937,20 @@ export class NtfyLanSync {
           && (!previous || previous.size !== file.size || previous.mtime !== file.mtime)
         ) queueScanCandidate(file.path);
         const activity = scan.files[file.scanIndex];
+        if (!activity || activity.reason === "missing-during-scan") return null;
+        // A file may be deleted or replaced between listFiles() and this
+        // metadata callback. Re-stat so the manifest and scan counters reflect
+        // the current device, never a stale snapshot entry.
+        const current = await this.options.storage.statFile(file.path).catch(() => null);
+        if (!current) {
+          await this.reconcilePathInActiveScan(scan, file.path);
+          return null;
+        }
+        if (current.size !== file.size || current.mtime !== file.mtime) {
+          file.size = current.size;
+          file.mtime = current.mtime;
+          this.markDirtyPath(file.path, REALTIME_DIRTY_DELAY_MS, true);
+        }
         activity.state = "cached";
         activity.reason = "metadata";
         scan.cached += 1;
@@ -5879,7 +5964,7 @@ export class NtfyLanSync {
         }
       }
       scan.phase = "complete";
-      scan.completed = scan.total;
+      scan.completed = Math.min(Math.max(0, scan.completed), Math.max(0, scan.total));
       if (scan.hashed === 0 && candidates.length > 0) scan.hashed = 1;
       report(true);
       const entries = [...new Map([...baseEntries, ...changedEntries].map((entry) => [entry.path, entry] as const)).values()]
@@ -6104,18 +6189,15 @@ export class NtfyLanSync {
     onProgress?: (completed: number, total: number) => void
   ): Promise<LanSyncManifestEntry[]> {
     const maxFileBytes = this.settings().maxFileBytes;
-    const rawFiles = (await this.options.storage.listFiles(true))
-      .map((file) => ({ ...file, originalPath: String(file.path || ""), path: this.normalizePath(file.path, includeConfigFolder) }))
-      .sort((left, right) => left.originalPath.localeCompare(right.originalPath));
+    const rawFiles = await this.listCurrentSyncFiles(includeConfigFolder);
     const scanFiles: LanSyncScanFileActivity[] = [];
     const candidates: Array<Omit<LanSyncFileStat, "path"> & { path: string; scanIndex: number }> = [];
     for (const file of rawFiles) {
       let reason = "";
-      if (!file.path || file.size < 0) reason = "unsafe-path";
-      else if (file.size > maxFileBytes) reason = "too-large";
+      if (file.size > maxFileBytes) reason = "too-large";
       else if (candidates.length >= MAX_MANIFEST_FILES) reason = "manifest-limit";
       const scanIndex = scanFiles.push({
-        path: file.path || file.originalPath,
+        path: file.path,
         state: reason ? "skipped" : "pending",
         size: Math.max(0, Number(file.size) || 0),
         reason

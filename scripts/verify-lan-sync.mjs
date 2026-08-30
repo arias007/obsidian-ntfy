@@ -1608,6 +1608,10 @@ try {
   assert.match(lanSource, /syncCandidatesTotal/, "Full-vault scan does not expose the discovered sync-candidate counter");
   assert.match(lanSource, /syncRoundCompleted/, "Transfer progress is missing the monotonic round completion counter");
   assert.match(lanSource, /queueScanCandidate\(file\.path\)/, "Filesystem producer does not queue changed files as soon as they are discovered");
+  assert.match(lanSource, /private async listCurrentSyncFiles\(includeConfigFolder: boolean\)/, "Metadata scans do not use a normalized current-file snapshot");
+  assert.match(lanSource, /const files = new Map<string, LanSyncFileStat>\(\)/, "Current-file snapshot does not deduplicate normalized paths");
+  assert.match(lanSource, /scan\.completed = Math\.min\(Math\.max\(0, scan\.completed\), Math\.max\(0, scan\.total\)\)/, "Scan completion is not clamped to the live denominator");
+  assert.match(lanSource, /missing-during-scan/, "Deletes racing a scan are not represented in the live scan counters");
   assert.match(source, /发现待同步/, "LAN details do not show discovered-vs-completed counters");
    assert.doesNotMatch(lanSource, /MAX_DIRTY_PATHS|4096/, "LAN runtime still contains the obsolete fixed dirty-path ceiling");
     assert.match(lanSource, /fullSyncOnlyPending/, "Manual full scan state is missing");
