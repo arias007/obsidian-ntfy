@@ -4048,7 +4048,7 @@ ${bodyHash}`;
         return;
       }
       if (!this.syncRoundId) this.beginSyncRound();
-      const localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation && !hasIncrementalWork ? this.fullSyncRequestId : "";
+      const localFullSyncRequestId = this.fullSyncRequested && !hasIncrementalWork ? this.fullSyncRequestId : "";
       const localDirty = /* @__PURE__ */ new Map();
       for (const path of this.activeEditDirty) {
         const generation = this.dirtyPaths.get(path);

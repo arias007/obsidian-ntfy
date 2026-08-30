@@ -4445,7 +4445,11 @@ export class NtfyLanSync {
     // A real changed path always outranks reconciliation. Even a full request
     // already advertised by either side waits until all discovered paths have
     // drained through bounded transfer batches.
-    const localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation && !hasIncrementalWork
+    // A manual full sync must be advertised immediately, even while the
+    // background filesystem walk is still enumerating. The peer can start its
+    // own scan in parallel; discovered paths remain eligible for incremental
+    // transfer and no longer leave the manual button apparently idle.
+    const localFullSyncRequestId = this.fullSyncRequested && !hasIncrementalWork
       ? this.fullSyncRequestId
       : "";
     const localDirty = new Map<string, number>();
