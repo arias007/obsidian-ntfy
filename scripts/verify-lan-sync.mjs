@@ -1631,6 +1631,8 @@ try {
    assert.match(source, /this\.lanSync\?\.requestSync\(\{ deep: true \}\)/, "Manual sync button must start a full-vault producer round");
   assert.match(lanSource, /syncCandidatesTotal/, "Full-vault scan does not expose the discovered sync-candidate counter");
   assert.match(lanSource, /syncRoundCompleted/, "Transfer progress is missing the monotonic round completion counter");
+  assert.match(lanSource, /scanScope: this\.fullRoundScanVisible \? "full" : "paths"/, "Remote scan scope is not distinguished between full-vault and path scans");
+  assert.match(lanSource, /previous\?\.scanScope === "full" && remoteProgress\.scanScope === "paths"/, "A path scan can overwrite the full-vault scan denominator");
   assert.match(lanSource, /queueScanCandidate\(file\.path\)/, "Filesystem producer does not queue changed files as soon as they are discovered");
   assert.match(lanSource, /private async listCurrentSyncFiles\(includeConfigFolder: boolean\)/, "Metadata scans do not use a normalized current-file snapshot");
   assert.match(lanSource, /const files = new Map<string, LanSyncFileStat>\(\)/, "Current-file snapshot does not deduplicate normalized paths");

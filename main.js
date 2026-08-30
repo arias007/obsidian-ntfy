@@ -2040,6 +2040,7 @@ ${bodyHash}`;
       this.fullSyncRequested = !this.metadataIndexReady && this.lastFullScanAt <= 0;
       if (this.fullSyncRequested) {
         this.roundRequiresScanCompletion = true;
+        this.fullRoundScanVisible = true;
         this.beginSyncRound();
       }
       await this.captureChangesSinceCheckpoint();
@@ -3748,7 +3749,7 @@ ${bodyHash}`;
       };
     }
     progressSignal() {
-      const scan = this.scanSignalValue ?? this.scanValue;
+      const scan = this.fullRoundScanVisible && this.scanValue.total > 0 ? this.scanValue : this.scanSignalValue ?? this.scanValue;
       const scanTotal = Math.max(0, Math.floor(scan.total));
       const scanCompleted = Math.min(Math.max(0, Math.floor(scan.completed)), scanTotal);
       return {
@@ -3765,6 +3766,7 @@ ${bodyHash}`;
         downloadCompleted: Math.max(0, Math.floor(this.progressValue.downloadCompleted)),
         scanPhase: scan.phase,
         scanTotalKnown: scan.totalKnown !== false,
+        scanScope: this.fullRoundScanVisible ? "full" : "paths",
         scanCompleted,
         scanTotal,
         roundId: this.syncRoundId,
@@ -3799,6 +3801,7 @@ ${bodyHash}`;
         downloadCompleted: count(value.downloadCompleted),
         scanPhase: value.scanPhase === "scanning" || value.scanPhase === "complete" || value.scanPhase === "error" || value.scanPhase === "idle" ? value.scanPhase : "idle",
         scanTotalKnown: value.scanTotalKnown !== false,
+        scanScope: value.scanScope === "full" ? "full" : "paths",
         scanCompleted,
         scanTotal,
         roundId: typeof value.roundId === "string" && /^[A-Za-z0-9_-]{8,96}$/.test(value.roundId) ? value.roundId : "",
@@ -3866,7 +3869,12 @@ ${bodyHash}`;
         this.prioritySyncPending = true;
       }
       const remoteProgress = this.parseRemoteProgress(payload.progress);
-      if (remoteProgress) peer.remoteProgress = remoteProgress;
+      if (remoteProgress) {
+        const previous = peer.remoteProgress;
+        if (!(previous?.scanScope === "full" && remoteProgress.scanScope === "paths")) {
+          peer.remoteProgress = remoteProgress;
+        }
+      }
       this.mergeRemoteRoundHistory(payload.roundHistory);
       this.mirrorRemoteProgress(peer);
       this.emitActivityChanged();
@@ -3951,6 +3959,11 @@ ${bodyHash}`;
             existing.port = peer.port;
             existing.canHost = existing.canHost || peer.canHost;
             existing.manual = true;
+            existing.lastInboundAt = Math.max(existing.lastInboundAt || 0, peer.lastInboundAt || 0);
+            existing.lastOutboundAt = Math.max(existing.lastOutboundAt || 0, peer.lastOutboundAt || 0);
+            existing.peerAckAt = Math.max(existing.peerAckAt || 0, peer.peerAckAt || 0);
+            existing.remoteConnectionToken = existing.remoteConnectionToken || peer.remoteConnectionToken;
+            existing.legacyHandshake = existing.legacyHandshake || peer.legacyHandshake;
             peer = existing;
           } else {
             peer.deviceId = responseDeviceId;
@@ -3965,6 +3978,7 @@ ${bodyHash}`;
         const remoteRequestedSync = this.applyRemoteSyncSignal(peer, response);
         const needsRemoteAck = !hadRemoteToken && typeof response.connectionToken === "string" && response.connectionToken.length > 0;
         peer.verifiedAt = this.now();
+        peer.peerAckAt = peer.peerAckAt || peer.verifiedAt;
         peer.lastSeenAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
         peer.consecutiveFailures = 0;
         peer.lastFailureAt = 0;
@@ -4009,7 +4023,7 @@ ${bodyHash}`;
     isPeerActive(peer, now = this.now()) {
       if (peer.verifiedAt <= 0) return false;
       const hasHandshakeState = typeof peer.peerAckAt === "number";
-      if (hasHandshakeState && peer.peerAckAt <= 0 && !peer.legacyHandshake) return false;
+      if (hasHandshakeState && peer.peerAckAt <= 0 && peer.lastOutboundAt <= 0 && !peer.legacyHandshake) return false;
       const lastSignalAt = peer.consecutiveFailures >= 3 ? peer.verifiedAt : Math.max(peer.lastSeenAt, peer.verifiedAt);
       if (peer.consecutiveFailures >= 3 && lastSignalAt > 0 && now - lastSignalAt > PEER_LINK_IDLE_TIMEOUT_MS) return false;
       if (peer.lastFailureAt > lastSignalAt && now - peer.lastFailureAt > PEER_FAILURE_EVICTION_DELAY_MS) return false;
@@ -5773,8 +5787,7 @@ ${bodyHash}`;
             peer.legacyHandshake = true;
             peer.peerAckAt = now;
           }
-          const acknowledged = typeof decrypted.connectionAckToken === "string" && decrypted.connectionAckToken === this.connectionToken;
-          if (acknowledged) peer.peerAckAt = now;
+          peer.peerAckAt = now;
           peer.consecutiveFailures = 0;
           peer.lastFailureAt = 0;
           peer.addresses = new Set([address, ...peer.addresses].slice(0, PEER_MAX_ADDRESS_HISTORY));

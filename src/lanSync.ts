@@ -376,6 +376,7 @@ type LanSyncRemoteProgress = {
   scanTotalKnown: boolean;
   scanCompleted: number;
   scanTotal: number;
+  scanScope: "full" | "paths";
   roundId?: string;
   roundCompleted?: number;
   roundTotal?: number;
@@ -1960,6 +1961,7 @@ export class NtfyLanSync {
     this.fullSyncRequested = !this.metadataIndexReady && this.lastFullScanAt <= 0;
     if (this.fullSyncRequested) {
       this.roundRequiresScanCompletion = true;
+      this.fullRoundScanVisible = true;
       this.beginSyncRound();
     }
     await this.captureChangesSinceCheckpoint();
@@ -4028,7 +4030,13 @@ export class NtfyLanSync {
     // other end can mirror it. Previously a passive peer showed nothing at all
     // while the coordinator scanned, which read as "stuck" on one side and
     // "working" on the other.
-    const scan = this.scanSignalValue ?? this.scanValue;
+    // A foreground full-vault round is the authoritative denominator. A
+    // concurrent path manifest may publish a smaller snapshot for its own
+    // request, but it must never replace the current device library total in
+    // the heartbeat sent to the peer.
+    const scan = this.fullRoundScanVisible && this.scanValue.total > 0
+      ? this.scanValue
+      : (this.scanSignalValue ?? this.scanValue);
     const scanTotal = Math.max(0, Math.floor(scan.total));
     const scanCompleted = Math.min(Math.max(0, Math.floor(scan.completed)), scanTotal);
     return {
@@ -4045,6 +4053,7 @@ export class NtfyLanSync {
       downloadCompleted: Math.max(0, Math.floor(this.progressValue.downloadCompleted)),
       scanPhase: scan.phase,
       scanTotalKnown: scan.totalKnown !== false,
+      scanScope: this.fullRoundScanVisible ? "full" : "paths",
       scanCompleted,
       scanTotal,
       roundId: this.syncRoundId,
@@ -4082,6 +4091,7 @@ export class NtfyLanSync {
         ? value.scanPhase
         : "idle",
       scanTotalKnown: value.scanTotalKnown !== false,
+      scanScope: value.scanScope === "full" ? "full" : "paths",
       scanCompleted,
       scanTotal,
       roundId: typeof value.roundId === "string" && /^[A-Za-z0-9_-]{8,96}$/.test(value.roundId) ? value.roundId : "",
@@ -4168,7 +4178,15 @@ export class NtfyLanSync {
       this.prioritySyncPending = true;
     }
     const remoteProgress = this.parseRemoteProgress(payload.progress);
-    if (remoteProgress) peer.remoteProgress = remoteProgress;
+    if (remoteProgress) {
+      const previous = peer.remoteProgress;
+      // A realtime path manifest is not a new library scan. Never let its
+      // tiny denominator replace the current full-vault total on the other
+      // device; only a full-scope snapshot may update that counter.
+      if (!(previous?.scanScope === "full" && remoteProgress.scanScope === "paths")) {
+        peer.remoteProgress = remoteProgress;
+      }
+    }
     this.mergeRemoteRoundHistory(payload.roundHistory);
     this.mirrorRemoteProgress(peer);
     // Heartbeat progress is an activity stream too. Refresh the panel even
@@ -4288,6 +4306,11 @@ export class NtfyLanSync {
           // otherwise the verified peer is silently excluded from syncTargets.
           existing.canHost = existing.canHost || peer.canHost;
           existing.manual = true;
+          existing.lastInboundAt = Math.max(existing.lastInboundAt || 0, peer.lastInboundAt || 0);
+          existing.lastOutboundAt = Math.max(existing.lastOutboundAt || 0, peer.lastOutboundAt || 0);
+          existing.peerAckAt = Math.max(existing.peerAckAt || 0, peer.peerAckAt || 0);
+          existing.remoteConnectionToken = existing.remoteConnectionToken || peer.remoteConnectionToken;
+          existing.legacyHandshake = existing.legacyHandshake || peer.legacyHandshake;
           peer = existing;
         } else {
           peer.deviceId = responseDeviceId;
@@ -4303,6 +4326,7 @@ export class NtfyLanSync {
       const remoteRequestedSync = this.applyRemoteSyncSignal(peer, response);
       const needsRemoteAck = !hadRemoteToken && typeof response.connectionToken === "string" && response.connectionToken.length > 0;
       peer.verifiedAt = this.now();
+      peer.peerAckAt = peer.peerAckAt || peer.verifiedAt;
       peer.lastSeenAt = Math.max(peer.lastSeenAt, peer.verifiedAt);
       peer.consecutiveFailures = 0;
       peer.lastFailureAt = 0;
@@ -4381,7 +4405,7 @@ export class NtfyLanSync {
     // Peers created by pre-handshake builds (or restored test fixtures) do not
     // have the new field; keep their existing grace-window semantics.
     const hasHandshakeState = typeof peer.peerAckAt === "number";
-    if (hasHandshakeState && peer.peerAckAt <= 0 && !peer.legacyHandshake) return false;
+    if (hasHandshakeState && peer.peerAckAt <= 0 && peer.lastOutboundAt <= 0 && !peer.legacyHandshake) return false;
     // Discovery packets are not a connection. A peer that has stopped sending
     // authenticated heartbeats/probe responses must leave the active set
     // quickly, otherwise a disconnected Wi-Fi link remains displayed for the
@@ -6580,8 +6604,11 @@ export class NtfyLanSync {
           peer.legacyHandshake = true;
           peer.peerAckAt = now;
         }
-        const acknowledged = typeof decrypted.connectionAckToken === "string" && decrypted.connectionAckToken === this.connectionToken;
-        if (acknowledged) peer.peerAckAt = now;
+        // A successful authenticated response carrying the remote runtime
+        // token proves both halves of the exchange. Older responses may omit
+        // the explicit ack field, so do not wait for a second probe when the
+        // encrypted response itself is valid.
+        peer.peerAckAt = now;
         peer.consecutiveFailures = 0;
         peer.lastFailureAt = 0;
         peer.addresses = new Set([address, ...peer.addresses].slice(0, PEER_MAX_ADDRESS_HISTORY));
