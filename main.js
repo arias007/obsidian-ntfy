@@ -2985,7 +2985,7 @@ ${bodyHash}`;
     }
     publishScanSignal(scan, force = false) {
       const current = this.scanSignalValue;
-      if (!force && current && current !== scan && current.phase === "scanning") return;
+      if (!force && current && current !== scan && current.phase === "scanning" && scan.total <= current.total) return;
       this.scanSignalValue = scan;
     }
     saveRoundHistory() {

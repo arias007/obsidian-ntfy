@@ -3149,7 +3149,11 @@ export class NtfyLanSync {
     // Keep a foreground/full scan authoritative while a small path manifest
     // runs alongside it. Once the current signal is complete, the next scan
     // may take over and its own denominator is sent to the peer.
-    if (!force && current && current !== scan && current.phase === "scanning") return;
+    // A full scan can start after a path manifest has already published a
+    // partial snapshot. Accept that replacement when its materialized total
+    // is larger; otherwise a phone may correctly display 19k/19k while the
+    // desktop keeps receiving the earlier 7k path-scan denominator.
+    if (!force && current && current !== scan && current.phase === "scanning" && scan.total <= current.total) return;
     this.scanSignalValue = scan;
   }
 
