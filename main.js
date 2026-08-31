@@ -855,6 +855,9 @@ var NtfyLanSyncRuntime = (() => {
   var PEER_LINK_IDLE_TIMEOUT_MS = 4e3;
   var PEER_PROBE_TIMEOUT_MS = 8e3;
   var PEER_RECONNECT_PROBE_TIMEOUT_MS = 2500;
+  var SUBNET_DISCOVERY_COOLDOWN_MS = 5e3;
+  var SUBNET_DISCOVERY_TIMEOUT_MS = 350;
+  var SUBNET_DISCOVERY_CONCURRENCY = 32;
   var PEER_FAILURE_EVICTION_DELAY_MS = 1800;
   var PEER_MAX_ADDRESS_HISTORY = 2;
   var REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 6e4;
@@ -890,6 +893,7 @@ var NtfyLanSyncRuntime = (() => {
   var MAX_CLOCK_SKEW_MS = 12e4;
   var REPLAY_TTL_MS = 18e4;
   var MAX_MANIFEST_FILES = 1e5;
+  var PASSIVE_PEER_TAKEOVER_SCAN_THRESHOLD = 1e4;
   var MAX_LEDGER_ENTRIES = 5e4;
   var HARD_MAX_REQUEST_BYTES = 960 * 1024 * 1024;
   var RATE_WINDOW_MS = 6e4;
@@ -1369,6 +1373,25 @@ ${bodyHash}`;
   function metadataMatches(entry, expected) {
     return Boolean(entry && expected && entry.size === expected.size && entry.mtime === expected.mtime);
   }
+  function firstSuccessful(tasks) {
+    if (!tasks.length) return Promise.reject(new Error("no_tasks"));
+    return new Promise((resolve, reject) => {
+      let remaining = tasks.length;
+      let lastError = null;
+      let settled = false;
+      for (const task of tasks) {
+        task.then((value) => {
+          if (settled) return;
+          settled = true;
+          resolve(value);
+        }).catch((error) => {
+          lastError = error;
+          remaining -= 1;
+          if (remaining <= 0 && !settled) reject(lastError instanceof Error ? lastError : new Error("peer_unreachable"));
+        });
+      }
+    });
+  }
   function metadataLedgerMatches(entry, expected) {
     return metadataMatches(entry, expected);
   }
@@ -1534,6 +1557,12 @@ ${bodyHash}`;
       downloadCompleted: 0
     };
   }
+  function isUploadAction(action) {
+    return action === "push" || action === "delete-remote";
+  }
+  function isDownloadAction(action) {
+    return action === "pull" || action === "delete-local";
+  }
   function sortedActivityGroups(groups) {
     return [...groups.values()].sort((left, right) => {
       if (!left.key) return -1;
@@ -1544,6 +1573,7 @@ ${bodyHash}`;
   function summarizeTransferGroups(files) {
     const groups = /* @__PURE__ */ new Map();
     for (const file of files) {
+      if (file.confirmed === false) continue;
       const key = lanSyncTopLevelGroup(file.path);
       const group = groups.get(key) ?? emptyActivityGroup(key);
       groups.set(key, group);
@@ -1557,10 +1587,10 @@ ${bodyHash}`;
         group.errors += 1;
       } else if (file.state === "syncing") group.active += 1;
       else if (file.state === "error") group.errors += 1;
-      if (file.action === "push") {
+      if (isUploadAction(file.action)) {
         group.uploads += 1;
         if (file.state === "complete") group.uploadCompleted += 1;
-      } else if (file.action === "pull") {
+      } else if (isDownloadAction(file.action)) {
         group.downloads += 1;
         if (file.state === "complete") group.downloadCompleted += 1;
       }
@@ -1713,6 +1743,7 @@ ${bodyHash}`;
     // Distinct from urgentDirtyPaths: it ships on its own 1-path channel and never
     // waits behind a bulk dirty scan.
     activeEditingPath = null;
+    activeEditBypassPath = null;
     activeEditDirty = /* @__PURE__ */ new Set();
     activeEditTimer = null;
     activeEditTimerDueAt = 0;
@@ -1728,6 +1759,8 @@ ${bodyHash}`;
     // a large vault.
     lastRealtimeProgressSignalAt = 0;
     reconnectTimer = null;
+    subnetProbeInFlight = false;
+    lastSubnetProbeAt = 0;
     transferBackoff = /* @__PURE__ */ new Map();
     syncRequestId = "";
     fullSyncRequestId = "";
@@ -1759,7 +1792,14 @@ ${bodyHash}`;
     // A round counts each path once, even when a transfer batch is retried or
     // rebuilt while the filesystem scan is still running.
     syncRoundPaths = /* @__PURE__ */ new Set();
+    // Completion is path based so retries/reconnects cannot increment the same
+    // shared-round counter more than once.
+    syncRoundCompletedPaths = /* @__PURE__ */ new Set();
     fullRoundScanVisible = false;
+    // True only while this device owns an active full-vault enumeration. A
+    // passive peer may keep a full-round snapshot visible while answering a
+    // remote request; that must not force a redundant filesystem walk.
+    localFullScanActive = false;
     // A round started by a full-vault request must not enter history until both
     // filesystem scans have reached their stable denominators. Incremental
     // rounds keep the flag false so a one-file edit can still complete quickly.
@@ -1768,6 +1808,7 @@ ${bodyHash}`;
     roundHistory = [];
     activityFiles = [];
     scanValue = this.emptyScanActivity();
+    scanValueScope = "paths";
     // Network peers need the scan that is actually running even when a
     // concurrent inbound/background scan is intentionally hidden from the
     // local panel. This signal snapshot is separate from the UI-owned scanValue
@@ -1796,7 +1837,8 @@ ${bodyHash}`;
     }
     progress() {
       const value = { ...this.progressValue };
-      if (!this.activePeers().length) {
+      const transferStillOwned = this.syncRunning || this.activeEditSyncRunning || this.inboundSession !== null || this.transferSessionActive;
+      if (!this.activePeers().length && !transferStillOwned) {
         value.changed = 0;
         value.roundCompleted = 0;
         value.roundTotal = 0;
@@ -1808,12 +1850,15 @@ ${bodyHash}`;
     }
     scanProgress() {
       const { files: _files, ...scan } = this.scanValue;
-      const total = Math.max(0, Math.floor(scan.total));
-      const connected = this.activePeers().length > 0;
+      const indexedTotal = this.metadataIndexReady ? Math.max(0, Math.floor(this.metadataIndex.size)) : 0;
+      const incremental = this.scanValueScope === "paths" && indexedTotal > scan.total && scan.total > 0;
+      const total = Math.max(0, Math.floor(incremental ? indexedTotal : scan.total || indexedTotal));
+      const baselineCompleted = incremental ? indexedTotal - scan.total + Math.max(0, Math.floor(scan.completed)) : Math.max(0, Math.floor(scan.completed));
+      const connected = this.activePeers().length > 0 || this.syncRunning || this.activeEditSyncRunning || this.inboundSession !== null || this.transferSessionActive;
       return {
         ...scan,
         total,
-        completed: Math.min(Math.max(0, Math.floor(scan.completed)), total),
+        completed: Math.min(Math.max(0, baselineCompleted), total),
         syncCandidates: connected ? scan.syncCandidates : 0,
         syncCandidatesTotal: connected ? scan.syncCandidatesTotal : 0
       };
@@ -1824,29 +1869,64 @@ ${bodyHash}`;
       const scanGroups = Array.isArray(options.scanGroups) ? new Set(options.scanGroups.map(String)) : null;
       const transferGroups = Array.isArray(options.transferGroups) ? new Set(options.transferGroups.map(String)) : null;
       const scanFiles = scanGroups ? this.scanValue.files.filter((file) => scanGroups.has(lanSyncTopLevelGroup(file.path))) : this.scanValue.files;
+      const roundFiles = this.syncRoundId && this.syncRoundTotal > 0 ? this.activityFiles.filter((file) => file.confirmed !== false && this.syncRoundPaths.has(file.path)) : this.activityFiles;
       const transferFiles = transferGroups ? this.activityFiles.filter((file) => transferGroups.has(lanSyncTopLevelGroup(file.path))) : this.activityFiles;
       const connected = this.activePeers().length > 0;
+      const indexedTotal = this.metadataIndexReady ? Math.max(0, Math.floor(this.metadataIndex.size)) : 0;
+      const incremental = this.scanValueScope === "paths" && indexedTotal > this.scanValue.total && this.scanValue.total > 0;
+      const localScanTotal = Math.max(0, Math.floor(incremental ? indexedTotal : this.scanValue.total || indexedTotal));
+      const localScanCompleted = incremental ? indexedTotal - this.scanValue.total + Math.max(0, Math.floor(this.scanValue.completed)) : Math.max(0, Math.floor(this.scanValue.completed));
+      const transferSummary = summarizeTransferGroups(roundFiles);
+      const transferTotals = transferSummary.reduce((totals, group) => ({
+        total: totals.total + Math.max(0, Number(group.total) || 0),
+        completed: totals.completed + Math.max(0, Number(group.completed) || 0),
+        uploads: totals.uploads + Math.max(0, Number(group.uploads) || 0),
+        uploadCompleted: totals.uploadCompleted + Math.max(0, Number(group.uploadCompleted) || 0),
+        downloads: totals.downloads + Math.max(0, Number(group.downloads) || 0),
+        downloadCompleted: totals.downloadCompleted + Math.max(0, Number(group.downloadCompleted) || 0)
+      }), { total: 0, completed: 0, uploads: 0, uploadCompleted: 0, downloads: 0, downloadCompleted: 0 });
+      const transferOwned = connected || this.syncRunning || this.activeEditSyncRunning || this.inboundSession !== null || this.transferSessionActive;
+      const activityProgress = transferOwned ? { ...this.progressValue } : {
+        ...this.progressValue,
+        changed: 0,
+        roundCompleted: 0,
+        roundTotal: 0,
+        scanCandidates: 0,
+        uploads: 0,
+        downloads: 0
+      };
+      if (transferTotals.total > 0) {
+        const sharedRoundTotal = Math.max(this.syncRoundTotal, transferTotals.total);
+        const sharedRoundCompleted = Math.min(
+          Math.max(this.syncRoundCompleted, transferTotals.completed),
+          sharedRoundTotal
+        );
+        activityProgress.roundTotal = sharedRoundTotal;
+        activityProgress.roundCompleted = sharedRoundCompleted;
+        activityProgress.total = sharedRoundTotal;
+        activityProgress.completed = sharedRoundCompleted;
+        activityProgress.uploads = transferTotals.uploads;
+        activityProgress.uploadCompleted = transferTotals.uploadCompleted;
+        activityProgress.downloads = transferTotals.downloads;
+        activityProgress.downloadCompleted = transferTotals.downloadCompleted;
+        activityProgress.roundId = activityProgress.roundId || this.syncRoundId || "pending-transfer";
+      }
       return {
-        progress: connected ? { ...this.progressValue } : {
-          ...this.progressValue,
-          changed: 0,
-          roundCompleted: 0,
-          roundTotal: 0,
-          scanCandidates: 0,
-          uploads: 0,
-          downloads: 0
-        },
+        progress: activityProgress,
         files: includeTransferFiles ? transferFiles.map((file) => ({ ...file })) : [],
         scan: {
           ...this.scanValue,
-          total: Math.max(0, Math.floor(this.scanValue.total)),
-          completed: Math.min(Math.max(0, Math.floor(this.scanValue.completed)), Math.max(0, Math.floor(this.scanValue.total))),
+          total: localScanTotal,
+          completed: Math.min(
+            localScanCompleted,
+            localScanTotal
+          ),
           syncCandidates: connected ? this.scanValue.syncCandidates : 0,
           syncCandidatesTotal: connected ? this.scanValue.syncCandidatesTotal : 0,
           files: includeScanFiles ? scanFiles.map((file) => ({ ...file })) : []
         },
         remote: this.remoteActivity(),
-        transferGroups: summarizeTransferGroups(this.activityFiles),
+        transferGroups: transferSummary,
         scanGroups: summarizeScanGroups(this.scanValue.files),
         roundHistory: this.roundHistory.map((round) => ({ ...round }))
       };
@@ -1861,8 +1941,10 @@ ${bodyHash}`;
         phase: remote.phase,
         scanPhase: remote.scanPhase,
         scanTotalKnown: remote.scanTotalKnown,
-        scanCompleted: remote.scanCompleted,
-        scanTotal: remote.scanTotal,
+        scanCompleted: remote.libraryCompleted ?? remote.scanCompleted,
+        scanTotal: remote.libraryTotal ?? remote.scanTotal,
+        libraryCompleted: remote.libraryCompleted,
+        libraryTotal: remote.libraryTotal,
         roundId: remote.roundId,
         roundCompleted: remote.roundCompleted,
         roundTotal: remote.roundTotal,
@@ -2041,6 +2123,7 @@ ${bodyHash}`;
       if (this.fullSyncRequested) {
         this.roundRequiresScanCompletion = true;
         this.fullRoundScanVisible = true;
+        this.localFullScanActive = true;
         this.beginSyncRound();
       }
       await this.captureChangesSinceCheckpoint();
@@ -2162,8 +2245,9 @@ ${bodyHash}`;
       this.prioritySyncPending = false;
       this.appliedMutationEvents.clear();
       this.servedFilesystemScanRequests.clear();
-      this.activityFiles = [];
+      this.activityFiles = this.activityFiles.filter((file) => file.state === "complete").map((file) => ({ ...file, confirmed: true }));
       this.scanValue = this.emptyScanActivity();
+      this.scanValueScope = "paths";
       this.scanSignalValue = null;
       this.fullRoundScanVisible = false;
       this.roundRequiresScanCompletion = false;
@@ -2171,6 +2255,7 @@ ${bodyHash}`;
       this.syncRoundCompleted = 0;
       this.syncRoundTotal = 0;
       this.syncRoundPaths.clear();
+      this.syncRoundCompletedPaths.clear();
       this.activityUpdatedAt = this.now();
       this.changePollInFlight = false;
       this.changePollInitialized = false;
@@ -2180,6 +2265,11 @@ ${bodyHash}`;
       this.testUpdateInFlight = false;
       this.lastTestUpdateBuildId = "";
       this.emit(defaultProgress("stopped"));
+    }
+    localFullScanTotal() {
+      const visibleTotal = Math.max(0, Math.floor(this.scanValue.total));
+      const indexedTotal = this.metadataIndexReady ? Math.max(0, Math.floor(this.metadataIndex.size)) : 0;
+      return Math.max(visibleTotal, indexedTotal);
     }
     async pollFilesystemChanges() {
       const listChangedSince = this.options.storage.listFilesChangedSince;
@@ -2305,15 +2395,21 @@ ${bodyHash}`;
       scan.completed = Math.min(Math.max(0, scan.completed), Math.max(0, scan.total));
       if (this.scanValue === scan) this.emitActivityChanged();
     }
-    async listCurrentSyncFiles(includeConfigFolder) {
+    async listCurrentSyncFiles(includeConfigFolder, onProgress) {
       const files = /* @__PURE__ */ new Map();
-      for (const raw of await this.options.storage.listFiles(true)) {
+      let discovered = 0;
+      for (const raw of await this.options.storage.listFiles(includeConfigFolder, (count) => {
+        discovered = Math.max(discovered, Math.floor(Number(count) || 0));
+        onProgress?.(discovered);
+      })) {
         const path = this.normalizePath(raw.path, includeConfigFolder);
         if (!path || !Number.isSafeInteger(raw.size) || raw.size < 0 || !Number.isFinite(raw.mtime) || raw.mtime < 0) continue;
         const entry = { path, size: raw.size, mtime: raw.mtime };
         const previous = files.get(path);
         if (!previous || entry.mtime > previous.mtime || entry.mtime === previous.mtime && entry.size >= previous.size) files.set(path, entry);
+        onProgress?.(Math.max(discovered, files.size));
       }
+      onProgress?.(files.size);
       return [...files.values()].sort((left, right) => left.path.localeCompare(right.path));
     }
     async classifyAppliedMutationEvent(path) {
@@ -2349,6 +2445,7 @@ ${bodyHash}`;
       const normalized = this.normalizePath(path, true);
       if (!normalized) return;
       this.activeEditingPath = normalized;
+      this.activeEditBypassPath = normalized;
       this.markDirtyPath(normalized, ACTIVE_EDIT_SYNC_DELAY_MS, true);
     }
     /** Clear the active-edit marker (called when the user switches away). */
@@ -2356,8 +2453,10 @@ ${bodyHash}`;
       const normalized = path ? this.normalizePath(path) : null;
       if (normalized && this.activeEditingPath === normalized) {
         this.activeEditingPath = null;
+        this.activeEditBypassPath = null;
       } else if (!normalized) {
         this.activeEditingPath = null;
+        this.activeEditBypassPath = null;
       }
       if (normalized && (this.dirtyPaths.has(normalized) || this.activeEditDirty.has(normalized))) {
         this.markDirtyPath(normalized, URGENT_SYNC_DELAY_MS, true);
@@ -2391,7 +2490,7 @@ ${bodyHash}`;
       if (urgent) {
         this.scheduleUrgentProbe();
         this.scheduleActiveEditSync(REALTIME_DIRTY_DELAY_MS);
-        if (this.isCoordinator() && !this.activeEditSyncRunning) {
+        if ((this.isCoordinator() || this.activeEditBypassPath === normalized) && !this.activeEditSyncRunning) {
           if (this.syncTimer) {
             clearTimeout(this.syncTimer);
             this.syncTimer = null;
@@ -2426,14 +2525,18 @@ ${bodyHash}`;
         this.fullSyncRequestId = randomId(18);
       }
       if (deep) {
+        this.localFullScanActive = true;
         this.roundRequiresScanCompletion = true;
         this.beginSyncRound();
         if (!this.fullRoundScanVisible) {
           this.fullRoundScanVisible = true;
+          this.localFullScanActive = true;
           if (this.scanValue.total > 0) {
-            this.scanValue = { ...this.scanValue, phase: "scanning", error: "" };
+            this.scanValue = { ...this.scanValue, phase: "scanning", error: "", scope: "full" };
+            this.scanValueScope = "full";
           } else {
-            this.scanValue = this.emptyScanActivity();
+            this.scanValue = { ...this.emptyScanActivity(), scope: "full" };
+            this.scanValueScope = "full";
           }
         }
       }
@@ -2900,13 +3003,16 @@ ${bodyHash}`;
     }
     emit(progress) {
       const sessionId = progress.sessionId || (progress.phase === "syncing" || progress.phase === "complete" ? this.currentTransferSessionId : "");
+      const mirroredRound = Boolean(
+        progress.roundId && Number.isFinite(progress.roundTotal) && Number(progress.roundTotal) > 0
+      );
       this.progressValue = {
         ...progress,
         sessionId,
         peerCount: this.activePeers().length,
-        roundId: this.syncRoundId,
-        roundCompleted: this.syncRoundCompleted,
-        roundTotal: this.syncRoundTotal,
+        roundId: mirroredRound ? progress.roundId : this.syncRoundId,
+        roundCompleted: mirroredRound ? Math.max(0, Math.floor(Number(progress.roundCompleted) || 0)) : this.syncRoundCompleted,
+        roundTotal: mirroredRound ? Math.max(0, Math.floor(Number(progress.roundTotal) || 0)) : this.syncRoundTotal,
         scanCandidates: this.scanValue.syncCandidatesTotal ?? this.scanValue.syncCandidates ?? 0,
         syncConfigFolder: this.settings().syncConfigFolder
       };
@@ -2943,16 +3049,18 @@ ${bodyHash}`;
         }
         return;
       }
-      this.activityFiles.push({ path: normalized, action, state: "pending", size: 0 });
+      this.activityFiles.push({ path: normalized, action, state: "pending", size: 0, confirmed: false });
       this.activityUpdatedAt = this.now();
       this.emitActivityChanged();
     }
     beginSyncRound() {
       if (this.syncRoundId) return;
+      this.activityFiles = [];
       this.syncRoundId = randomId(12);
       this.syncRoundCompleted = 0;
       this.syncRoundTotal = 0;
       this.syncRoundPaths.clear();
+      this.syncRoundCompletedPaths.clear();
       this.roundStartedAt = this.now();
     }
     roundScanCompleted(peer) {
@@ -3478,16 +3586,25 @@ ${bodyHash}`;
       this.emitInboundFileProgress(deviceId, success ? "syncing" : "error");
     }
     emitInboundFileProgress(deviceId, phase = "syncing") {
-      const completed = this.activityFiles.filter((file) => file.state === "complete").length;
-      const uploads = this.activityFiles.filter((file) => file.action === "push").length;
-      const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
-      const downloads = this.activityFiles.filter((file) => file.action === "pull").length;
-      const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
-      const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
       const session = this.inboundSession?.deviceId === deviceId ? this.inboundSession : null;
+      const sessionPaths = session ? new Set(session.filePaths) : null;
+      const trackedFiles = sessionPaths ? this.activityFiles.filter((file) => sessionPaths.has(file.path)) : this.activityFiles;
+      const completed = trackedFiles.filter((file) => file.state === "complete").length;
+      const uploads = trackedFiles.filter((file) => isUploadAction(file.action)).length;
+      const uploadCompleted = trackedFiles.filter((file) => isUploadAction(file.action) && file.state === "complete").length;
+      const downloads = trackedFiles.filter((file) => isDownloadAction(file.action)).length;
+      const downloadCompleted = trackedFiles.filter((file) => isDownloadAction(file.action) && file.state === "complete").length;
+      const bytesTransferred = trackedFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
       if (session) {
         this.syncRoundId = session.roundId || this.syncRoundId;
-        this.syncRoundCompleted = Math.max(this.syncRoundCompleted, session.roundCompleted + completed);
+        for (const file of trackedFiles) {
+          if (file.state === "complete") this.syncRoundCompletedPaths.add(file.path);
+        }
+        this.syncRoundCompleted = Math.min(
+          Math.max(this.syncRoundCompleted, session.roundCompleted),
+          Math.max(this.syncRoundTotal, session.roundTotal)
+        );
+        this.syncRoundCompleted = Math.max(this.syncRoundCompleted, this.syncRoundCompletedPaths.size);
         this.syncRoundTotal = Math.max(this.syncRoundTotal, session.roundTotal);
       }
       this.emit({
@@ -3495,9 +3612,9 @@ ${bodyHash}`;
         active: true,
         peerId: deviceId,
         completed,
-        total: Math.max(session?.total ?? 0, this.activityFiles.length),
+        total: Math.max(session?.total ?? 0, trackedFiles.length),
         bytesTransferred,
-        bytesTotal: Math.max(session?.bytesTotal ?? 0, this.activityFiles.reduce((sum, file) => sum + file.size, 0)),
+        bytesTotal: Math.max(session?.bytesTotal ?? 0, trackedFiles.reduce((sum, file) => sum + file.size, 0)),
         changed: completed,
         uploads,
         uploadCompleted,
@@ -3626,7 +3743,7 @@ ${bodyHash}`;
       for (const [path, generation] of [...this.dirtyPaths.entries()].reverse()) {
         if (!selected.has(path)) selected.set(path, generation);
       }
-      return [...selected.entries()].map(([path, generation]) => ({ path, generation }));
+      return [...selected.entries()].map(([path, generation]) => ({ path, generation, priority: this.urgentDirtyPaths.has(path) }));
     }
     parseDirtyPaths(value) {
       const paths = /* @__PURE__ */ new Map();
@@ -3750,8 +3867,14 @@ ${bodyHash}`;
     }
     progressSignal() {
       const scan = this.fullRoundScanVisible && this.scanValue.total > 0 ? this.scanValue : this.scanSignalValue ?? this.scanValue;
-      const scanTotal = Math.max(0, Math.floor(scan.total));
-      const scanCompleted = Math.min(Math.max(0, Math.floor(scan.completed)), scanTotal);
+      const indexedTotal = this.metadataIndexReady ? Math.max(0, Math.floor(this.metadataIndex.size)) : 0;
+      const rawScanTotal = Math.max(0, Math.floor(scan.total));
+      const useIndexedTotal = !this.fullRoundScanVisible || rawScanTotal <= 0;
+      const scanTotal = Math.max(rawScanTotal, useIndexedTotal ? indexedTotal : rawScanTotal);
+      const baselineCompleted = useIndexedTotal && indexedTotal > rawScanTotal && rawScanTotal > 0 ? indexedTotal - rawScanTotal + Math.max(0, Math.floor(scan.completed)) : Math.max(0, Math.floor(scan.completed));
+      const scanCompleted = Math.min(Math.max(0, baselineCompleted), scanTotal);
+      const scanScope = this.fullRoundScanVisible ? "full" : "paths";
+      const libraryCompleted = indexedTotal > rawScanTotal && rawScanTotal > 0 ? indexedTotal - rawScanTotal + Math.max(0, Math.floor(scan.completed)) : Math.max(0, Math.floor(scan.completed));
       return {
         phase: this.progressValue.phase,
         sessionId: this.progressValue.sessionId,
@@ -3766,9 +3889,11 @@ ${bodyHash}`;
         downloadCompleted: Math.max(0, Math.floor(this.progressValue.downloadCompleted)),
         scanPhase: scan.phase,
         scanTotalKnown: scan.totalKnown !== false,
-        scanScope: this.fullRoundScanVisible ? "full" : "paths",
+        scanScope,
         scanCompleted,
         scanTotal,
+        libraryCompleted: Math.min(libraryCompleted, indexedTotal > 0 ? indexedTotal : scanTotal),
+        libraryTotal: indexedTotal > 0 ? indexedTotal : scanTotal,
         roundId: this.syncRoundId,
         roundCompleted: Math.max(0, Math.floor(this.syncRoundCompleted)),
         roundTotal: Math.max(0, Math.floor(this.syncRoundTotal)),
@@ -3804,6 +3929,8 @@ ${bodyHash}`;
         scanScope: value.scanScope === "full" ? "full" : "paths",
         scanCompleted,
         scanTotal,
+        libraryCompleted: count(value.libraryCompleted),
+        libraryTotal: count(value.libraryTotal),
         roundId: typeof value.roundId === "string" && /^[A-Za-z0-9_-]{8,96}$/.test(value.roundId) ? value.roundId : "",
         roundCompleted: count(value.roundCompleted),
         roundTotal: count(value.roundTotal),
@@ -3857,10 +3984,13 @@ ${bodyHash}`;
       peer.remoteForceFilesystemScan = Boolean(peer.remoteFullSyncRequestId && payload.forceFilesystemScan === true);
       const previousRemoteDirty = peer.remoteDirtyPaths;
       const incomingRemoteDirty = this.parseDirtyPaths(payload.dirtyPaths);
+      const incomingPriority = new Set(
+        (Array.isArray(payload.dirtyPaths) ? payload.dirtyPaths : []).filter((item) => isRecord(item) && item.priority !== false).map((item) => this.normalizePath(item.path, true)).filter((path) => Boolean(path))
+      );
       let receivedPriorityPath = false;
       for (const [path, generation] of incomingRemoteDirty) {
         if (generation <= (previousRemoteDirty.get(path) ?? 0)) continue;
-        peer.remotePriorityDirtyPaths.set(path, generation);
+        if (incomingPriority.has(path)) peer.remotePriorityDirtyPaths.set(path, generation);
         this.ensurePendingActivityPath(path, "pull");
         receivedPriorityPath = true;
       }
@@ -3873,6 +4003,14 @@ ${bodyHash}`;
         const previous = peer.remoteProgress;
         if (!(previous?.scanScope === "full" && remoteProgress.scanScope === "paths")) {
           peer.remoteProgress = remoteProgress;
+        }
+        const remoteScanComplete = remoteProgress.scanScope === "full" && remoteProgress.scanTotal > 0 && remoteProgress.scanCompleted >= remoteProgress.scanTotal && remoteProgress.scanPhase !== "scanning";
+        const localEntryCount = this.metadataIndex.size;
+        const countDelta = Math.abs(localEntryCount - remoteProgress.scanTotal);
+        const materiallyDifferent = countDelta >= 512 && (remoteProgress.scanTotal * 2 <= localEntryCount || localEntryCount * 2 <= remoteProgress.scanTotal);
+        const localSnapshotMissing = this.scanValue.total <= 0;
+        if (remoteScanComplete && this.metadataIndexReady && (localSnapshotMissing || materiallyDifferent) && !this.fullSyncRequested && !this.syncRunning && !this.backgroundReconciliation && !this.syncRoundId && this.scanValue.phase !== "scanning" && this.progressValue.phase !== "syncing") {
+          this.requestSync({ deep: true });
         }
       }
       this.mergeRemoteRoundHistory(payload.roundHistory);
@@ -3902,6 +4040,9 @@ ${bodyHash}`;
         stage: "transferring",
         active: true,
         peerId: peer.deviceId,
+        roundId: remote.roundId ?? "",
+        roundCompleted: remote.roundCompleted ?? 0,
+        roundTotal: remote.roundTotal ?? 0,
         completed: remote.completed,
         total: remote.total,
         bytesTransferred: remote.bytesTransferred,
@@ -3930,7 +4071,7 @@ ${bodyHash}`;
         error
       });
     }
-    async verifyPeer(peer, force = false) {
+    async verifyPeer(peer, force = false, timeoutOverride) {
       const now = this.now();
       const minimumProbeInterval = Math.max(300, PEER_PROBE_INTERVAL_MS - 100);
       if (!this.runningValue || !peer.addresses.size) return;
@@ -3945,7 +4086,7 @@ ${bodyHash}`;
       const wasActiveBeforeProbe = this.isPeerActive(peer, now);
       const firstVerifiedConnection = peer.verifiedAt <= 0;
       try {
-        const probeTimeout = peer.consecutiveFailures > 0 ? PEER_RECONNECT_PROBE_TIMEOUT_MS : PEER_PROBE_TIMEOUT_MS;
+        const probeTimeout = timeoutOverride ?? (peer.consecutiveFailures > 0 ? PEER_RECONNECT_PROBE_TIMEOUT_MS : PEER_PROBE_TIMEOUT_MS);
         const hadRemoteToken = Boolean(peer.remoteConnectionToken);
         const response = await this.callPeer(peer, "/ping", this.syncSignalPayload(), probeTimeout);
         const responseDeviceId = typeof response.deviceId === "string" && /^[A-Za-z0-9_-]{16,64}$/.test(response.deviceId) ? response.deviceId : "";
@@ -4014,7 +4155,53 @@ ${bodyHash}`;
       await this.refreshIdentityIfChanged();
       this.refreshManualPeers();
       await Promise.all([...this.peers.values()].slice(0, 16).map(async (peer) => await this.verifyPeer(peer, force)));
+      if (this.settings().autoDiscovery && !this.activePeers().length) void this.probeLocalSubnets();
       this.emitPeersChanged();
+    }
+    localSubnetCandidates() {
+      const own = new Set(this.localAddresses());
+      const known = new Set([...this.peers.values()].flatMap((peer) => [...peer.addresses]));
+      const candidates = /* @__PURE__ */ new Set();
+      for (const item of this.localInterfaces()) {
+        const parts = item.address.split(".").map(Number);
+        const mask = item.netmask.split(".").map(Number);
+        if (parts.length !== 4 || mask.length !== 4) continue;
+        const hostBits = mask.reduce((count, value) => count + (8 - (value >>> 0).toString(2).replace(/0/g, "").length), 0);
+        if (hostBits > 8) continue;
+        const ip = parts.reduce((value, part) => value * 256 + part, 0) >>> 0;
+        const maskValue = mask.reduce((value, part) => value * 256 + part, 0) >>> 0;
+        const network = (ip & maskValue) >>> 0;
+        const broadcast = (network | ~maskValue >>> 0) >>> 0;
+        for (let value = network + 1; value < broadcast; value += 1) {
+          const address = `${value >>> 24}.${value >>> 16 & 255}.${value >>> 8 & 255}.${value & 255}`;
+          if (!own.has(address) && !known.has(address) && isPrivateLanAddress(address)) candidates.add(address);
+        }
+      }
+      return sortLanAddresses(candidates, this.localInterfaces()).slice(0, 512);
+    }
+    async probeLocalSubnets() {
+      if (!this.runningValue || this.subnetProbeInFlight) return;
+      const now = this.now();
+      if (now - this.lastSubnetProbeAt < SUBNET_DISCOVERY_COOLDOWN_MS) return;
+      const candidates = this.localSubnetCandidates();
+      if (!candidates.length) return;
+      this.lastSubnetProbeAt = now;
+      this.subnetProbeInFlight = true;
+      try {
+        await mapWithConcurrency(candidates, SUBNET_DISCOVERY_CONCURRENCY, async (address) => {
+          if (!this.runningValue || this.activePeers().length) return;
+          const probeId = randomId(18);
+          const probe = this.upsertPeer(probeId, this.settings().port, [address], this.now(), true, true);
+          try {
+            await this.verifyPeer(probe, true, SUBNET_DISCOVERY_TIMEOUT_MS);
+          } finally {
+            if (probe.verifiedAt <= 0 && this.peers.get(probeId) === probe) this.peers.delete(probeId);
+          }
+        });
+      } finally {
+        this.subnetProbeInFlight = false;
+        this.emitPeersChanged();
+      }
     }
     activePeers() {
       const now = this.now();
@@ -4068,10 +4255,14 @@ ${bodyHash}`;
     }
     isCoordinator() {
       if (!this.options.desktop) return true;
+      const peers = this.activePeers();
+      if (this.fullSyncRequested && peers.some((peer) => !peer.canHost && (peer.remoteProgress?.scanTotal ?? 0) >= PASSIVE_PEER_TAKEOVER_SCAN_THRESHOLD && peer.remoteProgress?.scanPhase === "complete")) return true;
       return this.syncTargets().every((peer) => this.deviceId.localeCompare(peer.deviceId) < 0);
     }
     syncTargets() {
-      return this.activePeers().filter((peer) => peer.canHost);
+      const peers = this.activePeers();
+      if (this.options.desktop && this.fullSyncRequested && peers.some((peer) => !peer.canHost && (peer.remoteProgress?.scanTotal ?? 0) >= PASSIVE_PEER_TAKEOVER_SCAN_THRESHOLD && peer.remoteProgress?.scanPhase === "complete")) return peers;
+      return peers.filter((peer) => peer.canHost);
     }
     ensureRealtimeWakeupPoll(peer) {
       if (this.options.desktop || !this.runningValue || !peer.canHost || !peer.capabilities.has(REALTIME_WAKEUP_CAPABILITY) || this.realtimeWakeupPolls.has(peer.deviceId)) return;
@@ -4176,6 +4367,7 @@ ${bodyHash}`;
             this.syncRoundId = "";
             this.syncRoundCompleted = 0;
             this.syncRoundTotal = 0;
+            this.syncRoundCompletedPaths.clear();
             this.roundRequiresScanCompletion = false;
             this.fullRoundScanVisible = false;
           }
@@ -4235,6 +4427,7 @@ ${bodyHash}`;
               this.syncRoundCompleted = 0;
               this.syncRoundTotal = 0;
               this.syncRoundPaths.clear();
+              this.syncRoundCompletedPaths.clear();
               this.roundRequiresScanCompletion = false;
               this.fullRoundScanVisible = false;
             }
@@ -4249,6 +4442,7 @@ ${bodyHash}`;
           this.syncRoundCompleted = 0;
           this.syncRoundTotal = 0;
           this.syncRoundPaths.clear();
+          this.syncRoundCompletedPaths.clear();
         }
         this.syncQueued = true;
         const peer = peers[0];
@@ -4310,7 +4504,8 @@ ${bodyHash}`;
       }, Math.max(0, delay));
     }
     async runActiveEditSync() {
-      if (!this.runningValue || this.activeEditSyncRunning || !this.isCoordinator()) return;
+      if (!this.runningValue || this.activeEditSyncRunning) return;
+      if (this.options.desktop && !this.isCoordinator() && !this.activeEditBypassPath) return;
       if (this.syncRunning && this.transferSessionActive) {
         this.prioritySyncPending = true;
         return;
@@ -4385,6 +4580,7 @@ ${bodyHash}`;
               this.syncRoundCompleted = 0;
               this.syncRoundTotal = 0;
               this.syncRoundPaths.clear();
+              this.syncRoundCompletedPaths.clear();
               this.roundRequiresScanCompletion = false;
               this.fullRoundScanVisible = false;
             }
@@ -4555,15 +4751,36 @@ ${bodyHash}`;
       }
       const transferSize = (action) => action.kind === "push" ? action.local?.size ?? 0 : action.kind === "pull" ? action.remote?.size ?? 0 : 0;
       const bytesTotal = actions.reduce((sum, action) => sum + transferSize(action), 0);
-      const uploads = actions.filter((action) => action.kind === "push").length;
-      const downloads = actions.filter((action) => action.kind === "pull").length;
-      this.activityFiles = actions.map((action) => ({
-        path: action.path,
-        action: action.kind,
-        state: "pending",
-        size: transferSize(action)
-      }));
+      const uploads = actions.filter((action) => isUploadAction(action.kind)).length;
+      const downloads = actions.filter((action) => isDownloadAction(action.kind)).length;
+      const previousActivity = new Map(this.activityFiles.map((file) => [file.path, file]));
+      this.activityFiles = actions.map((action) => {
+        const previous = previousActivity.get(action.path);
+        return {
+          path: action.path,
+          action: action.kind,
+          state: previous?.state === "complete" ? "complete" : "pending",
+          size: transferSize(action),
+          confirmed: true
+        };
+      });
+      for (const file of previousActivity.values()) {
+        if (!this.activityFiles.some((current) => current.path === file.path)) this.activityFiles.push({ ...file });
+      }
       this.activityUpdatedAt = this.now();
+      this.emit({
+        ...defaultProgress(actions.length ? "connected" : "complete"),
+        stage: actions.length ? "planning" : "complete",
+        active: true,
+        peerId: peer.deviceId,
+        total: actions.length,
+        bytesTotal,
+        uploads,
+        downloads,
+        uploadCompleted: 0,
+        downloadCompleted: 0
+      });
+      this.emitActivityChanged();
       let sessionId = randomId(18);
       this.currentTransferSessionId = sessionId;
       if (request.fullSync) {
@@ -4586,7 +4803,11 @@ ${bodyHash}`;
           roundId: this.syncRoundId,
           roundCompleted: this.syncRoundCompleted,
           roundTotal: this.syncRoundTotal,
-          files: this.activityFiles.map((file) => ({ path: file.path, action: file.action, size: file.size }))
+          // The wire plan is this batch only. `activityFiles` also retains
+          // completed paths from earlier batches in the same round for UI
+          // traceability, so serializing it here would make rawFiles.length
+          // exceed `total` and the receiver would reject the session.
+          files: actions.map((action) => ({ path: action.path, action: action.kind, size: transferSize(action) }))
         }, SESSION_TIMEOUT_MS);
       } catch (error) {
         this.transferSessionActive = false;
@@ -4635,7 +4856,7 @@ ${bodyHash}`;
       };
       const transferWorker = async () => {
         while (this.runningValue && failure === null && cursor < actions.length) {
-          if (this.prioritySyncPending) break;
+          if (this.prioritySyncPending && cursor > 0) break;
           const index = cursor;
           cursor += 1;
           const activity = this.activityFiles[index];
@@ -4666,9 +4887,12 @@ ${bodyHash}`;
             settledPaths.add(actions[index].path);
             if (result.commit) commits.push(result.commit);
             completed += 1;
-            this.syncRoundCompleted += 1;
-            if (actions[index].kind === "push") uploadCompleted += 1;
-            else if (actions[index].kind === "pull") downloadCompleted += 1;
+            if (!this.syncRoundCompletedPaths.has(actions[index].path)) {
+              this.syncRoundCompletedPaths.add(actions[index].path);
+              this.syncRoundCompleted = Math.min(this.syncRoundTotal, this.syncRoundCompleted + 1);
+            }
+            if (isUploadAction(actions[index].kind)) uploadCompleted += 1;
+            else if (isDownloadAction(actions[index].kind)) downloadCompleted += 1;
             bytesTransferred += result.bytes;
             changed += result.changed ? 1 : 0;
             conflicts += result.conflict ? 1 : 0;
@@ -4740,7 +4964,11 @@ ${bodyHash}`;
           }
         }
       };
-      await Promise.all(Array.from({ length: adaptiveTransferConcurrency(this.activityFiles) }, transferWorker));
+      const transferConcurrency = Math.max(1, adaptiveTransferConcurrency(actions));
+      await Promise.all(Array.from({ length: transferConcurrency }, transferWorker));
+      if (actions.length > 0 && completed === 0 && failure === null && cursor === 0) {
+        throw new Error("transfer_workers_not_started");
+      }
       this.saveMetadataLedger(peer.deviceId, ledger);
       const priorityYielded = failure === null && this.prioritySyncPending && actions.some((action) => !settledPaths.has(action.path));
       if (priorityYielded) {
@@ -4841,8 +5069,8 @@ ${bodyHash}`;
         size: Math.max(action.local?.size ?? 0, action.remote?.size ?? 0)
       }));
       this.activityUpdatedAt = this.now();
-      const uploads = actions.filter((action) => action.kind === "push").length;
-      const downloads = actions.filter((action) => action.kind === "pull").length;
+      const uploads = actions.filter((action) => isUploadAction(action.kind)).length;
+      const downloads = actions.filter((action) => isDownloadAction(action.kind)).length;
       let completed = 0;
       let uploadCompleted = 0;
       let downloadCompleted = 0;
@@ -4890,8 +5118,8 @@ ${bodyHash}`;
             const result = await this.executeAction(peer, actions[index], ledger);
             if (activity) activity.state = "complete";
             completed += 1;
-            if (actions[index].kind === "push") uploadCompleted += 1;
-            else if (actions[index].kind === "pull") downloadCompleted += 1;
+            if (isUploadAction(actions[index].kind)) uploadCompleted += 1;
+            else if (isDownloadAction(actions[index].kind)) downloadCompleted += 1;
             bytesTransferred += result.bytes;
             changed += result.changed ? 1 : 0;
             conflicts += result.conflict ? 1 : 0;
@@ -4919,7 +5147,11 @@ ${bodyHash}`;
           }
         }
       };
-      await Promise.all(Array.from({ length: adaptiveTransferConcurrency(this.activityFiles) }, transferWorker));
+      const transferConcurrency = Math.max(1, adaptiveTransferConcurrency(actions));
+      await Promise.all(Array.from({ length: transferConcurrency }, transferWorker));
+      if (actions.length > 0 && completed === 0 && failure === null && cursor === 0) {
+        throw new Error("transfer_workers_not_started");
+      }
       if (failure !== null) throw failure;
       this.saveLedger(peer.deviceId, ledger);
       peer.verifiedAt = this.now();
@@ -5131,7 +5363,11 @@ ${bodyHash}`;
       const scanLocked = this.fullRoundScanVisible || this.fullSyncRequested || this.scanValue.total > 0 || Boolean(this.syncRoundId && this.scanValue.total > 1);
       if (!scanLocked) this.publishScanSignal(scan);
       const exposeScanProgress = !scanLocked && this.canExposeScanProgress();
-      if (!scanLocked && this.canClaimScanValue()) this.scanValue = scan;
+      if (!scanLocked && this.canClaimScanValue()) {
+        scan.scope = "paths";
+        this.scanValue = scan;
+        this.scanValueScope = "paths";
+      }
       const report = () => {
         this.wakeRealtimeProgressSignal();
         if (!exposeScanProgress || this.scanValue !== scan) return;
@@ -5205,7 +5441,8 @@ ${bodyHash}`;
         if (this.metadataManifestBuild === activeBuild) this.metadataManifestBuild = null;
         return await this.buildMetadataManifest(includeConfigFolder, onProgress, forceFilesystemScan);
       }
-      const promise = !forceFilesystemScan && this.canUseMetadataIndex(includeConfigFolder) ? this.buildMetadataManifestFromIndex(includeConfigFolder, onProgress) : this.buildMetadataManifestOnce(includeConfigFolder, onProgress);
+      const requireCurrentSnapshot = forceFilesystemScan || this.localFullScanActive;
+      const promise = !requireCurrentSnapshot && this.canUseMetadataIndex(includeConfigFolder) ? this.buildMetadataManifestFromIndex(includeConfigFolder, onProgress) : this.buildMetadataManifestOnce(includeConfigFolder, onProgress);
       this.metadataManifestBuild = { includeConfigFolder, forceFilesystemScan, promise };
       this.manifestBuildStartedAt = this.now();
       try {
@@ -5233,7 +5470,31 @@ ${bodyHash}`;
     async buildMetadataManifestOnce(includeConfigFolder, onProgress) {
       const metadataMutationGenerationAtStart = this.metadataIndexMutationGeneration;
       this.metadataIndexReplaceBaselineGeneration = metadataMutationGenerationAtStart;
-      const rawFiles = await this.listCurrentSyncFiles(includeConfigFolder);
+      const indexedTotal = this.metadataIndexReady ? Math.max(0, this.metadataIndex.size) : 0;
+      const enumerationScan = {
+        ...this.emptyScanActivity(),
+        id: randomId(12),
+        phase: "scanning",
+        completed: 0,
+        total: indexedTotal,
+        totalKnown: false,
+        scope: "full"
+      };
+      if (this.fullRoundScanVisible || this.canClaimScanValue()) {
+        this.scanValue = enumerationScan;
+        this.scanValueScope = "full";
+        this.emitActivityChanged();
+      }
+      let lastEnumerationReportAt = 0;
+      const rawFiles = await this.listCurrentSyncFiles(includeConfigFolder, (discovered) => {
+        const count = Math.max(0, Math.floor(discovered));
+        enumerationScan.completed = count;
+        enumerationScan.total = Math.max(indexedTotal, count);
+        const now = this.now();
+        if (now - lastEnumerationReportAt < 40) return;
+        lastEnumerationReportAt = now;
+        if (this.scanValue === enumerationScan) this.emitActivityChanged();
+      });
       const scanFiles = [];
       const candidates = [];
       const baseEntries = [];
@@ -5279,15 +5540,19 @@ ${bodyHash}`;
       };
       this.publishScanSignal(scan, this.fullRoundScanVisible && this.fullSyncRequested);
       const exposeScanProgress = this.canExposeScanProgress();
-      if (this.fullRoundScanVisible && this.fullSyncRequested) {
+      if (this.fullRoundScanVisible) {
+        scan.scope = "full";
         this.scanValue = scan;
+        this.scanValueScope = "full";
       } else if (this.canClaimScanValue()) {
+        scan.scope = "full";
         this.scanValue = scan;
+        this.scanValueScope = "full";
       }
       let lastReportedAt = 0;
       const candidatePaths = /* @__PURE__ */ new Set();
       const queueScanCandidate = (path) => {
-        this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+        this.markDirtyPath(path, QUEUED_SYNC_DELAY_MS, false);
         if (candidatePaths.has(path)) return;
         candidatePaths.add(path);
         scan.syncCandidates = candidatePaths.size;
@@ -5333,6 +5598,7 @@ ${bodyHash}`;
         const entries = [...new Map([...baseEntries, ...changedEntries].map((entry) => [entry.path, entry])).values()].sort((left, right) => left.path.localeCompare(right.path));
         this.replaceMetadataIndex(entries, includeConfigFolder);
         this.recordFullScan();
+        this.localFullScanActive = false;
         return entries;
       } catch (error) {
         scan.phase = "error";
@@ -5541,7 +5807,11 @@ ${bodyHash}`;
       scan.hashed = Math.max(this.scanValue.hashed, candidates.length > 0 ? 1 : 0);
       scan.cached = this.scanValue.cached;
       const ownsScanDisplay = this.fullRoundScanVisible && this.scanValue.total === 0 || this.canClaimScanValue();
-      if (ownsScanDisplay) this.scanValue = scan;
+      if (ownsScanDisplay) {
+        scan.scope = "paths";
+        this.scanValue = scan;
+        this.scanValueScope = "paths";
+      }
       let lastReportedAt = 0;
       const report = (force = false) => {
         const now = this.now();
@@ -5753,45 +6023,64 @@ ${bodyHash}`;
       const requestPayload = peer.remoteConnectionToken ? { ...payload, connectionAckToken: peer.remoteConnectionToken, connectionToken: this.connectionToken } : { ...payload, connectionToken: this.connectionToken };
       const body = await encryptLanSyncPayload(secret, requestPayload);
       const headers = await authHeaders({ ...this.identity, secret }, this.deviceId, "POST", path, body, this.now());
-      let lastError = null;
       const addresses = sortLanAddresses(peer.addresses, this.localInterfaces());
-      for (const address of addresses) {
-        if (!isPrivateLanAddress(address)) continue;
+      if (!addresses.length) throw new Error("peer_unreachable:no_address");
+      const requestAtAddress = async (address) => {
+        if (!isPrivateLanAddress(address)) throw new Error("peer_unreachable:invalid_address");
         const host = address.includes(":") ? `[${address}]` : address;
-        try {
-          const response = await withTimeout(this.options.httpRequest({
-            url: `http://${host}:${peer.port}${path}`,
-            method: "POST",
-            headers,
-            body,
-            timeoutMs
-          }), timeoutMs);
-          if (response.status < 200 || response.status >= 300) {
-            let code = "peer_rejected";
-            try {
-              const errorBody = safeJsonObject(response.text);
-              if (typeof errorBody.error === "string") code = errorBody.error;
-            } catch {
-            }
-            throw new LanSyncProtocolError(code, response.status);
+        const response = await withTimeout(this.options.httpRequest({
+          url: `http://${host}:${peer.port}${path}`,
+          method: "POST",
+          headers,
+          body,
+          timeoutMs
+        }), timeoutMs);
+        if (response.status < 200 || response.status >= 300) {
+          let code = "peer_rejected";
+          try {
+            const errorBody = safeJsonObject(response.text);
+            if (typeof errorBody.error === "string") code = errorBody.error;
+          } catch {
           }
-          const decrypted = await decryptLanSyncPayload(secret, response.text);
-          const now = this.now();
-          peer.lastOutboundAt = now;
-          peer.verifiedAt = now;
-          const remoteToken = typeof decrypted.connectionToken === "string" ? decrypted.connectionToken : "";
-          if (remoteToken) {
-            peer.remoteConnectionToken = remoteToken;
-            peer.legacyHandshake = false;
-          } else {
-            peer.legacyHandshake = true;
-            peer.peerAckAt = now;
-          }
+          throw new LanSyncProtocolError(code, response.status);
+        }
+        const decrypted = await decryptLanSyncPayload(secret, response.text);
+        const now = this.now();
+        peer.lastOutboundAt = now;
+        peer.verifiedAt = now;
+        const remoteToken = typeof decrypted.connectionToken === "string" ? decrypted.connectionToken : "";
+        if (remoteToken) {
+          peer.remoteConnectionToken = remoteToken;
+          peer.legacyHandshake = false;
+        } else {
+          peer.legacyHandshake = true;
           peer.peerAckAt = now;
-          peer.consecutiveFailures = 0;
-          peer.lastFailureAt = 0;
-          peer.addresses = new Set([address, ...peer.addresses].slice(0, PEER_MAX_ADDRESS_HISTORY));
-          return decrypted;
+        }
+        peer.peerAckAt = now;
+        peer.consecutiveFailures = 0;
+        peer.lastFailureAt = 0;
+        peer.addresses = new Set([address, ...peer.addresses].slice(0, PEER_MAX_ADDRESS_HISTORY));
+        return decrypted;
+      };
+      if (route === "/ping" && addresses.length > 1) {
+        let protocolError = null;
+        let lastError2 = null;
+        const tasks = addresses.map((address) => requestAtAddress(address).catch((error) => {
+          lastError2 = error;
+          if (error instanceof LanSyncProtocolError) protocolError = error;
+          throw error;
+        }));
+        try {
+          return await firstSuccessful(tasks);
+        } catch {
+          if (protocolError) throw protocolError;
+          throw new Error(`peer_unreachable:${safeErrorCode(lastError2)}`);
+        }
+      }
+      let lastError = null;
+      for (const address of addresses) {
+        try {
+          return await requestAtAddress(address);
         } catch (error) {
           lastError = error;
         }
@@ -5975,6 +6264,20 @@ ${bodyHash}`;
         this.finishInboundFileActivity(deviceId, inboundActivityIndex, true);
         const encryptedResult = await encryptLanSyncPayload(secret, result);
         sendText(response, 200, encryptedResult);
+        if (metadataRoute === "/session/start" && this.inboundSession?.deviceId === inboundDeviceId) {
+          const coordinator = this.activePeers().find((candidate) => candidate.deviceId === inboundDeviceId);
+          if (coordinator) {
+            const sessionId = this.inboundSession.id;
+            let attempts = 0;
+            const nudge = () => {
+              if (!this.runningValue || !coordinator.remoteConnectionToken || this.inboundSession?.id !== sessionId) return;
+              attempts += 1;
+              void this.callPeer(coordinator, "/ping", this.syncSignalPayload(), PEER_RECONNECT_PROBE_TIMEOUT_MS).catch(() => void 0);
+              if (attempts < 8 && this.inboundSession?.id === sessionId) setTimeout(nudge, 250);
+            };
+            setTimeout(nudge, 0);
+          }
+        }
         if (metadataRoute === "/manifest") {
           this.emit({
             ...defaultProgress("connected"),
@@ -6049,13 +6352,35 @@ ${bodyHash}`;
         downloads: coordinatorUploads,
         roundId,
         roundCompleted,
-        roundTotal
+        roundTotal,
+        filePaths: files.map((file) => file.path)
       };
-      if (roundId) this.syncRoundId = roundId;
-      this.syncRoundCompleted = Math.max(this.syncRoundCompleted, roundCompleted);
-      this.syncRoundTotal = Math.max(this.syncRoundTotal, roundTotal);
+      const sameRound = Boolean(roundId && this.syncRoundId === roundId);
+      if (roundId && !sameRound) {
+        this.syncRoundId = roundId;
+        this.syncRoundCompleted = roundCompleted;
+        this.syncRoundTotal = roundTotal;
+        this.syncRoundPaths.clear();
+        this.syncRoundCompletedPaths.clear();
+      } else {
+        this.syncRoundCompleted = Math.max(this.syncRoundCompleted, roundCompleted);
+        this.syncRoundTotal = Math.max(this.syncRoundTotal, roundTotal);
+      }
       this.currentTransferSessionId = sessionId;
-      this.activityFiles = files;
+      for (const file of files) this.syncRoundPaths.add(file.path);
+      const previousActivity = sameRound ? new Map(this.activityFiles.map((file) => [file.path, file])) : /* @__PURE__ */ new Map();
+      this.activityFiles = files.map((file) => {
+        const previous = previousActivity.get(file.path);
+        return {
+          ...file,
+          state: previous?.state === "complete" ? "complete" : "pending",
+          confirmed: true
+        };
+      });
+      for (const file of previousActivity.values()) {
+        if (!this.activityFiles.some((current) => current.path === file.path)) this.activityFiles.push({ ...file });
+        if (sameRound && file.state === "complete") this.syncRoundCompletedPaths.add(file.path);
+      }
       this.activityUpdatedAt = this.now();
       this.emit({
         ...defaultProgress(files.length ? "syncing" : "complete"),
@@ -6122,11 +6447,17 @@ ${bodyHash}`;
       } else {
         for (const file of this.activityFiles) if (file.state === "pending" || file.state === "syncing") file.state = "error";
       }
-      const completed = this.activityFiles.filter((file) => file.state === "complete" || file.state === "deferred").length;
-      const completedForRound = this.activityFiles.filter((file) => file.state === "complete").length;
-      const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
-      const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
-      const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
+      const sessionPaths = new Set(session.filePaths);
+      const trackedFiles = this.activityFiles.filter((file) => sessionPaths.has(file.path));
+      const completed = trackedFiles.filter((file) => file.state === "complete" || file.state === "deferred").length;
+      const completedBefore = this.syncRoundCompletedPaths.size;
+      for (const file of trackedFiles) {
+        if (file.state === "complete") this.syncRoundCompletedPaths.add(file.path);
+      }
+      const completedForRound = Math.max(0, this.syncRoundCompletedPaths.size - completedBefore);
+      const uploadCompleted = trackedFiles.filter((file) => isUploadAction(file.action) && file.state === "complete").length;
+      const downloadCompleted = trackedFiles.filter((file) => isDownloadAction(file.action) && file.state === "complete").length;
+      const bytesTransferred = trackedFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
       if (session) {
         this.syncRoundId = session.roundId || this.syncRoundId;
         this.syncRoundCompleted = Math.max(this.syncRoundCompleted, session.roundCompleted + completedForRound);
@@ -6137,7 +6468,7 @@ ${bodyHash}`;
         active: true,
         peerId: deviceId,
         completed,
-        total: this.activityFiles.length,
+        total: trackedFiles.length,
         bytesTransferred,
         bytesTotal: session.bytesTotal,
         changed: completed,
@@ -6403,6 +6734,36 @@ class NtfyLanSyncDetailsModal extends Modal {
       : null;
     const effectiveStage = scanStage || (progress.phase === "syncing" ? "transferring" : (progress.stage || progress.phase));
     const headlineStage = scanStage ? "scanning" : effectiveStage;
+    // The transfer groups are the confirmed action snapshot. Use their
+    // totals for the headline too; otherwise the header can remain at 0/0
+    // while the rows below are already transferring files.
+    const transferSummary = (Array.isArray(transferGroups) ? transferGroups : []).reduce((totals, group) => ({
+      total: totals.total + Math.max(0, Number(group?.total) || 0),
+      completed: totals.completed + Math.max(0, Number(group?.completed) || 0),
+      uploads: totals.uploads + Math.max(0, Number(group?.uploads) || 0),
+      uploadCompleted: totals.uploadCompleted + Math.max(0, Number(group?.uploadCompleted) || 0),
+      downloads: totals.downloads + Math.max(0, Number(group?.downloads) || 0),
+      downloadCompleted: totals.downloadCompleted + Math.max(0, Number(group?.downloadCompleted) || 0),
+    }), { total: 0, completed: 0, uploads: 0, uploadCompleted: 0, downloads: 0, downloadCompleted: 0 });
+    const displayProgress = { ...progress };
+    if (transferSummary.total > 0) {
+      const sharedRoundTotal = Math.max(Number(progress.roundTotal) || 0, transferSummary.total);
+      const sharedRoundCompleted = Math.min(
+        Math.max(Number(progress.roundCompleted) || 0, transferSummary.completed),
+        sharedRoundTotal
+      );
+      displayProgress.total = sharedRoundTotal;
+      displayProgress.completed = sharedRoundCompleted;
+      displayProgress.roundTotal = sharedRoundTotal;
+      displayProgress.roundCompleted = sharedRoundCompleted;
+      displayProgress.uploads = transferSummary.uploads;
+      displayProgress.uploadCompleted = Math.min(transferSummary.uploadCompleted, transferSummary.uploads);
+      displayProgress.downloads = transferSummary.downloads;
+      displayProgress.downloadCompleted = Math.min(transferSummary.downloadCompleted, transferSummary.downloads);
+    }
+    // Keep the established renderer contract for older integrations/tests;
+    // the object now carries the same normalized values as the headline.
+    Object.assign(progress, displayProgress);
     const stageSteps = {
       stopped: 0,
       discovering: 0,
@@ -6450,18 +6811,18 @@ class NtfyLanSyncDetailsModal extends Modal {
         ? `对端发现 ${remoteFound} · 完成 ${remoteDone}`
         : `Peer found ${remoteFound} · completed ${remoteDone}`);
     }
-    if (progress.total > 0) progressParts.push(`${chinese ? "当前批次" : "Current batch"} ${progress.completed}/${progress.total}`);
-    const roundCompleted = Math.max(0, Number(progress.roundCompleted ?? 0) || 0);
-    const roundTotal = Math.max(0, Number(progress.roundTotal ?? 0) || 0);
+    if (displayProgress.total > 0) progressParts.push(`${chinese ? "当前批次" : "Current batch"} ${displayProgress.completed}/${displayProgress.total}`);
+    const roundCompleted = Math.max(0, Number(displayProgress.roundCompleted ?? 0) || 0);
+    const roundTotal = Math.max(0, Number(displayProgress.roundTotal ?? 0) || 0);
     if (roundCompleted > 0 || roundTotal > 0) {
       progressParts.push(chinese
         ? `需要同步 ${roundTotal} · 已完成 ${roundCompleted}/${roundTotal}`
         : `Need sync ${roundTotal} · Completed ${roundCompleted}/${roundTotal}`);
     }
-    if (progress.uploads > 0 || progress.downloads > 0) {
+    if (displayProgress.uploads > 0 || displayProgress.downloads > 0) {
       progressParts.push(chinese
-        ? `上传 ${progress.uploadCompleted || 0}/${progress.uploads || 0} · 下载 ${progress.downloadCompleted || 0}/${progress.downloads || 0}`
-        : `Upload ${progress.uploadCompleted || 0}/${progress.uploads || 0} · Download ${progress.downloadCompleted || 0}/${progress.downloads || 0}`);
+        ? `上传 ${displayProgress.uploadCompleted || 0}/${displayProgress.uploads || 0} · 下载 ${displayProgress.downloadCompleted || 0}/${displayProgress.downloads || 0}`
+        : `Upload ${displayProgress.uploadCompleted || 0}/${displayProgress.uploads || 0} · Download ${displayProgress.downloadCompleted || 0}/${displayProgress.downloads || 0}`);
     }
     if (progress.bytesTotal > 0) progressParts.push(`${formatLanFileSize(progress.bytesTransferred)} / ${formatLanFileSize(progress.bytesTotal)}`);
     if (progress.peerCount > 0) progressParts.push(chinese ? `${progress.peerCount} 台设备` : `${progress.peerCount} device${progress.peerCount === 1 ? "" : "s"}`);
@@ -6582,6 +6943,9 @@ class NtfyLanSyncDetailsModal extends Modal {
   }
 
   renderScanSection(body, scan, remote, groups, chinese, progress, stage, stageDescriptions) {
+    // Compatibility note for older generated bundles: the check section used
+    // to say "正在同步 · 本机已检查"; it now intentionally contains check-only
+    // wording so scan and transfer responsibilities stay visually separate.
     const details = body.createEl("details", { cls: "obsidian-ntfy-lan-details-section" });
     details.open = this.sectionState.scan;
     details.addEventListener("toggle", () => {
@@ -6596,15 +6960,13 @@ class NtfyLanSyncDetailsModal extends Modal {
       ? (stage === "peer-upgrade-required" ? "等待升级" : stage === "checking-peer" ? "检查版本" : stage === "requesting-peer-scan" ? "交换变化路径" : stage === "waiting-peer-scan" ? "等待变化文件" : stage === "complete" ? "已完成" : "尚未开始")
       : (stage === "peer-upgrade-required" ? "Update required" : stage === "checking-peer" ? "Checking version" : stage === "requesting-peer-scan" ? "Exchanging changed paths" : stage === "waiting-peer-scan" ? "Waiting for changed files" : stage === "complete" ? "Complete" : "Not started");
     const label = hasScanWork
-      ? `${chinese ? "正在同步 · 本机已检查" : "Syncing · Local checked"} ${scan.completed || 0} / ${chinese ? "本轮总检查" : "round total"} ${scan.total || 0}`
+      ? `${chinese ? "本机已检查" : "Local checked"} ${scan.completed || 0} / ${chinese ? "本轮总检查" : "round total"} ${scan.total || 0}`
       : hasRemoteScanWork
         ? (remote.scanTotalKnown === false
-          ? `${chinese ? "正在同步 · 对端扫描" : "Syncing · Peer scan"} ${remote.scanCompleted || 0}`
-          : `${chinese ? "正在同步 · 对端扫描" : "Syncing · Peer scan"} ${remote.scanCompleted || 0}/${remote.scanTotal}`)
+          ? `${chinese ? "对端已检查" : "Peer checked"} ${remote.scanCompleted || 0}`
+          : `${chinese ? "对端已检查" : "Peer checked"} ${remote.scanCompleted || 0}/${remote.scanTotal}`)
         : `${chinese ? "扫描" : "Scan"}：${idleLabel}`;
     summary.createSpan({ text: label });
-    const candidateCount = Math.max(0, Number(progress.roundTotal ?? 0) || 0);
-    if (candidateCount > 0) summary.createSpan({ cls: "obsidian-ntfy-lan-details-section-meta", text: chinese ? `待同步 ${candidateCount}` : `Need sync ${candidateCount}` });
     // Keep the collapsed summary limited to user-facing progress. Internal
     // cache/fingerprint counters made the panel look like diagnostic output
     // and obscured the actual scan and transfer state.
@@ -6619,7 +6981,6 @@ class NtfyLanSyncDetailsModal extends Modal {
     }
     const scanStats = panel.createDiv({ cls: "obsidian-ntfy-lan-details-progress-stats" });
     scanStats.createSpan({ text: chinese ? `已检查 ${scan.completed || 0} / 本轮总检查 ${scan.total || 0}` : `Checked ${scan.completed || 0} / Round total ${scan.total || 0}` });
-    scanStats.createSpan({ text: chinese ? `待同步 ${candidateCount}` : `Need sync ${candidateCount}` });
     if (hasRemoteScanWork) {
       const remoteLabel = `${chinese ? "对端已检查" : "Peer checked"} ${remote.scanCompleted || 0} / ${chinese ? "本轮总检查" : "round total"} ${remote.scanTotal || 0}`;
       panel.createDiv({ cls: "obsidian-ntfy-lan-details-section-empty", text: remoteLabel });
@@ -6640,9 +7001,6 @@ class NtfyLanSyncDetailsModal extends Modal {
     const summary = details.createEl("summary");
     const roundCompleted = Math.max(0, Number(progress.roundCompleted ?? 0) || 0);
     const roundTotal = Math.max(0, Number(progress.roundTotal ?? 0) || 0);
-    // A Vault event can be present in activity groups before the metadata
-    // planner has emitted its first transfer progress snapshot. Include those
-    // pending rows so the collapsed sync section immediately shows 0/N.
     const groupTotals = (Array.isArray(groups) ? groups : []).reduce((totals, group) => ({
       total: totals.total + Math.max(0, Number(group.total) || 0),
       completed: totals.completed + Math.max(0, Number(group.completed) || 0),
@@ -6651,15 +7009,15 @@ class NtfyLanSyncDetailsModal extends Modal {
       downloads: totals.downloads + Math.max(0, Number(group.downloads) || 0),
       downloadCompleted: totals.downloadCompleted + Math.max(0, Number(group.downloadCompleted) || 0),
     }), { total: 0, completed: 0, uploads: 0, uploadCompleted: 0, downloads: 0, downloadCompleted: 0 });
-    // Pending rows are wake-up hints discovered during scanning. They are not
-    // confirmed transfer actions until the metadata planner creates a session;
-    // never let those rows inflate the synchronized denominator.
-    const visibleTotal = Math.max(roundTotal, Number(progress.total) || 0);
-    const visibleCompleted = Math.max(roundCompleted, Number(progress.completed) || 0);
-    const visibleUploads = Math.max(Number(progress.uploads) || 0, roundTotal > 0 ? groupTotals.uploads : 0);
-    const visibleUploadCompleted = Math.max(Number(progress.uploadCompleted) || 0, roundTotal > 0 ? groupTotals.uploadCompleted : 0);
-    const visibleDownloads = Math.max(Number(progress.downloads) || 0, roundTotal > 0 ? groupTotals.downloads : 0);
-    const visibleDownloadCompleted = Math.max(Number(progress.downloadCompleted) || 0, roundTotal > 0 ? groupTotals.downloadCompleted : 0);
+    // The service exposes only confirmed actions in transferGroups. Use that
+    // same snapshot for every visible counter so total, directions, and rows
+    // cannot drift apart during the session handshake.
+    const visibleTotal = groupTotals.total > 0 ? groupTotals.total : roundTotal;
+    const visibleCompleted = groupTotals.total > 0 ? Math.min(groupTotals.completed, visibleTotal) : Math.min(roundCompleted, visibleTotal);
+    const visibleUploads = groupTotals.total > 0 ? groupTotals.uploads : Number(progress.uploads) || 0;
+    const visibleUploadCompleted = groupTotals.total > 0 ? Math.min(groupTotals.uploadCompleted, visibleUploads) : Math.min(Number(progress.uploadCompleted) || 0, visibleUploads);
+    const visibleDownloads = groupTotals.total > 0 ? groupTotals.downloads : Number(progress.downloads) || 0;
+    const visibleDownloadCompleted = groupTotals.total > 0 ? Math.min(groupTotals.downloadCompleted, visibleDownloads) : Math.min(Number(progress.downloadCompleted) || 0, visibleDownloads);
     const hasTransferWork = visibleTotal > 0;
     const label = hasTransferWork
       ? `${chinese ? "同步进度 · 本轮同步" : "Sync progress · Round sync"} ${visibleCompleted}/${visibleTotal}`
@@ -6826,7 +7184,7 @@ async function ensureNtfyLanFolder(adapter, folderPath) {
   }
 }
 
-async function listNtfyLanConfigFiles(adapter, configDir, identityRoot) {
+async function listNtfyLanConfigFiles(adapter, configDir, identityRoot, onProgress) {
   const root = normalizePath(configDir).replace(/^\/+|\/+$/g, "");
   const pathOptions = { syncConfigFolder: true, configDir: root, identityRoot };
   if (!root || !await adapter.exists(root)) return [];
@@ -6853,6 +7211,7 @@ async function listNtfyLanConfigFiles(adapter, configDir, identityRoot) {
         if (isLanSyncPathEligible(`${normalized}/__ntfy_scan__`, pathOptions)) pending.push(normalized);
       }
     }
+    onProgress?.(paths.length);
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
   const files = [];
@@ -6864,6 +7223,7 @@ async function listNtfyLanConfigFiles(adapter, configDir, identityRoot) {
     for (const { path, stat } of stats) {
       if (stat?.type === "file") files.push({ path, size: stat.size, mtime: stat.mtime });
     }
+    onProgress?.(files.length);
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
   return files;
@@ -7472,16 +7832,18 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       }),
       storage: {
         identityRoot,
-        listFiles: async (includeConfigFolder) => {
+        listFiles: async (includeConfigFolder, onProgress) => {
           const files = this.app.vault.getFiles().map((file) => ({
             path: file.path,
             size: file.stat.size,
             mtime: file.stat.mtime,
           }));
+          onProgress?.(files.length);
           if (!includeConfigFolder) return files;
-          const configFiles = await listNtfyLanConfigFiles(adapter, configDir, identityRoot);
+          const configFiles = await listNtfyLanConfigFiles(adapter, configDir, identityRoot, (configCount) => onProgress?.(files.length + configCount));
           const byPath = new Map(files.map((file) => [file.path, file]));
           for (const file of configFiles) byPath.set(file.path, file);
+          onProgress?.(byPath.size);
           return [...byPath.values()];
         },
         listFilesChangedSince: async (since, includeConfigFolder) => {
@@ -7606,7 +7968,32 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         return { status: response.status, text: await response.text() };
       },
       onProgress: (progress) => {
-        this.lanSyncProgress = progress;
+        // Progress callbacks can arrive from the coordinator batch and the
+        // receiver session in either order. Normalize them through the same
+        // confirmed transfer groups consumed by the panel before publishing
+        // to the status bar/API, so batch and round counters never diverge.
+        const activity = this.lanSync?.activity?.({ includeScanFiles: false, includeTransferFiles: false });
+        const totals = (Array.isArray(activity?.transferGroups) ? activity.transferGroups : []).reduce((sum, group) => ({
+          total: sum.total + Math.max(0, Number(group?.total) || 0),
+          completed: sum.completed + Math.max(0, Number(group?.completed) || 0),
+          uploads: sum.uploads + Math.max(0, Number(group?.uploads) || 0),
+          uploadCompleted: sum.uploadCompleted + Math.max(0, Number(group?.uploadCompleted) || 0),
+          downloads: sum.downloads + Math.max(0, Number(group?.downloads) || 0),
+          downloadCompleted: sum.downloadCompleted + Math.max(0, Number(group?.downloadCompleted) || 0),
+        }), { total: 0, completed: 0, uploads: 0, uploadCompleted: 0, downloads: 0, downloadCompleted: 0 });
+        this.lanSyncProgress = totals.total > 0
+          ? {
+              ...progress,
+              completed: Math.min(totals.completed, totals.total),
+              total: totals.total,
+              roundCompleted: Math.min(totals.completed, totals.total),
+              roundTotal: totals.total,
+              uploads: totals.uploads,
+              uploadCompleted: Math.min(totals.uploadCompleted, totals.uploads),
+              downloads: totals.downloads,
+              downloadCompleted: Math.min(totals.downloadCompleted, totals.downloads),
+            }
+          : progress;
         this.renderLanSyncStatusBar();
         this.lanSyncDetailsModal?.refresh();
         this.emitApiEvent("lan-progress", this.cloneApiValue(progress));
@@ -7702,8 +8089,22 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   lanSyncStatusText() {
     const progress = this.lanSyncProgress;
     const scan = this.lanSync?.scanProgress?.();
-    const syncCompleted = Math.max(0, Number(progress.roundCompleted ?? 0) || 0);
-    const syncTotal = Math.max(0, Number(progress.roundTotal ?? 0) || 0);
+    // Keep the compact status bar on the same confirmed transfer snapshot as
+    // the LAN panel. The legacy round counters are cumulative and can briefly
+    // include a prior batch while the panel has already switched to the
+    // current action set, which produced values such as 3 in the bar and 1 in
+    // the panel.
+    const snapshot = this.lanSyncActivitySnapshot({ includeScanFiles: false, includeTransferFiles: false });
+    const transferTotals = (Array.isArray(snapshot?.transferGroups) ? snapshot.transferGroups : []).reduce((totals, group) => ({
+      total: totals.total + Math.max(0, Number(group?.total) || 0),
+      completed: totals.completed + Math.max(0, Number(group?.completed) || 0),
+    }), { total: 0, completed: 0 });
+    const syncCompleted = transferTotals.total > 0
+      ? Math.min(transferTotals.completed, transferTotals.total)
+      : Math.max(0, Number(progress.roundCompleted ?? 0) || 0);
+    const syncTotal = transferTotals.total > 0
+      ? transferTotals.total
+      : Math.max(0, Number(progress.roundTotal ?? 0) || 0);
     // The status bar intentionally exposes only transfer progress. Scan
     // inspection counts belong in the LAN panel, where local and peer scans
     // can be shown without competing with the compact Wi-Fi indicator.
@@ -7712,7 +8113,31 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   }
 
   lanSyncActivitySnapshot(options = {}) {
-    return this.lanSync?.activity(options) ?? {
+    const snapshot = this.lanSync?.activity(options);
+    if (snapshot) {
+      // The service can briefly retain a smaller path/config snapshot while
+      // its complete local metadata index is already loaded. The modal must
+      // keep the local full-vault denominator authoritative in that handoff.
+      const indexedTotal = Number(this.lanSync?.metadataIndex?.size);
+      const scanTotal = Number(snapshot.scan?.total || 0);
+      const incremental = snapshot.scan?.scope === "paths"
+        && Number.isFinite(indexedTotal)
+        && indexedTotal > scanTotal
+        && scanTotal > 0;
+      if (incremental) {
+        snapshot.scan = {
+          ...snapshot.scan,
+          total: Math.floor(indexedTotal),
+          totalKnown: true,
+          completed: Math.min(
+            Math.max(0, Math.floor(indexedTotal - scanTotal + Number(snapshot.scan?.completed || 0))),
+            Math.floor(indexedTotal)
+          ),
+        };
+      }
+      return snapshot;
+    }
+    return {
       progress: Object.assign({}, this.lanSyncProgress),
       files: [],
       scan: { id: "", phase: "idle", completed: 0, total: 0, cached: 0, hashed: 0, skipped: 0, syncCandidates: 0, syncCandidatesTotal: 0, error: "", files: [] },

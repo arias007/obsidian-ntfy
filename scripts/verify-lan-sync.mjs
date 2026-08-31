@@ -959,6 +959,11 @@ try {
       immediateIncrementalActivity.files.some((file) => file.path === "Notes/identical.md" && file.state === "pending"),
       "A changed file did not appear in the transfer activity immediately"
     );
+    assert.ok(
+      immediateIncrementalActivity.progress.roundTotal >= 1
+        && immediateIncrementalActivity.progress.total >= 1,
+      "Pending transfer activity exposed a 0/0 synchronization denominator"
+    );
     await waitFor(() => storageB.text("Notes/identical.md") === "changed on A", "metadata push after a local edit");
     assert.equal((await storageB.statFile("Notes/identical.md")).mtime, 700, "Metadata push lost the source mtime");
     assert.ok(requestedRoutes.slice(incrementalRouteStart).includes("/cancip-lan/v1/metadata/v4/manifest/paths"), "A file event still requested a full-vault manifest");
@@ -1682,6 +1687,7 @@ try {
   assert.match(lanSource, /this\.wakeRealtimeSignalWaiters\(\);[\s\S]{0,180}this\.announce\(\)/, "Vault events do not wake waiting mobile peers before the compatibility announcement");
   assert.doesNotMatch(lanSource, /path\.startsWith\(`\$\{API_PREFIX\}\/metadata\/v3\/`\)/, "The server still blocks the v3 rolling-upgrade route");
   assert.match(lanSource, /const SMALL_TRANSFER_CONCURRENCY = 12/, "Small-file LAN transfers are not using the fast bounded worker pool");
+  assert.match(lanSource, /if \(this\.prioritySyncPending && cursor > 0\) break;/, "A pending priority edit must not prevent the bulk session from starting its first file");
   assert.match(lanSource, /function yieldToLanEventLoop\(\)/, "Full-vault enumeration does not yield to UI and heartbeat updates");
   assert.match(lanSource, /mapWithConcurrency\(candidates, HASH_CONCURRENCY/, "Large scans are not processed concurrently");
   assert.match(lanSource, /if \(!this\.runningValue \|\| this\.syncRunning \|\| this\.inboundSession \|\| this\.metadataManifestBuild \|\| this\.manifestBuild\) return;/, "Periodic full scans can still interrupt an active transfer or manifest enumeration");
