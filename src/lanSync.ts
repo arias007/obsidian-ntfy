@@ -3942,9 +3942,9 @@ export class NtfyLanSync {
       active: true,
       peerId: deviceId,
       completed,
-      total: Math.max(session?.total ?? 0, trackedFiles.length),
+      total: session?.total ?? this.activityFiles.length,
       bytesTransferred,
-      bytesTotal: Math.max(session?.bytesTotal ?? 0, trackedFiles.reduce((sum, file) => sum + file.size, 0)),
+      bytesTotal: session?.bytesTotal ?? this.activityFiles.reduce((sum, file) => sum + file.size, 0),
       changed: completed,
       uploads,
       uploadCompleted,
@@ -5148,7 +5148,6 @@ export class NtfyLanSync {
     // symmetric. A desktop that is not the elected coordinator must still be
     // able to push the file the user just changed.
     if (!this.runningValue || this.activeEditSyncRunning) return;
-    if (this.options.desktop && !this.isCoordinator() && !this.activeEditBypassPath) return;
     // A new edit is a green-lane event. Park the ordinary batch briefly so
     // this one-path session can start immediately after the current request
     // boundary, instead of waiting for every bulk file to drain.
@@ -7514,7 +7513,7 @@ export class NtfyLanSync {
       active: true,
       peerId: deviceId,
       completed,
-      total: trackedFiles.length,
+      total: session.total,
       bytesTransferred,
       bytesTotal: session.bytesTotal,
       changed: completed,

@@ -3612,9 +3612,9 @@ ${bodyHash}`;
         active: true,
         peerId: deviceId,
         completed,
-        total: Math.max(session?.total ?? 0, trackedFiles.length),
+        total: session?.total ?? this.activityFiles.length,
         bytesTransferred,
-        bytesTotal: Math.max(session?.bytesTotal ?? 0, trackedFiles.reduce((sum, file) => sum + file.size, 0)),
+        bytesTotal: session?.bytesTotal ?? this.activityFiles.reduce((sum, file) => sum + file.size, 0),
         changed: completed,
         uploads,
         uploadCompleted,
@@ -4504,8 +4504,7 @@ ${bodyHash}`;
       }, Math.max(0, delay));
     }
     async runActiveEditSync() {
-      if (!this.runningValue || this.activeEditSyncRunning) return;
-      if (this.options.desktop && !this.isCoordinator() && !this.activeEditBypassPath) return;
+    if (!this.runningValue || this.activeEditSyncRunning) return;
       if (this.syncRunning && this.transferSessionActive) {
         this.prioritySyncPending = true;
         return;
@@ -6468,7 +6467,7 @@ ${bodyHash}`;
         active: true,
         peerId: deviceId,
         completed,
-        total: trackedFiles.length,
+        total: session.total,
         bytesTransferred,
         bytesTotal: session.bytesTotal,
         changed: completed,
