@@ -802,7 +802,7 @@ var NtfyLanSyncRuntime = (() => {
   var ANNOUNCE_INTERVAL_MS = 800;
   var PEER_SWEEP_INTERVAL_MS = 300;
   var PEER_PROBE_INTERVAL_MS = 700;
-  var PEER_MIN_STABLE_GRACE_MS = 5e3;
+  var PEER_MIN_STABLE_GRACE_MS = 12e3;
   var PEER_MAX_ADDRESS_HISTORY = 2;
   var REMEMBERED_PEER_MAX_AGE_MS = 30 * 24 * 60 * 6e4;
   var SYNC_MIN_INTERVAL_MS = 250;
@@ -1711,7 +1711,7 @@ ${bodyHash}`;
       };
     }
     remoteActivity() {
-      const peer = this.activePeers().filter((candidate) => candidate.remoteProgress && this.now() - candidate.remoteProgress.receivedAt <= PEER_PROBE_INTERVAL_MS * 4).sort((left, right) => (right.remoteProgress?.receivedAt ?? 0) - (left.remoteProgress?.receivedAt ?? 0))[0];
+      const peer = this.activePeers().filter((candidate) => candidate.remoteProgress && this.now() - candidate.remoteProgress.receivedAt <= Math.max(1e4, PEER_PROBE_INTERVAL_MS * 12)).sort((left, right) => (right.remoteProgress?.receivedAt ?? 0) - (left.remoteProgress?.receivedAt ?? 0))[0];
       const remote = peer?.remoteProgress;
       if (!peer || !remote) return null;
       return {
@@ -3207,7 +3207,10 @@ ${bodyHash}`;
       peer.remoteForceFilesystemScan = Boolean(peer.remoteFullSyncRequestId && payload2.forceFilesystemScan === true);
       peer.remoteDirtyPaths = this.parseDirtyPaths(payload2.dirtyPaths);
       const remoteProgress = this.parseRemoteProgress(payload2.progress);
-      if (remoteProgress) peer.remoteProgress = remoteProgress;
+      if (remoteProgress) {
+        peer.remoteProgress = remoteProgress;
+        this.emitActivityChanged();
+      }
       this.mirrorRemoteProgress(peer);
       return requested;
     }
@@ -3216,7 +3219,7 @@ ${bodyHash}`;
       if (!remote) return;
       if (this.syncRunning || this.inboundSession || this.backgroundReconciliation) return;
       if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing") return;
-      if (this.now() - remote.receivedAt > PEER_PROBE_INTERVAL_MS * 4) return;
+      if (this.now() - remote.receivedAt > Math.max(1e4, PEER_PROBE_INTERVAL_MS * 12)) return;
       if (remote.phase !== "syncing" && !["enumerating", "fingerprinting", "packaging-manifest", "requesting-peer-scan", "planning", "waiting-plan"].includes(remote.stage)) return;
       if (remote.phase !== "syncing") {
         this.emit({

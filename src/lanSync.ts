@@ -390,7 +390,7 @@ const DISCOVERY_PORT = 43189;
 const ANNOUNCE_INTERVAL_MS = 800;
 const PEER_SWEEP_INTERVAL_MS = 300;
 const PEER_PROBE_INTERVAL_MS = 700;
-const PEER_MIN_STABLE_GRACE_MS = 5_000;
+const PEER_MIN_STABLE_GRACE_MS = 12_000;
 // Keep one current LAN address plus one recent fallback. Retaining a long
 // stale address list made reconnect try dead endpoints serially and look stuck.
 const PEER_MAX_ADDRESS_HISTORY = 2;
@@ -1494,7 +1494,7 @@ export class NtfyLanSync {
 
   private remoteActivity(): LanSyncRemoteActivity | null {
     const peer = this.activePeers()
-      .filter((candidate) => candidate.remoteProgress && this.now() - candidate.remoteProgress.receivedAt <= PEER_PROBE_INTERVAL_MS * 4)
+      .filter((candidate) => candidate.remoteProgress && this.now() - candidate.remoteProgress.receivedAt <= Math.max(10_000, PEER_PROBE_INTERVAL_MS * 12))
       .sort((left, right) => (right.remoteProgress?.receivedAt ?? 0) - (left.remoteProgress?.receivedAt ?? 0))[0];
     const remote = peer?.remoteProgress;
     if (!peer || !remote) return null;
@@ -3220,7 +3220,13 @@ export class NtfyLanSync {
     peer.remoteForceFilesystemScan = Boolean(peer.remoteFullSyncRequestId && payload.forceFilesystemScan === true);
     peer.remoteDirtyPaths = this.parseDirtyPaths(payload.dirtyPaths);
     const remoteProgress = this.parseRemoteProgress(payload.progress);
-    if (remoteProgress) peer.remoteProgress = remoteProgress;
+    if (remoteProgress) {
+      peer.remoteProgress = remoteProgress;
+      // Remote progress arrives on the authenticated heartbeat. Notify the UI
+      // immediately, even while this device is scanning, so the peer counter
+      // does not wait for the next local scan event or appear frozen.
+      this.emitActivityChanged();
+    }
     this.mirrorRemoteProgress(peer);
     return requested;
   }
@@ -3233,7 +3239,7 @@ export class NtfyLanSync {
     // of fighting over the status bar.
     if (this.syncRunning || this.inboundSession || this.backgroundReconciliation) return;
     if (this.progressValue.phase === "scanning" || this.progressValue.phase === "syncing") return;
-    if (this.now() - remote.receivedAt > PEER_PROBE_INTERVAL_MS * 4) return;
+    if (this.now() - remote.receivedAt > Math.max(10_000, PEER_PROBE_INTERVAL_MS * 12)) return;
     if (
       remote.phase !== "syncing"
       && !["enumerating", "fingerprinting", "packaging-manifest", "requesting-peer-scan", "planning", "waiting-plan"].includes(remote.stage)
