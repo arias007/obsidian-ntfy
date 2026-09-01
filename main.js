@@ -5635,12 +5635,15 @@ class NtfyLanSyncDetailsModal extends Modal {
       downloads: totals.downloads + Math.max(0, Number(group.downloads) || 0),
       downloadCompleted: totals.downloadCompleted + Math.max(0, Number(group.downloadCompleted) || 0),
     }), { total: 0, completed: 0, uploads: 0, uploadCompleted: 0, downloads: 0, downloadCompleted: 0 });
-    const visibleTotal = Math.max(roundTotal, Number(progress.total) || 0, groupTotals.total);
-    const visibleCompleted = Math.max(roundCompleted, Number(progress.completed) || 0, groupTotals.completed);
     const visibleUploads = Math.max(Number(progress.uploads) || 0, groupTotals.uploads);
     const visibleUploadCompleted = Math.max(Number(progress.uploadCompleted) || 0, groupTotals.uploadCompleted);
     const visibleDownloads = Math.max(Number(progress.downloads) || 0, groupTotals.downloads);
     const visibleDownloadCompleted = Math.max(Number(progress.downloadCompleted) || 0, groupTotals.downloadCompleted);
+    // Transfer completion is strictly the sum of the two directions. The
+    // scan round counters describe inspection and must never inflate sync
+    // progress (for example, 1730/1730 while only 1 file was uploaded).
+    const visibleTotal = Math.max(Number(progress.total) || 0, groupTotals.total, visibleUploads + visibleDownloads);
+    const visibleCompleted = Math.min(visibleTotal, visibleUploadCompleted + visibleDownloadCompleted);
     const hasTransferWork = visibleTotal > 0;
     const label = hasTransferWork
       ? `${chinese ? "同步进度 · 本轮同步" : "Sync progress · Round sync"} ${visibleCompleted}/${visibleTotal}`
@@ -5662,9 +5665,7 @@ class NtfyLanSyncDetailsModal extends Modal {
         ? `上传 ${visibleUploadCompleted}/${visibleUploads} · 下载 ${visibleDownloadCompleted}/${visibleDownloads}`
         : `Upload ${visibleUploadCompleted}/${visibleUploads} · Download ${visibleDownloadCompleted}/${visibleDownloads}`)
       : legacyDirectionSummary;
-    const transferStatsLabel = visibleTotal === roundTotal && visibleCompleted === roundCompleted
-      ? (chinese ? `已同步 ${roundCompleted}/${roundTotal}` : `Synchronized ${roundCompleted}/${roundTotal}`)
-      : (chinese ? `已同步 ${visibleCompleted}/${visibleTotal}` : `Synchronized ${visibleCompleted}/${visibleTotal}`);
+    const transferStatsLabel = chinese ? `已同步 ${visibleCompleted}/${visibleTotal}` : `Synchronized ${visibleCompleted}/${visibleTotal}`;
     summary.createSpan({ cls: "obsidian-ntfy-lan-details-section-meta", text: hasTransferWork
       ? (progress.bytesTotal > 0
           ? `${directionSummary} · ${formatLanFileSize(progress.bytesTransferred)} / ${formatLanFileSize(progress.bytesTotal)}`
@@ -5673,7 +5674,7 @@ class NtfyLanSyncDetailsModal extends Modal {
     if (!details.open) return;
     const panel = details.createDiv({ cls: "obsidian-ntfy-lan-details-section-body" });
     if (hasTransferWork) {
-      const bar = panel.createEl("progress", { cls: "obsidian-ntfy-lan-details-progress", attr: { max: String(visibleTotal || progress.bytesTotal || progress.total), value: String(Math.min(visibleCompleted || (progress.bytesTotal ? progress.bytesTransferred : progress.completed || 0), visibleTotal || progress.bytesTotal || progress.total)) } });
+      const bar = panel.createEl("progress", { cls: "obsidian-ntfy-lan-details-progress", attr: { max: String(visibleTotal || progress.bytesTotal || progress.total), value: String(Math.min(visibleCompleted, visibleTotal || progress.bytesTotal || progress.total)) } });
       bar.setAttribute("aria-label", label);
     }
     const transferStats = panel.createDiv({ cls: "obsidian-ntfy-lan-details-progress-stats" });
@@ -6683,9 +6684,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   lanSyncStatusText() {
     const progress = this.lanSyncProgress;
     const scan = this.lanSync?.scanProgress?.();
-    const syncCompleted = Math.max(0, Number(progress.roundCompleted ?? 0) || 0);
+    const syncCompleted = Math.max(0, (Number(progress.uploadCompleted) || 0) + (Number(progress.downloadCompleted) || 0));
     const discovered = Math.max(0, Number(scan?.syncCandidatesTotal ?? scan?.syncCandidates ?? progress.scanCandidates ?? 0) || 0);
-    const syncTotal = Math.max(0, Number(progress.roundTotal ?? 0) || 0, discovered);
+    const syncTotal = Math.max(0, (Number(progress.uploads) || 0) + (Number(progress.downloads) || 0));
     // The status bar intentionally exposes only transfer progress. Scan
     // inspection counts belong in the LAN panel, where local and peer scans
     // can be shown without competing with the compact Wi-Fi indicator.
