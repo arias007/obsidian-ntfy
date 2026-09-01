@@ -188,6 +188,23 @@ export type LanSyncActivitySnapshot = {
   remote: LanSyncRemoteActivity | null;
   transferGroups: LanSyncActivityGroup[];
   scanGroups: LanSyncActivityGroup[];
+  roundHistory: LanSyncRoundHistoryEntry[];
+};
+
+export type LanSyncRoundHistoryEntry = {
+  id: string;
+  startedAt: number;
+  finishedAt: number;
+  status: "complete" | "partial" | "error";
+  peerId: string;
+  localScanCompleted: number;
+  localScanTotal: number;
+  remoteScanCompleted: number;
+  remoteScanTotal: number;
+  syncCompleted: number;
+  syncTotal: number;
+  uploads: number;
+  downloads: number;
 };
 
 export type LanSyncRemoteActivity = {
@@ -1430,6 +1447,8 @@ export class NtfyLanSync {
   private progressValue = defaultProgress();
   private activityFiles: LanSyncFileActivity[] = [];
   private scanValue: LanSyncScanActivity = this.emptyScanActivity();
+  private roundHistory: LanSyncRoundHistoryEntry[] = [];
+  private recordedRoundIds = new Set<string>();
   // Manifest work performed on behalf of a peer must never take over the
   // local scan counter. When it did, the status bar rewound ("3/3" back to
   // "0/3") in the middle of the user's own pass, which is what made a sync
@@ -1489,7 +1508,8 @@ export class NtfyLanSync {
       },
       remote: this.remoteActivity(),
       transferGroups: summarizeTransferGroups(this.activityFiles),
-      scanGroups: summarizeScanGroups(this.scanValue.files)
+      scanGroups: summarizeScanGroups(this.scanValue.files),
+      roundHistory: this.roundHistory.map((round) => ({ ...round }))
     };
   }
 
@@ -1689,12 +1709,25 @@ export class NtfyLanSync {
       }
       await this.loadRememberedPeers();
       this.refreshManualPeers();
+      // The LAN endpoint is ready, while the vault index is still being
+      // recovered. Expose that work as an active scan immediately so the panel
+      // shows what is happening instead of appearing idle during startup.
+      this.emit({
+        ...defaultProgress("scanning"),
+        stage: "enumerating",
+        active: true,
+        completed: 0,
+        total: 0,
+        peerId: ""
+      });
       const metadataPreparation = (async (): Promise<void> => {
         await this.loadMetadataIndex();
         // Only a device with no persisted metadata baseline needs an initial
         // full-vault handshake. Reloads and ordinary elapsed time never create a
         // full scan request on their own.
-        this.fullSyncRequested = !this.metadataIndexReady && this.lastFullScanAt <= 0;
+    // Automatic startup is incremental. A full-vault round is only requested
+    // by the explicit manual sync command (requestSync({ deep: true })).
+    this.fullSyncRequested = false;
         await this.captureChangesSinceCheckpoint();
         if (!this.fullSyncRequestId) {
           this.fullSyncRequestId = randomId(18);
@@ -1715,7 +1748,6 @@ export class NtfyLanSync {
       this.intervals.push(setInterval(() => void this.pollLiveFilesystemChanges(), 1_000));
       this.intervals.push(setInterval(() => this.sweepPeers(), PEER_SWEEP_INTERVAL_MS));
       this.announce();
-      this.emit({ ...defaultProgress("discovering"), active: false });
       await metadataPreparation;
       void this.probePeers();
     } catch (error) {
@@ -3711,7 +3743,8 @@ export class NtfyLanSync {
   ): Promise<LanSyncPeerResult> {
     if (!this.metadataProtocol(peer)) throw new LanSyncProtocolError("peer_upgrade_required", 426);
     const remoteDirty = new Map([...new Map(peer.remoteDirtyPaths ?? []).entries()].slice(0, INCREMENTAL_PATH_BATCH_SIZE));
-    const hasIncrementalWork = localDirty.size > 0 || remoteDirty.size > 0;
+    const hasIncrementalWork = !localFullSyncRequestId && !peer.remoteFullSyncRequestId
+      && (localDirty.size > 0 || remoteDirty.size > 0);
     const remoteFullSyncRequestId = this.backgroundReconciliation || hasIncrementalWork
       ? ""
       : peer.remoteFullSyncRequestId ?? "";
@@ -4137,6 +4170,29 @@ export class NtfyLanSync {
       downloadCompleted,
       error: this.lastErrorValue
     });
+    if (success && finishFailure === null && this.scanValue.phase === "complete") {
+      const roundId = request.localFullSyncRequestId || request.remoteFullSyncRequestId || this.scanValue.id;
+      if (!this.recordedRoundIds.has(roundId)) {
+        this.recordedRoundIds.add(roundId);
+        this.roundHistory.push({
+          id: roundId,
+          startedAt: this.progressUpdatedAt || this.now(),
+          finishedAt: this.now(),
+          status: failedPaths.size ? "partial" : "complete",
+          peerId: peer.deviceId,
+          localScanCompleted: this.scanValue.completed,
+          localScanTotal: this.scanValue.total,
+          remoteScanCompleted: peer.remoteProgress?.scanCompleted ?? 0,
+          remoteScanTotal: peer.remoteProgress?.scanTotal ?? 0,
+          syncCompleted: completed,
+          syncTotal: actions.length,
+          uploads,
+          downloads
+        });
+        if (this.roundHistory.length > 50) this.roundHistory.splice(0, this.roundHistory.length - 50);
+        this.emitActivityChanged();
+      }
+    }
     this.currentTransferSessionId = "";
     return {
       settledLocalPaths: new Set([...request.localDirty.keys()].filter((path) => settledPaths.has(path))),
@@ -4453,7 +4509,12 @@ export class NtfyLanSync {
   // else is actively scanning.
   private canClaimScanValue(): boolean {
     if (this.backgroundReconciliation) return this.scanValue.phase !== "scanning";
-    return true;
+    // Never replace a visible scan while it is active. Full-vault and
+    // incremental/inbound manifests can overlap; letting the later one claim
+    // the shared value made progress jump from a completed total back to an
+    // earlier cursor. The current owner finishes its round before another
+    // scan may become visible.
+    return this.scanValue.phase !== "scanning";
   }
 
   private async withInboundManifestScope<T>(work: () => Promise<T>): Promise<T> {
@@ -4605,11 +4666,10 @@ export class NtfyLanSync {
       // Even an idle incremental check must expose the real local vault size;
       // reporting 0/0 made the panel look as if the device had not scanned.
       const currentTotal = (await this.options.storage.listFiles(includeConfigFolder)).length;
-      if (this.scanValue.phase !== "scanning") {
-        this.scanValue.total = currentTotal;
-        this.scanValue.completed = currentTotal;
-        this.scanValue.totalKnown = true;
-      }
+      this.scanValue.total = currentTotal;
+      this.scanValue.completed = currentTotal;
+      this.scanValue.totalKnown = true;
+      this.scanValue.phase = "complete";
       onProgress?.(this.scanValue.completed, this.scanValue.total);
     }
     if (dirty.length) onProgress?.(this.scanValue.completed, this.scanValue.total);
