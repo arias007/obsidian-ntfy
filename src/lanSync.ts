@@ -4411,12 +4411,20 @@ export class NtfyLanSync {
     includeConfigFolder = this.settings().syncConfigFolder
   ): Promise<LanSyncMetadataEntry[]> {
     const unique = [...new Set(paths)].slice(0, MAX_MANIFEST_FILES);
+    // The denominator is always the current device vault size, even when
+    // this pass only inspects dirty paths. Start the visible cursor at the
+    // portion already covered by the saved baseline, then advance it as each
+    // dirty path is checked. This keeps an incremental pass continuous (for
+    // example 15000/18000 -> 18000/18000) instead of resetting to 0/N.
+    const currentFiles = await this.options.storage.listFiles(includeConfigFolder);
+    const libraryTotal = currentFiles.length;
+    const baselineCompleted = Math.max(0, libraryTotal - unique.length);
     const scan: LanSyncScanActivity = {
       id: randomId(12),
       phase: "scanning",
-      completed: 0,
-      total: unique.length,
-      totalKnown: false,
+      completed: baselineCompleted,
+      total: libraryTotal,
+      totalKnown: true,
       cached: 0,
       hashed: 0,
       skipped: 0,
@@ -4438,7 +4446,7 @@ export class NtfyLanSync {
           activity.state = "skipped";
           activity.reason = "unsafe-path";
           scan.skipped += 1;
-          scan.completed += 1;
+          scan.completed = Math.min(scan.total, scan.completed + 1);
           report();
           return null;
         }
@@ -4448,7 +4456,7 @@ export class NtfyLanSync {
           activity.path = path;
           activity.state = "complete";
           activity.reason = "missing";
-          scan.completed += 1;
+          scan.completed = Math.min(scan.total, scan.completed + 1);
           report();
           return null;
         }
@@ -4459,7 +4467,7 @@ export class NtfyLanSync {
           activity.state = "skipped";
           activity.reason = stat.size > this.settings().maxFileBytes ? "too-large" : "invalid-metadata";
           scan.skipped += 1;
-          scan.completed += 1;
+          scan.completed = Math.min(scan.total, scan.completed + 1);
           report();
           return null;
         }
@@ -4535,7 +4543,15 @@ export class NtfyLanSync {
       await this.buildMetadataManifestForPaths(dirty, includeConfigFolder);
       this.metadataIndexGeneration = Math.max(this.metadataIndexGeneration, ...dirtyEntries.map(([, generation]) => generation));
     } else {
-      onProgress?.(0, 0);
+      // Even an idle incremental check must expose the real local vault size;
+      // reporting 0/0 made the panel look as if the device had not scanned.
+      const currentTotal = (await this.options.storage.listFiles(includeConfigFolder)).length;
+      if (this.scanValue.phase !== "scanning") {
+        this.scanValue.total = currentTotal;
+        this.scanValue.completed = currentTotal;
+        this.scanValue.totalKnown = true;
+      }
+      onProgress?.(this.scanValue.completed, this.scanValue.total);
     }
     if (dirty.length) onProgress?.(this.scanValue.completed, this.scanValue.total);
     const maxFileBytes = this.settings().maxFileBytes;
