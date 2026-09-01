@@ -1876,15 +1876,6 @@ ${bodyHash}`;
       this.lastFullScanAt = this.loadLastFullScanAt();
       this.loadChangeJournal();
       this.loadHashCache();
-      await this.loadMetadataIndex();
-      this.fullSyncRequested = !this.metadataIndexReady && this.lastFullScanAt <= 0;
-      await this.captureChangesSinceCheckpoint();
-      if (!this.fullSyncRequestId) {
-        this.fullSyncRequestId = randomId(18);
-        this.syncRequestId = this.fullSyncRequestId;
-      }
-      if (!this.syncRequestId) this.syncRequestId = randomId(18);
-      this.loadPendingMessages();
       this.runningValue = true;
       this.lastErrorValue = "";
       try {
@@ -1901,6 +1892,17 @@ ${bodyHash}`;
         }
         await this.loadRememberedPeers();
         this.refreshManualPeers();
+        const metadataPreparation = (async () => {
+          await this.loadMetadataIndex();
+          this.fullSyncRequested = !this.metadataIndexReady && this.lastFullScanAt <= 0;
+          await this.captureChangesSinceCheckpoint();
+          if (!this.fullSyncRequestId) {
+            this.fullSyncRequestId = randomId(18);
+            this.syncRequestId = this.fullSyncRequestId;
+          }
+          if (!this.syncRequestId) this.syncRequestId = randomId(18);
+          this.loadPendingMessages();
+        })();
         this.intervals.push(setInterval(() => this.announce(), ANNOUNCE_INTERVAL_MS));
         this.intervals.push(setInterval(() => void this.probePeers(), PEER_PROBE_INTERVAL_MS));
         this.intervals.push(setInterval(() => {
@@ -1910,6 +1912,7 @@ ${bodyHash}`;
         this.intervals.push(setInterval(() => this.sweepPeers(), PEER_SWEEP_INTERVAL_MS));
         this.announce();
         this.emit({ ...defaultProgress("discovering"), active: false });
+        await metadataPreparation;
         void this.probePeers();
       } catch (error) {
         this.lastErrorValue = safeErrorCode(error);

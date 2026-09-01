@@ -1670,21 +1670,12 @@ export class NtfyLanSync {
     this.lastFullScanAt = this.loadLastFullScanAt();
     this.loadChangeJournal();
     this.loadHashCache();
-    await this.loadMetadataIndex();
-    // Only a device with no persisted metadata baseline needs an initial
-    // full-vault handshake. Reloads and ordinary elapsed time never create a
-    // full scan request on their own.
-    this.fullSyncRequested = !this.metadataIndexReady && this.lastFullScanAt <= 0;
-    await this.captureChangesSinceCheckpoint();
-    if (!this.fullSyncRequestId) {
-      this.fullSyncRequestId = randomId(18);
-      this.syncRequestId = this.fullSyncRequestId;
-    }
-    if (!this.syncRequestId) this.syncRequestId = randomId(18);
-    this.loadPendingMessages();
     this.runningValue = true;
     this.lastErrorValue = "";
     try {
+      // Bring up the LAN endpoint before loading the vault index. On large
+      // vaults index recovery can take minutes, but peers can reconnect and
+      // exchange liveness immediately while that work continues.
       if (this.options.desktop) {
         await this.startServer();
         await this.publishPeerDescriptor();
@@ -1698,6 +1689,20 @@ export class NtfyLanSync {
       }
       await this.loadRememberedPeers();
       this.refreshManualPeers();
+      const metadataPreparation = (async (): Promise<void> => {
+        await this.loadMetadataIndex();
+        // Only a device with no persisted metadata baseline needs an initial
+        // full-vault handshake. Reloads and ordinary elapsed time never create a
+        // full scan request on their own.
+        this.fullSyncRequested = !this.metadataIndexReady && this.lastFullScanAt <= 0;
+        await this.captureChangesSinceCheckpoint();
+        if (!this.fullSyncRequestId) {
+          this.fullSyncRequestId = randomId(18);
+          this.syncRequestId = this.fullSyncRequestId;
+        }
+        if (!this.syncRequestId) this.syncRequestId = randomId(18);
+        this.loadPendingMessages();
+      })();
       this.intervals.push(setInterval(() => this.announce(), ANNOUNCE_INTERVAL_MS));
       this.intervals.push(setInterval(() => void this.probePeers(), PEER_PROBE_INTERVAL_MS));
       this.intervals.push(setInterval(() => {
@@ -1711,6 +1716,7 @@ export class NtfyLanSync {
       this.intervals.push(setInterval(() => this.sweepPeers(), PEER_SWEEP_INTERVAL_MS));
       this.announce();
       this.emit({ ...defaultProgress("discovering"), active: false });
+      await metadataPreparation;
       void this.probePeers();
     } catch (error) {
       this.lastErrorValue = safeErrorCode(error);
