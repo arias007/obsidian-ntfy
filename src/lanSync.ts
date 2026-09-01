@@ -2870,9 +2870,14 @@ export class NtfyLanSync {
 
   private emitInboundFileProgress(deviceId: string, phase: LanSyncProgressPhase = "syncing"): void {
     const completed = this.activityFiles.filter((file) => file.state === "complete").length;
-    const uploads = this.activityFiles.filter((file) => file.action === "push").length;
+    // Once a session is established, the coordinator's immutable plan is the
+    // source of truth for direction totals. Counting only file rows observed
+    // so far made the receiver briefly report 0/1 or 1065/1066 while requests
+    // were still arriving. Completion remains local and real-time below.
+    const session = this.inboundSession?.deviceId === deviceId ? this.inboundSession : null;
+    const uploads = session ? session.uploads : this.activityFiles.filter((file) => file.action === "push").length;
     const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
-    const downloads = this.activityFiles.filter((file) => file.action === "pull").length;
+    const downloads = session ? session.downloads : this.activityFiles.filter((file) => file.action === "pull").length;
     const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
     const bytesTransferred = this.activityFiles
       .filter((file) => file.state === "complete")
@@ -2880,7 +2885,6 @@ export class NtfyLanSync {
     // Prefer the totals the coordinator announced in /session/start. Counting
     // only locally observed files made the two ends display different
     // denominators for the very same transfer.
-    const session = this.inboundSession?.deviceId === deviceId ? this.inboundSession : null;
     this.emit({
       ...defaultProgress(phase),
       active: true,

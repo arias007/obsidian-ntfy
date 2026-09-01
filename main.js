@@ -2920,12 +2920,12 @@ ${bodyHash}`;
     }
     emitInboundFileProgress(deviceId, phase = "syncing") {
       const completed = this.activityFiles.filter((file) => file.state === "complete").length;
-      const uploads = this.activityFiles.filter((file) => file.action === "push").length;
+      const session = this.inboundSession?.deviceId === deviceId ? this.inboundSession : null;
+      const uploads = session ? session.uploads : this.activityFiles.filter((file) => file.action === "push").length;
       const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
-      const downloads = this.activityFiles.filter((file) => file.action === "pull").length;
+      const downloads = session ? session.downloads : this.activityFiles.filter((file) => file.action === "pull").length;
       const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
       const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
-      const session = this.inboundSession?.deviceId === deviceId ? this.inboundSession : null;
       this.emit({
         ...defaultProgress(phase),
         active: true,
