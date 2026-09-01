@@ -813,6 +813,7 @@ var NtfyLanSyncRuntime = (() => {
   var ACTIVE_EDIT_MIN_INTERVAL_MS = 100;
   var ACTIVE_EDIT_RETRY_MAX_MS = 3e4;
   var RECONNECT_REPROBE_DELAY_MS = 250;
+  var PING_TIMEOUT_MS = 1200;
   var MANIFEST_TIMEOUT_MS = 10 * 6e4;
   var PATH_MANIFEST_TIMEOUT_MS = 2e4;
   var SESSION_TIMEOUT_MS = 3e4;
@@ -4843,9 +4844,45 @@ ${bodyHash}`;
       const secret = this.activeSecret();
       const body = await encryptLanSyncPayload(secret, payload2);
       const headers = await authHeaders({ ...this.identity, secret }, this.deviceId, "POST", path2, body, this.now());
+      const addresses = [...peer.addresses].filter((address) => isPrivateLanAddress(address));
+      if (route === "/ping" && addresses.length > 1) {
+        const pingTimeout = Math.min(timeoutMs, PING_TIMEOUT_MS);
+        const attempts = addresses.map(async (address) => {
+          const host = address.includes(":") ? `[${address}]` : address;
+          const response = await withTimeout(this.options.httpRequest({
+            url: `http://${host}:${peer.port}${path2}`,
+            method: "POST",
+            headers,
+            body,
+            timeoutMs: pingTimeout
+          }), pingTimeout);
+          if (response.status < 200 || response.status >= 300) {
+            let code = "peer_rejected";
+            try {
+              const errorBody = safeJsonObject(response.text);
+              if (typeof errorBody.error === "string") code = errorBody.error;
+            } catch {
+            }
+            throw new LanSyncProtocolError(code, response.status);
+          }
+          return { address, decrypted: await decryptLanSyncPayload(secret, response.text) };
+        });
+        try {
+          const { address, decrypted } = await Promise.any(attempts);
+          peer.verifiedAt = this.now();
+          peer.consecutiveFailures = 0;
+          peer.lastFailureAt = 0;
+          peer.addresses = new Set([address, ...addresses].slice(0, PEER_MAX_ADDRESS_HISTORY));
+          return decrypted;
+        } catch (error) {
+          const reasons = error instanceof AggregateError ? error.errors : [];
+          const protocolError = reasons.find((reason) => reason instanceof LanSyncProtocolError);
+          if (protocolError) throw protocolError;
+          throw new Error(`peer_unreachable:${safeErrorCode(reasons[0])}`);
+        }
+      }
       let lastError = null;
-      for (const address of peer.addresses) {
-        if (!isPrivateLanAddress(address)) continue;
+      for (const address of addresses) {
         const host = address.includes(":") ? `[${address}]` : address;
         try {
           const response = await withTimeout(this.options.httpRequest({
