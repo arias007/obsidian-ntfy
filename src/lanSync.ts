@@ -1375,6 +1375,7 @@ export class NtfyLanSync {
   private metadataIndexIncludesConfig = false;
   private metadataIndexMaxFileBytes = 0;
   private metadataIndexGeneration = 0;
+  private liveChangePollRunning = false;
   private backgroundReconciliation: Promise<void> | null = null;
   private reconciliationDirtyPaths = new Set<string>();
   private manifestBuild: { includeConfigFolder: boolean; promise: Promise<LanSyncManifestEntry[]> } | null = null;
@@ -1701,6 +1702,11 @@ export class NtfyLanSync {
       this.intervals.push(setInterval(() => {
         if (this.settings().autoDiscovery) this.requestPeriodicSync();
       }, settings.checkIntervalSeconds * 1000));
+      // Vault events are normally immediate, but mobile/WebView and external
+      // editors can occasionally omit them. A metadata-only poll catches new,
+      // modified, and deleted files without hashing or resetting the visible
+      // full-scan progress.
+      this.intervals.push(setInterval(() => void this.pollLiveFilesystemChanges(), 1_000));
       this.intervals.push(setInterval(() => this.sweepPeers(), PEER_SWEEP_INTERVAL_MS));
       this.announce();
       this.emit({ ...defaultProgress("discovering"), active: false });
@@ -2041,6 +2047,33 @@ export class NtfyLanSync {
     // or by the change-journal recovery fallback. When there is no dirty work the
     // periodic tick simply does nothing.
     return;
+  }
+
+  private async pollLiveFilesystemChanges(): Promise<void> {
+    if (!this.runningValue || this.liveChangePollRunning || !this.metadataIndexReady) return;
+    if (this.metadataManifestBuild || this.manifestBuild || this.backgroundReconciliation) return;
+    this.liveChangePollRunning = true;
+    try {
+      const includeConfigFolder = this.settings().syncConfigFolder;
+      const files = await this.options.storage.listFiles(includeConfigFolder);
+      const current = new Map<string, LanSyncMetadataSnapshot>();
+      for (const file of files) {
+        const path = this.normalizePath(file.path, includeConfigFolder);
+        const size = Number(file.size);
+        const mtime = Number(file.mtime);
+        if (!path || !Number.isFinite(size) || size < 0 || !Number.isFinite(mtime) || mtime < 0) continue;
+        current.set(path, { size, mtime });
+        const previous = this.metadataIndex.get(path);
+        if ((!previous || !metadataMatches(previous, current.get(path)!)) && !this.dirtyPaths.has(path)) this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+      }
+      for (const path of this.metadataIndex.keys()) {
+        if (!current.has(path) && this.normalizePath(path, includeConfigFolder) && !this.dirtyPaths.has(path)) this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+      }
+    } catch {
+      // Event delivery and the next poll remain available after transient I/O.
+    } finally {
+      this.liveChangePollRunning = false;
+    }
   }
 
   private startBackgroundFilesystemReconciliation(): void {

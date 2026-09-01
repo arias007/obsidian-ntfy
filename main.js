@@ -1615,6 +1615,7 @@ ${bodyHash}`;
     metadataIndexIncludesConfig = false;
     metadataIndexMaxFileBytes = 0;
     metadataIndexGeneration = 0;
+    liveChangePollRunning = false;
     backgroundReconciliation = null;
     reconciliationDirtyPaths = /* @__PURE__ */ new Set();
     manifestBuild = null;
@@ -1904,6 +1905,7 @@ ${bodyHash}`;
         this.intervals.push(setInterval(() => {
           if (this.settings().autoDiscovery) this.requestPeriodicSync();
         }, settings.checkIntervalSeconds * 1e3));
+        this.intervals.push(setInterval(() => void this.pollLiveFilesystemChanges(), 1e3));
         this.intervals.push(setInterval(() => this.sweepPeers(), PEER_SWEEP_INTERVAL_MS));
         this.announce();
         this.emit({ ...defaultProgress("discovering"), active: false });
@@ -2189,6 +2191,31 @@ ${bodyHash}`;
         return;
       }
       return;
+    }
+    async pollLiveFilesystemChanges() {
+      if (!this.runningValue || this.liveChangePollRunning || !this.metadataIndexReady) return;
+      if (this.metadataManifestBuild || this.manifestBuild || this.backgroundReconciliation) return;
+      this.liveChangePollRunning = true;
+      try {
+        const includeConfigFolder = this.settings().syncConfigFolder;
+        const files = await this.options.storage.listFiles(includeConfigFolder);
+        const current = /* @__PURE__ */ new Map();
+        for (const file of files) {
+          const path2 = this.normalizePath(file.path, includeConfigFolder);
+          const size = Number(file.size);
+          const mtime = Number(file.mtime);
+          if (!path2 || !Number.isFinite(size) || size < 0 || !Number.isFinite(mtime) || mtime < 0) continue;
+          current.set(path2, { size, mtime });
+          const previous = this.metadataIndex.get(path2);
+          if ((!previous || !metadataMatches(previous, current.get(path2))) && !this.dirtyPaths.has(path2)) this.markDirtyPath(path2, REALTIME_DIRTY_DELAY_MS, true);
+        }
+        for (const path2 of this.metadataIndex.keys()) {
+          if (!current.has(path2) && this.normalizePath(path2, includeConfigFolder) && !this.dirtyPaths.has(path2)) this.markDirtyPath(path2, REALTIME_DIRTY_DELAY_MS, true);
+        }
+      } catch {
+      } finally {
+        this.liveChangePollRunning = false;
+      }
     }
     startBackgroundFilesystemReconciliation() {
       if (!this.runningValue || this.backgroundReconciliation) return;
