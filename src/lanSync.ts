@@ -384,10 +384,13 @@ const METADATA_PROTOCOLS = [
 const BOOTSTRAP_MTIME_TOLERANCE_MS = 2_000;
 const MULTICAST_ADDRESS = "239.255.67.19";
 const DISCOVERY_PORT = 43189;
-const ANNOUNCE_INTERVAL_MS = 5_000;
-const PEER_SWEEP_INTERVAL_MS = 2_000;
-const PEER_PROBE_INTERVAL_MS = 5_000;
-const PEER_MIN_STABLE_GRACE_MS = 30_000;
+// Keep discovery, authenticated heartbeats, and UI expiry on a sub-second
+// cadence. Five-second probes made one side appear online while the other
+// stayed stale and delayed remote scan progress by 10 seconds or more.
+const ANNOUNCE_INTERVAL_MS = 800;
+const PEER_SWEEP_INTERVAL_MS = 300;
+const PEER_PROBE_INTERVAL_MS = 700;
+const PEER_MIN_STABLE_GRACE_MS = 5_000;
 // Keep one current LAN address plus one recent fallback. Retaining a long
 // stale address list made reconnect try dead endpoints serially and look stuck.
 const PEER_MAX_ADDRESS_HISTORY = 2;
