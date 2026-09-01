@@ -399,8 +399,8 @@ const REALTIME_DIRTY_DELAY_MS = 30;
 // Highest-priority lane for the file the user is actively editing. Shorter than
 // any other debounce so a keystroke ships almost immediately, and it runs on its
 // own single-file channel instead of waiting behind a bulk dirty scan.
-const ACTIVE_EDIT_SYNC_DELAY_MS = 180;
-const ACTIVE_EDIT_MIN_INTERVAL_MS = 500;
+const ACTIVE_EDIT_SYNC_DELAY_MS = 50;
+const ACTIVE_EDIT_MIN_INTERVAL_MS = 100;
 const ACTIVE_EDIT_RETRY_MAX_MS = 30_000;
 const ACTIVE_EDIT_POLL_MS = 500;
 const RECONNECT_REPROBE_DELAY_MS = 250;
@@ -443,7 +443,10 @@ const HASH_CACHE_STORAGE_PREFIX = "ntfy.lan-sync.hash-cache.v1";
 const LAN_INBOX_ROOT = ".trash/ntfy-inbox";
 const MAX_MESSAGE_TEXT_LENGTH = 32_000;
 const MAX_MESSAGE_ATTACHMENTS = 12;
-const INCREMENTAL_PATH_BATCH_SIZE = 32;
+// Dirty paths are already deduplicated and bounded by MAX_MANIFEST_FILES.
+// A small fixed batch caused legitimate edits (including today's note) to
+// wait behind repeated 32-path rounds and made the next pass look stalled.
+const INCREMENTAL_PATH_BATCH_SIZE = 100_000;
 const LOCAL_INTERFACE_CACHE_MS = 30_000;
 const CRYPTO_KEY_CACHE_LIMIT = 4;
 const PEER_PROBE_CONCURRENCY = 4;
