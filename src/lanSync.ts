@@ -2861,9 +2861,16 @@ export class NtfyLanSync {
     return index;
   }
 
-  private finishInboundFileActivity(deviceId: string, index: number | null, success: boolean): void {
-    if (index === null || !this.activityFiles[index]) return;
-    this.activityFiles[index].state = success ? "complete" : "error";
+  private finishInboundFileActivity(deviceId: string, index: number | null, success: boolean, path = "", payload: Record<string, unknown> = {}): void {
+    const expectedPath = path.endsWith("/attachment/write")
+      ? normalizeLanInboxAttachmentPath(`${LAN_INBOX_ROOT}/${String(payload.attachmentId || "")}/${safeLanInboxName(payload.name)}`)
+      : this.normalizePath(payload.path);
+    const resolvedIndex = expectedPath
+      ? this.activityFiles.findIndex((file) => file.path === expectedPath && file.state === "syncing")
+      : -1;
+    const targetIndex = resolvedIndex >= 0 ? resolvedIndex : index;
+    if (targetIndex === null || targetIndex === undefined || targetIndex < 0 || !this.activityFiles[targetIndex]) return;
+    this.activityFiles[targetIndex].state = success ? "complete" : "error";
     this.activityUpdatedAt = this.now();
     this.emitInboundFileProgress(deviceId, success ? "syncing" : "error");
   }
@@ -5299,7 +5306,7 @@ export class NtfyLanSync {
       } else {
         throw new LanSyncProtocolError("not_found", 404);
       }
-      this.finishInboundFileActivity(deviceId, inboundActivityIndex, true);
+      this.finishInboundFileActivity(deviceId, inboundActivityIndex, true, path, payload);
       const encryptedResult = await encryptLanSyncPayload(secret, result);
       sendText(response, 200, encryptedResult);
       if (metadataRoute === "/manifest") {
@@ -5311,7 +5318,7 @@ export class NtfyLanSync {
         });
       }
     } catch (error) {
-      this.finishInboundFileActivity(inboundDeviceId, inboundActivityIndex, false);
+      this.finishInboundFileActivity(inboundDeviceId, inboundActivityIndex, false, path, payload);
       const protocol = error instanceof LanSyncProtocolError ? error : new LanSyncProtocolError(safeErrorCode(error), 500);
       sendText(response, protocol.status, JSON.stringify({ ok: false, error: authenticated ? protocol.code : "request_rejected" }));
     }

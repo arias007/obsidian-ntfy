@@ -951,8 +951,8 @@ var NtfyLanSyncRuntime = (() => {
   }
   function normalizedConfigDir(value) {
     if (typeof value !== "string") return ".obsidian";
-    const path = value.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-    return path && !path.includes("/") && path !== "." && path !== ".." ? path : ".obsidian";
+    const path2 = value.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    return path2 && !path2.includes("/") && path2 !== "." && path2 !== ".." ? path2 : ".obsidian";
   }
   function fileTransferTimeoutMs(bytes) {
     const estimatedAtTwoMbPerSecond = Math.ceil(Math.max(0, bytes) / (2 * 1024 * 1024) * 1e3) + 15e3;
@@ -1012,9 +1012,9 @@ var NtfyLanSyncRuntime = (() => {
   }
   function normalizeLanSyncPath(value, options = {}) {
     if (typeof value !== "string") return null;
-    const path = value.trim();
-    if (!path || path.length > 1024 || path.includes("\\") || path.includes("\0") || path.startsWith("/") || /^[A-Za-z]:/.test(path)) return null;
-    const segments = path.split("/");
+    const path2 = value.trim();
+    if (!path2 || path2.length > 1024 || path2.includes("\\") || path2.includes("\0") || path2.startsWith("/") || /^[A-Za-z]:/.test(path2)) return null;
+    const segments = path2.split("/");
     if (segments.some((segment) => !segment || segment === "." || segment === "..")) return null;
     if (segments.some((segment) => segment.toLocaleLowerCase() === "node_modules" || segment.toLocaleLowerCase() === ".git")) return null;
     if (segments.some((segment) => / \(lan conflict [^)]+\)(?:\.[^.]+)?$/i.test(segment))) return null;
@@ -1081,8 +1081,8 @@ var NtfyLanSyncRuntime = (() => {
   async function hashLanSyncBytes(value) {
     return await sha256Bytes(value);
   }
-  function isConfigPath(path, configDir) {
-    return path.toLocaleLowerCase().startsWith(`${normalizedConfigDir(configDir).toLocaleLowerCase()}/`);
+  function isConfigPath(path2, configDir) {
+    return path2.toLocaleLowerCase().startsWith(`${normalizedConfigDir(configDir).toLocaleLowerCase()}/`);
   }
   async function mapWithConcurrency(items, limit, task) {
     const results = new Array(items.length);
@@ -1194,12 +1194,12 @@ var NtfyLanSyncRuntime = (() => {
       return false;
     }
   }
-  async function authHeaders(identity, deviceId, method, path, body, now) {
+  async function authHeaders(identity, deviceId, method, path2, body, now) {
     const timestamp = String(Math.floor(now));
     const nonce = randomId(18);
     const bodyHash = await sha256Bytes(body);
     const canonical = `${method}
-${path}
+${path2}
 ${timestamp}
 ${nonce}
 ${bodyHash}`;
@@ -1263,22 +1263,22 @@ ${bodyHash}`;
     const canPull = localPolicy.incrementalPull || remotePolicy.incrementalPush;
     const canDeleteRemote = remotePolicy.deleteProtocol && (localPolicy.deletePush || remotePolicy.deletePull);
     const canDeleteLocal = localPolicy.deletePull || remotePolicy.deletePush;
-    for (const path of paths) {
-      const localEntry = local.get(path) ?? null;
-      const remoteEntry = remote.get(path) ?? null;
-      const baseline = ledger[path] ?? "";
+    for (const path2 of paths) {
+      const localEntry = local.get(path2) ?? null;
+      const remoteEntry = remote.get(path2) ?? null;
+      const baseline = ledger[path2] ?? "";
       if (localEntry && remoteEntry) {
         if (localEntry.hash === remoteEntry.hash) continue;
         if (baseline && localEntry.hash === baseline) {
-          if (canPull) actions.push({ kind: "pull", path, local: localEntry, remote: remoteEntry });
+          if (canPull) actions.push({ kind: "pull", path: path2, local: localEntry, remote: remoteEntry });
         } else if (baseline && remoteEntry.hash === baseline) {
-          if (canPush) actions.push({ kind: "push", path, local: localEntry, remote: remoteEntry });
+          if (canPush) actions.push({ kind: "push", path: path2, local: localEntry, remote: remoteEntry });
         } else if (canPush && canPull) {
-          actions.push({ kind: manifestWinner(localEntry, remoteEntry, localPolicy.conflictRule) === "local" ? "push" : "pull", path, local: localEntry, remote: remoteEntry });
+          actions.push({ kind: manifestWinner(localEntry, remoteEntry, localPolicy.conflictRule) === "local" ? "push" : "pull", path: path2, local: localEntry, remote: remoteEntry });
         } else if (canPush) {
-          actions.push({ kind: "push", path, local: localEntry, remote: remoteEntry });
+          actions.push({ kind: "push", path: path2, local: localEntry, remote: remoteEntry });
         } else if (canPull) {
-          actions.push({ kind: "pull", path, local: localEntry, remote: remoteEntry });
+          actions.push({ kind: "pull", path: path2, local: localEntry, remote: remoteEntry });
         } else {
           continue;
         }
@@ -1286,16 +1286,16 @@ ${bodyHash}`;
       }
       if (baseline) {
         if (localEntry) {
-          if (localEntry.hash === baseline && canDeleteLocal) actions.push({ kind: "delete-local", path, local: localEntry, remote: null });
-          else if (localEntry.hash !== baseline && canPush) actions.push({ kind: "push", path, local: localEntry, remote: null });
+          if (localEntry.hash === baseline && canDeleteLocal) actions.push({ kind: "delete-local", path: path2, local: localEntry, remote: null });
+          else if (localEntry.hash !== baseline && canPush) actions.push({ kind: "push", path: path2, local: localEntry, remote: null });
         } else if (remoteEntry) {
-          if (remoteEntry.hash === baseline && canDeleteRemote) actions.push({ kind: "delete-remote", path, local: null, remote: remoteEntry });
-          else if (remoteEntry.hash !== baseline && canPull) actions.push({ kind: "pull", path, local: null, remote: remoteEntry });
+          if (remoteEntry.hash === baseline && canDeleteRemote) actions.push({ kind: "delete-remote", path: path2, local: null, remote: remoteEntry });
+          else if (remoteEntry.hash !== baseline && canPull) actions.push({ kind: "pull", path: path2, local: null, remote: remoteEntry });
         }
         continue;
       }
-      if (localEntry && canPush) actions.push({ kind: "push", path, local: localEntry, remote: null });
-      else if (remoteEntry && canPull) actions.push({ kind: "pull", path, local: null, remote: remoteEntry });
+      if (localEntry && canPush) actions.push({ kind: "push", path: path2, local: localEntry, remote: null });
+      else if (remoteEntry && canPull) actions.push({ kind: "pull", path: path2, local: null, remote: remoteEntry });
     }
     return actions;
   }
@@ -1323,42 +1323,42 @@ ${bodyHash}`;
     const canPull = localPolicy.incrementalPull || remotePolicy.incrementalPush;
     const canDeleteRemote = remotePolicy.deleteProtocol && (localPolicy.deletePush || remotePolicy.deletePull);
     const canDeleteLocal = localPolicy.deletePull || remotePolicy.deletePush;
-    for (const path of paths) {
-      const localEntry = local.get(path) ?? null;
-      const remoteEntry = remote.get(path) ?? null;
-      const baseline = ledger[path];
+    for (const path2 of paths) {
+      const localEntry = local.get(path2) ?? null;
+      const remoteEntry = remote.get(path2) ?? null;
+      const baseline = ledger[path2];
       if (localEntry && remoteEntry) {
         if (metadataMatches(localEntry, remoteEntry)) continue;
         const localChanged = !baseline || !metadataMatches(localEntry, baseline.local);
         const remoteChanged = !baseline || !metadataMatches(remoteEntry, baseline.remote);
         if (!localChanged && !remoteChanged) continue;
         if (!localChanged && remoteChanged) {
-          if (canPull) actions.push({ kind: "pull", path, local: localEntry, remote: remoteEntry });
+          if (canPull) actions.push({ kind: "pull", path: path2, local: localEntry, remote: remoteEntry });
         } else if (localChanged && !remoteChanged) {
-          if (canPush) actions.push({ kind: "push", path, local: localEntry, remote: remoteEntry });
+          if (canPush) actions.push({ kind: "push", path: path2, local: localEntry, remote: remoteEntry });
         } else if (canPush && canPull) {
-          actions.push({ kind: metadataWinner(localEntry, remoteEntry, localPolicy.conflictRule) === "local" ? "push" : "pull", path, local: localEntry, remote: remoteEntry });
+          actions.push({ kind: metadataWinner(localEntry, remoteEntry, localPolicy.conflictRule) === "local" ? "push" : "pull", path: path2, local: localEntry, remote: remoteEntry });
         } else if (canPush) {
-          actions.push({ kind: "push", path, local: localEntry, remote: remoteEntry });
+          actions.push({ kind: "push", path: path2, local: localEntry, remote: remoteEntry });
         } else if (canPull) {
-          actions.push({ kind: "pull", path, local: localEntry, remote: remoteEntry });
+          actions.push({ kind: "pull", path: path2, local: localEntry, remote: remoteEntry });
         }
         continue;
       }
       if (baseline) {
         if (localEntry) {
           const localChanged = !metadataMatches(localEntry, baseline.local);
-          if (localChanged && canPush) actions.push({ kind: "push", path, local: localEntry, remote: null });
-          else if (!localChanged && canDeleteLocal) actions.push({ kind: "delete-local", path, local: localEntry, remote: null });
+          if (localChanged && canPush) actions.push({ kind: "push", path: path2, local: localEntry, remote: null });
+          else if (!localChanged && canDeleteLocal) actions.push({ kind: "delete-local", path: path2, local: localEntry, remote: null });
         } else if (remoteEntry) {
           const remoteChanged = !metadataMatches(remoteEntry, baseline.remote);
-          if (remoteChanged && canPull) actions.push({ kind: "pull", path, local: null, remote: remoteEntry });
-          else if (!remoteChanged && canDeleteRemote) actions.push({ kind: "delete-remote", path, local: null, remote: remoteEntry });
+          if (remoteChanged && canPull) actions.push({ kind: "pull", path: path2, local: null, remote: remoteEntry });
+          else if (!remoteChanged && canDeleteRemote) actions.push({ kind: "delete-remote", path: path2, local: null, remote: remoteEntry });
         }
         continue;
       }
-      if (localEntry && canPush) actions.push({ kind: "push", path, local: localEntry, remote: null });
-      else if (remoteEntry && canPull) actions.push({ kind: "pull", path, local: null, remote: remoteEntry });
+      if (localEntry && canPush) actions.push({ kind: "push", path: path2, local: localEntry, remote: null });
+      else if (remoteEntry && canPull) actions.push({ kind: "pull", path: path2, local: null, remote: remoteEntry });
     }
     return actions;
   }
@@ -1372,7 +1372,7 @@ ${bodyHash}`;
       if (!action.local || !action.remote) return 2;
       return 3;
     };
-    const generation = (path) => Math.max(localDirty.get(path) ?? 0, remoteDirty.get(path) ?? 0);
+    const generation = (path2) => Math.max(localDirty.get(path2) ?? 0, remoteDirty.get(path2) ?? 0);
     const size = (action) => action.kind === "push" ? action.local?.size ?? 0 : action.kind === "pull" ? action.remote?.size ?? 0 : 0;
     return actions.map((action, index) => ({ action, index })).sort((left, right) => {
       const rankDelta = rank(left.action) - rank(right.action);
@@ -1440,8 +1440,8 @@ ${bodyHash}`;
       error: ""
     };
   }
-  function lanSyncTopLevelGroup(path) {
-    const normalized = String(path || "").replace(/\\/g, "/").replace(/^\/+/, "");
+  function lanSyncTopLevelGroup(path2) {
+    const normalized = String(path2 || "").replace(/\\/g, "/").replace(/^\/+/, "");
     const separator = normalized.indexOf("/");
     return separator < 0 ? "" : normalized.slice(0, separator);
   }
@@ -1763,8 +1763,8 @@ ${bodyHash}`;
       if (response.ok !== true || response.id !== message.id) throw new Error("message_delivery_failed");
       return { id: message.id };
     }
-    async sendFile(deviceId, path) {
-      const normalized = this.normalizePath(path);
+    async sendFile(deviceId, path2) {
+      const normalized = this.normalizePath(path2);
       if (!normalized) throw new LanSyncProtocolError("unsafe_path");
       const stat = await this.options.storage.statFile(normalized);
       if (!stat || stat.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("file_unavailable", 404);
@@ -1784,9 +1784,9 @@ ${bodyHash}`;
       const hash = await sha256Bytes(bytes);
       const attachmentId = randomId(18);
       if (!peer.canHost) {
-        const path = normalizeLanInboxAttachmentPath(`${LAN_INBOX_ROOT}/${attachmentId}/${name}`);
-        const sourcePath = path ? this.outboundAttachmentPath(deviceId, path) : null;
-        if (!path || !sourcePath) throw new LanSyncProtocolError("unsafe_attachment");
+        const path2 = normalizeLanInboxAttachmentPath(`${LAN_INBOX_ROOT}/${attachmentId}/${name}`);
+        const sourcePath = path2 ? this.outboundAttachmentPath(deviceId, path2) : null;
+        if (!path2 || !sourcePath) throw new LanSyncProtocolError("unsafe_attachment");
         await this.options.storage.ensureFolder(sourcePath.split("/").slice(0, -1).join("/"));
         await this.options.storage.writeBinary(sourcePath, arrayBuffer(bytes));
         const written = await this.options.storage.statFile(sourcePath);
@@ -1794,7 +1794,7 @@ ${bodyHash}`;
         return {
           name,
           type,
-          path,
+          path: path2,
           size: bytes.byteLength,
           hash,
           temporary: true,
@@ -1978,8 +1978,8 @@ ${bodyHash}`;
       this.activityUpdatedAt = this.now();
       this.emit(defaultProgress("stopped"));
     }
-    notifyVaultChange(path) {
-      const normalized = this.normalizePath(path, true);
+    notifyVaultChange(path2) {
+      const normalized = this.normalizePath(path2, true);
       if (!normalized) return;
       if (!this.appliedMutationEvents.has(normalized)) {
         this.markDirtyPath(normalized, REALTIME_DIRTY_DELAY_MS, true);
@@ -1987,7 +1987,7 @@ ${bodyHash}`;
       }
       void this.classifyAppliedMutationEvent(normalized);
     }
-    markAppliedMutation(path) {
+    markAppliedMutation(path2) {
       if (this.appliedMutationEvents.size >= MAX_MANIFEST_FILES) {
         const now = this.now();
         for (const [candidate, token] of this.appliedMutationEvents) {
@@ -1999,37 +1999,37 @@ ${bodyHash}`;
           this.appliedMutationEvents.delete(oldest);
         }
       }
-      this.appliedMutationEvents.set(path, {
+      this.appliedMutationEvents.set(path2, {
         expiresAt: this.now() + APPLIED_MUTATION_EVENT_TTL_MS
       });
     }
-    confirmAppliedMutation(path, expected) {
-      const token = this.appliedMutationEvents.get(path);
+    confirmAppliedMutation(path2, expected) {
+      const token = this.appliedMutationEvents.get(path2);
       if (token) token.expected = expected;
     }
-    clearAppliedMutation(path) {
-      this.appliedMutationEvents.delete(path);
+    clearAppliedMutation(path2) {
+      this.appliedMutationEvents.delete(path2);
     }
-    async classifyAppliedMutationEvent(path) {
-      let token = this.appliedMutationEvents.get(path);
+    async classifyAppliedMutationEvent(path2) {
+      let token = this.appliedMutationEvents.get(path2);
       if (!token) {
-        this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+        this.markDirtyPath(path2, REALTIME_DIRTY_DELAY_MS, true);
         return;
       }
       if (token.expected === void 0) {
         await new Promise((resolve) => setTimeout(resolve, 25));
-        token = this.appliedMutationEvents.get(path);
+        token = this.appliedMutationEvents.get(path2);
       }
       if (!token || token.expiresAt < this.now() || token.expected === void 0) {
-        this.appliedMutationEvents.delete(path);
-        this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+        this.appliedMutationEvents.delete(path2);
+        this.markDirtyPath(path2, REALTIME_DIRTY_DELAY_MS, true);
         return;
       }
-      const current = await this.options.storage.statFile(path).catch(() => null);
+      const current = await this.options.storage.statFile(path2).catch(() => null);
       const unchanged = token.expected === null ? current === null : Boolean(current && metadataMatches(current, token.expected));
       if (unchanged) return;
-      this.appliedMutationEvents.delete(path);
-      this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+      this.appliedMutationEvents.delete(path2);
+      this.markDirtyPath(path2, REALTIME_DIRTY_DELAY_MS, true);
     }
     /**
      * Highest-priority signal: the user is actively editing `path` right now.
@@ -2038,8 +2038,8 @@ ${bodyHash}`;
      * kind of work. The file is also tracked in the normal dirty/urgent sets so a
      * bulk round still covers it if the dedicated lane is blocked.
      */
-    notifyActiveEdit(path) {
-      const normalized = this.normalizePath(path);
+    notifyActiveEdit(path2) {
+      const normalized = this.normalizePath(path2);
       if (!normalized) return;
       this.hashCache.delete(normalized);
       this.queueHashCacheSave();
@@ -2055,8 +2055,8 @@ ${bodyHash}`;
       this.scheduleActiveEditSync(ACTIVE_EDIT_SYNC_DELAY_MS);
     }
     /** Clear the active-edit marker (called when the user switches away). */
-    clearActiveEdit(path) {
-      const normalized = path ? this.normalizePath(path) : null;
+    clearActiveEdit(path2) {
+      const normalized = path2 ? this.normalizePath(path2) : null;
       if (normalized && this.activeEditingPath === normalized) {
         this.activeEditingPath = null;
       } else if (!normalized) {
@@ -2064,8 +2064,8 @@ ${bodyHash}`;
       }
       if (normalized) this.markDirtyPath(normalized, URGENT_SYNC_DELAY_MS, true);
     }
-    markDirtyPath(path, delay = QUEUED_SYNC_DELAY_MS, urgent = false) {
-      const normalized = this.normalizePath(path);
+    markDirtyPath(path2, delay = QUEUED_SYNC_DELAY_MS, urgent = false) {
+      const normalized = this.normalizePath(path2);
       if (!normalized) return;
       this.hashCache.delete(normalized);
       this.queueHashCacheSave();
@@ -2116,11 +2116,11 @@ ${bodyHash}`;
       }
       this.scheduleSync(0, true);
     }
-    recordTransferFailure(path) {
-      const current = this.transferBackoff.get(path);
+    recordTransferFailure(path2) {
+      const current = this.transferBackoff.get(path2);
       const failures = Math.min(8, (current?.failures ?? 0) + 1);
       const delay = Math.min(5 * 6e4, 5e3 * 2 ** (failures - 1));
-      this.transferBackoff.set(path, { failures, nextAttemptAt: this.now() + delay });
+      this.transferBackoff.set(path2, { failures, nextAttemptAt: this.now() + delay });
       if (this.transferBackoff.size > MAX_MANIFEST_FILES) {
         const oldest = [...this.transferBackoff.keys()].slice(0, this.transferBackoff.size - MAX_MANIFEST_FILES);
         for (const key of oldest) this.transferBackoff.delete(key);
@@ -2211,7 +2211,7 @@ ${bodyHash}`;
         while (this.reconciliationDirtyPaths.size && rounds < 8 && this.now() - startedAt < SCAN_STALL_TIMEOUT_MS) {
           rounds += 1;
           const changed = [...this.reconciliationDirtyPaths].slice(0, INCREMENTAL_PATH_BATCH_SIZE);
-          for (const path of changed) this.reconciliationDirtyPaths.delete(path);
+          for (const path2 of changed) this.reconciliationDirtyPaths.delete(path2);
           await this.buildMetadataManifestForPaths(changed, includeConfigFolder);
         }
         this.reconciliationDirtyPaths.clear();
@@ -2261,10 +2261,10 @@ ${bodyHash}`;
         const restored = /* @__PURE__ */ new Map();
         for (const item of parsed.entries.slice(-MAX_MANIFEST_FILES)) {
           if (!Array.isArray(item) || item.length !== 2) continue;
-          const path = this.normalizePath(item[0]);
+          const path2 = this.normalizePath(item[0]);
           const generation = Number(item[1]);
-          if (!path || !Number.isSafeInteger(generation) || generation <= 0) continue;
-          restored.set(path, generation);
+          if (!path2 || !Number.isSafeInteger(generation) || generation <= 0) continue;
+          restored.set(path2, generation);
         }
         this.dirtyPaths = restored;
         this.dirtySequence = Math.max(Number.isSafeInteger(Number(parsed.sequence)) ? Number(parsed.sequence) : 0, ...restored.values(), 0);
@@ -2313,9 +2313,9 @@ ${bodyHash}`;
       this.metadataIndex.clear();
       this.metadataIndexReady = false;
       try {
-        const path = this.metadataIndexPath();
-        if (!await this.options.storage.exists(path)) return;
-        const parsed = safeJsonObject(await this.options.storage.readText(path));
+        const path2 = this.metadataIndexPath();
+        if (!await this.options.storage.exists(path2)) return;
+        const parsed = safeJsonObject(await this.options.storage.readText(path2));
         if (parsed.schemaVersion !== 1 || parsed.complete !== true || !Array.isArray(parsed.entries)) return;
         const entries = /* @__PURE__ */ new Map();
         for (const item of parsed.entries.slice(-MAX_MANIFEST_FILES)) {
@@ -2354,7 +2354,7 @@ ${bodyHash}`;
           complete: true,
           includeConfigFolder: this.metadataIndexIncludesConfig,
           maxFileBytes: this.metadataIndexMaxFileBytes,
-          entries: [...this.metadataIndex.entries()].slice(-MAX_MANIFEST_FILES).map(([path, metadata]) => [path, metadata.size, metadata.mtime])
+          entries: [...this.metadataIndex.entries()].slice(-MAX_MANIFEST_FILES).map(([path2, metadata]) => [path2, metadata.size, metadata.mtime])
         })}
 `);
       } catch {
@@ -2448,11 +2448,11 @@ ${bodyHash}`;
         if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.entries)) return;
         for (const item of parsed.entries.slice(-MAX_MANIFEST_FILES)) {
           if (!Array.isArray(item) || item.length !== 3) continue;
-          const path = this.normalizePath(item[0], true);
+          const path2 = this.normalizePath(item[0], true);
           const signature = typeof item[1] === "string" ? item[1] : "";
           const hash = typeof item[2] === "string" ? item[2] : "";
-          if (path && /^\d+(?:\.\d+)?:\d+$/.test(signature) && /^[A-Za-z0-9_-]{32,64}$/.test(hash)) {
-            this.hashCache.set(path, { signature, hash });
+          if (path2 && /^\d+(?:\.\d+)?:\d+$/.test(signature) && /^[A-Za-z0-9_-]{32,64}$/.test(hash)) {
+            this.hashCache.set(path2, { signature, hash });
           }
         }
       } catch {
@@ -2468,23 +2468,23 @@ ${bodyHash}`;
     }
     saveHashCache() {
       try {
-        const entries = [...this.hashCache.entries()].slice(-MAX_MANIFEST_FILES).map(([path, value]) => [path, value.signature, value.hash]);
+        const entries = [...this.hashCache.entries()].slice(-MAX_MANIFEST_FILES).map(([path2, value]) => [path2, value.signature, value.hash]);
         this.localStore()?.setItem(this.hashCacheKey(), JSON.stringify({ schemaVersion: 1, entries }));
       } catch {
       }
     }
     parseAttachment(value) {
       if (!isRecord(value)) throw new LanSyncProtocolError("invalid_message_attachment");
-      const path = normalizeLanInboxAttachmentPath(value.path);
+      const path2 = normalizeLanInboxAttachmentPath(value.path);
       const name = safeLanInboxName(value.name);
       const type = typeof value.type === "string" ? value.type.slice(0, 128) : "application/octet-stream";
       const size = Number(value.size);
       const hash = typeof value.hash === "string" ? value.hash : "";
       const expiresAtDate = new Date(typeof value.expiresAt === "string" ? value.expiresAt : 0);
-      if (!path || path.split("/").pop() !== name || !Number.isFinite(size) || size < 0 || size > this.settings().maxFileBytes || !/^[A-Za-z0-9_-]{32,64}$/.test(hash) || !Number.isFinite(expiresAtDate.getTime())) {
+      if (!path2 || path2.split("/").pop() !== name || !Number.isFinite(size) || size < 0 || size > this.settings().maxFileBytes || !/^[A-Za-z0-9_-]{32,64}$/.test(hash) || !Number.isFinite(expiresAtDate.getTime())) {
         throw new LanSyncProtocolError("invalid_message_attachment");
       }
-      return { name, type, path, size, hash, temporary: true, expiresAt: expiresAtDate.toISOString() };
+      return { name, type, path: path2, size, hash, temporary: true, expiresAt: expiresAtDate.toISOString() };
     }
     localStore() {
       if (this.options.localStore !== void 0) return this.options.localStore;
@@ -2558,10 +2558,10 @@ ${bodyHash}`;
     }
     async loadOrCreateIdentity() {
       const root = this.options.storage.identityRoot.replace(/\/+$/, "");
-      const path = `${root}/identity.json`;
+      const path2 = `${root}/identity.json`;
       await this.options.storage.ensureFolder(root);
-      if (await this.options.storage.exists(path)) {
-        const identity2 = identityFromRaw(safeJsonObject(await this.options.storage.readText(path)));
+      if (await this.options.storage.exists(path2)) {
+        const identity2 = identityFromRaw(safeJsonObject(await this.options.storage.readText(path2)));
         if (!identity2) throw new Error("invalid_lan_identity");
         return identity2;
       }
@@ -2571,17 +2571,17 @@ ${bodyHash}`;
         secret: randomId(32),
         createdAt: new Date(this.now()).toISOString()
       };
-      await this.options.storage.writeText(path, `${JSON.stringify(identity, null, 2)}
+      await this.options.storage.writeText(path2, `${JSON.stringify(identity, null, 2)}
 `);
-      const verified = identityFromRaw(safeJsonObject(await this.options.storage.readText(path)));
+      const verified = identityFromRaw(safeJsonObject(await this.options.storage.readText(path2)));
       if (!verified) throw new Error("lan_identity_write_failed");
       return verified;
     }
     async refreshIdentityIfChanged() {
       if (!this.identity) return;
-      const path = `${this.options.storage.identityRoot.replace(/\/+$/, "")}/identity.json`;
+      const path2 = `${this.options.storage.identityRoot.replace(/\/+$/, "")}/identity.json`;
       try {
-        const next = identityFromRaw(safeJsonObject(await this.options.storage.readText(path)));
+        const next = identityFromRaw(safeJsonObject(await this.options.storage.readText(path2)));
         if (!next || next.vaultId === this.identity.vaultId && next.secret === this.identity.secret) return;
         this.identity = next;
         this.peers.clear();
@@ -2680,12 +2680,12 @@ ${bodyHash}`;
       const addresses = this.localAddresses();
       if (!addresses.length) return;
       const folder = `${this.options.storage.identityRoot.replace(/\/+$/, "")}/peers`;
-      const path = `${folder}/${this.deviceId}.json`;
+      const path2 = `${folder}/${this.deviceId}.json`;
       await this.options.storage.ensureFolder(folder);
       let previous = null;
-      if (await this.options.storage.exists(path)) {
+      if (await this.options.storage.exists(path2)) {
         try {
-          previous = descriptorFromRaw(safeJsonObject(await this.options.storage.readText(path)));
+          previous = descriptorFromRaw(safeJsonObject(await this.options.storage.readText(path2)));
         } catch {
           previous = null;
         }
@@ -2701,7 +2701,7 @@ ${bodyHash}`;
         addresses,
         updatedAt: new Date(this.now()).toISOString()
       };
-      await this.options.storage.writeText(path, `${JSON.stringify(descriptor, null, 2)}
+      await this.options.storage.writeText(path2, `${JSON.stringify(descriptor, null, 2)}
 `);
     }
     async loadRememberedPeers() {
@@ -2714,10 +2714,10 @@ ${bodyHash}`;
       } catch {
         return;
       }
-      for (const path of files.slice(0, 100)) {
-        if (!path.toLowerCase().endsWith(".json")) continue;
+      for (const path2 of files.slice(0, 100)) {
+        if (!path2.toLowerCase().endsWith(".json")) continue;
         try {
-          const descriptor = descriptorFromRaw(safeJsonObject(await this.options.storage.readText(path)));
+          const descriptor = descriptorFromRaw(safeJsonObject(await this.options.storage.readText(path2)));
           if (!descriptor || descriptor.vaultId !== this.identity.vaultId || descriptor.deviceId === this.deviceId) continue;
           const updatedAt = Date.parse(descriptor.updatedAt);
           if (!Number.isFinite(updatedAt) || this.now() - updatedAt > REMEMBERED_PEER_MAX_AGE_MS) continue;
@@ -2883,15 +2883,15 @@ ${bodyHash}`;
       }
       this.emitPeersChanged();
     }
-    beginInboundFileActivity(deviceId, route, payload) {
+    beginInboundFileActivity(deviceId, route, payload2) {
       if (!route.includes("/file/") && !route.includes("/attachment/")) return null;
-      const attachmentPath = route.endsWith("/attachment/write") ? normalizeLanInboxAttachmentPath(`${LAN_INBOX_ROOT}/${String(payload.attachmentId || "")}/${safeLanInboxName(payload.name)}`) : null;
-      const path = attachmentPath || this.normalizePath(payload.path);
-      if (!path) return null;
+      const attachmentPath = route.endsWith("/attachment/write") ? normalizeLanInboxAttachmentPath(`${LAN_INBOX_ROOT}/${String(payload2.attachmentId || "")}/${safeLanInboxName(payload2.name)}`) : null;
+      const path2 = attachmentPath || this.normalizePath(payload2.path);
+      if (!path2) return null;
       const now = this.now();
-      const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : "";
+      const sessionId = typeof payload2.sessionId === "string" ? payload2.sessionId : "";
       if (sessionId && this.inboundSession?.id === sessionId && this.inboundSession.deviceId === deviceId) {
-        const index2 = this.activityFiles.findIndex((file) => file.path === path && file.state !== "complete");
+        const index2 = this.activityFiles.findIndex((file) => file.path === path2 && file.state !== "complete");
         if (index2 < 0) return null;
         this.activityFiles[index2].state = "syncing";
         this.inboundSession.updatedAt = now;
@@ -2901,9 +2901,9 @@ ${bodyHash}`;
       }
       if (this.progressValue.peerId !== deviceId || now - this.activityUpdatedAt > 1500) this.activityFiles = [];
       const action = route.endsWith("/read") ? "push" : route.endsWith("/delete") ? "delete-local" : "pull";
-      const encodedLength = typeof payload.data === "string" ? payload.data.length : 0;
+      const encodedLength = typeof payload2.data === "string" ? payload2.data.length : 0;
       const index = this.activityFiles.push({
-        path,
+        path: path2,
         action,
         state: "syncing",
         size: encodedLength ? Math.floor(encodedLength * 0.75) : 0
@@ -2912,9 +2912,12 @@ ${bodyHash}`;
       this.emitInboundFileProgress(deviceId);
       return index;
     }
-    finishInboundFileActivity(deviceId, index, success) {
-      if (index === null || !this.activityFiles[index]) return;
-      this.activityFiles[index].state = success ? "complete" : "error";
+    finishInboundFileActivity(deviceId, index, success, path2 = "", payload2 = {}) {
+      const expectedPath = path2.endsWith("/attachment/write") ? normalizeLanInboxAttachmentPath(`${LAN_INBOX_ROOT}/${String(payload2.attachmentId || "")}/${safeLanInboxName(payload2.name)}`) : this.normalizePath(payload2.path);
+      const resolvedIndex = expectedPath ? this.activityFiles.findIndex((file) => file.path === expectedPath && file.state === "syncing") : -1;
+      const targetIndex = resolvedIndex >= 0 ? resolvedIndex : index;
+      if (targetIndex === null || targetIndex === void 0 || targetIndex < 0 || !this.activityFiles[targetIndex]) return;
+      this.activityFiles[targetIndex].state = success ? "complete" : "error";
       this.activityUpdatedAt = this.now();
       this.emitInboundFileProgress(deviceId, success ? "syncing" : "error");
     }
@@ -2951,17 +2954,17 @@ ${bodyHash}`;
       const attachments = (Array.isArray(raw.attachments) ? raw.attachments : []).slice(0, MAX_MESSAGE_ATTACHMENTS).map((item) => {
         if (!isRecord(item)) throw new LanSyncProtocolError("invalid_message_attachment");
         const inboxPath = normalizeLanInboxAttachmentPath(item.path);
-        const path = inboxPath || this.normalizePath(item.path, false);
+        const path2 = inboxPath || this.normalizePath(item.path, false);
         const hash = typeof item.hash === "string" ? item.hash : "";
         const size = Number(item.size);
-        if (!path || !/^[A-Za-z0-9_-]{32,64}$/.test(hash) || !Number.isFinite(size) || size < 0 || size > this.settings().maxFileBytes) {
+        if (!path2 || !/^[A-Za-z0-9_-]{32,64}$/.test(hash) || !Number.isFinite(size) || size < 0 || size > this.settings().maxFileBytes) {
           throw new LanSyncProtocolError("invalid_message_attachment");
         }
         const expiresAtDate = new Date(typeof item.expiresAt === "string" ? item.expiresAt : 0);
         return {
-          name: safeLanInboxName(item.name || path.split("/").pop() || "attachment"),
+          name: safeLanInboxName(item.name || path2.split("/").pop() || "attachment"),
           type: String(item.type || "application/octet-stream").slice(0, 128),
-          path,
+          path: path2,
           size,
           hash,
           temporary: Boolean(inboxPath),
@@ -2971,8 +2974,8 @@ ${bodyHash}`;
       if (!text && !attachments.length) throw new LanSyncProtocolError("empty_message");
       return { id, deviceId, text, sentAt, attachments };
     }
-    async handleIncomingMessage(deviceId, payload) {
-      const message = this.normalizeMessagePayload(payload, deviceId);
+    async handleIncomingMessage(deviceId, payload2) {
+      const message = this.normalizeMessagePayload(payload2, deviceId);
       for (const attachment of message.attachments) {
         const stat = await this.options.storage.statFile(attachment.path);
         if (!stat || stat.size !== attachment.size || stat.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("message_attachment_unavailable", 409);
@@ -3022,13 +3025,13 @@ ${bodyHash}`;
         }
       }
     }
-    async handleReadQueuedAttachment(deviceId, payload) {
-      const messageId = typeof payload.messageId === "string" ? payload.messageId : "";
-      const path = normalizeLanInboxAttachmentPath(payload.path);
-      const expectedHash = typeof payload.expectedHash === "string" ? payload.expectedHash : "";
+    async handleReadQueuedAttachment(deviceId, payload2) {
+      const messageId = typeof payload2.messageId === "string" ? payload2.messageId : "";
+      const path2 = normalizeLanInboxAttachmentPath(payload2.path);
+      const expectedHash = typeof payload2.expectedHash === "string" ? payload2.expectedHash : "";
       const message = (this.pendingMessages.get(deviceId) ?? []).find((item) => item.id === messageId);
-      const attachment = message?.attachments.find((item) => item.path === path && item.hash === expectedHash);
-      const sourcePath = attachment && path ? this.outboundAttachmentPath(deviceId, path) : null;
+      const attachment = message?.attachments.find((item) => item.path === path2 && item.hash === expectedHash);
+      const sourcePath = attachment && path2 ? this.outboundAttachmentPath(deviceId, path2) : null;
       if (!message || !attachment || !sourcePath) throw new LanSyncProtocolError("file_unavailable", 404);
       const stat = await this.options.storage.statFile(sourcePath);
       if (!stat || stat.size !== attachment.size) throw new LanSyncProtocolError("file_unavailable", 404);
@@ -3036,8 +3039,8 @@ ${bodyHash}`;
       if (bytes.byteLength !== attachment.size || await sha256Bytes(bytes) !== attachment.hash) throw new LanSyncProtocolError("precondition_failed", 409);
       return { attachment, data: bytesToBase64Url(bytes) };
     }
-    async handleMessageAcknowledgement(deviceId, payload) {
-      const ids = Array.isArray(payload.ids) ? payload.ids.filter((value) => typeof value === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(value)).slice(0, MAX_PING_MESSAGES) : [];
+    async handleMessageAcknowledgement(deviceId, payload2) {
+      const ids = Array.isArray(payload2.ids) ? payload2.ids.filter((value) => typeof value === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(value)).slice(0, MAX_PING_MESSAGES) : [];
       const idSet = new Set(ids);
       const queue = this.pendingMessages.get(deviceId) ?? [];
       const removed = queue.filter((message) => idSet.has(message.id));
@@ -3055,26 +3058,26 @@ ${bodyHash}`;
     }
     dirtySnapshot() {
       const selected = /* @__PURE__ */ new Map();
-      for (const path of this.urgentDirtyPaths) {
-        const generation = this.dirtyPaths.get(path);
-        if (generation !== void 0) selected.set(path, generation);
+      for (const path2 of this.urgentDirtyPaths) {
+        const generation = this.dirtyPaths.get(path2);
+        if (generation !== void 0) selected.set(path2, generation);
         if (selected.size >= INCREMENTAL_PATH_BATCH_SIZE) break;
       }
-      for (const [path, generation] of [...this.dirtyPaths.entries()].reverse()) {
+      for (const [path2, generation] of [...this.dirtyPaths.entries()].reverse()) {
         if (selected.size >= INCREMENTAL_PATH_BATCH_SIZE) break;
-        if (!selected.has(path)) selected.set(path, generation);
+        if (!selected.has(path2)) selected.set(path2, generation);
       }
-      return [...selected.entries()].map(([path, generation]) => ({ path, generation }));
+      return [...selected.entries()].map(([path2, generation]) => ({ path: path2, generation }));
     }
     parseDirtyPaths(value) {
       const paths = /* @__PURE__ */ new Map();
       if (!Array.isArray(value) || value.length > MAX_MANIFEST_FILES) return paths;
       for (const item of value) {
         if (!isRecord(item)) continue;
-        const path = this.normalizePath(item.path, true);
+        const path2 = this.normalizePath(item.path, true);
         const generation = Number(item.generation);
-        if (!path || !Number.isSafeInteger(generation) || generation <= 0) continue;
-        paths.set(path, generation);
+        if (!path2 || !Number.isSafeInteger(generation) || generation <= 0) continue;
+        paths.set(path2, generation);
       }
       return paths;
     }
@@ -3158,8 +3161,8 @@ ${bodyHash}`;
         receivedAt: this.now()
       };
     }
-    applyRemoteSyncSignal(peer, payload) {
-      const capabilities = (Array.isArray(payload.capabilities) ? payload.capabilities : []).filter((value) => typeof value === "string" && value.length <= 64);
+    applyRemoteSyncSignal(peer, payload2) {
+      const capabilities = (Array.isArray(payload2.capabilities) ? payload2.capabilities : []).filter((value) => typeof value === "string" && value.length <= 64);
       const compatibleCapabilities = METADATA_PROTOCOLS.map((protocol) => protocol.capability).filter((capability) => capabilities.includes(capability));
       if (compatibleCapabilities.length) {
         for (const capability of compatibleCapabilities) peer.capabilities.add(capability);
@@ -3168,15 +3171,15 @@ ${bodyHash}`;
       } else if (!this.metadataProtocol(peer) && peer.compatibilityPendingSince <= 0) {
         peer.compatibilityPendingSince = this.now();
       }
-      const requestId = typeof payload.syncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.syncRequestId) ? payload.syncRequestId : "";
+      const requestId = typeof payload2.syncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload2.syncRequestId) ? payload2.syncRequestId : "";
       const requested = Boolean(requestId && requestId !== peer.lastRemoteSyncRequestId);
       if (requestId) peer.lastRemoteSyncRequestId = requestId;
-      const remoteFullSyncRequestId = typeof payload.fullSyncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.fullSyncRequestId) ? payload.fullSyncRequestId : "";
+      const remoteFullSyncRequestId = typeof payload2.fullSyncRequestId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload2.fullSyncRequestId) ? payload2.fullSyncRequestId : "";
       const hasPeerBaseline = Object.keys(this.loadMetadataLedger(peer.deviceId).entries).length > 0;
       peer.remoteFullSyncRequestId = hasPeerBaseline ? "" : remoteFullSyncRequestId;
-      peer.remoteForceFilesystemScan = Boolean(peer.remoteFullSyncRequestId && payload.forceFilesystemScan === true);
-      peer.remoteDirtyPaths = this.parseDirtyPaths(payload.dirtyPaths);
-      const remoteProgress = this.parseRemoteProgress(payload.progress);
+      peer.remoteForceFilesystemScan = Boolean(peer.remoteFullSyncRequestId && payload2.forceFilesystemScan === true);
+      peer.remoteDirtyPaths = this.parseDirtyPaths(payload2.dirtyPaths);
+      const remoteProgress = this.parseRemoteProgress(payload2.progress);
       if (remoteProgress) peer.remoteProgress = remoteProgress;
       this.mirrorRemoteProgress(peer);
       return requested;
@@ -3379,21 +3382,21 @@ ${bodyHash}`;
       const hasIncrementalWork = this.dirtyPaths.size > 0 || hasRemoteDirty;
       const localFullSyncRequestId = this.fullSyncRequested && !this.backgroundReconciliation && !hasIncrementalWork ? this.fullSyncRequestId : "";
       const localDirty = /* @__PURE__ */ new Map();
-      for (const path of this.activeEditDirty) {
-        const generation = this.dirtyPaths.get(path);
-        if (generation !== void 0) localDirty.set(path, generation);
+      for (const path2 of this.activeEditDirty) {
+        const generation = this.dirtyPaths.get(path2);
+        if (generation !== void 0) localDirty.set(path2, generation);
         if (localDirty.size >= INCREMENTAL_PATH_BATCH_SIZE) break;
       }
-      for (const [path, generation] of this.dirtyPaths) {
-        if (!localDirty.has(path)) localDirty.set(path, generation);
+      for (const [path2, generation] of this.dirtyPaths) {
+        if (!localDirty.has(path2)) localDirty.set(path2, generation);
         if (localDirty.size >= INCREMENTAL_PATH_BATCH_SIZE) break;
       }
       let localForceFilesystemScan = Boolean(
         localFullSyncRequestId && this.forceFilesystemScanRequested && this.localFilesystemScanCompletedRequestId !== localFullSyncRequestId
       );
       let remoteForceFilesystemScan = Boolean(localFullSyncRequestId && this.forceFilesystemScanRequested);
-      const urgentPaths = new Set([...localDirty.keys()].filter((path) => this.urgentDirtyPaths.has(path)));
-      for (const path of urgentPaths) this.urgentDirtyPaths.delete(path);
+      const urgentPaths = new Set([...localDirty.keys()].filter((path2) => this.urgentDirtyPaths.has(path2)));
+      for (const path2 of urgentPaths) this.urgentDirtyPaths.delete(path2);
       this.syncRunning = true;
       this.lastSyncCycleAt = this.now();
       this.syncStartedAt = this.now();
@@ -3405,15 +3408,15 @@ ${bodyHash}`;
           if (!this.runningValue) break;
           if (this.now() - peer.lastSyncAt < SYNC_MIN_INTERVAL_MS && !this.syncQueued && !forced) continue;
           const result = await this.syncPeer(peer, localDirty, localFullSyncRequestId, localForceFilesystemScan, remoteForceFilesystemScan, urgentPaths);
-          settledAcrossPeers = settledAcrossPeers === null ? new Set(result.settledLocalPaths) : new Set([...settledAcrossPeers].filter((path) => result.settledLocalPaths.has(path)));
+          settledAcrossPeers = settledAcrossPeers === null ? new Set(result.settledLocalPaths) : new Set([...settledAcrossPeers].filter((path2) => result.settledLocalPaths.has(path2)));
           if (localFullSyncRequestId) fullSyncCompletedEverywhere = fullSyncCompletedEverywhere && result.fullSyncComplete;
           peer.lastSyncAt = this.now();
           synchronizedPeers += 1;
         }
         if (synchronizedPeers === peers.length) {
-          for (const path of settledAcrossPeers ?? []) {
-            const generation = localDirty.get(path);
-            if (generation !== void 0 && (this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
+          for (const path2 of settledAcrossPeers ?? []) {
+            const generation = localDirty.get(path2);
+            if (generation !== void 0 && (this.dirtyPaths.get(path2) ?? 0) <= generation) this.dirtyPaths.delete(path2);
           }
           if (fullSyncCompletedEverywhere && this.fullSyncRequested && (!localFullSyncRequestId || this.fullSyncRequestId === localFullSyncRequestId)) {
             this.fullSyncRequested = false;
@@ -3471,14 +3474,14 @@ ${bodyHash}`;
         this.syncQueued = true;
         return;
       }
-      const paths = [...this.activeEditDirty].filter((path) => this.dirtyPaths.has(path)).slice(0, INCREMENTAL_PATH_BATCH_SIZE);
+      const paths = [...this.activeEditDirty].filter((path2) => this.dirtyPaths.has(path2)).slice(0, INCREMENTAL_PATH_BATCH_SIZE);
       if (!paths.length) {
         this.activeEditDirty.clear();
         return;
       }
       const peers = this.syncTargets();
       if (!peers.length) return;
-      const localDirty = new Map(paths.map((path) => [path, this.dirtyPaths.get(path) ?? this.dirtySequence]));
+      const localDirty = new Map(paths.map((path2) => [path2, this.dirtyPaths.get(path2) ?? this.dirtySequence]));
       let settledAcrossPeers = null;
       let synchronizedPeers = 0;
       this.activeEditSyncRunning = true;
@@ -3503,17 +3506,17 @@ ${bodyHash}`;
             forceLocalFilesystemScan: false,
             forceRemoteFilesystemScan: false
           });
-          settledAcrossPeers = settledAcrossPeers === null ? new Set(result.settledLocalPaths) : new Set([...settledAcrossPeers].filter((path) => result.settledLocalPaths.has(path)));
+          settledAcrossPeers = settledAcrossPeers === null ? new Set(result.settledLocalPaths) : new Set([...settledAcrossPeers].filter((path2) => result.settledLocalPaths.has(path2)));
           synchronizedPeers += 1;
         }
         if (synchronizedPeers === peers.length) {
           this.activeEditFailureStreak = 0;
           this.activeEditRetryAt = 0;
-          for (const path of paths) this.activeEditDirty.delete(path);
-          for (const path of settledAcrossPeers ?? []) {
-            const generation = localDirty.get(path);
-            if (generation !== void 0 && (this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
-            this.urgentDirtyPaths.delete(path);
+          for (const path2 of paths) this.activeEditDirty.delete(path2);
+          for (const path2 of settledAcrossPeers ?? []) {
+            const generation = localDirty.get(path2);
+            if (generation !== void 0 && (this.dirtyPaths.get(path2) ?? 0) <= generation) this.dirtyPaths.delete(path2);
+            this.urgentDirtyPaths.delete(path2);
           }
           this.queueChangeJournalSave();
           this.recordSyncCheckpoint();
@@ -3608,21 +3611,21 @@ ${bodyHash}`;
       const localMap = new Map(filteredLocalEntries.map((entry) => [entry.path, entry]));
       const remoteMap = new Map(remoteEntries.map((entry) => [entry.path, entry]));
       const selectedPaths = new Set(
-        (request.fullSync ? [...localMap.keys(), ...remoteMap.keys(), ...request.paths] : requestedPaths).filter((path) => shareConfig || !isConfigPath(path, this.settings().configDir))
+        (request.fullSync ? [...localMap.keys(), ...remoteMap.keys(), ...request.paths] : requestedPaths).filter((path2) => shareConfig || !isConfigPath(path2, this.settings().configDir))
       );
       if (request.fullSync) {
-        for (const path of Object.keys(ledger.entries)) {
-          if (!localMap.has(path) && !remoteMap.has(path)) delete ledger.entries[path];
+        for (const path2 of Object.keys(ledger.entries)) {
+          if (!localMap.has(path2) && !remoteMap.has(path2)) delete ledger.entries[path2];
         }
       }
-      for (const path of [.../* @__PURE__ */ new Set([...localMap.keys(), ...remoteMap.keys()])]) {
-        const local = localMap.get(path);
-        const remote = remoteMap.get(path);
-        if (local && remote && (metadataMatches(local, remote) || !ledger.entries[path] && metadataBootstrapEquivalent(local, remote))) {
-          ledger.entries[path] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
+      for (const path2 of [.../* @__PURE__ */ new Set([...localMap.keys(), ...remoteMap.keys()])]) {
+        const local = localMap.get(path2);
+        const remote = remoteMap.get(path2);
+        if (local && remote && (metadataMatches(local, remote) || !ledger.entries[path2] && metadataBootstrapEquivalent(local, remote))) {
+          ledger.entries[path2] = { local: metadataSnapshot(local), remote: metadataSnapshot(remote) };
         }
       }
-      const bootstrapCandidates = [...localMap.keys()].map((path) => ({ path, local: localMap.get(path), remote: remoteMap.get(path) })).filter((item) => Boolean(
+      const bootstrapCandidates = [...localMap.keys()].map((path2) => ({ path: path2, local: localMap.get(path2), remote: remoteMap.get(path2) })).filter((item) => Boolean(
         !ledger.entries[item.path] && item.local && item.remote && item.local.size === item.remote.size
       ));
       if (bootstrapCandidates.length) {
@@ -3644,12 +3647,12 @@ ${bodyHash}`;
         const localHashesPromise = this.buildMetadataHashManifest(
           bootstrapCandidates.map((item) => item.local),
           shareConfig,
-          (path, cached) => {
+          (path2, cached) => {
             verified += 1;
             scan.completed = completedBeforeHashes + verified;
             if (cached) scan.cached += 1;
             else scan.hashed += 1;
-            const activity = scanFiles.get(path);
+            const activity = scanFiles.get(path2);
             if (activity) {
               activity.state = cached ? "cached" : "complete";
               activity.reason = cached ? "fingerprint-cache" : "fingerprint";
@@ -3687,16 +3690,16 @@ ${bodyHash}`;
         localDirty: request.localDirty,
         remoteDirty: request.remoteDirty
       });
-      const settledPaths = new Set([...selectedPaths].filter((path) => !actionPaths.has(path)));
+      const settledPaths = new Set([...selectedPaths].filter((path2) => !actionPaths.has(path2)));
       const commits = [];
-      for (const path of settledPaths) {
-        const local = localMap.get(path);
-        const remote = remoteMap.get(path);
-        const baseline = ledger.entries[path];
+      for (const path2 of settledPaths) {
+        const local = localMap.get(path2);
+        const remote = remoteMap.get(path2);
+        const baseline = ledger.entries[path2];
         if (local && remote && (metadataMatches(local, remote) || baseline && metadataMatches(local, baseline.local) && metadataMatches(remote, baseline.remote))) {
-          commits.push({ path, coordinator: metadataSnapshot(local), peer: metadataSnapshot(remote) });
+          commits.push({ path: path2, coordinator: metadataSnapshot(local), peer: metadataSnapshot(remote) });
         } else if (!local && !remote) {
-          commits.push({ path, coordinator: null, peer: null });
+          commits.push({ path: path2, coordinator: null, peer: null });
         }
       }
       const transferSize = (action) => action.kind === "push" ? action.local?.size ?? 0 : action.kind === "pull" ? action.remote?.size ?? 0 : 0;
@@ -3869,7 +3872,7 @@ ${bodyHash}`;
       await Promise.all(Array.from({ length: adaptiveTransferConcurrency(this.activityFiles) }, transferWorker));
       this.saveMetadataLedger(peer.deviceId, ledger);
       const success = failure === null;
-      const acknowledgedRemoteDirty = [...request.remoteDirty.entries()].filter(([path]) => settledPaths.has(path)).map(([path, generation]) => ({ path, generation }));
+      const acknowledgedRemoteDirty = [...request.remoteDirty.entries()].filter(([path2]) => settledPaths.has(path2)).map(([path2, generation]) => ({ path: path2, generation }));
       let finishFailure = null;
       try {
         await this.callPeer(peer, this.metadataRoute(peer, "/session/finish"), {
@@ -3884,12 +3887,12 @@ ${bodyHash}`;
         finishFailure = error;
       }
       if (success && finishFailure === null) {
-        for (const { path, generation } of acknowledgedRemoteDirty) {
-          if ((peer.remoteDirtyPaths?.get(path) ?? 0) <= generation) peer.remoteDirtyPaths?.delete(path);
+        for (const { path: path2, generation } of acknowledgedRemoteDirty) {
+          if ((peer.remoteDirtyPaths?.get(path2) ?? 0) <= generation) peer.remoteDirtyPaths?.delete(path2);
         }
         if (request.remoteFullSyncRequestId && peer.remoteFullSyncRequestId === request.remoteFullSyncRequestId) peer.remoteFullSyncRequestId = "";
         if (!peer.remoteFullSyncRequestId) peer.remoteForceFilesystemScan = false;
-        for (const path of retryPaths) this.markDirtyPath(path, QUEUED_SYNC_DELAY_MS);
+        for (const path2 of retryPaths) this.markDirtyPath(path2, QUEUED_SYNC_DELAY_MS);
       }
       if (failure !== null) throw failure;
       if (finishFailure !== null) throw finishFailure;
@@ -3915,7 +3918,7 @@ ${bodyHash}`;
       });
       this.currentTransferSessionId = "";
       return {
-        settledLocalPaths: new Set([...request.localDirty.keys()].filter((path) => settledPaths.has(path))),
+        settledLocalPaths: new Set([...request.localDirty.keys()].filter((path2) => settledPaths.has(path2))),
         fullSyncComplete: Boolean(request.fullSync && success && !failedPaths.size)
       };
     }
@@ -3934,13 +3937,13 @@ ${bodyHash}`;
       const remoteEntries = this.parseManifest(remoteResponse.files, shareConfig);
       const localMap = new Map(filteredLocalEntries.map((entry) => [entry.path, entry]));
       const remoteMap = new Map(remoteEntries.map((entry) => [entry.path, entry]));
-      for (const path of Object.keys(ledger.entries)) {
-        if (!localMap.has(path) && !remoteMap.has(path)) delete ledger.entries[path];
+      for (const path2 of Object.keys(ledger.entries)) {
+        if (!localMap.has(path2) && !remoteMap.has(path2)) delete ledger.entries[path2];
       }
-      for (const path of [.../* @__PURE__ */ new Set([...localMap.keys(), ...remoteMap.keys()])]) {
-        const local = localMap.get(path);
-        const remote = remoteMap.get(path);
-        if (local && remote && local.hash === remote.hash) ledger.entries[path] = local.hash;
+      for (const path2 of [.../* @__PURE__ */ new Set([...localMap.keys(), ...remoteMap.keys()])]) {
+        const local = localMap.get(path2);
+        const remote = remoteMap.get(path2);
+        if (local && remote && local.hash === remote.hash) ledger.entries[path2] = local.hash;
       }
       const actions = planLanSyncReconciliation(filteredLocalEntries, remoteEntries, ledger.entries, localPolicy, remotePolicy);
       const bytesTotal = actions.reduce((sum, action) => sum + Math.max(action.local?.size ?? 0, action.remote?.size ?? 0), 0);
@@ -4108,32 +4111,32 @@ ${bodyHash}`;
           onProgress?.(expected.path, false);
           return null;
         }
-        const path = this.normalizePath(expected.path, includeConfigFolder);
-        if (!path) {
+        const path2 = this.normalizePath(expected.path, includeConfigFolder);
+        if (!path2) {
           onProgress?.(expected.path, false);
           return null;
         }
-        const before = await this.options.storage.statFile(path);
+        const before = await this.options.storage.statFile(path2);
         if (!before || !metadataMatches(before, expected) || before.size > this.settings().maxFileBytes) {
-          onProgress?.(path, false);
+          onProgress?.(path2, false);
           return null;
         }
         const signature = `${before.mtime}:${before.size}`;
-        const cachedHash = this.hashCache.get(path);
+        const cachedHash = this.hashCache.get(path2);
         if (cachedHash?.signature === signature) {
-          onProgress?.(path, true);
-          return { path, size: before.size, mtime: before.mtime, hash: cachedHash.hash };
+          onProgress?.(path2, true);
+          return { path: path2, size: before.size, mtime: before.mtime, hash: cachedHash.hash };
         }
-        const bytes = new Uint8Array(await this.options.storage.readBinary(path));
-        const after = await this.options.storage.statFile(path);
+        const bytes = new Uint8Array(await this.options.storage.readBinary(path2));
+        const after = await this.options.storage.statFile(path2);
         if (!after || !metadataMatches(after, expected) || bytes.byteLength !== after.size) {
-          onProgress?.(path, false);
+          onProgress?.(path2, false);
           return null;
         }
         const hash = await sha256Bytes(bytes);
-        this.hashCache.set(path, { signature, hash });
-        onProgress?.(path, false);
-        return { path, size: after.size, mtime: after.mtime, hash };
+        this.hashCache.set(path2, { signature, hash });
+        onProgress?.(path2, false);
+        return { path: path2, size: after.size, mtime: after.mtime, hash };
       });
       this.queueHashCacheSave();
       return entries.filter((entry) => entry !== null);
@@ -4154,12 +4157,12 @@ ${bodyHash}`;
       this.emitActivityChanged();
       let verified = 0;
       let lastReportedAt = 0;
-      const entries = await this.buildMetadataHashManifest(expectedEntries, includeConfigFolder, (path, cached) => {
+      const entries = await this.buildMetadataHashManifest(expectedEntries, includeConfigFolder, (path2, cached) => {
         verified += 1;
         scan.completed = completedBeforeHashes + verified;
         if (cached) scan.cached += 1;
         else scan.hashed += 1;
-        const activity = scanFiles.get(path);
+        const activity = scanFiles.get(path2);
         if (activity) {
           activity.state = cached ? "cached" : "complete";
           activity.reason = cached ? "fingerprint-cache" : "fingerprint";
@@ -4223,7 +4226,7 @@ ${bodyHash}`;
         hashed: 0,
         skipped: 0,
         error: "",
-        files: unique.map((path) => ({ path, state: "pending", size: 0, reason: "" }))
+        files: unique.map((path2) => ({ path: path2, state: "pending", size: 0, reason: "" }))
       };
       const exposeScanProgress = this.canExposeScanProgress();
       if (this.canClaimScanValue()) this.scanValue = scan;
@@ -4233,10 +4236,10 @@ ${bodyHash}`;
       };
       report();
       try {
-        const results = await mapWithConcurrency(unique.map((path, index) => ({ path, index })), HASH_CONCURRENCY, async ({ path: rawPath, index }) => {
+        const results = await mapWithConcurrency(unique.map((path2, index) => ({ path: path2, index })), HASH_CONCURRENCY, async ({ path: rawPath, index }) => {
           const activity = scan.files[index];
-          const path = this.normalizePath(rawPath, includeConfigFolder);
-          if (!path) {
+          const path2 = this.normalizePath(rawPath, includeConfigFolder);
+          if (!path2) {
             activity.state = "skipped";
             activity.reason = "unsafe-path";
             scan.skipped += 1;
@@ -4244,20 +4247,20 @@ ${bodyHash}`;
             report();
             return null;
           }
-          const stat = await this.options.storage.statFile(path);
+          const stat = await this.options.storage.statFile(path2);
           if (!stat) {
-            this.metadataIndex.delete(path);
-            activity.path = path;
+            this.metadataIndex.delete(path2);
+            activity.path = path2;
             activity.state = "complete";
             activity.reason = "missing";
             scan.completed = Math.min(scan.total, scan.completed + 1);
             report();
             return null;
           }
-          activity.path = path;
+          activity.path = path2;
           activity.size = stat.size;
           if (!Number.isFinite(stat.size) || stat.size < 0 || stat.size > this.settings().maxFileBytes || !Number.isFinite(stat.mtime) || stat.mtime < 0) {
-            this.metadataIndex.delete(path);
+            this.metadataIndex.delete(path2);
             activity.state = "skipped";
             activity.reason = stat.size > this.settings().maxFileBytes ? "too-large" : "invalid-metadata";
             scan.skipped += 1;
@@ -4267,11 +4270,11 @@ ${bodyHash}`;
           }
           activity.state = "cached";
           activity.reason = "metadata";
-          this.metadataIndex.set(path, { size: stat.size, mtime: stat.mtime });
+          this.metadataIndex.set(path2, { size: stat.size, mtime: stat.mtime });
           scan.cached += 1;
           scan.completed += 1;
           report();
-          return { path, size: stat.size, mtime: stat.mtime };
+          return { path: path2, size: stat.size, mtime: stat.mtime };
         });
         scan.phase = "complete";
         scan.completed = scan.total;
@@ -4312,8 +4315,8 @@ ${bodyHash}`;
       }
     }
     async buildMetadataManifestFromIndex(includeConfigFolder, onProgress) {
-      const dirtyEntries = [...this.dirtyPaths.entries()].filter(([path, generation]) => generation > this.metadataIndexGeneration && this.normalizePath(path, includeConfigFolder) !== null).slice(0, MAX_MANIFEST_FILES);
-      const dirty = dirtyEntries.map(([path]) => path);
+      const dirtyEntries = [...this.dirtyPaths.entries()].filter(([path2, generation]) => generation > this.metadataIndexGeneration && this.normalizePath(path2, includeConfigFolder) !== null).slice(0, MAX_MANIFEST_FILES);
+      const dirty = dirtyEntries.map(([path2]) => path2);
       if (dirty.length) {
         await this.buildMetadataManifestForPaths(dirty, includeConfigFolder);
         this.metadataIndexGeneration = Math.max(this.metadataIndexGeneration, ...dirtyEntries.map(([, generation]) => generation));
@@ -4328,7 +4331,7 @@ ${bodyHash}`;
       }
       if (dirty.length) onProgress?.(this.scanValue.completed, this.scanValue.total);
       const maxFileBytes = this.settings().maxFileBytes;
-      return [...this.metadataIndex.entries()].map(([path, metadata]) => ({ path, ...metadata })).filter((entry) => this.normalizePath(entry.path, includeConfigFolder) !== null && entry.size <= maxFileBytes).sort((left, right) => left.path.localeCompare(right.path));
+      return [...this.metadataIndex.entries()].map(([path2, metadata]) => ({ path: path2, ...metadata })).filter((entry) => this.normalizePath(entry.path, includeConfigFolder) !== null && entry.size <= maxFileBytes).sort((left, right) => left.path.localeCompare(right.path));
     }
     async buildMetadataManifestOnce(includeConfigFolder, onProgress) {
       const maxFileBytes = this.settings().maxFileBytes;
@@ -4391,9 +4394,9 @@ ${bodyHash}`;
           report();
           if ((index + 1) % 256 === 0 && index + 1 < candidates.length) await yieldToLanEventLoop();
         }
-        for (const path of this.metadataIndex.keys()) {
-          if (this.backgroundReconciliation && !seenPaths.has(path) && this.normalizePath(path, includeConfigFolder)) {
-            this.markDirtyPath(path, REALTIME_DIRTY_DELAY_MS, true);
+        for (const path2 of this.metadataIndex.keys()) {
+          if (this.backgroundReconciliation && !seenPaths.has(path2) && this.normalizePath(path2, includeConfigFolder)) {
+            this.markDirtyPath(path2, REALTIME_DIRTY_DELAY_MS, true);
           }
         }
         scan.phase = "complete";
@@ -4421,10 +4424,10 @@ ${bodyHash}`;
       const entries = [];
       for (const item of value) {
         if (!isRecord(item)) throw new LanSyncProtocolError("invalid_metadata_manifest");
-        const path = this.normalizePath(item.path, includeConfigFolder);
+        const path2 = this.normalizePath(item.path, includeConfigFolder);
         const metadata = this.parseMetadataSnapshot(item);
-        if (!path || !metadata) throw new LanSyncProtocolError("invalid_metadata_manifest");
-        entries.push({ path, ...metadata });
+        if (!path2 || !metadata) throw new LanSyncProtocolError("invalid_metadata_manifest");
+        entries.push({ path: path2, ...metadata });
       }
       return entries;
     }
@@ -4438,8 +4441,8 @@ ${bodyHash}`;
         const parsed = safeJsonObject(raw);
         if (parsed.schemaVersion !== 3 || !isRecord(parsed.entries)) return { schemaVersion: 3, entries: {} };
         const entries = {};
-        for (const [path, value] of Object.entries(parsed.entries).slice(-MAX_LEDGER_ENTRIES)) {
-          const normalized = this.normalizePath(path, true);
+        for (const [path2, value] of Object.entries(parsed.entries).slice(-MAX_LEDGER_ENTRIES)) {
+          const normalized = this.normalizePath(path2, true);
           if (!normalized || !isRecord(value)) continue;
           const local = this.parseMetadataSnapshot(value.local);
           const remote = this.parseMetadataSnapshot(value.remote);
@@ -4463,8 +4466,8 @@ ${bodyHash}`;
         }
       }
     }
-    async readLocalMetadataVerified(path, expected) {
-      const normalized = this.normalizePath(path);
+    async readLocalMetadataVerified(path2, expected) {
+      const normalized = this.normalizePath(path2);
       if (!normalized) throw new LanSyncProtocolError("unsafe_path");
       const before = await this.options.storage.statFile(normalized);
       if (!before || !metadataMatches(before, expected) || before.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("precondition_failed", 409);
@@ -4473,19 +4476,19 @@ ${bodyHash}`;
       if (!after || !metadataMatches(after, expected) || bytes.byteLength !== after.size) throw new LanSyncProtocolError("precondition_failed", 409);
       return { bytes, metadata: metadataSnapshot(after) };
     }
-    async existingContentMatches(path, expected, bytes) {
-      const before = await this.options.storage.statFile(path);
+    async existingContentMatches(path2, expected, bytes) {
+      const before = await this.options.storage.statFile(path2);
       if (!before || before.size !== bytes.byteLength || before.size !== expected.size) return null;
-      const current = new Uint8Array(await this.options.storage.readBinary(path));
-      const after = await this.options.storage.statFile(path);
+      const current = new Uint8Array(await this.options.storage.readBinary(path2));
+      const after = await this.options.storage.statFile(path2);
       if (!after || !metadataMatches(before, after) || current.byteLength !== bytes.byteLength) return null;
       for (let index = 0; index < bytes.byteLength; index += 1) {
         if (current[index] !== bytes[index]) return null;
       }
       return metadataSnapshot(after);
     }
-    async writeLocalMetadata(path, bytes, expected, source, allowExistingSame = false) {
-      const normalized = this.normalizePath(path);
+    async writeLocalMetadata(path2, bytes, expected, source, allowExistingSame = false) {
+      const normalized = this.normalizePath(path2);
       if (!normalized || bytes.byteLength !== source.size || bytes.byteLength > this.settings().maxFileBytes) throw new LanSyncProtocolError("unsafe_write");
       const current = await this.options.storage.statFile(normalized);
       if (expected === null) {
@@ -4517,8 +4520,8 @@ ${bodyHash}`;
       this.queueMetadataIndexSave();
       return writtenMetadata;
     }
-    async deleteLocalMetadata(path, expected) {
-      const normalized = this.normalizePath(path);
+    async deleteLocalMetadata(path2, expected) {
+      const normalized = this.normalizePath(path2);
       if (!normalized) throw new LanSyncProtocolError("unsafe_delete");
       const current = await this.options.storage.statFile(normalized);
       if (!current || !metadataMatches(current, expected)) throw new LanSyncProtocolError("precondition_failed", 409);
@@ -4545,9 +4548,9 @@ ${bodyHash}`;
       if (bytes.byteLength !== metadata.size || bytes.byteLength > this.settings().maxFileBytes) throw new LanSyncProtocolError("invalid_file_response");
       return { bytes, metadata };
     }
-    async writeRemoteMetadata(peer, path, bytes, expected, source, allowExistingSame = false, sessionId = "") {
+    async writeRemoteMetadata(peer, path2, bytes, expected, source, allowExistingSame = false, sessionId = "") {
       const response = await this.callPeer(peer, this.metadataRoute(peer, "/file/write"), {
-        path,
+        path: path2,
         expectedMetadata: expected,
         sourceMetadata: source,
         allowExistingSame,
@@ -4555,13 +4558,13 @@ ${bodyHash}`;
         data: bytesToBase64Url(bytes)
       }, fileTransferTimeoutMs(bytes.byteLength));
       const metadata = this.parseMetadataSnapshot(response.metadata);
-      if (response.path !== path || !metadata || metadata.size !== bytes.byteLength) throw new Error("remote_write_verification_failed");
+      if (response.path !== path2 || !metadata || metadata.size !== bytes.byteLength) throw new Error("remote_write_verification_failed");
       return metadata;
     }
-    async deleteRemoteMetadata(peer, path, expected, sessionId = "") {
-      const response = await this.callPeer(peer, this.metadataRoute(peer, "/file/delete"), { path, expectedMetadata: expected, sessionId }, 45e3);
+    async deleteRemoteMetadata(peer, path2, expected, sessionId = "") {
+      const response = await this.callPeer(peer, this.metadataRoute(peer, "/file/delete"), { path: path2, expectedMetadata: expected, sessionId }, 45e3);
       const deletedMetadata = this.parseMetadataSnapshot(response.deletedMetadata);
-      if (response.path !== path || response.deleted !== true || !deletedMetadata || !metadataMatches(deletedMetadata, expected)) {
+      if (response.path !== path2 || response.deleted !== true || !deletedMetadata || !metadataMatches(deletedMetadata, expected)) {
         throw new Error("remote_delete_verification_failed");
       }
     }
@@ -4660,14 +4663,14 @@ ${bodyHash}`;
       const entries = [];
       for (const item of value) {
         if (!isRecord(item)) throw new LanSyncProtocolError("invalid_manifest");
-        const path = this.normalizePath(item.path, includeConfigFolder);
+        const path2 = this.normalizePath(item.path, includeConfigFolder);
         const size = Number(item.size);
         const mtime = Number(item.mtime);
         const hash = typeof item.hash === "string" ? item.hash : "";
-        if (!path || !Number.isFinite(size) || size < 0 || size > this.settings().maxFileBytes || !Number.isFinite(mtime) || !/^[A-Za-z0-9_-]{32,64}$/.test(hash)) {
+        if (!path2 || !Number.isFinite(size) || size < 0 || size > this.settings().maxFileBytes || !Number.isFinite(mtime) || !/^[A-Za-z0-9_-]{32,64}$/.test(hash)) {
           throw new LanSyncProtocolError("invalid_manifest");
         }
-        entries.push({ path, size, mtime, hash });
+        entries.push({ path: path2, size, mtime, hash });
       }
       return entries;
     }
@@ -4681,8 +4684,8 @@ ${bodyHash}`;
         const parsed = safeJsonObject(raw);
         if (parsed.schemaVersion !== 1 || !isRecord(parsed.entries)) return { schemaVersion: 1, entries: {} };
         const entries = {};
-        for (const [path, hash] of Object.entries(parsed.entries).slice(-MAX_LEDGER_ENTRIES)) {
-          const normalized = this.normalizePath(path);
+        for (const [path2, hash] of Object.entries(parsed.entries).slice(-MAX_LEDGER_ENTRIES)) {
+          const normalized = this.normalizePath(path2);
           if (normalized && typeof hash === "string" && /^[A-Za-z0-9_-]{32,64}$/.test(hash)) entries[normalized] = hash;
         }
         return { schemaVersion: 1, entries };
@@ -4703,8 +4706,8 @@ ${bodyHash}`;
         }
       }
     }
-    async readLocalVerified(path, expectedHash) {
-      const normalized = this.normalizePath(path);
+    async readLocalVerified(path2, expectedHash) {
+      const normalized = this.normalizePath(path2);
       if (!normalized) throw new LanSyncProtocolError("unsafe_path");
       const before = await this.options.storage.statFile(normalized);
       if (!before || before.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("precondition_failed", 409);
@@ -4721,8 +4724,8 @@ ${bodyHash}`;
       }
       return bytes;
     }
-    async writeLocal(path, bytes, expectedHash, suppliedHash, contentVerified = false) {
-      const normalized = this.normalizePath(path);
+    async writeLocal(path2, bytes, expectedHash, suppliedHash, contentVerified = false) {
+      const normalized = this.normalizePath(path2);
       if (!normalized || bytes.byteLength > this.settings().maxFileBytes || !/^[A-Za-z0-9_-]{32,64}$/.test(suppliedHash)) throw new LanSyncProtocolError("unsafe_write", 400);
       if (!contentVerified && await sha256Bytes(bytes) !== suppliedHash) throw new LanSyncProtocolError("unsafe_write", 400);
       const current = await this.options.storage.statFile(normalized);
@@ -4742,25 +4745,25 @@ ${bodyHash}`;
       this.hashCache.set(normalized, { signature: `${written.mtime}:${written.size}`, hash: suppliedHash });
       this.queueHashCacheSave();
     }
-    async writeLocalIfMissingOrSame(path, bytes, hash) {
-      const stat = await this.options.storage.statFile(path);
+    async writeLocalIfMissingOrSame(path2, bytes, hash) {
+      const stat = await this.options.storage.statFile(path2);
       if (stat) {
         const signature = `${stat.mtime}:${stat.size}`;
-        const cached = this.hashCache.get(path);
-        const currentHash = cached?.signature === signature ? cached.hash : await sha256Bytes(await this.options.storage.readBinary(path));
+        const cached = this.hashCache.get(path2);
+        const currentHash = cached?.signature === signature ? cached.hash : await sha256Bytes(await this.options.storage.readBinary(path2));
         if (currentHash === hash) {
           if (cached?.signature !== signature) {
-            this.hashCache.set(path, { signature, hash });
+            this.hashCache.set(path2, { signature, hash });
             this.queueHashCacheSave();
           }
           return;
         }
         throw new LanSyncProtocolError("conflict_copy_collision", 409);
       }
-      await this.writeLocal(path, bytes, null, hash, true);
+      await this.writeLocal(path2, bytes, null, hash, true);
     }
-    async deleteLocal(path, expectedHash) {
-      const normalized = this.normalizePath(path);
+    async deleteLocal(path2, expectedHash) {
+      const normalized = this.normalizePath(path2);
       if (!normalized || !/^[A-Za-z0-9_-]{32,64}$/.test(expectedHash)) throw new LanSyncProtocolError("unsafe_delete");
       const current = await this.options.storage.statFile(normalized);
       const signature = current ? `${current.mtime}:${current.size}` : "";
@@ -4780,43 +4783,43 @@ ${bodyHash}`;
       if (bytes.byteLength !== entry.size || bytes.byteLength > this.settings().maxFileBytes || await sha256Bytes(bytes) !== entry.hash) throw new LanSyncProtocolError("invalid_file_response");
       return bytes;
     }
-    async writeRemote(peer, path, bytes, expectedHash, hash) {
+    async writeRemote(peer, path2, bytes, expectedHash, hash) {
       const response = await this.callPeer(peer, "/file/write", {
-        path,
+        path: path2,
         expectedHash,
         hash,
         data: bytesToBase64Url(bytes)
       }, fileTransferTimeoutMs(bytes.byteLength));
       if (response.hash !== hash) throw new Error("remote_write_verification_failed");
     }
-    async writeRemoteIfMissingOrSame(peer, path, bytes, hash) {
+    async writeRemoteIfMissingOrSame(peer, path2, bytes, hash) {
       try {
-        await this.writeRemote(peer, path, bytes, null, hash);
+        await this.writeRemote(peer, path2, bytes, null, hash);
       } catch (error) {
         if (safeErrorCode(error) !== "precondition_failed") throw error;
-        const response = await this.callPeer(peer, "/file/read", { path, expectedHash: hash }, fileTransferTimeoutMs(bytes.byteLength));
+        const response = await this.callPeer(peer, "/file/read", { path: path2, expectedHash: hash }, fileTransferTimeoutMs(bytes.byteLength));
         if (response.hash !== hash) throw error;
       }
     }
-    async deleteRemote(peer, path, expectedHash) {
-      const response = await this.callPeer(peer, "/file/delete", { path, expectedHash }, 45e3);
-      if (response.path !== path || response.deletedHash !== expectedHash || response.deleted !== true) {
+    async deleteRemote(peer, path2, expectedHash) {
+      const response = await this.callPeer(peer, "/file/delete", { path: path2, expectedHash }, 45e3);
+      if (response.path !== path2 || response.deletedHash !== expectedHash || response.deleted !== true) {
         throw new Error("remote_delete_verification_failed");
       }
     }
-    async callPeer(peer, route, payload, timeoutMs = 8e3) {
+    async callPeer(peer, route, payload2, timeoutMs = 8e3) {
       if (!this.identity) throw new Error("identity_unavailable");
-      const path = `${API_PREFIX}${route}`;
+      const path2 = `${API_PREFIX}${route}`;
       const secret = this.activeSecret();
-      const body = await encryptLanSyncPayload(secret, payload);
-      const headers = await authHeaders({ ...this.identity, secret }, this.deviceId, "POST", path, body, this.now());
+      const body = await encryptLanSyncPayload(secret, payload2);
+      const headers = await authHeaders({ ...this.identity, secret }, this.deviceId, "POST", path2, body, this.now());
       let lastError = null;
       for (const address of peer.addresses) {
         if (!isPrivateLanAddress(address)) continue;
         const host = address.includes(":") ? `[${address}]` : address;
         try {
           const response = await withTimeout(this.options.httpRequest({
-            url: `http://${host}:${peer.port}${path}`,
+            url: `http://${host}:${peer.port}${path2}`,
             method: "POST",
             headers,
             body,
@@ -4861,8 +4864,8 @@ ${bodyHash}`;
       try {
         if (!this.identity || request.method !== "POST") throw new LanSyncProtocolError("not_found", 404);
         const url = new URL(request.url ?? "/", "http://cancip-lan.local");
-        const path = url.pathname;
-        if (!path.startsWith(`${API_PREFIX}/`)) throw new LanSyncProtocolError("not_found", 404);
+        const path2 = url.pathname;
+        if (!path2.startsWith(`${API_PREFIX}/`)) throw new LanSyncProtocolError("not_found", 404);
         const maxBody = Math.min(HARD_MAX_REQUEST_BYTES, this.settings().maxFileBytes * 2 + 2 * 1024 * 1024);
         const body = await readBody(request, maxBody);
         const headers = {
@@ -4878,7 +4881,7 @@ ${bodyHash}`;
           secret,
           vaultId: this.identity.vaultId,
           method: request.method,
-          path,
+          path: path2,
           body,
           headers,
           replayCache: this.replayCache,
@@ -4887,21 +4890,21 @@ ${bodyHash}`;
         authenticated = true;
         const remoteAddress = normalizeRemoteAddress(request.socket.remoteAddress ?? "");
         if (!this.allowedByRateLimit(`${remoteAddress}:${deviceId}`)) throw new LanSyncProtocolError("rate_limited", 429);
-        const payload = await decryptLanSyncPayload(secret, body);
-        const metadataProtocol = METADATA_PROTOCOLS.find((protocol) => path.startsWith(`${API_PREFIX}${protocol.routePrefix}/`));
-        const metadataRoute = metadataProtocol ? path.slice(`${API_PREFIX}${metadataProtocol.routePrefix}`.length) : "";
-        if (path === `${API_PREFIX}/manifest` || path === `${API_PREFIX}/file/read` || path === `${API_PREFIX}/file/write` || path === `${API_PREFIX}/file/delete` || path === `${API_PREFIX}/manifest/metadata` || path === `${API_PREFIX}/manifest/metadata/paths` || path === `${API_PREFIX}/metadata/session/start` || path === `${API_PREFIX}/metadata/session/finish` || path === `${API_PREFIX}/metadata/file/read` || path === `${API_PREFIX}/metadata/file/write` || path === `${API_PREFIX}/metadata/file/delete` || path.startsWith(`${API_PREFIX}/metadata/v2/`)) {
+        const payload2 = await decryptLanSyncPayload(secret, body);
+        const metadataProtocol = METADATA_PROTOCOLS.find((protocol) => path2.startsWith(`${API_PREFIX}${protocol.routePrefix}/`));
+        const metadataRoute = metadataProtocol ? path2.slice(`${API_PREFIX}${metadataProtocol.routePrefix}`.length) : "";
+        if (path2 === `${API_PREFIX}/manifest` || path2 === `${API_PREFIX}/file/read` || path2 === `${API_PREFIX}/file/write` || path2 === `${API_PREFIX}/file/delete` || path2 === `${API_PREFIX}/manifest/metadata` || path2 === `${API_PREFIX}/manifest/metadata/paths` || path2 === `${API_PREFIX}/metadata/session/start` || path2 === `${API_PREFIX}/metadata/session/finish` || path2 === `${API_PREFIX}/metadata/file/read` || path2 === `${API_PREFIX}/metadata/file/write` || path2 === `${API_PREFIX}/metadata/file/delete` || path2.startsWith(`${API_PREFIX}/metadata/v2/`)) {
           throw new LanSyncProtocolError("peer_upgrade_required", 426);
         }
-        this.markInboundPeer(deviceId, remoteAddress, path);
+        this.markInboundPeer(deviceId, remoteAddress, path2);
         inboundDeviceId = deviceId;
-        inboundActivityIndex = this.beginInboundFileActivity(deviceId, path, payload);
+        inboundActivityIndex = this.beginInboundFileActivity(deviceId, path2, payload2);
         let result;
-        if (path === `${API_PREFIX}/ping`) {
+        if (path2 === `${API_PREFIX}/ping`) {
           const peer = this.peers.get(deviceId);
           let remoteRequestedSync = false;
           if (peer) {
-            remoteRequestedSync = this.applyRemoteSyncSignal(peer, payload);
+            remoteRequestedSync = this.applyRemoteSyncSignal(peer, payload2);
             this.emitPeerConnectionStage(peer);
           }
           result = {
@@ -4917,8 +4920,8 @@ ${bodyHash}`;
           }
         } else if (metadataRoute === "/manifest") {
           const policy = this.policy();
-          const scanRequestIds = this.parseScanRequestIds(payload.scanRequestIds);
-          const forceFilesystemScan = payload.forceFilesystemScan === true && !this.filesystemScanAlreadyServed(deviceId, scanRequestIds);
+          const scanRequestIds = this.parseScanRequestIds(payload2.scanRequestIds);
+          const forceFilesystemScan = payload2.forceFilesystemScan === true && !this.filesystemScanAlreadyServed(deviceId, scanRequestIds);
           this.emit({
             ...defaultProgress("connected"),
             stage: "enumerating",
@@ -4926,7 +4929,7 @@ ${bodyHash}`;
             peerId: deviceId
           });
           const files = await this.withInboundManifestScope(() => this.buildMetadataManifest(
-            policy.syncConfigFolder && payload.syncConfigFolder === true,
+            policy.syncConfigFolder && payload2.syncConfigFolder === true,
             void 0,
             forceFilesystemScan
           ));
@@ -4944,11 +4947,11 @@ ${bodyHash}`;
           };
         } else if (metadataRoute === "/manifest/paths") {
           const policy = this.policy();
-          const paths = Array.isArray(payload.paths) ? payload.paths.filter((value) => typeof value === "string") : [];
+          const paths = Array.isArray(payload2.paths) ? payload2.paths.filter((value) => typeof value === "string") : [];
           if (paths.length > MAX_MANIFEST_FILES) throw new LanSyncProtocolError("too_many_dirty_paths", 413);
           const files = await this.withInboundManifestScope(() => this.buildMetadataManifestForPaths(
             paths,
-            policy.syncConfigFolder && payload.syncConfigFolder === true
+            policy.syncConfigFolder && payload2.syncConfigFolder === true
           ));
           this.emitActivityChanged();
           result = {
@@ -4957,31 +4960,31 @@ ${bodyHash}`;
           };
         } else if (metadataRoute === "/bootstrap/hashes") {
           const policy = this.policy();
-          const includeConfigFolder = policy.syncConfigFolder && payload.syncConfigFolder === true;
-          const expected = this.parseMetadataManifest(payload.files, includeConfigFolder);
+          const includeConfigFolder = policy.syncConfigFolder && payload2.syncConfigFolder === true;
+          const expected = this.parseMetadataManifest(payload2.files, includeConfigFolder);
           result = { files: await this.buildInboundMetadataHashManifest(expected, includeConfigFolder, deviceId) };
         } else if (metadataRoute === "/session/start") {
-          result = await this.handleMetadataSessionStart(deviceId, payload);
+          result = await this.handleMetadataSessionStart(deviceId, payload2);
         } else if (metadataRoute === "/session/finish") {
-          result = await this.handleMetadataSessionFinish(deviceId, payload);
+          result = await this.handleMetadataSessionFinish(deviceId, payload2);
         } else if (metadataRoute === "/file/read") {
-          result = await this.handleReadMetadataFile(payload);
+          result = await this.handleReadMetadataFile(payload2);
         } else if (metadataRoute === "/file/write") {
-          result = await this.handleWriteMetadataFile(payload);
+          result = await this.handleWriteMetadataFile(payload2);
         } else if (metadataRoute === "/file/delete") {
-          result = await this.handleDeleteMetadataFile(payload);
-        } else if (path === `${API_PREFIX}/attachment/read`) {
-          result = await this.handleReadQueuedAttachment(deviceId, payload);
-        } else if (path === `${API_PREFIX}/attachment/write`) {
-          result = await this.handleWriteAttachment(payload);
-        } else if (path === `${API_PREFIX}/message/send`) {
-          result = await this.handleIncomingMessage(deviceId, payload);
-        } else if (path === `${API_PREFIX}/message/ack`) {
-          result = await this.handleMessageAcknowledgement(deviceId, payload);
+          result = await this.handleDeleteMetadataFile(payload2);
+        } else if (path2 === `${API_PREFIX}/attachment/read`) {
+          result = await this.handleReadQueuedAttachment(deviceId, payload2);
+        } else if (path2 === `${API_PREFIX}/attachment/write`) {
+          result = await this.handleWriteAttachment(payload2);
+        } else if (path2 === `${API_PREFIX}/message/send`) {
+          result = await this.handleIncomingMessage(deviceId, payload2);
+        } else if (path2 === `${API_PREFIX}/message/ack`) {
+          result = await this.handleMessageAcknowledgement(deviceId, payload2);
         } else {
           throw new LanSyncProtocolError("not_found", 404);
         }
-        this.finishInboundFileActivity(deviceId, inboundActivityIndex, true);
+        this.finishInboundFileActivity(deviceId, inboundActivityIndex, true, path2, payload2);
         const encryptedResult = await encryptLanSyncPayload(secret, result);
         sendText(response, 200, encryptedResult);
         if (metadataRoute === "/manifest") {
@@ -4993,18 +4996,18 @@ ${bodyHash}`;
           });
         }
       } catch (error) {
-        this.finishInboundFileActivity(inboundDeviceId, inboundActivityIndex, false);
+        this.finishInboundFileActivity(inboundDeviceId, inboundActivityIndex, false, path, payload);
         const protocol = error instanceof LanSyncProtocolError ? error : new LanSyncProtocolError(safeErrorCode(error), 500);
         sendText(response, protocol.status, JSON.stringify({ ok: false, error: authenticated ? protocol.code : "request_rejected" }));
       }
     }
-    async handleMetadataSessionStart(deviceId, payload) {
-      const sessionId = typeof payload.sessionId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload.sessionId) ? payload.sessionId : "";
-      const rawFiles = Array.isArray(payload.files) ? payload.files : [];
-      const total = Number(payload.total);
-      const bytesTotal = Number(payload.bytesTotal);
-      const coordinatorUploads = Number(payload.uploads);
-      const coordinatorDownloads = Number(payload.downloads);
+    async handleMetadataSessionStart(deviceId, payload2) {
+      const sessionId = typeof payload2.sessionId === "string" && /^[A-Za-z0-9_-]{12,96}$/.test(payload2.sessionId) ? payload2.sessionId : "";
+      const rawFiles = Array.isArray(payload2.files) ? payload2.files : [];
+      const total = Number(payload2.total);
+      const bytesTotal = Number(payload2.bytesTotal);
+      const coordinatorUploads = Number(payload2.uploads);
+      const coordinatorDownloads = Number(payload2.downloads);
       if (!sessionId || !Number.isSafeInteger(total) || total < 0 || total !== rawFiles.length || total > MAX_MANIFEST_FILES || !Number.isSafeInteger(bytesTotal) || bytesTotal < 0 || !Number.isSafeInteger(coordinatorUploads) || coordinatorUploads < 0 || !Number.isSafeInteger(coordinatorDownloads) || coordinatorDownloads < 0) {
         throw new LanSyncProtocolError("invalid_sync_session");
       }
@@ -5017,11 +5020,11 @@ ${bodyHash}`;
       };
       const files = rawFiles.map((item) => {
         if (!isRecord(item)) throw new LanSyncProtocolError("invalid_sync_session");
-        const path = this.normalizePath(item.path, true);
+        const path2 = this.normalizePath(item.path, true);
         const action = mirrorAction(item.action);
         const size = Number(item.size);
-        if (!path || !action || !Number.isSafeInteger(size) || size < 0 || size > this.settings().maxFileBytes) throw new LanSyncProtocolError("invalid_sync_session");
-        return { path, action, state: "pending", size };
+        if (!path2 || !action || !Number.isSafeInteger(size) || size < 0 || size > this.settings().maxFileBytes) throw new LanSyncProtocolError("invalid_sync_session");
+        return { path: path2, action, state: "pending", size };
       });
       const planKey = JSON.stringify({
         total,
@@ -5070,47 +5073,47 @@ ${bodyHash}`;
       });
       return { ok: true, sessionId };
     }
-    async handleMetadataSessionFinish(deviceId, payload) {
-      const sessionId = typeof payload.sessionId === "string" ? payload.sessionId : "";
+    async handleMetadataSessionFinish(deviceId, payload2) {
+      const sessionId = typeof payload2.sessionId === "string" ? payload2.sessionId : "";
       const session = this.inboundSession;
       if (!session || session.id !== sessionId || session.deviceId !== deviceId) throw new LanSyncProtocolError("invalid_sync_session", 409);
       session.updatedAt = this.now();
-      const commits = Array.isArray(payload.commits) ? payload.commits : [];
+      const commits = Array.isArray(payload2.commits) ? payload2.commits : [];
       if (commits.length > MAX_MANIFEST_FILES) throw new LanSyncProtocolError("invalid_sync_session");
       const ledger = this.loadMetadataLedger(deviceId);
       for (const item of commits) {
         if (!isRecord(item)) continue;
-        const path = this.normalizePath(item.path, true);
-        if (!path) continue;
+        const path2 = this.normalizePath(item.path, true);
+        if (!path2) continue;
         const coordinator = item.coordinator === null ? null : this.parseMetadataSnapshot(item.coordinator);
         const peer = item.peer === null ? null : this.parseMetadataSnapshot(item.peer);
         if (item.coordinator !== null && !coordinator || item.peer !== null && !peer) continue;
-        const current = await this.options.storage.statFile(path);
+        const current = await this.options.storage.statFile(path2);
         if (coordinator === null && peer === null) {
-          if (!current) delete ledger.entries[path];
+          if (!current) delete ledger.entries[path2];
           continue;
         }
         if (coordinator && peer && current && metadataMatches(current, peer)) {
-          ledger.entries[path] = { local: peer, remote: coordinator };
+          ledger.entries[path2] = { local: peer, remote: coordinator };
         }
       }
       this.saveMetadataLedger(deviceId, ledger);
       const retryPaths = new Set(
-        (Array.isArray(payload.retryPaths) ? payload.retryPaths : []).map((path) => this.normalizePath(path, true)).filter((path) => Boolean(path)).slice(0, MAX_MANIFEST_FILES)
+        (Array.isArray(payload2.retryPaths) ? payload2.retryPaths : []).map((path2) => this.normalizePath(path2, true)).filter((path2) => Boolean(path2)).slice(0, MAX_MANIFEST_FILES)
       );
-      const acknowledgedDirtyPaths = this.parseDirtyPaths(payload.acknowledgedDirtyPaths);
-      for (const [path, generation] of acknowledgedDirtyPaths) {
-        if ((this.dirtyPaths.get(path) ?? 0) <= generation) this.dirtyPaths.delete(path);
+      const acknowledgedDirtyPaths = this.parseDirtyPaths(payload2.acknowledgedDirtyPaths);
+      for (const [path2, generation] of acknowledgedDirtyPaths) {
+        if ((this.dirtyPaths.get(path2) ?? 0) <= generation) this.dirtyPaths.delete(path2);
       }
       this.queueChangeJournalSave();
-      const acknowledgedFullSyncRequestId = typeof payload.acknowledgedFullSyncRequestId === "string" ? payload.acknowledgedFullSyncRequestId : "";
+      const acknowledgedFullSyncRequestId = typeof payload2.acknowledgedFullSyncRequestId === "string" ? payload2.acknowledgedFullSyncRequestId : "";
       if (acknowledgedFullSyncRequestId && this.fullSyncRequestId === acknowledgedFullSyncRequestId) {
         this.fullSyncRequested = false;
         this.forceFilesystemScanRequested = false;
         this.fullSyncOnlyPending = false;
         this.localFilesystemScanCompletedRequestId = "";
       }
-      const success = payload.success === true;
+      const success = payload2.success === true;
       if (success) this.recordSyncCheckpoint();
       if (success) {
         for (const file of this.activityFiles) {
@@ -5144,78 +5147,78 @@ ${bodyHash}`;
       this.currentTransferSessionId = "";
       return { ok: true, sessionId, committed: commits.length };
     }
-    async handleReadMetadataFile(payload) {
-      const path = this.normalizePath(payload.path);
-      const expected = this.parseMetadataSnapshot(payload.expectedMetadata);
-      if (!path || !expected) throw new LanSyncProtocolError("unsafe_path");
-      const read = await this.readLocalMetadataVerified(path, expected);
-      return { path, metadata: read.metadata, data: bytesToBase64Url(read.bytes) };
+    async handleReadMetadataFile(payload2) {
+      const path2 = this.normalizePath(payload2.path);
+      const expected = this.parseMetadataSnapshot(payload2.expectedMetadata);
+      if (!path2 || !expected) throw new LanSyncProtocolError("unsafe_path");
+      const read = await this.readLocalMetadataVerified(path2, expected);
+      return { path: path2, metadata: read.metadata, data: bytesToBase64Url(read.bytes) };
     }
-    async handleWriteMetadataFile(payload) {
-      const path = this.normalizePath(payload.path);
-      const expectsMissing = payload.expectedMetadata === null;
-      const expected = expectsMissing ? null : this.parseMetadataSnapshot(payload.expectedMetadata);
-      const source = this.parseMetadataSnapshot(payload.sourceMetadata);
-      const encoded = typeof payload.data === "string" ? payload.data : "";
-      if (!path || !expectsMissing && !expected || !source) throw new LanSyncProtocolError("unsafe_write");
+    async handleWriteMetadataFile(payload2) {
+      const path2 = this.normalizePath(payload2.path);
+      const expectsMissing = payload2.expectedMetadata === null;
+      const expected = expectsMissing ? null : this.parseMetadataSnapshot(payload2.expectedMetadata);
+      const source = this.parseMetadataSnapshot(payload2.sourceMetadata);
+      const encoded = typeof payload2.data === "string" ? payload2.data : "";
+      if (!path2 || !expectsMissing && !expected || !source) throw new LanSyncProtocolError("unsafe_write");
       const bytes = base64UrlToBytes(encoded);
       if (bytes.byteLength !== source.size || bytes.byteLength > this.settings().maxFileBytes) throw new LanSyncProtocolError("invalid_file_content");
-      const metadata = await this.writeLocalMetadata(path, bytes, expected, source, payload.allowExistingSame === true);
-      return { ok: true, path, metadata };
+      const metadata = await this.writeLocalMetadata(path2, bytes, expected, source, payload2.allowExistingSame === true);
+      return { ok: true, path: path2, metadata };
     }
-    async handleDeleteMetadataFile(payload) {
-      const path = this.normalizePath(payload.path);
-      const expected = this.parseMetadataSnapshot(payload.expectedMetadata);
-      if (!path || !expected) throw new LanSyncProtocolError("unsafe_delete");
-      await this.deleteLocalMetadata(path, expected);
-      return { ok: true, deleted: true, path, deletedMetadata: expected };
+    async handleDeleteMetadataFile(payload2) {
+      const path2 = this.normalizePath(payload2.path);
+      const expected = this.parseMetadataSnapshot(payload2.expectedMetadata);
+      if (!path2 || !expected) throw new LanSyncProtocolError("unsafe_delete");
+      await this.deleteLocalMetadata(path2, expected);
+      return { ok: true, deleted: true, path: path2, deletedMetadata: expected };
     }
-    async handleReadFile(payload) {
-      const path = this.normalizePath(payload.path);
-      const expectedHash = typeof payload.expectedHash === "string" ? payload.expectedHash : "";
-      if (!path || !/^[A-Za-z0-9_-]{32,64}$/.test(expectedHash)) throw new LanSyncProtocolError("unsafe_path");
-      const stat = await this.options.storage.statFile(path);
+    async handleReadFile(payload2) {
+      const path2 = this.normalizePath(payload2.path);
+      const expectedHash = typeof payload2.expectedHash === "string" ? payload2.expectedHash : "";
+      if (!path2 || !/^[A-Za-z0-9_-]{32,64}$/.test(expectedHash)) throw new LanSyncProtocolError("unsafe_path");
+      const stat = await this.options.storage.statFile(path2);
       if (!stat || stat.size > this.settings().maxFileBytes) throw new LanSyncProtocolError("file_unavailable", 404);
-      const bytes = await this.readLocalVerified(path, expectedHash);
-      return { path, hash: expectedHash, mtime: stat.mtime, size: bytes.byteLength, data: bytesToBase64Url(bytes) };
+      const bytes = await this.readLocalVerified(path2, expectedHash);
+      return { path: path2, hash: expectedHash, mtime: stat.mtime, size: bytes.byteLength, data: bytesToBase64Url(bytes) };
     }
-    async handleWriteFile(payload) {
-      const path = this.normalizePath(payload.path);
-      const expectedHash = payload.expectedHash === null ? null : typeof payload.expectedHash === "string" ? payload.expectedHash : void 0;
-      const hash = typeof payload.hash === "string" ? payload.hash : "";
-      const encoded = typeof payload.data === "string" ? payload.data : "";
-      if (!path || expectedHash === void 0 || expectedHash !== null && !/^[A-Za-z0-9_-]{32,64}$/.test(expectedHash) || !/^[A-Za-z0-9_-]{32,64}$/.test(hash)) {
+    async handleWriteFile(payload2) {
+      const path2 = this.normalizePath(payload2.path);
+      const expectedHash = payload2.expectedHash === null ? null : typeof payload2.expectedHash === "string" ? payload2.expectedHash : void 0;
+      const hash = typeof payload2.hash === "string" ? payload2.hash : "";
+      const encoded = typeof payload2.data === "string" ? payload2.data : "";
+      if (!path2 || expectedHash === void 0 || expectedHash !== null && !/^[A-Za-z0-9_-]{32,64}$/.test(expectedHash) || !/^[A-Za-z0-9_-]{32,64}$/.test(hash)) {
         throw new LanSyncProtocolError("unsafe_write");
       }
       const bytes = base64UrlToBytes(encoded);
       if (bytes.byteLength > this.settings().maxFileBytes || await sha256Bytes(bytes) !== hash) throw new LanSyncProtocolError("invalid_file_content");
-      await this.writeLocal(path, bytes, expectedHash, hash, true);
-      return { ok: true, path, hash, size: bytes.byteLength };
+      await this.writeLocal(path2, bytes, expectedHash, hash, true);
+      return { ok: true, path: path2, hash, size: bytes.byteLength };
     }
-    async handleDeleteFile(payload) {
-      const path = this.normalizePath(payload.path);
-      const expectedHash = typeof payload.expectedHash === "string" ? payload.expectedHash : "";
-      if (!path || !/^[A-Za-z0-9_-]{32,64}$/.test(expectedHash)) throw new LanSyncProtocolError("unsafe_delete");
-      await this.deleteLocal(path, expectedHash);
-      return { ok: true, deleted: true, path, deletedHash: expectedHash };
+    async handleDeleteFile(payload2) {
+      const path2 = this.normalizePath(payload2.path);
+      const expectedHash = typeof payload2.expectedHash === "string" ? payload2.expectedHash : "";
+      if (!path2 || !/^[A-Za-z0-9_-]{32,64}$/.test(expectedHash)) throw new LanSyncProtocolError("unsafe_delete");
+      await this.deleteLocal(path2, expectedHash);
+      return { ok: true, deleted: true, path: path2, deletedHash: expectedHash };
     }
-    async handleWriteAttachment(payload) {
-      const attachmentId = typeof payload.attachmentId === "string" ? payload.attachmentId : "";
-      const name = safeLanInboxName(payload.name);
-      const path = normalizeLanInboxAttachmentPath(`${LAN_INBOX_ROOT}/${attachmentId}/${name}`);
-      const type = String(payload.type || "application/octet-stream").slice(0, 128);
-      const hash = typeof payload.hash === "string" ? payload.hash : "";
-      const encoded = typeof payload.data === "string" ? payload.data : "";
-      if (!path || !/^[A-Za-z0-9_-]{32,64}$/.test(hash)) throw new LanSyncProtocolError("unsafe_attachment");
+    async handleWriteAttachment(payload2) {
+      const attachmentId = typeof payload2.attachmentId === "string" ? payload2.attachmentId : "";
+      const name = safeLanInboxName(payload2.name);
+      const path2 = normalizeLanInboxAttachmentPath(`${LAN_INBOX_ROOT}/${attachmentId}/${name}`);
+      const type = String(payload2.type || "application/octet-stream").slice(0, 128);
+      const hash = typeof payload2.hash === "string" ? payload2.hash : "";
+      const encoded = typeof payload2.data === "string" ? payload2.data : "";
+      if (!path2 || !/^[A-Za-z0-9_-]{32,64}$/.test(hash)) throw new LanSyncProtocolError("unsafe_attachment");
       const bytes = base64UrlToBytes(encoded);
       if (bytes.byteLength > this.settings().maxFileBytes || await sha256Bytes(bytes) !== hash) throw new LanSyncProtocolError("invalid_file_content");
-      if (await this.options.storage.exists(path)) throw new LanSyncProtocolError("attachment_exists", 409);
-      await this.options.storage.ensureFolder(path.split("/").slice(0, -1).join("/"));
-      await this.options.storage.writeBinary(path, arrayBuffer(bytes));
-      const written = await this.options.storage.statFile(path);
+      if (await this.options.storage.exists(path2)) throw new LanSyncProtocolError("attachment_exists", 409);
+      await this.options.storage.ensureFolder(path2.split("/").slice(0, -1).join("/"));
+      await this.options.storage.writeBinary(path2, arrayBuffer(bytes));
+      const written = await this.options.storage.statFile(path2);
       if (!written || written.size !== bytes.byteLength) throw new Error("write_verification_failed");
       const expiresAt = new Date(this.now() + this.settings().inboxRetentionHours * 60 * 6e4).toISOString();
-      return { name, type, path, size: bytes.byteLength, hash, temporary: true, expiresAt };
+      return { name, type, path: path2, size: bytes.byteLength, hash, temporary: true, expiresAt };
     }
   };
   return __toCommonJS(lanSync_exports);
