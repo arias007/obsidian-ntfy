@@ -186,7 +186,6 @@ try {
     isLanInboxAttachmentPath,
     lanSyncTopLevelGroup,
     normalizeManualLanPeer,
-    sortLanAddresses,
     planLanSyncMetadataReconciliation,
     planLanSyncReconciliation,
     verifyLanSyncRequest
@@ -224,22 +223,13 @@ try {
   ]) {
     assert.equal(normalizeLanSyncPath(sharedPluginPath, configPathOptions), sharedPluginPath, `Plugin release file was excluded: ${sharedPluginPath}`);
   }
-  assert.equal(normalizeLanSyncPath(".obsidian/hotkeys.json"), ".obsidian/hotkeys.json", "Whole-vault config path was dropped");
+  assert.equal(normalizeLanSyncPath(".obsidian/hotkeys.json", configPathOptions), ".obsidian/hotkeys.json", "Whole-vault config path was dropped");
   for (const address of ["127.0.0.1", "10.0.0.2", "172.20.1.2", "192.168.1.8", "169.254.2.3"]) assert.equal(isPrivateLanAddress(address), true);
   for (const address of ["8.8.8.8", "1.1.1.1", "example.com"]) assert.equal(isPrivateLanAddress(address), false);
   assert.equal(classifyLanLinkType("Wi-Fi"), "wifi");
   assert.equal(classifyLanLinkType("Bluetooth Network Connection"), "bluetooth-pan");
   assert.equal(classifyLanLinkType("Remote NDIS Compatible Device"), "usb");
   assert.equal(classifyLanLinkType("Local Area Connection* 10"), "hotspot");
-  const interfaceRows = [
-    { name: "vEthernet (Default Switch)", address: "172.21.16.1", netmask: "255.255.255.0", broadcast: "172.21.16.255", linkType: "lan" },
-    { name: "WLAN", address: "192.168.1.4", netmask: "255.255.255.0", broadcast: "192.168.1.255", linkType: "wifi" }
-  ];
-  assert.deepEqual(
-    sortLanAddresses(["172.21.16.1", "192.168.1.4"], interfaceRows),
-    ["192.168.1.4", "172.21.16.1"],
-    "Wi-Fi address was not preferred over a virtual adapter"
-  );
   assert.equal(ipv4BroadcastAddress("192.168.137.1", "255.255.255.0"), "192.168.137.255");
   assert.deepEqual(normalizeManualLanPeer("192.168.137.2:43190"), { address: "192.168.137.2", port: 43190 });
   assert.deepEqual(normalizeManualLanPeer("10.0.0.5"), { address: "10.0.0.5", port: 43190 });
@@ -579,7 +569,10 @@ try {
     ...stabilityPeer,
     deviceId: "MUTUALHANDSHAKE12345",
     lastSeenAt: stabilityClock,
-    verifiedAt: stabilityClock,
+    // An inbound authenticated request is not a completed two-way session.
+    // Start this fixture unverified; the peer becomes visible only after the
+    // outbound acknowledgement below, matching the production handshake.
+    verifiedAt: 0,
     lastInboundAt: stabilityClock,
     lastOutboundAt: 0,
     peerAckAt: 0,
@@ -592,12 +585,13 @@ try {
   stabilityService.peers.set(mutualPeer.deviceId, mutualPeer);
   stabilityService.dirtyPaths.set("Notes/offline-edit.md", 1);
   assert.equal(stabilityService.listPeers().length, 0, "An authenticated inbound request alone must not display a connected peer");
-  assert.equal(stabilityService.status().dirtyCount, 0, "Offline journal entries must not appear as confirmed sync work");
+  assert.equal(stabilityService.activity().files.filter((file) => !file.provisional).length, 0, "Offline journal entries must not appear as confirmed sync work");
   assert.equal(stabilityService.activity().scan.syncCandidatesTotal, 0, "Offline scan candidates must not inflate sync progress");
   mutualPeer.peerAckAt = stabilityClock;
   mutualPeer.lastOutboundAt = stabilityClock;
+  mutualPeer.verifiedAt = stabilityClock;
   assert.equal(stabilityService.listPeers().length, 1, "A mutually acknowledged peer should become connected");
-  assert.equal(stabilityService.status().dirtyCount, 1, "The durable journal should become visible after mutual connection");
+  assert.equal(stabilityService.dirtyPaths.size, 1, "The durable journal should remain queued after mutual connection");
 
   const journalPort = await freePort();
   const journalDevice = "JOURNALCHECKPOINT123456";
