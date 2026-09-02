@@ -196,6 +196,18 @@ export type LanSyncActivitySnapshot = {
   roundHistory: LanSyncRoundHistoryEntry[];
 };
 
+// Transfer directions include deletion operations. A delete-remote action is
+// sent by this device to the peer (upload lane); a delete-local action is
+// received from the peer (download lane). Keeping this mapping centralized
+// prevents the total action count from drifting away from upload+download.
+function isLanUploadAction(action: LanSyncFileAction): boolean {
+  return action === "push" || action === "delete-remote";
+}
+
+function isLanDownloadAction(action: LanSyncFileAction): boolean {
+  return action === "pull" || action === "delete-local";
+}
+
 export type LanSyncRoundHistoryEntry = {
   id: string;
   startedAt: number;
@@ -1269,10 +1281,10 @@ function summarizeTransferGroups(files: LanSyncFileActivity[]): LanSyncActivityG
     } else if (file.state === "syncing") group.active += 1;
     else if (file.state === "error") group.errors += 1;
     if (file.provisional) continue;
-    if (file.action === "push") {
+    if (isLanUploadAction(file.action)) {
       group.uploads += 1;
       if (file.state === "complete") group.uploadCompleted += 1;
-    } else if (file.action === "pull") {
+    } else if (isLanDownloadAction(file.action)) {
       group.downloads += 1;
       if (file.state === "complete") group.downloadCompleted += 1;
     }
@@ -1744,7 +1756,10 @@ export class NtfyLanSync {
         // no inbound HTTP server, but it still owns a local vault and must
         // show its own scan rather than 0/0 while waiting for the peer plan.
         await this.publishLocalScanSnapshot();
-        if (!this.metadataIndexReady) {
+        // A valid persisted checkpoint is sufficient for incremental startup
+        // even when the optional metadata index is unavailable. Only a truly
+        // uncheckpointed device needs the one-time full reconciliation.
+        if (!this.metadataIndexReady && this.lastSyncCheckpointAt <= 0) {
           await this.buildMetadataManifestOnce(this.settings().syncConfigFolder);
           // First pairing has no trustworthy baseline to compare against. A
           // one-time reconciliation is required to discover files present on
@@ -2236,6 +2251,7 @@ export class NtfyLanSync {
       const parsed = safeJsonObject(raw);
       if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.entries)) {
         this.lastFullScanAt = 0;
+        this.lastSyncCheckpointAt = 0;
         return;
       }
       const checkpointAt = Number(parsed.checkpointAt);
@@ -2254,6 +2270,7 @@ export class NtfyLanSync {
       this.dirtyPaths.clear();
       this.dirtySequence = 0;
       this.lastFullScanAt = 0;
+      this.lastSyncCheckpointAt = 0;
     }
   }
 
@@ -2453,8 +2470,15 @@ export class NtfyLanSync {
     if (!this.runningValue || this.scanValue.phase === "scanning") return;
     try {
       const includeConfigFolder = this.settings().syncConfigFolder;
-      const files = await (this.options.storage.listFilesLive?.(includeConfigFolder)
-        ?? this.options.storage.listFiles(includeConfigFolder));
+      // A complete persisted index is already the local library snapshot.
+      // Re-enumerating the whole vault on every startup defeated incremental
+      // sync and made the UI look like a fresh scan before the real change
+      // journal was even applied. Use the index when it covers the requested
+      // config scope; the changed-since catch-up below adds newer paths.
+      const files = this.metadataIndexReady && (includeConfigFolder || this.metadataIndexIncludesConfig)
+        ? [...this.metadataIndex.entries()].map(([path, metadata]) => ({ path, ...metadata }))
+        : await (this.options.storage.listFilesLive?.(includeConfigFolder)
+          ?? this.options.storage.listFiles(includeConfigFolder));
       const unique = new Map<string, LanSyncFileStat>();
       for (const file of files) {
         const path = this.normalizePath(file.path, includeConfigFolder);
@@ -2543,10 +2567,10 @@ export class NtfyLanSync {
     const hasPeer = this.activePeers().length > 0;
     if (candidates.size > 0 && hasPeer) {
       const confirmed = this.activityFiles.filter((file) => !file.provisional);
-      const uploads = confirmed.filter((file) => file.action === "push").length;
-      const downloads = confirmed.filter((file) => file.action === "pull").length;
-      const uploadCompleted = confirmed.filter((file) => file.action === "push" && file.state === "complete").length;
-      const downloadCompleted = confirmed.filter((file) => file.action === "pull" && file.state === "complete").length;
+      const uploads = confirmed.filter((file) => isLanUploadAction(file.action)).length;
+      const downloads = confirmed.filter((file) => isLanDownloadAction(file.action)).length;
+      const uploadCompleted = confirmed.filter((file) => isLanUploadAction(file.action) && file.state === "complete").length;
+      const downloadCompleted = confirmed.filter((file) => isLanDownloadAction(file.action) && file.state === "complete").length;
       this.emit({
         ...this.progressValue,
         phase: "syncing",
@@ -3139,10 +3163,10 @@ export class NtfyLanSync {
     // so far made the receiver briefly report 0/1 or 1065/1066 while requests
     // were still arriving. Completion remains local and real-time below.
     const session = this.inboundSession?.deviceId === deviceId ? this.inboundSession : null;
-    const uploads = session ? session.uploads : this.activityFiles.filter((file) => file.action === "push").length;
-    const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
-    const downloads = session ? session.downloads : this.activityFiles.filter((file) => file.action === "pull").length;
-    const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
+    const uploads = session ? session.uploads : this.activityFiles.filter((file) => isLanUploadAction(file.action)).length;
+    const uploadCompleted = this.activityFiles.filter((file) => isLanUploadAction(file.action) && file.state === "complete").length;
+    const downloads = session ? session.downloads : this.activityFiles.filter((file) => isLanDownloadAction(file.action)).length;
+    const downloadCompleted = this.activityFiles.filter((file) => isLanDownloadAction(file.action) && file.state === "complete").length;
     const bytesTransferred = this.activityFiles
       .filter((file) => file.state === "complete")
       .reduce((sum, file) => sum + file.size, 0);
@@ -4101,8 +4125,8 @@ export class NtfyLanSync {
         ? action.remote?.size ?? 0
         : 0;
     const bytesTotal = actions.reduce((sum, action) => sum + transferSize(action), 0);
-    const uploads = actions.filter((action) => action.kind === "push").length;
-    const downloads = actions.filter((action) => action.kind === "pull").length;
+    const uploads = actions.filter((action) => isLanUploadAction(action.kind)).length;
+    const downloads = actions.filter((action) => isLanDownloadAction(action.kind)).length;
     this.activityFiles = actions.map((action) => ({
       path: action.path,
       action: action.kind,
@@ -4199,8 +4223,8 @@ export class NtfyLanSync {
           settledPaths.add(actions[index].path);
           if (result.commit) commits.push(result.commit);
           completed += 1;
-          if (actions[index].kind === "push") uploadCompleted += 1;
-          else if (actions[index].kind === "pull") downloadCompleted += 1;
+          if (isLanUploadAction(actions[index].kind)) uploadCompleted += 1;
+          else if (isLanDownloadAction(actions[index].kind)) downloadCompleted += 1;
           bytesTransferred += result.bytes;
           changed += result.changed ? 1 : 0;
           conflicts += result.conflict ? 1 : 0;
@@ -4389,8 +4413,8 @@ export class NtfyLanSync {
       size: Math.max(action.local?.size ?? 0, action.remote?.size ?? 0)
     }));
     this.activityUpdatedAt = this.now();
-    const uploads = actions.filter((action) => action.kind === "push").length;
-    const downloads = actions.filter((action) => action.kind === "pull").length;
+    const uploads = actions.filter((action) => isLanUploadAction(action.kind)).length;
+    const downloads = actions.filter((action) => isLanDownloadAction(action.kind)).length;
     let completed = 0;
     let uploadCompleted = 0;
     let downloadCompleted = 0;
@@ -4438,8 +4462,8 @@ export class NtfyLanSync {
           const result = await this.executeAction(peer, actions[index], ledger);
           if (activity) activity.state = "complete";
           completed += 1;
-          if (actions[index].kind === "push") uploadCompleted += 1;
-          else if (actions[index].kind === "pull") downloadCompleted += 1;
+          if (isLanUploadAction(actions[index].kind)) uploadCompleted += 1;
+          else if (isLanDownloadAction(actions[index].kind)) downloadCompleted += 1;
           bytesTransferred += result.bytes;
           changed += result.changed ? 1 : 0;
           conflicts += result.conflict ? 1 : 0;
@@ -4707,7 +4731,13 @@ export class NtfyLanSync {
       files: unique.map((path) => ({ path, state: "pending", size: 0, reason: "" }))
     };
     const exposeScanProgress = this.canExposeScanProgress();
-    if (this.canClaimScanValue()) this.scanValue = scan;
+    // A path-only refresh is an incremental handoff, not a new visible scan
+    // round. Keep the current full-vault counter stable while its transfer
+    // plan is draining; replacing it here was the source of 0/N or baseline/N
+    // jumps after an edit, and made a completed scan look like it restarted.
+    const preserveVisibleScan = this.scanValue.total > 0
+      && (this.scanValue.phase === "scanning" || this.syncRunning || this.progressValue.phase === "syncing");
+    if (!preserveVisibleScan && this.canClaimScanValue()) this.scanValue = scan;
     const report = (): void => {
       if (!exposeScanProgress || this.scanValue !== scan) return;
       this.emitActivityChanged();
@@ -5776,8 +5806,8 @@ export class NtfyLanSync {
       for (const file of this.activityFiles) if (file.state === "pending" || file.state === "syncing") file.state = "error";
     }
     const completed = this.activityFiles.filter((file) => file.state === "complete" || file.state === "deferred").length;
-    const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
-    const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
+    const uploadCompleted = this.activityFiles.filter((file) => isLanUploadAction(file.action) && file.state === "complete").length;
+    const downloadCompleted = this.activityFiles.filter((file) => isLanDownloadAction(file.action) && file.state === "complete").length;
     const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
     this.emit({
       ...defaultProgress(success ? "complete" : "error"),

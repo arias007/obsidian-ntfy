@@ -599,7 +599,7 @@ try {
   const journalStorage = new MemoryStorage(identity, {
     "Notes/existing-before-checkpoint.md": { content: "existing", mtime: 10 }
   });
-  const journalOptions = commonOptions(journalStorage, journalPort, journalDevice, [], { autoDiscovery: false });
+  const journalOptions = commonOptions(journalStorage, journalPort, journalDevice, [], { autoDiscovery: false, syncConfigFolder: true });
   journalOptions.localStore = journalStore;
   const journalService = new NtfyLanSync(journalOptions);
   await journalService.start();
@@ -616,7 +616,7 @@ try {
   );
   journalStorage.listFilesCalls = 0;
   journalStorage.listFilesChangedSinceCalls = 0;
-  const reloadOptions = commonOptions(journalStorage, journalPort, journalDevice, [], { autoDiscovery: false });
+  const reloadOptions = commonOptions(journalStorage, journalPort, journalDevice, [], { autoDiscovery: false, syncConfigFolder: true });
   reloadOptions.localStore = journalStore;
   const reloadedJournalService = new NtfyLanSync(reloadOptions);
   await reloadedJournalService.start();
@@ -1588,7 +1588,7 @@ try {
   assert.match(source, /this\.sectionState\.history = details\.open/, "LAN history section does not preserve its expanded state during live refresh");
   assert.match(source, /obsidian-ntfy-lan-round-history-heading/, "LAN history entries do not expose a stable always-visible heading");
   assert.match(source, /本机已检查.*对端已检查/s, "LAN history details do not use check-style progress");
-  assert.match(source, /已同步.*上传.*下载/s, "LAN history details do not use transfer-style progress");
+  assert.match(source, /已同步.*推送.*拉取/s, "LAN history details do not use transfer-style progress");
   assert.match(stylesSource, /\.obsidian-ntfy-lan-details-summary \{[\s\S]*?align-items: start;[\s\S]*?min-height: 0;/, "Current LAN status does not reserve enough height for multiline progress");
   assert.match(stylesSource, /\.obsidian-ntfy-lan-current-status \{[\s\S]*?display: flow-root;[\s\S]*?flex: 0 0 auto;[\s\S]*?padding-bottom: 16px;/, "Current LAN status has no independent flow boundary");
   assert.match(stylesSource, /\.obsidian-ntfy-lan-round-history \{[\s\S]*?flex: 0 0 auto;[\s\S]*?margin-top: 8px;[\s\S]*?position: relative;/, "LAN history has no stable gap after the isolated current status box");
@@ -1619,8 +1619,8 @@ try {
   assert.match(lanSource, /deletePull: settings\.mode === "bidirectional" \|\| settings\.mode === "delete-pull"/, "Default bidirectional mode does not pull deletions");
   assert.match(lanSource, /remoteRequestedSync \|\| \(peer\.remoteDirtyPaths\?\.size \?\? 0\) > 0/, "Inbound mobile dirty signals do not immediately schedule synchronization");
   assert.doesNotMatch(source, /const label = `\$\{chinese \? "扫描" : "Scan"\} \$\{scan\.completed \|\| 0\}\/\$\{scan\.total \|\| 0\}`/, "LAN details still render an unexplained scan 0/0");
-  assert.match(source, /上传/, "LAN transfer details do not label uploads");
-  assert.match(source, /下载/, "LAN transfer details do not label downloads");
+  assert.match(source, /推送/, "LAN transfer details do not label pushes");
+  assert.match(source, /拉取/, "LAN transfer details do not label pulls");
   assert.match(source, /progress\.uploadCompleted[^\n]*progress\.uploads/, "LAN details do not show completed/total uploads");
   assert.match(source, /progress\.downloadCompleted[^\n]*progress\.downloads/, "LAN details do not show completed/total downloads");
   assert.match(source, /已检查 \$\{scan\.completed \|\| 0\} \/ 本轮总检查 \$\{scan\.total \|\| 0\}/, "LAN details do not show local checked/round-total progress");

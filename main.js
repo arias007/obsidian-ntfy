@@ -789,6 +789,12 @@ var NtfyLanSyncRuntime = (() => {
     prioritizeLanSyncActions: () => prioritizeLanSyncActions,
     verifyLanSyncRequest: () => verifyLanSyncRequest
   });
+  function isLanUploadAction(action) {
+    return action === "push" || action === "delete-remote";
+  }
+  function isLanDownloadAction(action) {
+    return action === "pull" || action === "delete-local";
+  }
   var PROTOCOL_VERSION = 1;
   var PROTOCOL_NAME = "cancip-lan-sync";
   var API_PREFIX = "/cancip-lan/v1";
@@ -1491,10 +1497,10 @@ ${bodyHash}`;
       } else if (file.state === "syncing") group.active += 1;
       else if (file.state === "error") group.errors += 1;
       if (file.provisional) continue;
-      if (file.action === "push") {
+      if (isLanUploadAction(file.action)) {
         group.uploads += 1;
         if (file.state === "complete") group.uploadCompleted += 1;
-      } else if (file.action === "pull") {
+      } else if (isLanDownloadAction(file.action)) {
         group.downloads += 1;
         if (file.state === "complete") group.downloadCompleted += 1;
       }
@@ -1911,7 +1917,7 @@ ${bodyHash}`;
         const metadataPreparation = (async () => {
           await this.loadMetadataIndex();
           await this.publishLocalScanSnapshot();
-          if (!this.metadataIndexReady) {
+          if (!this.metadataIndexReady && this.lastSyncCheckpointAt <= 0) {
             await this.buildMetadataManifestOnce(this.settings().syncConfigFolder);
             this.fullSyncRequested = true;
             this.fullSyncRequestId = this.fullSyncRequestId || randomId(18);
@@ -2307,6 +2313,7 @@ ${bodyHash}`;
         const parsed = safeJsonObject(raw);
         if (parsed.schemaVersion !== 1 || !Array.isArray(parsed.entries)) {
           this.lastFullScanAt = 0;
+          this.lastSyncCheckpointAt = 0;
           return;
         }
         const checkpointAt = Number(parsed.checkpointAt);
@@ -2325,6 +2332,7 @@ ${bodyHash}`;
         this.dirtyPaths.clear();
         this.dirtySequence = 0;
         this.lastFullScanAt = 0;
+        this.lastSyncCheckpointAt = 0;
       }
     }
     async captureChangesSinceCheckpoint() {
@@ -2495,7 +2503,7 @@ ${bodyHash}`;
       if (!this.runningValue || this.scanValue.phase === "scanning") return;
       try {
         const includeConfigFolder = this.settings().syncConfigFolder;
-        const files = await (this.options.storage.listFilesLive?.(includeConfigFolder) ?? this.options.storage.listFiles(includeConfigFolder));
+        const files = this.metadataIndexReady && (includeConfigFolder || this.metadataIndexIncludesConfig) ? [...this.metadataIndex.entries()].map(([path, metadata]) => ({ path, ...metadata })) : await (this.options.storage.listFilesLive?.(includeConfigFolder) ?? this.options.storage.listFiles(includeConfigFolder));
         const unique = /* @__PURE__ */ new Map();
         for (const file of files) {
           const path = this.normalizePath(file.path, includeConfigFolder);
@@ -2571,10 +2579,10 @@ ${bodyHash}`;
       const hasPeer = this.activePeers().length > 0;
       if (candidates.size > 0 && hasPeer) {
         const confirmed = this.activityFiles.filter((file) => !file.provisional);
-        const uploads = confirmed.filter((file) => file.action === "push").length;
-        const downloads = confirmed.filter((file) => file.action === "pull").length;
-        const uploadCompleted = confirmed.filter((file) => file.action === "push" && file.state === "complete").length;
-        const downloadCompleted = confirmed.filter((file) => file.action === "pull" && file.state === "complete").length;
+        const uploads = confirmed.filter((file) => isLanUploadAction(file.action)).length;
+        const downloads = confirmed.filter((file) => isLanDownloadAction(file.action)).length;
+        const uploadCompleted = confirmed.filter((file) => isLanUploadAction(file.action) && file.state === "complete").length;
+        const downloadCompleted = confirmed.filter((file) => isLanDownloadAction(file.action) && file.state === "complete").length;
         this.emit({
           ...this.progressValue,
           phase: "syncing",
@@ -3089,10 +3097,10 @@ ${bodyHash}`;
     emitInboundFileProgress(deviceId, phase = "syncing") {
       const completed = this.activityFiles.filter((file) => file.state === "complete").length;
       const session = this.inboundSession?.deviceId === deviceId ? this.inboundSession : null;
-      const uploads = session ? session.uploads : this.activityFiles.filter((file) => file.action === "push").length;
-      const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
-      const downloads = session ? session.downloads : this.activityFiles.filter((file) => file.action === "pull").length;
-      const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
+      const uploads = session ? session.uploads : this.activityFiles.filter((file) => isLanUploadAction(file.action)).length;
+      const uploadCompleted = this.activityFiles.filter((file) => isLanUploadAction(file.action) && file.state === "complete").length;
+      const downloads = session ? session.downloads : this.activityFiles.filter((file) => isLanDownloadAction(file.action)).length;
+      const downloadCompleted = this.activityFiles.filter((file) => isLanDownloadAction(file.action) && file.state === "complete").length;
       const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
       this.emit({
         ...defaultProgress(phase),
@@ -3824,8 +3832,8 @@ ${bodyHash}`;
       }
       const transferSize = (action) => action.kind === "push" ? action.local?.size ?? 0 : action.kind === "pull" ? action.remote?.size ?? 0 : 0;
       const bytesTotal = actions.reduce((sum, action) => sum + transferSize(action), 0);
-      const uploads = actions.filter((action) => action.kind === "push").length;
-      const downloads = actions.filter((action) => action.kind === "pull").length;
+      const uploads = actions.filter((action) => isLanUploadAction(action.kind)).length;
+      const downloads = actions.filter((action) => isLanDownloadAction(action.kind)).length;
       this.activityFiles = actions.map((action) => ({
         path: action.path,
         action: action.kind,
@@ -3916,8 +3924,8 @@ ${bodyHash}`;
             settledPaths.add(actions[index].path);
             if (result.commit) commits.push(result.commit);
             completed += 1;
-            if (actions[index].kind === "push") uploadCompleted += 1;
-            else if (actions[index].kind === "pull") downloadCompleted += 1;
+            if (isLanUploadAction(actions[index].kind)) uploadCompleted += 1;
+            else if (isLanDownloadAction(actions[index].kind)) downloadCompleted += 1;
             bytesTransferred += result.bytes;
             changed += result.changed ? 1 : 0;
             conflicts += result.conflict ? 1 : 0;
@@ -4097,8 +4105,8 @@ ${bodyHash}`;
         size: Math.max(action.local?.size ?? 0, action.remote?.size ?? 0)
       }));
       this.activityUpdatedAt = this.now();
-      const uploads = actions.filter((action) => action.kind === "push").length;
-      const downloads = actions.filter((action) => action.kind === "pull").length;
+      const uploads = actions.filter((action) => isLanUploadAction(action.kind)).length;
+      const downloads = actions.filter((action) => isLanDownloadAction(action.kind)).length;
       let completed = 0;
       let uploadCompleted = 0;
       let downloadCompleted = 0;
@@ -4146,8 +4154,8 @@ ${bodyHash}`;
             const result = await this.executeAction(peer, actions[index], ledger);
             if (activity) activity.state = "complete";
             completed += 1;
-            if (actions[index].kind === "push") uploadCompleted += 1;
-            else if (actions[index].kind === "pull") downloadCompleted += 1;
+            if (isLanUploadAction(actions[index].kind)) uploadCompleted += 1;
+            else if (isLanDownloadAction(actions[index].kind)) downloadCompleted += 1;
             bytesTransferred += result.bytes;
             changed += result.changed ? 1 : 0;
             conflicts += result.conflict ? 1 : 0;
@@ -4372,7 +4380,8 @@ ${bodyHash}`;
         files: unique.map((path) => ({ path, state: "pending", size: 0, reason: "" }))
       };
       const exposeScanProgress = this.canExposeScanProgress();
-      if (this.canClaimScanValue()) this.scanValue = scan;
+      const preserveVisibleScan = this.scanValue.total > 0 && (this.scanValue.phase === "scanning" || this.syncRunning || this.progressValue.phase === "syncing");
+      if (!preserveVisibleScan && this.canClaimScanValue()) this.scanValue = scan;
       const report = () => {
         if (!exposeScanProgress || this.scanValue !== scan) return;
         this.emitActivityChanged();
@@ -5308,8 +5317,8 @@ ${bodyHash}`;
         for (const file of this.activityFiles) if (file.state === "pending" || file.state === "syncing") file.state = "error";
       }
       const completed = this.activityFiles.filter((file) => file.state === "complete" || file.state === "deferred").length;
-      const uploadCompleted = this.activityFiles.filter((file) => file.action === "push" && file.state === "complete").length;
-      const downloadCompleted = this.activityFiles.filter((file) => file.action === "pull" && file.state === "complete").length;
+      const uploadCompleted = this.activityFiles.filter((file) => isLanUploadAction(file.action) && file.state === "complete").length;
+      const downloadCompleted = this.activityFiles.filter((file) => isLanDownloadAction(file.action) && file.state === "complete").length;
       const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
       this.emit({
         ...defaultProgress(success ? "complete" : "error"),
@@ -5631,8 +5640,8 @@ class NtfyLanSyncDetailsModal extends Modal {
     if (progress.total > 0) progressParts.push(`${chinese ? "当前批次" : "Current batch"} ${progress.completed}/${progress.total}`);
     if (progress.uploads > 0 || progress.downloads > 0) {
       progressParts.push(chinese
-        ? `上传 ${progress.uploadCompleted || 0}/${progress.uploads || 0} · 下载 ${progress.downloadCompleted || 0}/${progress.downloads || 0}`
-        : `Upload ${progress.uploadCompleted || 0}/${progress.uploads || 0} · Download ${progress.downloadCompleted || 0}/${progress.downloads || 0}`);
+        ? `推送 ${progress.uploadCompleted || 0}/${progress.uploads || 0} · 拉取 ${progress.downloadCompleted || 0}/${progress.downloads || 0}`
+        : `Push ${progress.uploadCompleted || 0}/${progress.uploads || 0} · Pull ${progress.downloadCompleted || 0}/${progress.downloads || 0}`);
     }
     if (progress.bytesTotal > 0) progressParts.push(`${formatLanFileSize(progress.bytesTransferred)} / ${formatLanFileSize(progress.bytesTotal)}`);
     if (progress.peerCount > 0) progressParts.push(chinese ? `${progress.peerCount} 台设备` : `${progress.peerCount} device${progress.peerCount === 1 ? "" : "s"}`);
@@ -5746,8 +5755,8 @@ class NtfyLanSyncDetailsModal extends Modal {
       const syncStats = syncBlock.createDiv({ cls: "obsidian-ntfy-lan-details-progress-stats" });
       syncStats.createSpan({ text: chinese ? `已同步 ${syncCompleted}/${syncTotal}` : `Synchronized ${syncCompleted}/${syncTotal}` });
       syncStats.createSpan({ text: chinese
-        ? `上传 ${safeNumber(round.uploads)} · 下载 ${safeNumber(round.downloads)}`
-        : `Upload ${safeNumber(round.uploads)} · Download ${safeNumber(round.downloads)}` });
+        ? `推送 ${safeNumber(round.uploads)} · 拉取 ${safeNumber(round.downloads)}`
+        : `Push ${safeNumber(round.uploads)} · Pull ${safeNumber(round.downloads)}` });
       if (typeof round.peerId === "string" && round.peerId.trim()) content.createDiv({ cls: "obsidian-ntfy-lan-round-history-peer", text: `${chinese ? "设备" : "Peer"}: ${round.peerId.slice(0, 96)}` });
     }
   }
@@ -5829,12 +5838,12 @@ class NtfyLanSyncDetailsModal extends Modal {
               : (chinese ? "同步进度 · 0/0" : "Sync progress · 0/0");
     summary.createSpan({ text: label });
     const legacyDirectionSummary = chinese
-      ? `上传 ${progress.uploadCompleted || 0}/${progress.uploads || 0} · 下载 ${progress.downloadCompleted || 0}/${progress.downloads || 0}`
-      : `Upload ${progress.uploadCompleted || 0}/${progress.uploads || 0} · Download ${progress.downloadCompleted || 0}/${progress.downloads || 0}`;
+      ? `推送 ${progress.uploadCompleted || 0}/${progress.uploads || 0} · 拉取 ${progress.downloadCompleted || 0}/${progress.downloads || 0}`
+      : `Push ${progress.uploadCompleted || 0}/${progress.uploads || 0} · Pull ${progress.downloadCompleted || 0}/${progress.downloads || 0}`;
     const directionSummary = groupTotals.total > 0
       ? (chinese
-        ? `上传 ${visibleUploadCompleted}/${visibleUploads} · 下载 ${visibleDownloadCompleted}/${visibleDownloads}`
-        : `Upload ${visibleUploadCompleted}/${visibleUploads} · Download ${visibleDownloadCompleted}/${visibleDownloads}`)
+        ? `推送 ${visibleUploadCompleted}/${visibleUploads} · 拉取 ${visibleDownloadCompleted}/${visibleDownloads}`
+        : `Push ${visibleUploadCompleted}/${visibleUploads} · Pull ${visibleDownloadCompleted}/${visibleDownloads}`)
       : legacyDirectionSummary;
     const transferStatsLabel = chinese ? `已同步 ${visibleCompleted}/${visibleTotal}` : `Synchronized ${visibleCompleted}/${visibleTotal}`;
     summary.createSpan({ cls: "obsidian-ntfy-lan-details-section-meta", text: hasTransferWork
@@ -5879,8 +5888,8 @@ class NtfyLanSyncDetailsModal extends Modal {
       summary.createSpan({ cls: "obsidian-ntfy-lan-details-group-name", text: this.groupLabel(group.key, chinese) });
       const meta = kind === "transfer"
         ? (chinese
-          ? `${group.completed}/${group.total} · 上传 ${group.uploadCompleted}/${group.uploads} · 下载 ${group.downloadCompleted}/${group.downloads}`
-          : `${group.completed}/${group.total} · Upload ${group.uploadCompleted}/${group.uploads} · Download ${group.downloadCompleted}/${group.downloads}`)
+          ? `${group.completed}/${group.total} · 推送 ${group.uploadCompleted}/${group.uploads} · 拉取 ${group.downloadCompleted}/${group.downloads}`
+          : `${group.completed}/${group.total} · Push ${group.uploadCompleted}/${group.uploads} · Pull ${group.downloadCompleted}/${group.downloads}`)
         : `${group.completed}/${group.total}`;
       summary.createSpan({ cls: "obsidian-ntfy-lan-details-group-meta", text: meta });
       if (!details.open) continue;
@@ -5931,8 +5940,8 @@ class NtfyLanSyncDetailsModal extends Modal {
 
   renderFile(parent, file, chinese) {
     const actionLabels = chinese
-      ? { push: "上传", pull: "下载", "delete-local": "删除本地", "delete-remote": "删除对端" }
-      : { push: "Upload", pull: "Download", "delete-local": "Delete local", "delete-remote": "Delete peer" };
+      ? { push: "推送", pull: "拉取", "delete-local": "删除本地", "delete-remote": "删除对端" }
+      : { push: "Push", pull: "Pull", "delete-local": "Delete local", "delete-remote": "Delete peer" };
     const stateLabels = chinese
       ? { pending: "等待", syncing: "同步中", complete: "完成", deferred: "变化中，自动重试", error: "失败" }
       : { pending: "Pending", syncing: "Syncing", complete: "Complete", deferred: "Changing; retry queued", error: "Failed" };
