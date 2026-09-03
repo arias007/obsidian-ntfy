@@ -3452,7 +3452,15 @@ ${bodyHash}`;
         this.emitPeersChanged();
         await this.receiveQueuedMessages(peer, response.messages);
         const mobilePullWake = !this.options.desktop && peer.canHost && peer.lastSyncAt <= 0;
-        if (firstVerifiedConnection || remoteRequestedSync || mobilePullWake || this.dirtyPaths.size > 0 || this.activeEditDirty.size > 0) {
+        const needsInitialBaseline = this.metadataProtocol(peer) !== null && !this.hasPeerMetadataBaseline(peer.deviceId) && (this.scanValue.total > 0 || this.metadataIndex.size > 0);
+        if (needsInitialBaseline && !this.fullSyncRequested) {
+          this.fullSyncRequested = true;
+          this.fullSyncRequestId = randomId(18);
+          this.forceFilesystemScanRequested = true;
+          this.syncRequestId = randomId(18);
+          this.announce();
+        }
+        if (firstVerifiedConnection || remoteRequestedSync || mobilePullWake || needsInitialBaseline || this.dirtyPaths.size > 0 || this.activeEditDirty.size > 0) {
           this.scheduleSync(remoteRequestedSync || this.dirtyPaths.size > 0 ? 0 : 20, true);
           if (this.activeEditDirty.size > 0) this.scheduleActiveEditSync(0);
         }
@@ -3545,7 +3553,21 @@ ${bodyHash}`;
     async syncActivePeers() {
       const forced = this.syncForced;
       this.syncForced = false;
-      if (!this.runningValue || !this.isCoordinator() && this.dirtyPaths.size === 0) return;
+      const activePeers = this.activePeers();
+      const peerNeedingBaseline = activePeers.find(
+        (peer) => this.metadataProtocol(peer) !== null && !this.hasPeerMetadataBaseline(peer.deviceId)
+      );
+      if (peerNeedingBaseline && !this.fullSyncRequested) {
+        this.fullSyncRequested = true;
+        this.fullSyncRequestId = randomId(18);
+        this.forceFilesystemScanRequested = true;
+        this.syncRequestId = randomId(18);
+        this.announce();
+      }
+      const hasRemoteRequest = activePeers.some(
+        (peer) => Boolean(peer.remoteFullSyncRequestId) || (peer.remoteDirtyPaths?.size ?? 0) > 0
+      );
+      if (!this.runningValue || !this.isCoordinator() && this.dirtyPaths.size === 0 && !this.fullSyncRequested && !hasRemoteRequest) return;
       if (this.syncRunning || this.activeEditSyncRunning) {
         this.syncQueued = true;
         return;
@@ -4583,6 +4605,20 @@ ${bodyHash}`;
     }
     metadataLedgerKey(peerId) {
       return `ntfy.lan-sync.metadata-ledger.v3.${this.identity?.vaultId ?? "unknown"}.${peerId}`;
+    }
+    /**
+     * A metadata index only describes this device. It is not proof that this
+     * particular peer has ever completed a transfer. Keep the remotely-save
+     * invariant here: a peer without a committed ledger must get one initial
+     * reconciliation, even after a plugin reload or an upgrade.
+     */
+    hasPeerMetadataBaseline(peerId) {
+      try {
+        const ledger = this.loadMetadataLedger(peerId);
+        return Object.keys(ledger.entries).length > 0;
+      } catch {
+        return false;
+      }
     }
     loadMetadataLedger(peerId) {
       try {

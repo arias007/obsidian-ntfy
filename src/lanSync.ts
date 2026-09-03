@@ -3616,7 +3616,19 @@ export class NtfyLanSync {
       // a new request; otherwise dirty files remain stuck until the periodic
       // minute tick.
       const mobilePullWake = !this.options.desktop && peer.canHost && peer.lastSyncAt <= 0;
-      if (firstVerifiedConnection || remoteRequestedSync || mobilePullWake || this.dirtyPaths.size > 0 || this.activeEditDirty.size > 0) {
+      const needsInitialBaseline = this.metadataProtocol(peer) !== null
+        && !this.hasPeerMetadataBaseline(peer.deviceId)
+        && (this.scanValue.total > 0 || this.metadataIndex.size > 0);
+      // A local metadata index is not a successful sync record. Start one
+      // initial remotely-save-style reconciliation for a peer with no ledger.
+      if (needsInitialBaseline && !this.fullSyncRequested) {
+        this.fullSyncRequested = true;
+        this.fullSyncRequestId = randomId(18);
+        this.forceFilesystemScanRequested = true;
+        this.syncRequestId = randomId(18);
+        this.announce();
+      }
+      if (firstVerifiedConnection || remoteRequestedSync || mobilePullWake || needsInitialBaseline || this.dirtyPaths.size > 0 || this.activeEditDirty.size > 0) {
         this.scheduleSync(remoteRequestedSync || this.dirtyPaths.size > 0 ? 0 : 20, true);
         if (this.activeEditDirty.size > 0) this.scheduleActiveEditSync(0);
       }
@@ -3734,7 +3746,29 @@ export class NtfyLanSync {
     // Empty rounds remain coordinator-driven, but a concrete local edit must
     // never wait for the other device to notice it first. Either side may
     // initiate while it has dirty paths, which is the fast path for new files.
-    if (!this.runningValue || (!this.isCoordinator() && this.dirtyPaths.size === 0)) return;
+    const activePeers = this.activePeers();
+    // Treat a peer with no committed metadata ledger as an initial sync
+    // participant. This is deliberately independent of the local index: the
+    // index is only a cache of this device, while remotely-save starts from a
+    // shared previous-sync record. Without this promotion a reloaded device
+    // could advertise a healthy scan but never create its first transfer plan.
+    const peerNeedingBaseline = activePeers.find((peer) =>
+      this.metadataProtocol(peer) !== null && !this.hasPeerMetadataBaseline(peer.deviceId)
+    );
+    if (peerNeedingBaseline && !this.fullSyncRequested) {
+      this.fullSyncRequested = true;
+      this.fullSyncRequestId = randomId(18);
+      this.forceFilesystemScanRequested = true;
+      this.syncRequestId = randomId(18);
+      this.announce();
+    }
+    const hasRemoteRequest = activePeers.some((peer) =>
+      Boolean(peer.remoteFullSyncRequestId) || (peer.remoteDirtyPaths?.size ?? 0) > 0
+    );
+    // A passive device must still execute a peer-requested full round. The old
+    // gate only looked at local dirty paths, so a phone that received the
+    // desktop's request stayed forever at 0/0 and never pulled anything.
+    if (!this.runningValue || (!this.isCoordinator() && this.dirtyPaths.size === 0 && !this.fullSyncRequested && !hasRemoteRequest)) return;
     if (this.syncRunning || this.activeEditSyncRunning) {
       this.syncQueued = true;
       return;
@@ -4982,6 +5016,21 @@ export class NtfyLanSync {
 
   private metadataLedgerKey(peerId: string): string {
     return `ntfy.lan-sync.metadata-ledger.v3.${this.identity?.vaultId ?? "unknown"}.${peerId}`;
+  }
+
+  /**
+   * A metadata index only describes this device. It is not proof that this
+   * particular peer has ever completed a transfer. Keep the remotely-save
+   * invariant here: a peer without a committed ledger must get one initial
+   * reconciliation, even after a plugin reload or an upgrade.
+   */
+  private hasPeerMetadataBaseline(peerId: string): boolean {
+    try {
+      const ledger = this.loadMetadataLedger(peerId);
+      return Object.keys(ledger.entries).length > 0;
+    } catch {
+      return false;
+    }
   }
 
   private loadMetadataLedger(peerId: string): LanSyncMetadataLedger {
