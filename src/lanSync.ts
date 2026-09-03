@@ -1267,6 +1267,11 @@ function sortedActivityGroups(groups: Map<string, LanSyncActivityGroup>): LanSyn
 function summarizeTransferGroups(files: LanSyncFileActivity[]): LanSyncActivityGroup[] {
   const groups = new Map<string, LanSyncActivityGroup>();
   for (const file of files) {
+    // Provisional dirty rows are only a local wake-up hint. Until the peer
+    // manifest confirms push/pull direction they are not part of this round's
+    // transfer totals, otherwise the panel can show 0/8761 with 0/0 in both
+    // directions.
+    if (file.provisional) continue;
     const key = lanSyncTopLevelGroup(file.path);
     const group = groups.get(key) ?? emptyActivityGroup(key);
     groups.set(key, group);
@@ -1280,7 +1285,6 @@ function summarizeTransferGroups(files: LanSyncFileActivity[]): LanSyncActivityG
       group.errors += 1;
     } else if (file.state === "syncing") group.active += 1;
     else if (file.state === "error") group.errors += 1;
-    if (file.provisional) continue;
     if (isLanUploadAction(file.action)) {
       group.uploads += 1;
       if (file.state === "complete") group.uploadCompleted += 1;
@@ -2576,11 +2580,10 @@ export class NtfyLanSync {
         phase: "syncing",
         stage: "transferring",
         active: true,
-        // The total is the visible pending queue, including candidates whose
-        // direction is not known until the peer manifest arrives. Direction
-        // counters intentionally remain confirmed-only to avoid fake uploads.
-        total: this.activityFiles.length,
-        completed: Math.min(this.activityFiles.length, uploadCompleted + downloadCompleted),
+        // Only manifest-confirmed actions belong to the round total. Local
+        // dirty hints remain queued separately until their direction is known.
+        total: confirmed.length,
+        completed: Math.min(confirmed.length, uploadCompleted + downloadCompleted),
         uploads,
         uploadCompleted,
         downloads,
@@ -3178,7 +3181,7 @@ export class NtfyLanSync {
       active: true,
       peerId: deviceId,
       completed,
-      total: Math.max(session?.total ?? 0, this.activityFiles.length),
+      total: Math.max(session?.total ?? 0, this.activityFiles.filter((file) => !file.provisional).length),
       bytesTransferred,
       bytesTotal: Math.max(session?.bytesTotal ?? 0, this.activityFiles.reduce((sum, file) => sum + file.size, 0)),
       changed: completed,
