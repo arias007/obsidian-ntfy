@@ -4778,8 +4778,11 @@ export class NtfyLanSync {
     let bytesTransferred = 0;
     let changed = 0;
     let conflicts = 0;
+    // An empty incremental plan is a completed check, not an active transfer.
+    // Keep both peers in the same connected/idle state instead of leaving one
+    // side stuck on a permanent `complete` phase with a 0/0 denominator.
     this.emit({
-      ...defaultProgress(actions.length ? "syncing" : "complete"),
+      ...defaultProgress(actions.length ? "syncing" : "connected"),
       active: true,
       peerId: peer.deviceId,
       total: actions.length,
@@ -4985,7 +4988,7 @@ export class NtfyLanSync {
     peer.lastFailureAt = 0;
     this.lastErrorValue = failedPaths.size ? `partial_transfer:${failedPaths.size}` : "";
     this.emit({
-      ...defaultProgress("complete"),
+      ...defaultProgress(actions.length ? "complete" : "connected"),
       active: true,
       peerId: peer.deviceId,
       completed,
@@ -5056,7 +5059,7 @@ export class NtfyLanSync {
     let changed = 0;
     let conflicts = 0;
     this.emit({
-      ...defaultProgress(actions.length ? "syncing" : "complete"),
+      ...defaultProgress(actions.length ? "syncing" : "connected"),
       active: true,
       peerId: peer.deviceId,
       total: actions.length,
@@ -5133,7 +5136,7 @@ export class NtfyLanSync {
     peer.lastFailureAt = 0;
     this.lastErrorValue = "";
     this.emit({
-      ...defaultProgress("complete"),
+      ...defaultProgress(actions.length ? "complete" : "connected"),
       active: true,
       peerId: peer.deviceId,
       completed,
@@ -6502,7 +6505,7 @@ export class NtfyLanSync {
     const downloadCompleted = this.activityFiles.filter((file) => isLanDownloadAction(file.action) && file.state === "complete").length;
     const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
     this.emit({
-      ...defaultProgress(success ? "complete" : "error"),
+      ...defaultProgress(success && this.activityFiles.length === 0 ? "connected" : success ? "complete" : "error"),
       active: true,
       peerId: deviceId,
       completed,

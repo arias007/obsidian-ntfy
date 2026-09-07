@@ -4308,7 +4308,7 @@ ${bodyHash}`;
       let changed = 0;
       let conflicts = 0;
       this.emit({
-        ...defaultProgress(actions.length ? "syncing" : "complete"),
+        ...defaultProgress(actions.length ? "syncing" : "connected"),
         active: true,
         peerId: peer.deviceId,
         total: actions.length,
@@ -4503,7 +4503,7 @@ ${bodyHash}`;
       peer.lastFailureAt = 0;
       this.lastErrorValue = failedPaths.size ? `partial_transfer:${failedPaths.size}` : "";
       this.emit({
-        ...defaultProgress("complete"),
+        ...defaultProgress(actions.length ? "complete" : "connected"),
         active: true,
         peerId: peer.deviceId,
         completed,
@@ -4571,7 +4571,7 @@ ${bodyHash}`;
       let changed = 0;
       let conflicts = 0;
       this.emit({
-        ...defaultProgress(actions.length ? "syncing" : "complete"),
+        ...defaultProgress(actions.length ? "syncing" : "connected"),
         active: true,
         peerId: peer.deviceId,
         total: actions.length,
@@ -4648,7 +4648,7 @@ ${bodyHash}`;
       peer.lastFailureAt = 0;
       this.lastErrorValue = "";
       this.emit({
-        ...defaultProgress("complete"),
+        ...defaultProgress(actions.length ? "complete" : "connected"),
         active: true,
         peerId: peer.deviceId,
         completed,
@@ -5830,7 +5830,7 @@ ${bodyHash}`;
       const downloadCompleted = this.activityFiles.filter((file) => isLanDownloadAction(file.action) && file.state === "complete").length;
       const bytesTransferred = this.activityFiles.filter((file) => file.state === "complete").reduce((sum, file) => sum + file.size, 0);
       this.emit({
-        ...defaultProgress(success ? "complete" : "error"),
+        ...defaultProgress(success && this.activityFiles.length === 0 ? "connected" : success ? "complete" : "error"),
         active: true,
         peerId: deviceId,
         completed,
