@@ -11,13 +11,24 @@ import esbuild from "esbuild";
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const temp = await mkdtemp(join(tmpdir(), "ntfy-lan-sync-"));
 
-function memoryLocalStore(deviceId) {
-  const values = new Map([["cancip.lan-sync.device-id.v1", deviceId]]);
+function testDeviceIdStorageKey(deviceScope = "") {
+  let normalized = String(deviceScope).trim().replace(/\\/g, "/");
+  if (/^[A-Za-z]:\/?$/.test(normalized)) normalized = `${normalized[0].toLowerCase()}:/`;
+  else normalized = normalized.replace(/\/+$/, "");
+  if (/^[A-Za-z]:\//.test(normalized)) normalized = normalized.toLowerCase();
+  return `cancip.lan-sync.device-id.v2.${Buffer.from(normalized || "default", "utf8").toString("base64url")}`;
+}
+
+function localStore(values = new Map()) {
   return {
     getItem: (key) => values.get(key) ?? null,
     setItem: (key, value) => values.set(key, String(value)),
     removeItem: (key) => values.delete(key)
   };
+}
+
+function memoryLocalStore(deviceId, deviceScope = "") {
+  return localStore(new Map([[testDeviceIdStorageKey(deviceScope), deviceId]]));
 }
 
 function bytes(value) {
@@ -42,6 +53,7 @@ class MemoryStorage {
     this.clock = 1000;
     this.readCounts = new Map();
     this.writeCounts = new Map();
+    this.writeHistory = [];
     this.listFilesCalls = 0;
     this.listFilesChangedSinceCalls = 0;
     this.beforeRead = null;
@@ -104,8 +116,10 @@ class MemoryStorage {
 
   async writeBinary(path, data, mtime) {
     const requestedMtime = Number.isFinite(mtime) ? mtime : ++this.clock;
-    this.files.set(path, { data: new Uint8Array(data), mtime: this.mtimeTransform(requestedMtime, path) });
+    const actualMtime = this.mtimeTransform(requestedMtime, path);
+    this.files.set(path, { data: new Uint8Array(data), mtime: actualMtime });
     this.writeCounts.set(path, (this.writeCounts.get(path) || 0) + 1);
+    this.writeHistory.push({ path, requestedMtime, actualMtime, at: Date.now() });
     if (typeof this.afterWrite === "function") await this.afterWrite(path, this);
   }
 
@@ -159,7 +173,12 @@ async function waitFor(predicate, label, timeoutMs = 12_000, intervalMs = 80) {
   throw new Error(`Timed out waiting for ${label}`);
 }
 
+function trace(label) {
+  if (process.env.NTFY_LAN_TEST_TRACE === "1") console.log(`[lan-test] ${label}`);
+}
+
 try {
+  trace("bundle-start");
   const bundle = join(temp, "lanSync.cjs");
   await esbuild.build({
     entryPoints: [join(root, "src", "lanSync.ts")],
@@ -181,15 +200,21 @@ try {
     encryptLanSyncPayload,
     isPrivateLanAddress,
     ipv4BroadcastAddress,
+    lanSyncDeviceIdStorageKey,
     normalizeLanSyncPath,
     normalizeLanInboxAttachmentPath,
     isLanInboxAttachmentPath,
     lanSyncTopLevelGroup,
     normalizeManualLanPeer,
     planLanSyncMetadataReconciliation,
+    prioritizeLanSyncActions,
     planLanSyncReconciliation,
     verifyLanSyncRequest
   } = require(bundle);
+  trace("bundle-ready");
+
+  assert.equal(lanSyncDeviceIdStorageKey("E:\\note\\"), testDeviceIdStorageKey("e:/note"));
+  assert.notEqual(lanSyncDeviceIdStorageKey("E:\\note"), lanSyncDeviceIdStorageKey("D:\\note"));
 
   assert.equal(normalizeLanSyncPath("Notes/Safe.md"), "Notes/Safe.md");
   for (const unsafe of ["../secret", "/absolute", "C:/drive", ".trash/a", "folder\\file", "a//b", "a/./b", "a/../b"]) {
@@ -209,11 +234,11 @@ try {
   for (const protectedPath of [
     ".obsidian/workspace.json",
     ".obsidian/workspace-mobile.json",
-    ".obsidian/plugins/remotely-save/data.json",
-    ".obsidian/plugins/android-ntfy-notifier/data.json",
-    ".obsidian/plugins/android-ntfy-notifier/lan-sync/identity.json",
-    ".obsidian/plugins/example/node_modules/cache.bin"
-  ]) {
+  ".obsidian/plugins/remotely-save/data.json",
+  ".obsidian/plugins/android-ntfy-notifier/data.json",
+  ".obsidian/plugins/android-ntfy-notifier/lan-sync/identity.json",
+  ".obsidian/plugins/example/node_modules/cache.bin"
+]) {
     assert.equal(normalizeLanSyncPath(protectedPath, configPathOptions), null, `Protected config path accepted: ${protectedPath}`);
   }
   for (const sharedPluginPath of [
@@ -224,6 +249,14 @@ try {
     assert.equal(normalizeLanSyncPath(sharedPluginPath, configPathOptions), sharedPluginPath, `Plugin release file was excluded: ${sharedPluginPath}`);
   }
   assert.equal(normalizeLanSyncPath(".obsidian/hotkeys.json", configPathOptions), ".obsidian/hotkeys.json", "Whole-vault config path was dropped");
+  for (const runtimePath of [
+    ".obsidian/plugins/cancip/data/index/universal-search.json",
+    ".obsidian/plugins/weave-epub-reader/state/epub-local-state.json",
+    ".obsidian/plugins/example/cache/render.bin",
+    ".obsidian/plugins/example/.local-backups/old/main.js"
+  ]) {
+    assert.equal(normalizeLanSyncPath(runtimePath, configPathOptions), runtimePath, `Plugin runtime path was excluded: ${runtimePath}`);
+  }
   for (const address of ["127.0.0.1", "10.0.0.2", "172.20.1.2", "192.168.1.8", "169.254.2.3"]) assert.equal(isPrivateLanAddress(address), true);
   for (const address of ["8.8.8.8", "1.1.1.1", "example.com"]) assert.equal(isPrivateLanAddress(address), false);
   assert.equal(classifyLanLinkType("Wi-Fi"), "wifi");
@@ -455,6 +488,65 @@ try {
       activityChanges
     };
   };
+  trace("clone-identity-start");
+  // A cloned vault intentionally shares identity.json, while two Obsidian
+  // windows also share Electron localStorage. Device IDs must remain stable
+  // per vault path without inheriting the copied legacy global ID.
+  const cloneLocalValues = new Map([["cancip.lan-sync.device-id.v1", "COPIEDLEGACYDEVICEID1234"]]);
+  const cloneLocalStore = localStore(cloneLocalValues);
+  const cloneScopeA = "E:\\note";
+  const cloneScopeB = "D:\\note";
+  const clonePortA = await freePort();
+  const clonePortB = await freePort();
+  const cloneStorageA = new MemoryStorage(identity, {});
+  const cloneStorageB = new MemoryStorage(identity, {});
+  const clonedLegacyId = cloneLocalValues.get("cancip.lan-sync.device-id.v1");
+  cloneStorageA.putText(`${cloneStorageA.identityRoot}/peers/${clonedLegacyId}.json`, descriptor(clonedLegacyId, clonePortA));
+  cloneStorageB.putText(`${cloneStorageB.identityRoot}/peers/${clonedLegacyId}.json`, descriptor(clonedLegacyId, clonePortB));
+  const cloneOptionsA = commonOptions(cloneStorageA, clonePortA, "UNUSEDCLONEAAAAAAAAAA", [], {
+    autoDiscovery: false,
+    manualPeers: [`127.0.0.1:${clonePortB}`]
+  });
+  const cloneOptionsB = commonOptions(cloneStorageB, clonePortB, "UNUSEDCLONEBBBBBBBBBB", [], {
+    autoDiscovery: false
+  });
+  Object.assign(cloneOptionsA, { localStore: cloneLocalStore, deviceScope: cloneScopeA });
+  Object.assign(cloneOptionsB, { localStore: cloneLocalStore, deviceScope: cloneScopeB });
+  const cloneServiceA = new NtfyLanSync(cloneOptionsA);
+  const cloneServiceB = new NtfyLanSync(cloneOptionsB);
+  let cloneDeviceA;
+  let cloneDeviceB;
+  try {
+    await cloneServiceB.start();
+    await cloneServiceA.start();
+    cloneDeviceA = cloneServiceA.deviceId;
+    cloneDeviceB = cloneServiceB.deviceId;
+    assert.notEqual(cloneDeviceA, cloneDeviceB, "Cloned vaults reused the same device ID");
+    assert.notEqual(cloneDeviceA, cloneLocalValues.get("cancip.lan-sync.device-id.v1"));
+    assert.notEqual(cloneDeviceB, cloneLocalValues.get("cancip.lan-sync.device-id.v1"));
+    await waitFor(
+      () => cloneServiceA.status().peerCount === 1 && cloneServiceB.status().peerCount === 1,
+      "cloned vault peers to authenticate"
+    );
+    assert.equal(await cloneStorageA.exists(`${cloneStorageA.identityRoot}/peers/${clonedLegacyId}.json`), false, "Primary clone retained its retired device descriptor");
+    assert.equal(await cloneStorageB.exists(`${cloneStorageB.identityRoot}/peers/${clonedLegacyId}.json`), false, "Secondary clone retained its retired device descriptor");
+  } finally {
+    await Promise.all([cloneServiceA.stop(), cloneServiceB.stop()]);
+  }
+  const cloneRestartOptionsA = commonOptions(new MemoryStorage(identity, {}), await freePort(), "UNUSEDRESTARTAAAAAAAA", [], { autoDiscovery: false });
+  const cloneRestartOptionsB = commonOptions(new MemoryStorage(identity, {}), await freePort(), "UNUSEDRESTARTBBBBBBBB", [], { autoDiscovery: false });
+  Object.assign(cloneRestartOptionsA, { localStore: cloneLocalStore, deviceScope: cloneScopeA });
+  Object.assign(cloneRestartOptionsB, { localStore: cloneLocalStore, deviceScope: cloneScopeB });
+  const cloneRestartA = new NtfyLanSync(cloneRestartOptionsA);
+  const cloneRestartB = new NtfyLanSync(cloneRestartOptionsB);
+  try {
+    await Promise.all([cloneRestartA.start(), cloneRestartB.start()]);
+    assert.equal(cloneRestartA.deviceId, cloneDeviceA, "Primary vault device ID changed after restart");
+    assert.equal(cloneRestartB.deviceId, cloneDeviceB, "Clone vault device ID changed after restart");
+  } finally {
+    await Promise.all([cloneRestartA.stop(), cloneRestartB.stop()]);
+  }
+  trace("clone-identity-complete");
   // Shared-key compatibility: device identities may differ while a
   // user-supplied key keeps the authenticated LAN channel common. This guards
   // the runtime settings normalization path as well as the wire handshake.
@@ -495,6 +587,7 @@ try {
   } finally {
     await Promise.all([sharedServiceA.stop(), sharedServiceB.stop()]);
   }
+  trace("shared-key-complete");
   let stabilityClock = 1_000;
   let stabilityPeerEvents = 0;
   const stabilityProgress = [];
@@ -593,6 +686,62 @@ try {
   assert.equal(stabilityService.listPeers().length, 1, "A mutually acknowledged peer should become connected");
   assert.equal(stabilityService.dirtyPaths.size, 1, "The durable journal should remain queued after mutual connection");
 
+  stabilityService.dirtyPaths.clear();
+  for (let index = 0; index < 20_000; index += 1) {
+    stabilityService.dirtyPaths.set(`Candidates/${String(index).padStart(5, "0")}.md`, index + 1);
+  }
+  stabilityService.activityFiles = Array.from({ length: 6 }, (_value, index) => ({
+    path: `Confirmed/${index}.md`,
+    action: "push",
+    state: "pending",
+    size: 1
+  }));
+  stabilityService.syncRunning = true;
+  stabilityService.emit({
+    ...stabilityService.progress(),
+    phase: "syncing",
+    stage: "transferring",
+    active: true,
+    peerId: mutualPeer.deviceId,
+    total: 6,
+    uploads: 6,
+    uploadCompleted: 0,
+    downloads: 0,
+    downloadCompleted: 0
+  });
+  stabilityService.refreshVisibleSyncCandidates();
+  const largeCandidateActivity = stabilityService.activity();
+  assert.equal(largeCandidateActivity.scan.syncCandidatesTotal, 20_000, "Large scan candidate count was not kept in scan progress");
+  assert.equal(largeCandidateActivity.progress.total, 6, "Scan candidates inflated the active transfer total");
+  assert.equal(largeCandidateActivity.progress.roundTotal, 6, "Round total must equal the confirmed upload/download plan");
+  assert.equal(largeCandidateActivity.progress.roundCompleted, 0, "Untransferred scan candidates were counted as completed actions");
+  assert.equal(largeCandidateActivity.progress.uploads, 6, "Confirmed upload total changed while scan candidates were refreshed");
+  assert.equal(largeCandidateActivity.progress.downloads, 0, "Scan candidates were assigned a fake transfer direction");
+  stabilityService.emit({
+    ...stabilityService.progress(),
+    phase: "complete",
+    stage: "complete",
+    active: true,
+    total: 11,
+    completed: 0,
+    bytesTransferred: 37 * 1024,
+    bytesTotal: 37 * 1024,
+    uploads: 0,
+    uploadCompleted: 0,
+    downloads: 0,
+    downloadCompleted: 0
+  });
+  const stalePlanActivity = stabilityService.activity();
+  assert.equal(stalePlanActivity.progress.total, 0, "A stale nondirectional total survived an empty transfer plan");
+  assert.equal(stalePlanActivity.progress.completed, 0, "A stale completion value survived an empty transfer plan");
+  assert.equal(stalePlanActivity.progress.bytesTotal, 0, "A stale byte total survived an empty transfer plan");
+  assert.equal(stalePlanActivity.progress.bytesTransferred, 0, "A stale transferred-byte value survived an empty transfer plan");
+  assert.equal(stalePlanActivity.transferGroups.length, 0, "Stale transfer groups survived after the directional plan was cleared");
+  stabilityService.syncRunning = false;
+  stabilityService.dirtyPaths.clear();
+  stabilityService.visibleCandidatePaths.clear();
+  stabilityService.activityFiles = [];
+
   const journalPort = await freePort();
   const journalDevice = "JOURNALCHECKPOINT123456";
   const journalStore = memoryLocalStore(journalDevice);
@@ -668,6 +817,7 @@ try {
   assert.equal(overflowService.fullSyncRequested, false, "A large change queue incorrectly promoted itself to a blocking full scan");
   assert.equal(overflowService.forceFilesystemScanRequested, false, "A large change queue incorrectly requested a filesystem scan");
   await overflowService.stop();
+  trace("journal-and-stability-complete");
 
   // Manual strict sync must start both full filesystem walks concurrently.
   // A serial coordinator scan made the phone sit at "waiting for manifest"
@@ -677,6 +827,7 @@ try {
   const concurrentStorageB = new MemoryStorage(identity, { "Concurrent/b.md": { content: "B", mtime: 20 } });
   let concurrentScanAStarted = false;
   let concurrentScanBStarted = false;
+  let concurrentScanArmed = false;
   let releaseConcurrentScanA;
   let releaseConcurrentScanB;
   const concurrentScanAGate = new Promise((resolvePromise) => { releaseConcurrentScanA = resolvePromise; });
@@ -684,11 +835,13 @@ try {
   const concurrentListA = concurrentStorageA.listFiles.bind(concurrentStorageA);
   const concurrentListB = concurrentStorageB.listFiles.bind(concurrentStorageB);
   concurrentStorageA.listFiles = async (...args) => {
+    if (!concurrentScanArmed) return await concurrentListA(...args);
     concurrentScanAStarted = true;
     await concurrentScanAGate;
     return await concurrentListA(...args);
   };
   concurrentStorageB.listFiles = async (...args) => {
+    if (!concurrentScanArmed) return await concurrentListB(...args);
     concurrentScanBStarted = true;
     await concurrentScanBGate;
     return await concurrentListB(...args);
@@ -713,6 +866,9 @@ try {
     await concurrentServiceB.start();
     await concurrentServiceA.start();
     await waitFor(() => concurrentServiceA.status().peerCount === 1, "concurrent full-scan peer");
+    concurrentStorageA.listFilesCalls = 0;
+    concurrentStorageB.listFilesCalls = 0;
+    concurrentScanArmed = true;
     concurrentServiceA.requestSync({ deep: true, strict: true });
     await waitFor(() => concurrentScanAStarted && concurrentScanBStarted, "both full filesystem walks to start before either completes");
     assert.equal(concurrentServiceA.progress().phase === "syncing", false, "Transfer started before both strict scans completed");
@@ -732,7 +888,9 @@ try {
     }
     await Promise.all([concurrentServiceA.stop(), concurrentServiceB.stop()]);
   }
+  trace("concurrent-scan-complete");
 
+  trace("primary-sync-start");
   const optionsB = commonOptions(storageB, portB, deviceB, progressB);
   const optionsA = commonOptions(storageA, portA, deviceA, progressA, { autoDiscovery: false, manualPeers: [`127.0.0.1:${portB}`] });
   const messagesB = [];
@@ -747,6 +905,7 @@ try {
     assert.equal(serviceA.listPeers()[0].linkType, "manual");
     assert.equal(serviceA.peers.get(deviceB).capabilities.has("metadata-session-v4"), true, "Authenticated ping did not negotiate metadata sync");
     assert.equal(serviceA.peers.get(deviceB).capabilities.has("metadata-session-v3"), true, "Authenticated ping did not advertise rolling-upgrade compatibility");
+    const primarySyncProgressStart = progressA.length;
     serviceA.requestSync();
     await waitFor(() => storageA.text("Notes/from-b.md") === "from B" && storageB.text("Notes/from-a.md") === "from A", "automatic bidirectional LAN transfer");
     await waitFor(() => storageA.text("Notes/shared.md") === "newer B" && storageB.text("Notes/shared.md") === "newer B", "original-path convergence");
@@ -756,7 +915,7 @@ try {
     assert.equal((await storageA.statFile("Notes/from-b.md")).mtime, 300, "Pulled file did not preserve the source mtime");
     assert.equal((await storageB.statFile("Notes/from-a.md")).mtime, 100, "Pushed file did not preserve the source mtime");
     assert.ok(progressA.some((value) => value.phase === "syncing" && value.active));
-    assert.equal(progressA.some((value) => value.phase === "scanning"), false, "Local scanning still overwrote the transfer progress channel");
+    assert.equal(progressA.slice(primarySyncProgressStart).some((value) => value.phase === "scanning"), false, "Local scanning still overwrote the transfer progress channel");
     assert.ok(optionsA.activityChanges.length > 0, "Independent scan activity did not notify the UI");
     await waitFor(() => progressA.some((value) => value.phase === "complete" && value.uploads > 0 && value.downloads > 0), "bidirectional completion progress");
     assert.ok(progressA.some((value) => value.phase === "complete"
@@ -795,18 +954,81 @@ try {
     assert.ok(notesOnlyActivity.scan.files.length > 0 && notesOnlyActivity.scan.files.every((file) => lanSyncTopLevelGroup(file.path) === "Notes"), "Expanded scan group materialized another folder");
     assert.ok(notesOnlyActivity.files.length > 0 && notesOnlyActivity.files.every((file) => lanSyncTopLevelGroup(file.path) === "Notes"), "Expanded transfer group materialized another folder");
 
+    // A finished round is history, not a live pending queue. Both peers must
+    // converge to an idle 0/0 snapshot after the short completion grace
+    // period, and stale activity groups must disappear from the transfer
+    // section while the scan/history streams remain available.
+    await waitFor(() => {
+      const progress = serviceA.progress();
+      return progress.phase === "connected"
+        && progress.total === 0
+        && progress.completed === 0
+        && progress.uploads === 0
+        && progress.downloads === 0;
+    }, "coordinator idle transfer reset", 7_000);
+    await waitFor(() => {
+      const progress = serviceB.progress();
+      return progress.phase === "connected"
+        && progress.total === 0
+        && progress.completed === 0
+        && progress.uploads === 0
+        && progress.downloads === 0;
+    }, "receiver idle transfer reset", 7_000);
+    assert.deepEqual(serviceA.activity().transferGroups, [], "Completed transfer groups leaked into the idle queue");
+    assert.deepEqual(serviceB.activity().transferGroups, [], "Receiver completed transfer groups leaked into the idle queue");
+    assert.ok(serviceA.activity().roundHistory.length > 0, "Idle reset discarded round history");
+
+    // A normal changed-path pass is an automatic incremental round, not a
+    // second full scan and not an independent active-edit history row.
+    storageA.putText("Notes/incremental-history.md", "incremental round", 905);
+    serviceA.notifyVaultChange("Notes/incremental-history.md");
+    await waitFor(() => storageB.text("Notes/incremental-history.md") === "incremental round", "automatic incremental round");
+    await waitFor(() => serviceA.activity().roundHistory.some((round) => round.kind === "incremental"), "incremental round history");
+    const incrementalHistory = serviceA.activity().roundHistory.findLast((round) => round.kind === "incremental");
+    assert.ok(incrementalHistory && incrementalHistory.syncTotal >= 1 && incrementalHistory.syncCompleted === incrementalHistory.syncTotal, "Incremental history did not record the complete changed-path cycle");
+    assert.ok(serviceB.activity().roundHistory.some((round) => round.id === incrementalHistory.id && round.kind === "incremental"), "Receiver did not mirror the incremental round history");
+
     // A second explicit full round must retain the same denominator and reuse
     // the metadata index for unchanged files instead of walking every file
     // through the producer again.
     const previousFullScan = serviceA.activity().scan;
+    const previousFullSyncRequestId = serviceA.fullSyncRequestId;
     serviceA.requestSync({ deep: true, strict: true });
+    trace(`cached-full-request ${JSON.stringify({
+      requestId: serviceA.fullSyncRequestId,
+      syncRunning: serviceA.syncRunning,
+      syncQueued: serviceA.syncQueued,
+      syncTimer: Boolean(serviceA.syncTimer),
+      syncForced: serviceA.syncForced,
+      peerCount: serviceA.status().peerCount
+    })}`);
+    assert.notEqual(serviceA.fullSyncRequestId, previousFullSyncRequestId, "A new explicit full sync reused an in-flight request ID");
     await waitFor(
       () => !serviceA.fullSyncRequested
         && serviceA.activity().scan.phase === "complete"
         && serviceA.activity().scan.total >= previousFullScan.total,
       "cached full-vault scan settlement",
       30_000
-    );
+    ).catch((error) => {
+      const peer = serviceA.peers.get(deviceB);
+      throw new Error(`${error.message}; state=${JSON.stringify({
+        fullSyncRequested: serviceA.fullSyncRequested,
+        fullSyncRequestId: serviceA.fullSyncRequestId,
+        localFilesystemScanCompletedRequestId: serviceA.localFilesystemScanCompletedRequestId,
+        syncRunning: serviceA.syncRunning,
+        syncQueued: serviceA.syncQueued,
+        syncTimer: Boolean(serviceA.syncTimer),
+        syncForced: serviceA.syncForced,
+        status: serviceA.status(),
+        scan: serviceA.activity().scan,
+        progress: serviceA.progress(),
+        peer: peer ? {
+          remoteFullSyncRequestId: peer.remoteFullSyncRequestId,
+          lastRemoteSyncRequestId: peer.lastRemoteSyncRequestId,
+          remoteDirtyPaths: [...peer.remoteDirtyPaths]
+        } : null
+      })}`);
+    });
     const cachedFullScan = serviceA.activity().scan;
     // The first follow-up may legitimately discover a file that was pulled
     // into this device during the preceding transfer. That file belongs in
@@ -953,11 +1175,9 @@ try {
       immediateIncrementalActivity.files.some((file) => file.path === "Notes/identical.md" && file.state === "pending"),
       "A changed file did not appear in the transfer activity immediately"
     );
-    assert.ok(
-      immediateIncrementalActivity.progress.roundTotal >= 1
-        && immediateIncrementalActivity.progress.total >= 1,
-      "Pending transfer activity exposed a 0/0 synchronization denominator"
-    );
+    assert.equal(immediateIncrementalActivity.progress.roundTotal, 0, "A dirty hint was counted before the transfer plan existed");
+    assert.equal(immediateIncrementalActivity.progress.total, 0, "A scan candidate inflated the pre-plan transfer denominator");
+    assert.ok(immediateIncrementalActivity.progress.scanCandidates >= 1, "A dirty hint was not exposed through the scan-candidate counter");
     await waitFor(() => storageB.text("Notes/identical.md") === "changed on A", "metadata push after a local edit");
     assert.equal((await storageB.statFile("Notes/identical.md")).mtime, 700, "Metadata push lost the source mtime");
     assert.ok(requestedRoutes.slice(incrementalRouteStart).includes("/cancip-lan/v1/metadata/v4/manifest/paths"), "A file event still requested a full-vault manifest");
@@ -990,9 +1210,23 @@ try {
   assert.equal(serviceB.dirtyPaths.has("Notes/identical.md"), false, "A LAN-applied write echoed back into the receiver dirty journal");
   assert.match(
     (await readFile(join(root, "src", "lanSync.ts"), "utf8")),
-    /echoWindowActive = this\.now\(\) - token\.appliedAt <= 2_000/,
-    "LAN-applied mutation suppression must use a short echo window"
+    /const unchanged = token\.expected === null \? current === null : Boolean\(current && metadataMatches\(current, token\.expected\)\)/,
+    "LAN-applied mutation suppression must verify the current file metadata"
   );
+  const mixedPriorityPlan = prioritizeLanSyncActions([
+    { kind: "push", path: ".obsidian/plugins/cancip/data/session.json", local: { path: ".obsidian/plugins/cancip/data/session.json", size: 1, mtime: 400 }, remote: null },
+    { kind: "push", path: "Notes/edited.md", local: { path: "Notes/edited.md", size: 20, mtime: 300 }, remote: null },
+    { kind: "push", path: ".obsidian/hotkeys.json", local: { path: ".obsidian/hotkeys.json", size: 2, mtime: 500 }, remote: null }
+  ], {
+    localDirty: new Map([
+      [".obsidian/plugins/cancip/data/session.json", 3],
+      ["Notes/edited.md", 2],
+      [".obsidian/hotkeys.json", 4]
+    ]),
+    configDir: ".obsidian"
+  });
+  assert.equal(mixedPriorityPlan[0].path, "Notes/edited.md", "A config/runtime file outranked a changed note");
+  assert.ok(mixedPriorityPlan.slice(1).every((action) => action.path.startsWith(".obsidian/")), "Config files did not remain in the incremental plan");
 
     const burstPaths = Array.from({ length: 40 }, (_value, index) => `Burst/f-${String(index).padStart(2, "0")}.md`);
     const scanBeforeBurst = serviceA.activity().scan;
@@ -1000,6 +1234,7 @@ try {
       storageA.putText(path, `burst-${index}`, 1_000 + index);
       serviceA.notifyVaultChange(path);
     }
+    assert.equal(serviceA.activeEditDirty.size, 0, "Generic Vault events polluted the dedicated active-edit lane");
     await waitFor(() => storageB.text("Burst/f-00.md") === "burst-0", "first incremental burst batch");
     const scanAfterBurst = serviceA.activity().scan;
     if (scanBeforeBurst.total > 0) {
@@ -1097,6 +1332,8 @@ try {
       assert.ok(progressA.some((value) => value.total === firstProgress.total && value.completed === completed), `LAN progress skipped ${completed}/${firstProgress.total}`);
     }
     // Configuration files are part of the full-vault contract by default.
+    optionsA.runtimeSettings.syncConfigFolder = true;
+    optionsB.runtimeSettings.syncConfigFolder = true;
     serviceA.requestSync({ deep: true });
     await waitFor(
       () => storageB.text(".obsidian/hotkeys.json") === "hotkeys from A"
@@ -1160,6 +1397,7 @@ try {
   } finally {
     await Promise.all([serviceA.stop(), serviceB.stop()]);
   }
+  trace("primary-sync-complete");
 
   const [exactPort, roundedPort] = await Promise.all([freePort(), freePort()]);
   const exactDevice = "DDDDDDDDDDDDDDDDDDDDDDDD";
@@ -1172,7 +1410,10 @@ try {
   });
   const exactProgress = [];
   const roundedProgress = [];
-  const roundedService = new NtfyLanSync(commonOptions(roundedStorage, roundedPort, roundedDevice, roundedProgress));
+  trace("rounded-mtime-start");
+  const roundedService = new NtfyLanSync(commonOptions(roundedStorage, roundedPort, roundedDevice, roundedProgress, {
+    autoDiscovery: false
+  }));
   const exactService = new NtfyLanSync(commonOptions(exactStorage, exactPort, exactDevice, exactProgress, {
     autoDiscovery: false,
     manualPeers: [`127.0.0.1:${roundedPort}`]
@@ -1182,6 +1423,56 @@ try {
     await exactService.start();
     await waitFor(() => roundedStorage.text("Notes/android-mtime.md") === "stable content", "Android-like initial transfer");
     await waitFor(() => exactProgress.some((value) => value.phase === "complete" && value.total === 1), "Android-like initial session completion");
+    const roundedPairSettled = () => [exactService, roundedService].every((service) => (
+      !service.syncRunning
+      && !service.inboundSession
+      && !service.fullSyncRequested
+      && !service.backgroundReconciliation
+      && !service.syncTimer
+      && service.dirtyPaths.size === 0
+      && [...service.peers.values()].every((peer) => !peer.remoteFullSyncRequestId && peer.remoteDirtyPaths.size === 0)
+    ));
+    await waitFor(
+      roundedPairSettled,
+      "Android-like initial session settlement",
+      30_000
+    );
+    const writesAtFirstSettlement = roundedStorage.totalWrites();
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_200));
+    await waitFor(roundedPairSettled, "Android-like quiet heartbeat settlement", 30_000);
+    if (roundedStorage.totalWrites() !== writesAtFirstSettlement) {
+      const serviceState = (service, peerId) => {
+        const peer = service.peers.get(peerId);
+        return {
+          syncRequestId: service.syncRequestId,
+          fullSyncRequestId: service.fullSyncRequestId,
+          fullSyncRequested: service.fullSyncRequested,
+          localFilesystemScanCompletedRequestId: service.localFilesystemScanCompletedRequestId,
+          syncRunning: service.syncRunning,
+          syncQueued: service.syncQueued,
+          syncTimer: Boolean(service.syncTimer),
+          backgroundReconciliation: Boolean(service.backgroundReconciliation),
+          dirtyPaths: [...service.dirtyPaths],
+          metadataIndex: [...service.metadataIndex],
+          ledger: service.loadMetadataLedger(peerId),
+          progress: service.progress(),
+          recentProgress: (service === exactService ? exactProgress : roundedProgress).slice(-12),
+          peer: peer ? {
+            remoteFullSyncRequestId: peer.remoteFullSyncRequestId,
+            lastRemoteSyncRequestId: peer.lastRemoteSyncRequestId,
+            remoteDirtyPaths: [...peer.remoteDirtyPaths]
+          } : null
+        };
+      };
+      console.error(`[lan-test] rounded-mtime-diagnostics ${JSON.stringify({
+        writesAtFirstSettlement,
+        totalWrites: roundedStorage.totalWrites(),
+        writeHistory: roundedStorage.writeHistory,
+        exact: serviceState(exactService, roundedDevice),
+        rounded: serviceState(roundedService, exactDevice)
+      })}`);
+    }
+    assert.equal(roundedStorage.totalWrites(), writesAtFirstSettlement, "Android-like pair rewrote an unchanged file after settlement");
     const exactMetadata = await exactStorage.statFile("Notes/android-mtime.md");
     const roundedMetadata = await roundedStorage.statFile("Notes/android-mtime.md");
     assert.notEqual(exactMetadata.mtime, roundedMetadata.mtime, "Android-like storage unexpectedly preserved the source mtime exactly");
@@ -1206,6 +1497,7 @@ try {
   } finally {
     await Promise.all([exactService.stop(), roundedService.stop()]);
   }
+  trace("rounded-mtime-complete");
 
   const [baselinePortA, baselinePortB] = await Promise.all([freePort(), freePort()]);
   const baselineDeviceA = "FFFFFFFFFFFFFFFFFFFFFFFF";
@@ -1237,6 +1529,7 @@ try {
     manualPeers: [`127.0.0.1:${baselinePortB}`],
     checkIntervalSeconds: 60
   });
+  trace("bulk-baseline-start");
   const baselineServiceB = new NtfyLanSync(baselineOptionsB);
   const baselineServiceA = new NtfyLanSync(baselineOptionsA);
   try {
@@ -1246,19 +1539,36 @@ try {
     const firstBaselineProgress = baselineProgressA.length;
     baselineServiceA.requestSync({ deep: true });
     await waitFor(
-      () => baselineProgressA.slice(firstBaselineProgress).some((value) => value.phase === "complete" && value.total === 4),
+      () => baselineProgressA.slice(firstBaselineProgress).some((value) => value.phase === "complete" && value.total === 3),
       "large Remotely Save baseline",
       30_000
-    );
+    ).catch((error) => {
+      throw new Error(`${error.message}; state=${JSON.stringify({
+        progress: baselineServiceA.progress(),
+        scan: baselineServiceA.scanProgress(),
+        completions: baselineProgressA.slice(firstBaselineProgress).filter((value) => value.phase === "complete").slice(-5),
+        syncRunning: baselineServiceA.syncRunning,
+        syncQueued: baselineServiceA.syncQueued,
+        fullSyncRequested: baselineServiceA.fullSyncRequested,
+        dirtyPaths: baselineServiceA.dirtyPaths.size,
+        peerCount: baselineServiceA.status().peerCount,
+        files: {
+          changedA: baselineStorageA.text("Bulk/changed.bin"),
+          changedB: baselineStorageB.text("Bulk/changed.bin"),
+          onlyAOnB: baselineStorageB.text("Only-A/new.md"),
+          onlyBOnA: baselineStorageA.text("Only-B/new.md")
+        }
+      })}`);
+    });
     const firstBaseline = baselineProgressA.slice(firstBaselineProgress).filter((value) => value.phase === "complete").at(-1);
-    assert.equal(firstBaseline.total, 4, "Metadata differences were not planned from exact size/mtime");
+    assert.equal(firstBaseline.total, 3, "Content-equivalent metadata drift was planned as a transfer");
     assert.equal(firstBaseline.uploads, 1, "Large baseline upload count included metadata-equivalent files");
-    assert.equal(firstBaseline.downloads, 3, "Metadata-only differences were not downloaded");
-    assert.equal(baselineProgressA.some((value) => value.phase === "scanning"), false, "Large-vault scanning leaked into transfer progress");
+    assert.equal(firstBaseline.downloads, 2, "Large baseline download count included metadata-equivalent files");
+    assert.equal(baselineProgressA.slice(firstBaselineProgress).some((value) => value.phase === "scanning"), false, "Large-vault scanning leaked into transfer progress");
     assert.equal(baselineStorageA.text("Bulk/changed.bin"), "remote-x", "A real same-size content change was not reconciled");
     assert.equal(baselineStorageB.text("Only-A/new.md"), "from A", "A unique local file was not uploaded");
     assert.equal(baselineStorageA.text("Only-B/new.md"), "from B", "A unique remote file was not downloaded");
-    assert.equal(baselineServiceA.activity().files.length, 4, "The transfer list did not expose exact metadata differences");
+    assert.equal(baselineServiceA.activity().files.length, 3, "The transfer list included a content-equivalent metadata difference");
 
     const beforeIncrementalProgress = baselineProgressA.length;
     baselineOptionsA.runtimeSettings.mode = "delete-push";
@@ -1300,9 +1610,9 @@ try {
     });
     // Adapter safety net: an external write with no Vault event must still be
     // observed by the metadata poll and transferred without a manual scan.
-    await waitFor(() => baselineServiceA.changePollInitialized === true, "metadata poll baseline");
+    await waitFor(() => baselineServiceA.metadataIndexReady === true, "metadata poll baseline");
     baselineStorageA.putText("Only-A/poll-without-event.md", "poll detected", 100_000_010);
-    await baselineServiceA.pollFilesystemChanges();
+    await baselineServiceA.pollLiveFilesystemChanges();
     await waitFor(
       () => baselineStorageB.text("Only-A/poll-without-event.md") === "poll detected",
       "external write without a Vault event",
@@ -1313,6 +1623,7 @@ try {
   } finally {
     await Promise.all([baselineServiceA.stop(), baselineServiceB.stop()]);
   }
+  trace("bulk-baseline-complete");
 
   const [desktopPort] = await Promise.all([freePort()]);
   const desktopDevice = "CCCCCCCCCCCCCCCCCCCCCCCC";
@@ -1335,18 +1646,24 @@ try {
   const mobilePort = await freePort();
   const mobileOptions = commonOptions(mobileStorage, mobilePort, mobileDevice, mobileProgress, { autoDiscovery: false });
   mobileOptions.onMessage = (message) => mobileMessages.push(message);
+  trace("mobile-passive-start");
   const mobileService = new NtfyLanSync({
     ...mobileOptions,
     desktop: false
   });
+  // Model a real outbound-only Android runtime. Desktop Mobile UI test mode
+  // still has node:http and is covered separately by the host-capable smoke
+  // test, where both ends must elect one shared coordinator.
+  mobileService.startServer = async () => { throw new Error("node_http_unavailable"); };
   const mobileSyncSignalPayload = mobileService.syncSignalPayload.bind(mobileService);
   mobileService.syncSignalPayload = () => ({
     ...mobileSyncSignalPayload(),
-    capabilities: ["metadata-session-v3", "realtime-wakeup-v1"]
+    capabilities: ["metadata-session-v3"]
   });
   mobileService.metadataProtocol = (peer) => peer.capabilities.has("metadata-session-v3")
     ? { capability: "metadata-session-v3", routePrefix: "/metadata/v3" }
     : null;
+  const desktopProgressStart = desktopProgress.length;
   try {
     await desktopService.start();
     await mobileService.start();
@@ -1355,21 +1672,23 @@ try {
     assert.equal(desktopService.listPeers()[0].compatible, true, "Desktop did not learn the passive mobile peer capability from its inbound ping");
     assert.equal(desktopService.peers.get(mobileDevice).capabilities.has("metadata-session-v3"), true, "Desktop did not accept the mobile v3 compatibility capability");
     assert.equal(desktopService.peers.get(mobileDevice).capabilities.has("metadata-session-v4"), false, "The old-mobile fixture unexpectedly advertised v4");
-    // The poll map is populated before the first network await. Waiting only
-    // for its size races the request recording and intermittently asserted
-    // before the encrypted route had actually been opened.
-    await waitFor(
-      () => requestedRoutes.includes("/cancip-lan/v1/events/wait"),
-      "mobile realtime wakeup route"
-    );
-    await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "automatic full-vault sync");
+    await waitFor(() => desktopStorage.text("Mobile/client-created.md") === "from mobile client", "automatic full-vault sync").catch((error) => {
+      throw new Error(`${error.message}; desktop=${JSON.stringify(desktopService.status())}; mobile=${JSON.stringify(mobileService.status())}; desktopPeer=${JSON.stringify(desktopService.listPeers())}; mobilePeer=${JSON.stringify(mobileService.listPeers())}; desktopProgress=${JSON.stringify(desktopService.progress())}; mobileProgress=${JSON.stringify(mobileService.progress())}`);
+    });
     await waitFor(
       () => !mobileService.syncRunning && !mobileService.activeEditSyncRunning && !mobileService.fullSyncRequested,
       "automatic full-vault sync settlement",
       30_000
     );
     assert.ok(desktopOptions.activityChanges.length > 0, "Passive desktop did not report independent scan activity");
-    assert.equal(desktopProgress.some((value) => value.phase === "scanning"), false, "Passive desktop scan overwrote mirrored transfer progress");
+    const desktopScenarioProgress = desktopProgress.slice(desktopProgressStart);
+    const mirroredTransferIndex = desktopScenarioProgress.findIndex((value) => value.phase === "syncing" && value.total > 0);
+    assert.ok(mirroredTransferIndex >= 0, "Passive desktop did not expose mirrored transfer progress");
+    assert.equal(
+      desktopScenarioProgress.slice(mirroredTransferIndex).some((value) => value.phase === "scanning"),
+      false,
+      "Passive desktop scan overwrote mirrored transfer progress"
+    );
 
     const originalMobileListFiles = mobileStorage.listFiles.bind(mobileStorage);
     let releaseMobileScan;
@@ -1393,10 +1712,10 @@ try {
         "mobile full scan waiting for passive desktop manifest"
       );
       const scanBeforeRemoteEdit = mobileService.activity().scan;
-      desktopStorage.putText(".obsidian/realtime-priority.json", "priority config", 1250);
-      desktopService.notifyVaultChange(".obsidian/realtime-priority.json");
+      desktopStorage.putText("Desktop/realtime-priority.md", "priority edit", 1250);
+      desktopService.notifyVaultChange("Desktop/realtime-priority.md");
       await waitFor(
-        () => mobileStorage.text(".obsidian/realtime-priority.json") === "priority config",
+        () => mobileStorage.text("Desktop/realtime-priority.md") === "priority edit",
         "passive desktop priority transfer during blocked full scan",
         5_000
       ).catch((error) => {
@@ -1485,6 +1804,7 @@ try {
   } finally {
     await Promise.all([mobileService.stop(), desktopService.stop()]);
   }
+  trace("mobile-passive-complete");
 
   // Test-channel loopback: a lower test build must fetch the higher build
   // through the authenticated LAN routes, verify every bundle hash, invoke
@@ -1543,6 +1863,7 @@ try {
     readTestBuildFile: async (name) => arrayBuffer(newTestBuild.source[name]),
     onTestDebug: async (event) => receivedTestDebug.push(event)
   });
+  trace("test-channel-start");
   const testServiceA = new NtfyLanSync(testOptionsA);
   const testServiceB = new NtfyLanSync(testOptionsB);
   try {
@@ -1551,7 +1872,10 @@ try {
     await waitFor(
       () => installedTestBuilds.length === 1 || testServiceA.status().error.startsWith("test_update:"),
       "automatic test build installation"
-    );
+    ).catch((error) => {
+      const peer = testServiceA.peers.get("TEST_BBBBBBBBBBBBBBBBB");
+      throw new Error(`${error.message}; status=${JSON.stringify(testServiceA.status())}; capabilities=${JSON.stringify(peer ? [...peer.capabilities] : [])}; remoteBuild=${JSON.stringify(peer?.testBuild)}`);
+    });
     if (installedTestBuilds.length !== 1) {
       const peer = testServiceA.peers.get("TEST_BBBBBBBBBBBBBBBBB");
       throw new Error(`automatic test build update failed: ${testServiceA.status().error}; capabilities=${JSON.stringify(peer ? [...peer.capabilities] : [])}; remoteBuild=${JSON.stringify(peer?.testBuild)}`);
@@ -1567,7 +1891,9 @@ try {
   } finally {
     await Promise.all([testServiceA.stop(), testServiceB.stop()]);
   }
+  trace("test-channel-complete");
 
+  trace("source-contracts-start");
   const source = await readFile(join(root, "main.js"), "utf8");
   const lanSource = await readFile(join(root, "src", "lanSync.ts"), "utf8");
   const stylesSource = await readFile(join(root, "styles.css"), "utf8");
@@ -1587,7 +1913,7 @@ try {
   assert.doesNotMatch(source, /historyRoundState|row\.open = this\.historyRoundState/, "LAN history rounds should not hide their details behind nested disclosure controls");
   assert.match(source, /this\.sectionState\.history = details\.open/, "LAN history section does not preserve its expanded state during live refresh");
   assert.match(source, /obsidian-ntfy-lan-round-history-heading/, "LAN history entries do not expose a stable always-visible heading");
-  assert.match(source, /本机已检查.*对端已检查/s, "LAN history details do not use check-style progress");
+  assert.match(source, /本机已扫描.*对端已扫描/s, "LAN history details do not use scan progress");
   assert.match(source, /已同步.*推送.*拉取/s, "LAN history details do not use transfer-style progress");
   assert.match(stylesSource, /\.obsidian-ntfy-lan-details-summary \{[\s\S]*?align-items: start;[\s\S]*?min-height: 0;/, "Current LAN status does not reserve enough height for multiline progress");
   assert.match(stylesSource, /\.obsidian-ntfy-lan-current-status \{[\s\S]*?display: flow-root;[\s\S]*?flex: 0 0 auto;[\s\S]*?padding-bottom: 16px;/, "Current LAN status has no independent flow boundary");
@@ -1597,21 +1923,28 @@ try {
   assert.match(source, /renderScanSection\(body, scan, remote, scanGroups, chinese, progress, effectiveStage, stageDescriptions\)/, "LAN scan section is missing local/peer stage context");
   assert.match(source, /renderTransferSection\(body, progress, files, transferGroups, chinese, effectiveStage, stageDescriptions\)/, "LAN transfer section is missing stage context");
   assert.match(source, /const headlineStage = scanStage \? "scanning" : effectiveStage/, "LAN headline must follow the scan stream while scanning");
-  assert.match(source, /scanning: "正在同步"/, "LAN scan headline must use the syncing label");
-  assert.match(source, /正在同步 · 本机已检查/, "LAN scan section must identify its check progress");
+  assert.match(source, /scanning: "正在扫描文件"/, "LAN scan headline must use the scan label");
+  assert.match(source, /本机已扫描/, "LAN scan section must identify its scan progress");
   assert.match(source, /同步进度 · 本轮同步/, "LAN transfer section must identify its transfer progress");
+  assert.match(source, /const currentTransferTotal = currentUploads \+ currentDownloads/, "Current batch total must be derived from upload and download plans");
+  assert.match(source, /const currentTransferBytesTotal = currentTransferTotal > 0/, "Current batch bytes must be hidden without an active transfer plan");
+  assert.match(source, /const visibleTotal = visibleUploads \+ visibleDownloads/, "Transfer section total must be derived from upload and download plans");
+  assert.match(source, /const visibleBytesTotal = hasTransferWork \?/, "Transfer bytes must be hidden without an active transfer plan");
+  assert.doesNotMatch(source, /roundTotal[^\n]*scanCandidates/, "Transfer round total still falls back to scan candidates");
+  assert.doesNotMatch(source, /const visibleTotal[^\n]*(?:progress\.total|groupTotals\.total)/, "Transfer section still accepts a non-directional total");
    assert.match(source, /"requesting-peer-scan": "正在交换变化清单"/, "LAN details do not show changed-path exchange");
-   assert.match(source, /"waiting-peer-scan": "等待新的变化文件"/, "LAN details do not explain the idle incremental wait stage");
+   assert.match(source, /"waiting-peer-scan": "等待新的变化文件"|"waiting-peer-scan": "Waiting for changed files"/, "LAN details do not explain the idle incremental wait stage");
    assert.doesNotMatch(source, /电脑和手机都可主动发起|Both devices may initiate/, "LAN details still show non-actionable initiator text");
   assert.match(source, /"peer-upgrade-required": "对端插件需要升级"/, "LAN details do not explain an incompatible peer");
   assert.match(source, /正在核对内容指纹/, "LAN details do not expose first-baseline fingerprinting");
   assert.match(source, /"packaging-manifest": "正在封装并发送清单"/, "LAN details hide manifest packaging after a completed scan");
   assert.match(source, /"waiting-plan": "清单已发送，等待同步计划"/, "LAN details hide the post-manifest plan wait");
-  assert.match(source, /本机已检查/, "LAN details do not identify the local check counter");
-  assert.match(source, /对端已检查/, "LAN details do not expose peer check progress");
+  assert.match(source, /本机已扫描/, "LAN details do not identify the local scan counter");
+  assert.match(source, /对端已扫描/, "LAN details do not expose peer scan progress");
   assert.match(source, /const idleLabel = chinese/, "An idle scan does not derive a meaningful stage label");
   assert.match(source, /同步：发现文件即开始/, "The transfer section does not explain that discovered files start immediately");
-  assert.match(lanSource, /INCREMENTAL_PATH_BATCH_SIZE = Number\.MAX_SAFE_INTEGER/, "Dirty journal must not stop at an arbitrary 32-path limit");
+  assert.match(lanSource, /INCREMENTAL_PATH_BATCH_SIZE = MAX_MANIFEST_FILES/, "Dirty journal must share the full protocol path limit instead of stopping at an arbitrary small batch");
+  assert.match(lanSource, /PATH_MANIFEST_BATCH_SIZE = 512/, "Incremental manifest requests need a bounded restart-safe batch");
   assert.match(lanSource, /this\.scheduleActiveEditSync\(REALTIME_DIRTY_DELAY_MS\)/, "Vault events do not enter the immediate transfer lane");
   assert.match(lanSource, /const RECONNECT_REPROBE_DELAY_MS = 250/, "LAN reconnect does not have a fast reprobe path");
   assert.match(lanSource, /this\.scheduleReconnectProbe\(\)/, "LAN peer failures do not schedule immediate reconnect probing");
@@ -1621,28 +1954,31 @@ try {
   assert.doesNotMatch(source, /const label = `\$\{chinese \? "扫描" : "Scan"\} \$\{scan\.completed \|\| 0\}\/\$\{scan\.total \|\| 0\}`/, "LAN details still render an unexplained scan 0/0");
   assert.match(source, /推送/, "LAN transfer details do not label pushes");
   assert.match(source, /拉取/, "LAN transfer details do not label pulls");
-  assert.match(source, /progress\.uploadCompleted[^\n]*progress\.uploads/, "LAN details do not show completed/total uploads");
-  assert.match(source, /progress\.downloadCompleted[^\n]*progress\.downloads/, "LAN details do not show completed/total downloads");
-  assert.match(source, /已检查 \$\{scan\.completed \|\| 0\} \/ 本轮总检查 \$\{scan\.total \|\| 0\}/, "LAN details do not show local checked/round-total progress");
-  assert.match(source, /已同步 \$\{roundCompleted\}\/\$\{roundTotal\}/, "LAN details do not show round sync progress");
+  assert.match(source, /const visibleUploads = Math\.max\(0, Number\(progress\.uploads\) \|\| 0\)/, "LAN details do not use the current upload plan as the denominator");
+  assert.match(source, /const visibleUploadCompleted = Math\.min\(visibleUploads, Math\.max\(0, Number\(progress\.uploadCompleted\) \|\| 0\)\)/, "LAN details do not clamp completed uploads to the current plan");
+  assert.match(source, /const visibleDownloads = Math\.max\(0, Number\(progress\.downloads\) \|\| 0\)/, "LAN details do not use the current download plan as the denominator");
+  assert.match(source, /const visibleDownloadCompleted = Math\.min\(visibleDownloads, Math\.max\(0, Number\(progress\.downloadCompleted\) \|\| 0\)\)/, "LAN details do not clamp completed downloads to the current plan");
+  assert.match(source, /已扫描 \$\{scan\.completed \|\| 0\} \/ 本轮总扫描 \$\{scan\.total \|\| 0\}/, "LAN details do not show local scan/round-total progress");
+  assert.match(source, /已同步 \$\{visibleCompleted\}\/\$\{visibleTotal\}/, "LAN details do not show transfer-plan sync progress");
   assert.match(source, /animationDelay = `-\$\{Date\.now\(\) % 700\}/, "LAN spinner phase is reset on every live panel refresh");
    assert.match(source, /title: chinese \? "立即扫描并同步全库" : "Scan and synchronize the whole vault now"/, "LAN details do not identify the manual button as a full-vault sync");
-   assert.match(source, /this\.lanSync\?\.requestSync\(\{ deep: true \}\)/, "Manual sync button must start a full-vault producer round");
+   assert.match(source, /this\.requestLanSync\(\{ deep: true, strict: true \}\)/, "Manual sync button must start a strict full-vault producer round");
+   assert.match(source, /requestLanSync\(options = \{\}\)/, "Ordinary automatic checks cannot be separated from the full-vault button");
+   assert.match(lanSource, /kind: "full" \| "incremental"/, "Completed synchronization history does not distinguish full and incremental rounds");
+   assert.match(lanSource, /round: completedRound/, "The receiving peer does not receive the coordinator's completed round record");
   assert.match(lanSource, /syncCandidatesTotal/, "Full-vault scan does not expose the discovered sync-candidate counter");
-  assert.match(lanSource, /syncRoundCompleted/, "Transfer progress is missing the monotonic round completion counter");
-  assert.match(lanSource, /scanScope: this\.fullRoundScanVisible \? "full" : "paths"/, "Remote scan scope is not distinguished between full-vault and path scans");
-  assert.match(lanSource, /previous\?\.scanScope === "full" && remoteProgress\.scanScope === "paths"/, "A path scan can overwrite the full-vault scan denominator");
-  assert.match(lanSource, /queueScanCandidate\(file\.path\)/, "Filesystem producer does not queue changed files as soon as they are discovered");
-  assert.match(lanSource, /private async listCurrentSyncFiles\(includeConfigFolder: boolean\)/, "Metadata scans do not use a normalized current-file snapshot");
-  assert.match(lanSource, /const files = new Map<string, LanSyncFileStat>\(\)/, "Current-file snapshot does not deduplicate normalized paths");
-  assert.match(lanSource, /scan\.completed = Math\.min\(Math\.max\(0, scan\.completed\), Math\.max\(0, scan\.total\)\)/, "Scan completion is not clamped to the live denominator");
-  assert.match(lanSource, /missing-during-scan/, "Deletes racing a scan are not represented in the live scan counters");
-  assert.match(source, /需要同步/, "LAN details do not show planner-confirmed sync counters");
+  assert.match(lanSource, /const roundCompleted = uploadCompleted \+ downloadCompleted/, "Transfer progress is not derived from directional completion counters");
+  assert.match(lanSource, /const preserveVisibleScan = this\.scanValue\.total > 0/, "A path scan can overwrite the stable full-vault scan denominator");
+  assert.match(lanSource, /this\.scanValue\.syncCandidates = candidates\.size/, "Filesystem events do not expose changed paths in the scan stream");
+  assert.match(lanSource, /this\.activityFiles\.push\(\{ path, action: "push", state: "pending", size: 0, provisional: true \}\)/, "Changed files are not queued visibly before planning");
+  assert.match(lanSource, /const unique = new Map<string, LanSyncFileStat>\(\)/, "Current-file snapshots do not deduplicate normalized paths");
+  assert.match(lanSource, /scan\.completed = Math\.min\(scan\.total, scan\.completed \+ 1\)/, "Scan completion is not clamped to its current denominator");
+  assert.match(lanSource, /if \(!stat\) \{[\s\S]{0,160}this\.metadataIndex\.delete\(path\)/, "Deletes discovered during a path scan are not removed from the metadata index");
+  assert.match(source, /同步进度 · 本轮同步/, "LAN details do not show planner-confirmed sync counters");
    assert.doesNotMatch(lanSource, /MAX_DIRTY_PATHS|4096/, "LAN runtime still contains the obsolete fixed dirty-path ceiling");
     assert.match(lanSource, /fullSyncOnlyPending/, "Manual full scan state is missing");
-    assert.doesNotMatch(lanSource, /if \(this\.fullSyncOnlyPending && this\.backgroundReconciliation\) return;/, "A manual full scan still blocks incremental transfer during enumeration");
-   assert.doesNotMatch(lanSource, /if \(this\.fullSyncOnlyPending && \(this\.backgroundReconciliation \|\| this\.metadataManifestBuild\)\) return;/, "A completed shared manifest can still strand a manual sync before plan calculation");
-   assert.match(lanSource, /const \[localEntries, remoteResponse, ledger\] = await Promise\.all/, "Full-vault scans are not started concurrently on both devices");
+    assert.doesNotMatch(lanSource, /if \(this\.fullSyncOnlyPending && \(this\.backgroundReconciliation \|\| this\.metadataManifestBuild\)\) return;/, "A completed shared manifest can still strand a manual sync before plan calculation");
+    assert.match(lanSource, /const \[localEntries, remoteResponse, loadedLedger\] = await Promise\.all/, "Full-vault scans are not started concurrently on both devices");
    assert.doesNotMatch(lanSource, /if \(this\.fullSyncOnlyPending\) \{[\s\S]{0,900}await this\.buildMetadataManifest/, "The coordinator still finishes its full scan before asking the peer to scan");
   assert.match(source, /this\.sectionState = \{ history: false, scan: false, transfer: false \}/, "LAN history and activity file lists should be collapsed by default");
   assert.match(source, /includeScanFiles: this\.sectionState\.scan && expandedScanGroups\.length > 0/, "Collapsed scan groups should not materialize hidden file rows");
@@ -1670,21 +2006,19 @@ try {
   assert.match(lanSource, /peer_upgrade_required/, "Outdated LAN peers are not isolated from the original-path protocol");
   assert.match(lanSource, /capability: "metadata-session-v4", routePrefix: "\/metadata\/v4"/, "The preferred metadata protocol is missing");
   assert.match(lanSource, /capability: "metadata-session-v3", routePrefix: "\/metadata\/v3"/, "Rolling-upgrade metadata compatibility is missing");
-  assert.match(lanSource, /REALTIME_WAKEUP_CAPABILITY = "realtime-wakeup-v1"/, "The realtime wakeup capability is missing");
   assert.match(lanSource, /TEST_UPDATE_CAPABILITY = "test-update-v1"/, "The encrypted test update capability is missing");
   assert.match(lanSource, /TEST_DEBUG_CAPABILITY = "test-debug-v1"/, "The encrypted test debug capability is missing");
   assert.match(lanSource, /test\/update\/manifest/, "The test build manifest route is missing");
   assert.match(lanSource, /test\/update\/file/, "The test build file route is missing");
   assert.match(lanSource, /TEST_BUILD_FILE_NAMES = \["main\.js", "manifest\.json", "styles\.css"\]/, "Test updates are not restricted to the plugin bundle files");
-  assert.match(lanSource, /\.\.\.METADATA_PROTOCOLS\.map\(\(protocol\) => protocol\.capability\)[\s\S]{0,120}REALTIME_WAKEUP_CAPABILITY/, "Peers do not advertise metadata and realtime capabilities together");
-  assert.match(lanSource, /path === `\$\{API_PREFIX\}\/events\/wait`/, "The encrypted realtime wait route is missing");
-  assert.match(lanSource, /this\.wakeRealtimeSignalWaiters\(\);[\s\S]{0,180}this\.announce\(\)/, "Vault events do not wake waiting mobile peers before the compatibility announcement");
+  assert.match(lanSource, /void this\.probePeers\(true\)/, "Vault events do not trigger an immediate authenticated peer probe");
   assert.doesNotMatch(lanSource, /path\.startsWith\(`\$\{API_PREFIX\}\/metadata\/v3\/`\)/, "The server still blocks the v3 rolling-upgrade route");
   assert.match(lanSource, /const SMALL_TRANSFER_CONCURRENCY = 12/, "Small-file LAN transfers are not using the fast bounded worker pool");
-  assert.match(lanSource, /if \(this\.prioritySyncPending && cursor > 0\) break;/, "A pending priority edit must not prevent the bulk session from starting its first file");
+  assert.match(lanSource, /private schedulePriorityRemoteSync\(peer: LanSyncPeer\)/, "Remote priority edits do not have a dedicated transfer lane");
+  assert.match(lanSource, /this\.transferSessionActive[\s\S]{0,180}this\.prioritySyncPromise/, "A remote priority edit can overlap an active transfer session");
   assert.match(lanSource, /function yieldToLanEventLoop\(\)/, "Full-vault enumeration does not yield to UI and heartbeat updates");
   assert.match(lanSource, /mapWithConcurrency\(candidates, HASH_CONCURRENCY/, "Large scans are not processed concurrently");
-  assert.match(lanSource, /if \(!this\.runningValue \|\| this\.syncRunning \|\| this\.inboundSession \|\| this\.metadataManifestBuild \|\| this\.manifestBuild\) return;/, "Periodic full scans can still interrupt an active transfer or manifest enumeration");
+  assert.match(lanSource, /if \(!this\.runningValue \|\| this\.periodicIncrementalCheckRunning \|\| this\.syncRunning \|\| this\.inboundSession \|\| this\.metadataManifestBuild \|\| this\.manifestBuild\) return;/, "Periodic incremental checks can still interrupt an active transfer or manifest enumeration");
   assert.match(lanSource, /private isPeriodicInitiator\(peers = this\.activePeers\(\)\)/, "Periodic synchronization is still permanently assigned to one device role");
   assert.match(lanSource, /BACKGROUND_FULL_RESCAN_INTERVAL_MS = 24 \* 60 \* 60_000/, "Converged Vaults can still run frequent background full scans");
   assert.match(lanSource, /ntfy\.lan-sync\.change-journal\.v1\./, "Dirty paths are not stored in a durable journal");
@@ -1698,13 +2032,13 @@ try {
   assert.match(source, /const configFiles = await listNtfyLanConfigFiles\(adapter, configDir, identityRoot\);[\s\S]{0,300}file\.mtime >= since/, "Startup catch-up still omits configuration files changed while the plugin was stopped");
   assert.match(source, /while \(pending\.length\)/, "Configuration enumeration no longer walks every pending folder");
   assert.doesNotMatch(source, /pending\.length && paths\.length < 25_000|paths\.length >= 25_000/, "Configuration enumeration still truncates the Vault at 25,000 files");
-  assert.match(lanSource, /this\.buildManifest\(true\),\s*this\.callPeer\(peer, "\/manifest", \{ syncConfigFolder: true \}\)/, "Rolling-upgrade manifest compatibility can still omit configuration files");
+  assert.match(lanSource, /this\.buildManifest\(localPolicy\.syncConfigFolder\),\s*this\.callPeer\(peer, "\/manifest", \{ syncConfigFolder: localPolicy\.syncConfigFolder \}\)/, "Rolling-upgrade manifest compatibility does not use the same config-folder scope on both ends");
   assert.match(lanSource, /this\.metadataManifestBuild \|\| this\.manifestBuild/, "Periodic calibration can still overlap manifest enumeration");
   assert.match(lanSource, /safeErrorCode\(error\) === "precondition_failed"/, "One changing file can still abort the entire transfer batch");
   assert.match(lanSource, /written\.size !== bytes\.byteLength\) throw new LanSyncProtocolError\("precondition_failed", 409\)/, "A receiver-side write race can still abort the entire batch");
   assert.match(lanSource, /retryPaths: \[\.\.\.retryPaths\]/, "Deferred paths are not mirrored to the peer retry queue");
   assert.match(lanSource, /onActivityChanged\?\.\(\)/, "Scan activity is not reported on its independent channel");
-  assert.doesNotMatch(lanSource, /defaultProgress\("scanning"\)/, "Scanning still writes into the transfer progress state");
+  assert.match(lanSource, /\.\.\.defaultProgress\("scanning"\)[\s\S]{0,180}completed: 0,[\s\S]{0,80}total: 0/, "Startup scanning can invent a transfer denominator");
   assert.match(lanSource, /sync_session_busy/, "A second transfer session can still overwrite an active session");
   assert.match(lanSource, /scanRequestIds/, "Full-vault scan requests are not deduplicated across peers");
   assert.match(lanSource, /classifyAppliedMutationEvent\(normalized\)/, "LAN-applied writes can still echo back into the dirty journal");

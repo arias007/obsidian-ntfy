@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { mkdtemp } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,10 +39,21 @@ class Store {
 const identity = { schemaVersion: 1, vaultId: "SMOKEVault123456789", secret: "s".repeat(48), createdAt: new Date().toISOString() };
 const a = new Store(identity, { "Notes/from-desktop.md": "desktop" });
 const b = new Store(identity, { "Notes/from-phone.md": "phone" });
-const ports = [43191, 43192];
+async function freePort() {
+  const server = createServer();
+  await new Promise((resolvePromise, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolvePromise);
+  });
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  await new Promise((resolvePromise) => server.close(resolvePromise));
+  return port;
+}
+const ports = [await freePort(), await freePort()];
 const progressA = [], progressB = [];
 const make = (storage, port, deviceId, progress, desktop) => {
-  const values = new Map([["cancip.lan-sync.device-id.v1", deviceId]]);
+  const values = new Map([[`cancip.lan-sync.device-id.v2.${Buffer.from("default", "utf8").toString("base64url")}`, deviceId]]);
   return new NtfyLanSync({
   desktop,
   getSettings: () => ({ enabled: true, autoDiscovery: false, checkIntervalSeconds: 1, mode: "bidirectional", syncConfigFolder: false, configDir: ".obsidian", port, maxFileBytes: 10 * 1024 * 1024, manualPeers: desktop ? [`127.0.0.1:${ports[1]}`] : [`127.0.0.1:${ports[0]}`] }),
@@ -66,6 +78,23 @@ assert.equal(new TextDecoder().decode(a.files.get("Notes/from-phone.md")?.data),
 assert.ok(phone.scanProgress().total >= 1, `phone local scan was ${phone.scanProgress().completed}/${phone.scanProgress().total}`);
 assert.ok(progressA.some((p) => p.downloads > 0 || p.uploads > 0), "desktop never exposed transfer direction");
 assert.ok(progressB.some((p) => p.downloads > 0 || p.uploads > 0), "phone never exposed transfer direction");
+const completedA = progressA.filter((p) => p.phase === "complete" && p.total === 2 && p.sessionId).at(-1);
+const completedB = progressB.find((p) => p.phase === "complete" && p.total === 2 && p.sessionId === completedA?.sessionId);
+assert.ok(completedA && completedB, "both host-capable peers did not finish one shared transfer session");
+assert.equal(completedA.uploads, completedB.downloads, "shared session upload/download plans were not mirrored");
+assert.equal(completedA.downloads, completedB.uploads, "shared session download/upload plans were not mirrored");
+// The completion snapshot is intentionally short-lived. Once both endpoints
+// are idle, their live queue must be normalized to 0/0 while the sampled
+// progress history above still proves the transfer happened.
+await new Promise((r) => setTimeout(r, 6_500));
+for (const [label, service] of [["desktop", desktop], ["phone", phone]]) {
+  const current = service.progress();
+  assert.equal(current.phase, "connected", `${label} did not return to connected idle state`);
+  assert.equal(current.total, 0, `${label} retained a stale transfer total`);
+  assert.equal(current.completed, 0, `${label} retained stale completed work`);
+  assert.equal(current.uploads + current.downloads, 0, `${label} retained stale directional work`);
+  assert.deepEqual(service.activity().transferGroups, [], `${label} retained stale transfer groups`);
+}
 const phoneScan = phone.scanProgress();
 const desktopTransfer = progressA.filter((p) => p.total > 0).at(-1);
 const phoneTransfer = progressB.filter((p) => p.total > 0).at(-1);
