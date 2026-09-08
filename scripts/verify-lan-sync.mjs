@@ -354,6 +354,15 @@ try {
   const localMetadata = { path: "Note.md", size: 5, mtime: 100 };
   const remoteMetadata = { path: "Note.md", size: 6, mtime: 200 };
   const metadataBaseline = { local: { size: 5, mtime: 100 }, remote: { size: 5, mtime: 100 } };
+  assert.deepEqual(
+    planLanSyncReconciliation(
+      [{ path: "Precision.md", size: 5, mtime: 1_000.75 }],
+      [{ path: "Precision.md", size: 5, mtime: 1_000 }],
+      { "Precision.md": { local: { size: 5, mtime: 1_000 }, remote: { size: 5, mtime: 1_000 } } }
+    ),
+    [],
+    "Sub-millisecond filesystem timestamp precision created a false sync action"
+  );
   assert.equal(planLanSyncMetadataReconciliation([localMetadata], [remoteMetadata], { "Note.md": metadataBaseline })[0].kind, "pull");
   assert.equal(planLanSyncMetadataReconciliation([{ ...localMetadata, mtime: 3_000 }], [localMetadata], { "Note.md": metadataBaseline })[0].kind, "push");
   assert.equal(planLanSyncMetadataReconciliation([localMetadata], [remoteMetadata], {})[0].kind, "pull");
@@ -742,6 +751,156 @@ try {
   stabilityService.visibleCandidatePaths.clear();
   stabilityService.activityFiles = [];
 
+  // A slow hidden-config enumeration must never sit in front of an already
+  // discovered note transfer. The full inventory producer is intentionally
+  // left pending while the path-level manifest completes from direct stat.
+  const priorityStorage = new MemoryStorage(identity, {
+    "Notes/priority.md": { content: "priority", mtime: 20 }
+  });
+  let finishPriorityInventory;
+  priorityStorage.listFiles = async (includeConfigFolder = false) => {
+    if (!includeConfigFolder) return await MemoryStorage.prototype.listFiles.call(priorityStorage, false);
+    return await new Promise((resolvePromise) => { finishPriorityInventory = resolvePromise; });
+  };
+  priorityStorage.isFileListComplete = (includeConfigFolder) => !includeConfigFolder;
+  const priorityService = new NtfyLanSync(commonOptions(
+    priorityStorage,
+    await freePort(),
+    "PRIORITYPATHCHECK12345",
+    [],
+    { autoDiscovery: false, syncConfigFolder: true }
+  ));
+  const priorityStartedAt = Date.now();
+  const priorityEntries = await priorityService.buildMetadataManifestForPaths(["Notes/priority.md"], true);
+  const priorityElapsed = Date.now() - priorityStartedAt;
+  assert.equal(priorityEntries.length, 1, "Priority path manifest was lost behind config enumeration");
+  assert.ok(priorityElapsed < 500, `Priority path manifest waited ${priorityElapsed}ms for config enumeration`);
+  finishPriorityInventory?.(await MemoryStorage.prototype.listFiles.call(priorityStorage, true));
+
+  // Address fallback represents one fresh authenticated HTTP attempt per
+  // address. A response can be lost after the receiver consumes the nonce;
+  // reusing it on the next address would turn a successful write into a
+  // replay rejection.
+  const retryNonces = [];
+  let retryAttempt = 0;
+  const retryOptions = commonOptions(
+    new MemoryStorage(identity, {}),
+    await freePort(),
+    "NONCERETRYCHECK123456",
+    [],
+    { autoDiscovery: false }
+  );
+  retryOptions.desktop = false;
+  let encryptedRetryResponse = "";
+  retryOptions.httpRequest = async (request) => {
+    retryNonces.push(request.headers["X-Cancip-Nonce"]);
+    retryAttempt += 1;
+    if (retryAttempt === 1) throw new Error("response_lost");
+    return { status: 200, text: encryptedRetryResponse };
+  };
+  const retryService = new NtfyLanSync(retryOptions);
+  retryService.identity = identity;
+  retryService.deviceId = "NONCERETRYCHECK123456";
+  encryptedRetryResponse = await encryptLanSyncPayload(retryService.activeSecret(), { ok: true });
+  const retryPeer = {
+    deviceId: "NONCERETRYPEER1234567",
+    port: 43190,
+    addresses: new Set(["10.0.0.1", "10.0.0.2"]),
+    capabilities: new Set(["metadata-session-v4"])
+  };
+  const retryResponse = await retryService.callPeer(retryPeer, "/nonce-retry-probe", {});
+  assert.equal(retryResponse.ok, true, "Address fallback did not recover from a lost response");
+  assert.equal(retryNonces.length, 2, "Address fallback did not exercise both addresses");
+  assert.notEqual(retryNonces[0], retryNonces[1], "Address fallback reused an authenticated nonce");
+
+  // A write whose response was lost must be accepted when retried against
+  // the old precondition, provided the current bytes already equal source.
+  const idempotentStorage = new MemoryStorage(identity, {
+    "Notes/idempotent-write.md": { content: "old", mtime: 40 }
+  });
+  const idempotentService = new NtfyLanSync(commonOptions(
+    idempotentStorage,
+    await freePort(),
+    "IDEMPOTENTWRITECHECK1",
+    [],
+    { autoDiscovery: false }
+  ));
+  const idempotentSource = { size: 3, mtime: 41 };
+  await idempotentService.writeLocalMetadata(
+    "Notes/idempotent-write.md",
+    bytes("new"),
+    { size: 3, mtime: 40 },
+    idempotentSource,
+    true
+  );
+  await idempotentService.writeLocalMetadata(
+    "Notes/idempotent-write.md",
+    bytes("new"),
+    { size: 3, mtime: 40 },
+    idempotentSource,
+    true
+  );
+  assert.equal(idempotentStorage.writeCounts.get("Notes/idempotent-write.md"), 1, "An idempotent write retry rewrote identical content");
+
+  // A bounded/partial config list may add useful rows, but it cannot erase a
+  // previously known full inventory or be committed as the new denominator.
+  const partialStorage = new MemoryStorage(identity, {
+    "Notes/visible.md": { content: "visible", mtime: 30 }
+  });
+  partialStorage.isFileListComplete = (includeConfigFolder) => !includeConfigFolder;
+  const partialService = new NtfyLanSync(commonOptions(
+    partialStorage,
+    await freePort(),
+    "PARTIALLISTCHECK12345",
+    [],
+    { autoDiscovery: false, syncConfigFolder: true }
+  ));
+  partialService.scanInventory.set(".obsidian/plugins/example/known.json", { size: 9, mtime: 10 });
+  partialService.scanInventoryReady = true;
+  partialService.scanInventoryIncludesConfig = true;
+  await partialService.ensureScanInventory(true);
+  assert.ok(partialService.scanInventory.has(".obsidian/plugins/example/known.json"), "Partial inventory erased the complete config baseline");
+  await assert.rejects(
+    () => partialService.buildMetadataManifestOnce(true),
+    /file_list_incomplete/,
+    "Partial config enumeration was accepted as a complete full scan"
+  );
+
+  // Obsidian raw/create/delete/rename events include folders. Only concrete
+  // files or deletions of previously known files may enter the dirty journal.
+  const eventStorage = new MemoryStorage(identity, {
+    "Notes/new.md": { content: "new", mtime: 40 },
+    "Old/inside.md": { content: "inside", mtime: 41 }
+  });
+  const eventService = new NtfyLanSync(commonOptions(
+    eventStorage,
+    await freePort(),
+    "EVENTCLASSIFYCHECK1234",
+    [],
+    { autoDiscovery: false, syncConfigFolder: true }
+  ));
+  await eventService.notifyVaultRawChange("Notes");
+  assert.equal(eventService.dirtyPaths.has("Notes"), false, "A raw folder event entered the dirty-file journal");
+  await eventService.notifyVaultRawChange("Notes/new.md");
+  assert.equal(eventService.dirtyPaths.has("Notes/new.md"), true, "A new raw file event was not queued");
+  eventService.dirtyPaths.clear();
+  eventService.scanInventory.set("Notes/deleted.md", { size: 7, mtime: 39 });
+  eventService.metadataIndex.set("Notes/deleted.md", { size: 7, mtime: 39 });
+  await eventService.notifyVaultRawChange("Notes/deleted.md");
+  assert.equal(eventService.dirtyPaths.has("Notes/deleted.md"), true, "A known raw file deletion was not queued");
+  eventService.dirtyPaths.clear();
+  eventService.scanInventory.set("Deleted/a.md", { size: 1, mtime: 30 });
+  eventService.scanInventory.set("Deleted/nested/b.md", { size: 2, mtime: 31 });
+  eventService.notifyVaultFolderDelete("Deleted");
+  assert.deepEqual([...eventService.dirtyPaths.keys()].sort(), ["Deleted/a.md", "Deleted/nested/b.md"], "A folder deletion was not expanded to its known files");
+  assert.equal(eventService.dirtyPaths.has("Deleted"), false, "A deleted folder itself entered the dirty-file journal");
+  eventService.dirtyPaths.clear();
+  eventService.scanInventory.set("Old/inside.md", { size: 6, mtime: 41 });
+  eventService.notifyVaultFolderRename("Old", "New");
+  assert.deepEqual([...eventService.dirtyPaths.keys()].sort(), ["New/inside.md", "Old/inside.md"], "A folder rename was not expanded to paired file changes");
+  assert.equal(eventService.scanInventory.has("Old/inside.md"), false, "A folder rename retained its old live path");
+  assert.equal(eventService.scanInventory.has("New/inside.md"), true, "A folder rename did not publish its new live path");
+
   const journalPort = await freePort();
   const journalDevice = "JOURNALCHECKPOINT123456";
   const journalStore = memoryLocalStore(journalDevice);
@@ -756,6 +915,9 @@ try {
   journalService.recordSyncCheckpoint();
   const savedCheckpoint = journalService.lastSyncCheckpointAt;
   journalService.notifyVaultChange("Notes/deleted-while-running.md");
+  // Simulate a legacy build that persisted the containing folder as though it
+  // were a file. Reload must prune it without dropping the real deletion.
+  journalService.notifyVaultChange("Notes");
   await journalService.stop();
   journalStorage.putText("Notes/created-while-stopped.md", "offline change", savedCheckpoint + 100);
   journalStorage.putText(
@@ -771,6 +933,7 @@ try {
   await reloadedJournalService.start();
   assert.equal(reloadedJournalService.fullSyncRequested, false, "A recent checkpoint still forced a full-vault scan after reload");
   assert.ok(reloadedJournalService.dirtyPaths.has("Notes/deleted-while-running.md"), "The durable deletion journal was lost across reload");
+  assert.equal(reloadedJournalService.dirtyPaths.has("Notes"), false, "A legacy folder path survived dirty-journal recovery");
   assert.ok(reloadedJournalService.dirtyPaths.has("Notes/created-while-stopped.md"), "Checkpoint catch-up missed a file changed while the watcher was stopped");
   assert.ok(
     reloadedJournalService.dirtyPaths.has(".obsidian/plugins/example-plugin/settings/config.json"),
@@ -986,7 +1149,10 @@ try {
     await waitFor(() => serviceA.activity().roundHistory.some((round) => round.kind === "incremental"), "incremental round history");
     const incrementalHistory = serviceA.activity().roundHistory.findLast((round) => round.kind === "incremental");
     assert.ok(incrementalHistory && incrementalHistory.syncTotal >= 1 && incrementalHistory.syncCompleted === incrementalHistory.syncTotal, "Incremental history did not record the complete changed-path cycle");
+    assert.ok(incrementalHistory.files?.some((file) => file.path === "Notes/incremental-history.md"), "Incremental history did not retain the synchronized file name");
     assert.ok(serviceB.activity().roundHistory.some((round) => round.id === incrementalHistory.id && round.kind === "incremental"), "Receiver did not mirror the incremental round history");
+    const mirroredIncrementalHistory = serviceB.activity().roundHistory.find((round) => round.id === incrementalHistory.id);
+    assert.ok(mirroredIncrementalHistory?.files?.some((file) => file.path === "Notes/incremental-history.md"), "Receiver did not mirror the synchronized file name");
 
     // A second explicit full round must retain the same denominator and reuse
     // the metadata index for unchanged files instead of walking every file
@@ -1239,7 +1405,8 @@ try {
     const scanAfterBurst = serviceA.activity().scan;
     if (scanBeforeBurst.total > 0) {
       assert.equal(scanAfterBurst.id, scanBeforeBurst.id, "Realtime burst replaced the existing scan snapshot");
-      assert.equal(scanAfterBurst.total, scanBeforeBurst.total, "Realtime burst changed the existing scan denominator");
+      assert.ok(scanAfterBurst.total >= scanBeforeBurst.total + burstPaths.length, "Realtime burst did not expand the live full-vault denominator");
+      assert.ok(scanAfterBurst.completed <= scanAfterBurst.total, "Realtime burst scan cursor exceeded the live denominator");
     }
     await waitFor(() => storageB.text("Burst/f-39.md") === "burst-39", "all incremental burst batches");
     await waitFor(() => serviceA.dirtyPaths.size === 0 && serviceA.activeEditDirty.size === 0, "incremental burst journal settlement");
@@ -1274,8 +1441,63 @@ try {
       /sync_session_busy/,
       "A second session replaced the active receiver plan"
     );
+    serviceB.inboundSession.updatedAt -= 6_000;
+    const replacementSession = {
+      sessionId: "SESSIONREPLACE654321",
+      total: 1,
+      bytesTotal: 0,
+      uploads: 1,
+      downloads: 0,
+      files: [{ path: "Notes/replacement-session.md", action: "push", size: 0 }]
+    };
+    const replacementResult = await serviceB.handleMetadataSessionStart(deviceA, replacementSession);
+    assert.equal(replacementResult.sessionId, replacementSession.sessionId, "A stale receiver plan blocked a fresh plan from the same peer");
+    assert.equal(serviceB.activityFiles.length, 1, "A stale receiver plan leaked its old activity rows into the replacement");
+    serviceB.dirtyPaths.set("Notes/receiver-urgent.md", 1);
+    serviceB.urgentDirtyPaths.add("Notes/receiver-urgent.md");
     await serviceB.handleMetadataSessionFinish(deviceA, {
-      sessionId: sessionProbe.sessionId,
+      sessionId: replacementSession.sessionId,
+      success: true,
+      commits: [],
+      retryPaths: [],
+      acknowledgedDirtyPaths: [{ path: "Notes/receiver-urgent.md", generation: 1 }],
+      acknowledgedFullSyncRequestId: ""
+    });
+    assert.equal(serviceB.dirtyPaths.has("Notes/receiver-urgent.md"), false, "Receiver acknowledgement retained a completed dirty path");
+    assert.equal(serviceB.urgentDirtyPaths.has("Notes/receiver-urgent.md"), false, "Receiver acknowledgement retained a completed urgent path");
+    serviceB.urgentDirtyPaths.add("Notes/orphan-urgent.md");
+    serviceB.dirtySnapshot();
+    assert.equal(serviceB.urgentDirtyPaths.has("Notes/orphan-urgent.md"), false, "Heartbeat snapshots retained an orphan urgent path");
+
+    const asymmetricSession = {
+      sessionId: "ASYMMETRICSESSION123",
+      total: 2,
+      bytesTotal: 0,
+      uploads: 2,
+      downloads: 0,
+      files: [
+        { path: "Notes/asymmetric-a.md", action: "push", size: 0 },
+        { path: "Notes/asymmetric-b.md", action: "push", size: 0 }
+      ]
+    };
+    await serviceB.handleMetadataSessionStart(deviceA, asymmetricSession);
+    const asymmetricAppend = {
+      sessionId: asymmetricSession.sessionId,
+      appendId: "ASYMMETRICAPPEND123",
+      total: 3,
+      bytesTotal: 0,
+      uploads: 2,
+      downloads: 1,
+      files: [{ path: "Notes/asymmetric-c.md", action: "pull", size: 0 }]
+    };
+    const asymmetricAppendResult = await serviceB.handleMetadataSessionAppend(deviceA, asymmetricAppend);
+    assert.equal(asymmetricAppendResult.uploads, 1, "Receiver did not mirror the coordinator's appended download count");
+    assert.equal(asymmetricAppendResult.downloads, 2, "Receiver did not mirror the coordinator's existing upload count");
+    const asymmetricReplay = await serviceB.handleMetadataSessionAppend(deviceA, asymmetricAppend);
+    assert.equal(asymmetricReplay.replayed, true, "An asymmetric append retry was not idempotent");
+    assert.equal(serviceB.activityFiles.length, 3, "An asymmetric append retry duplicated the receiver plan");
+    await serviceB.handleMetadataSessionFinish(deviceA, {
+      sessionId: asymmetricSession.sessionId,
       success: true,
       commits: [],
       retryPaths: [],
@@ -1356,7 +1578,27 @@ try {
     await waitFor(() => storageB.text(nestedConfigPath) === "config-v2", "updated nested configuration file synchronization");
     storageA.files.delete(nestedConfigPath);
     serviceA.notifyVaultChange(nestedConfigPath);
-    await waitFor(() => storageB.text(nestedConfigPath) === null, "deleted nested configuration file synchronization");
+    await waitFor(() => storageB.text(nestedConfigPath) === null, "deleted nested configuration file synchronization").catch((error) => {
+      throw new Error(`${error.message}; state=${JSON.stringify({
+        aDirty: serviceA.dirtyPaths.get(nestedConfigPath),
+        bRemoteDirty: serviceB.peers.get(deviceA)?.remoteDirtyPaths?.get(nestedConfigPath),
+        aInventory: serviceA.scanInventory.get(nestedConfigPath),
+        aMetadata: serviceA.metadataIndex.get(nestedConfigPath),
+        aBackoff: serviceA.transferBackoff.get(nestedConfigPath),
+        aLastError: serviceA.lastErrorValue,
+        bLastError: serviceB.lastErrorValue,
+        aFiles: serviceA.activity().files.filter((file) => file.path === nestedConfigPath),
+        bFiles: serviceB.activity().files.filter((file) => file.path === nestedConfigPath),
+        bStat: storageB.files.get(nestedConfigPath) && {
+          size: storageB.files.get(nestedConfigPath).data.byteLength,
+          mtime: storageB.files.get(nestedConfigPath).mtime
+        },
+        aProgress: serviceA.progress(),
+        bProgress: serviceB.progress(),
+        aSyncRunning: serviceA.syncRunning,
+        bSyncRunning: serviceB.syncRunning
+      })}`);
+    });
 
     optionsA.runtimeSettings.mode = "delete-push";
     optionsB.runtimeSettings.mode = "bidirectional";
@@ -1610,15 +1852,32 @@ try {
     });
     // Adapter safety net: an external write with no Vault event must still be
     // observed by the metadata poll and transferred without a manual scan.
-    await waitFor(() => baselineServiceA.metadataIndexReady === true, "metadata poll baseline");
-    baselineStorageA.putText("Only-A/poll-without-event.md", "poll detected", 100_000_010);
-    await baselineServiceA.pollLiveFilesystemChanges();
+  await waitFor(() => baselineServiceA.metadataIndexReady === true, "metadata poll baseline");
+  baselineStorageA.putText("Only-A/poll-without-event.md", "poll detected", 100_000_010);
+  await baselineServiceA.pollLiveFilesystemChanges();
     await waitFor(
       () => baselineStorageB.text("Only-A/poll-without-event.md") === "poll detected",
       "external write without a Vault event",
       10_000,
       50
     );
+    // The hot note poll intentionally receives a partial view without
+    // .obsidian. It must preserve config inventory and must never manufacture
+    // config deletions while the slower config scan is in flight.
+    baselineStorageA.putText(".obsidian/plugins/example/config.json", "config", 100_000_011);
+    baselineServiceA.scanInventory.set(".obsidian/plugins/example/config.json", { size: 6, mtime: 100_000_011 });
+    baselineServiceA.metadataIndex.set(".obsidian/plugins/example/config.json", { size: 6, mtime: 100_000_011 });
+    const originalListFiles = baselineStorageA.listFiles.bind(baselineStorageA);
+    let hotPollIncludedConfig = null;
+    baselineStorageA.listFiles = async (includeConfigFolder = false) => {
+      hotPollIncludedConfig = includeConfigFolder;
+      return await originalListFiles(false);
+    };
+    baselineServiceA.dirtyPaths.delete(".obsidian/plugins/example/config.json");
+    await baselineServiceA.pollLiveFilesystemChanges();
+    assert.equal(hotPollIncludedConfig, false, "The five-second fallback still requested the config tree");
+    assert.ok(baselineServiceA.scanInventory.has(".obsidian/plugins/example/config.json"), "The note-only poll discarded config inventory");
+    assert.equal(baselineServiceA.dirtyPaths.has(".obsidian/plugins/example/config.json"), false, "A partial note listing was treated as a config deletion");
     assert.equal([...baselineStorageA.files.keys(), ...baselineStorageB.files.keys()].some((path) => path.includes("LAN conflict")), false, "Baseline reconciliation created a renamed conflict copy");
   } finally {
     await Promise.all([baselineServiceA.stop(), baselineServiceB.stop()]);
@@ -1966,13 +2225,22 @@ try {
    assert.match(source, /requestLanSync\(options = \{\}\)/, "Ordinary automatic checks cannot be separated from the full-vault button");
    assert.match(lanSource, /kind: "full" \| "incremental"/, "Completed synchronization history does not distinguish full and incremental rounds");
    assert.match(lanSource, /round: completedRound/, "The receiving peer does not receive the coordinator's completed round record");
+   assert.match(lanSource, /files: \[\.\.\.transferRound\.files\.values\(\)\]/, "Completed synchronization history does not retain file names");
+  assert.match(lanSource, /metadata\/session\/append/, "A running transfer cannot accept newly discovered priority files");
+  assert.match(lanSource, /coordinatorUploads !== session\.downloads \+ addedCoordinatorUploads/, "Asymmetric live-session appends still compare unmirrored upload counters");
+  assert.match(lanSource, /const requestHeaders = async \(\)/, "Address retries still reuse one authenticated nonce");
+  assert.match(lanSource, /local\.metadata, true, sessionId/, "Remote metadata writes are not idempotent after a lost response");
+  assert.match(lanSource, /remote\.metadata, true\)/, "Local metadata writes are not idempotent after a lost response");
+  assert.match(lanSource, /this\.now\(\) - this\.inboundSession\.updatedAt >= STALE_SESSION_RESUME_MS[\s\S]{0,500}this\.inboundSession = null/, "A stale receiver session can still block a different fresh plan");
+  assert.match(lanSource, /generation === undefined[\s\S]{0,160}this\.urgentDirtyPaths\.delete\(path\)/, "Heartbeat snapshots do not prune orphan urgent paths");
+  assert.match(lanSource, /this\.dirtyPaths\.delete\(path\);\s*this\.urgentDirtyPaths\.delete\(path\)/, "Receiver acknowledgements leave completed paths in the urgent queue");
   assert.match(lanSource, /syncCandidatesTotal/, "Full-vault scan does not expose the discovered sync-candidate counter");
   assert.match(lanSource, /const roundCompleted = uploadCompleted \+ downloadCompleted/, "Transfer progress is not derived from directional completion counters");
-  assert.match(lanSource, /const preserveVisibleScan = this\.scanValue\.total > 0/, "A path scan can overwrite the stable full-vault scan denominator");
-  assert.match(lanSource, /this\.scanValue\.syncCandidates = candidates\.size/, "Filesystem events do not expose changed paths in the scan stream");
+   assert.match(lanSource, /The denominator is always the current live-vault size/, "A path scan can overwrite the stable full-vault scan denominator");
+  assert.match(lanSource, /this\.scanValue\.syncCandidates = candidateCount/, "Filesystem events do not expose changed paths in the scan stream");
   assert.match(lanSource, /this\.activityFiles\.push\(\{ path, action: "push", state: "pending", size: 0, provisional: true \}\)/, "Changed files are not queued visibly before planning");
   assert.match(lanSource, /const unique = new Map<string, LanSyncFileStat>\(\)/, "Current-file snapshots do not deduplicate normalized paths");
-  assert.match(lanSource, /scan\.completed = Math\.min\(scan\.total, scan\.completed \+ 1\)/, "Scan completion is not clamped to its current denominator");
+   assert.match(lanSource, /scan\.completed = Math\.max\(0, Math\.min\(scan\.total, scan\.total - this\.scanPendingPaths\.size\)\)/, "Scan completion is not clamped to its current denominator");
   assert.match(lanSource, /if \(!stat\) \{[\s\S]{0,160}this\.metadataIndex\.delete\(path\)/, "Deletes discovered during a path scan are not removed from the metadata index");
   assert.match(source, /同步进度 · 本轮同步/, "LAN details do not show planner-confirmed sync counters");
    assert.doesNotMatch(lanSource, /MAX_DIRTY_PATHS|4096/, "LAN runtime still contains the obsolete fixed dirty-path ceiling");
@@ -2023,12 +2291,46 @@ try {
   assert.match(lanSource, /BACKGROUND_FULL_RESCAN_INTERVAL_MS = 24 \* 60 \* 60_000/, "Converged Vaults can still run frequent background full scans");
   assert.match(lanSource, /ntfy\.lan-sync\.change-journal\.v1\./, "Dirty paths are not stored in a durable journal");
   assert.match(lanSource, /captureChangesSinceCheckpoint\(\)/, "Plugin reload does not catch up from the last successful checkpoint");
+  assert.match(lanSource, /await metadataPreparation;[\s\S]{0,500}this\.pollLiveFilesystemChanges\(\)/, "Live inventory polling can still race an incomplete startup index");
   assert.match(lanSource, /this\.recordSyncCheckpoint\(\)/, "Successful synchronization does not record a checkpoint");
   assert.match(lanSource, /metadata-index-v1\.json/, "The last complete metadata manifest is not persisted");
+  assert.match(lanSource, /METADATA_INDEX_SAVE_DELAY_MS = 30_000/, "Metadata index writes are not debounced behind a quiet edit window");
+  assert.match(lanSource, /LIVE_FILESYSTEM_POLL_INTERVAL_MS = 5_000/, "Missed-event fallback still rebuilds the live inventory too frequently");
+  assert.match(lanSource, /const detectedPaths = new Set<string>\(\)/, "Live inventory polling does not batch changed-path discovery");
+  assert.match(lanSource, /listFilesLive\?\.\(false\)/, "The five-second fallback still enumerates the configuration tree");
+  assert.match(lanSource, /!isConfigPath\(path, this\.settings\(\)\.configDir\)[\s\S]{0,180}!current\.has\(path\)/, "A partial note listing can still manufacture configuration deletions");
+  assert.match(lanSource, /this\.markDirtyPaths\(detectedPaths, REALTIME_DIRTY_DELAY_MS, true, false\)/, "Live inventory polling still launches one stat and UI rebuild per changed file");
+  assert.match(lanSource, /this\.markDirtyPaths\(changedPaths, QUEUED_SYNC_DELAY_MS, false, false\)/, "Checkpoint catch-up still refreshes and broadcasts once per changed file");
+  assert.match(lanSource, /refreshVisibleSyncCandidates\(changedPaths\?: Iterable<string>\)/, "Realtime candidate rendering still rebuilds every visible file for each edit");
+  assert.match(lanSource, /const stat = this\.scanInventory\.get\(path\)/, "Restart recovery does not prune unchanged dirty paths against the restored inventory");
+  assert.match(lanSource, /const cachedStat = this\.scanInventory\.get\(path\)/, "Changed-path manifests still restat files already present in the live inventory");
+  assert.match(lanSource, /void this\.ensureScanInventory\(includeConfigFolder\)/, "Changed-path manifests still wait for full configuration inventory");
+  assert.match(lanSource, /throw new Error\("file_list_incomplete"\)/, "Partial configuration listings can still replace a complete metadata baseline");
+  assert.match(lanSource, /this\.markDirtyPaths\(reconciliationChanges, REALTIME_DIRTY_DELAY_MS, true, false\)/, "Full reconciliation still emits one UI/broadcast cycle per changed path");
+  assert.match(lanSource, /this\.metadataIndex\.set\(normalized, actualMetadata\);\s*this\.scanInventory\.set\(normalized, actualMetadata\)/, "Inbound writes leave the live inventory stale");
+  assert.match(lanSource, /this\.metadataIndex\.delete\(normalized\);\s*this\.scanInventory\.delete\(normalized\)/, "Inbound deletions leave the live inventory stale");
+  assert.match(lanSource, /while \(this\.metadataIndexSaveAgain && this\.metadataIndexReady\)/, "Overlapping metadata index saves are not drained by one serial writer");
+  assert.match(lanSource, /if \(metadataSavePending\) await this\.saveMetadataIndex\(\)/, "Plugin shutdown still rewrites an unchanged sharded metadata index");
   assert.match(lanSource, /buildMetadataManifestFromIndex\(/, "Peer full requests cannot reuse the persistent metadata index");
   assert.match(lanSource, /this\.replaceMetadataIndex\(entries, includeConfigFolder\)/, "A completed filesystem reconciliation does not refresh the metadata index");
   assert.match(source, /this\.app\.vault\.on\("raw"/, "Hidden configuration changes are not added to the path journal");
+  assert.match(source, /file instanceof TFile[\s\S]{0,120}notifyVaultChange\(file\.path\)/, "Typed Vault events do not reject folder paths");
+  assert.match(source, /notifyVaultFolderDelete\(file\.path\)/, "Folder deletes are not expanded to known child files");
+  assert.match(source, /notifyVaultFolderRename\(oldPath, file\.path\)/, "Folder renames are not expanded to paired child-file paths");
+  assert.match(source, /notifyVaultRawChange\(path\)/, "Raw Vault events are not classified before entering the dirty journal");
+  assert.match(lanSource, /const legacyFolderPath = !baseline && !stat/, "Legacy folder paths are not pruned from the restored dirty journal");
   assert.match(source, /listFilesChangedSince: async \(since, includeConfigFolder\)/, "Startup catch-up does not expose configuration-folder recovery");
+  assert.match(source, /listNtfyLanPhysicalFiles\(adapterBasePath, configDir, identityRoot, true\)/, "Desktop config polling still depends on thousands of renderer-thread adapter calls");
+  assert.match(source, /statNtfyLanPhysicalFile\(adapterBasePath, path\)/, "Desktop changed-path scans still depend on renderer-thread adapter stat calls");
+  assert.match(source, /function isNtfyMobileRuntime\(\)[\s\S]{0,240}document\.body\?\.classList\?\.contains\("is-mobile"\)/, "Desktop mobile emulation is not recognized as a mobile runtime");
+  assert.match(source, /if \(isNtfyMobileRuntime\(\) \|\| !rootPath \|\| typeof require !== "function"\) return \[\];/, "Mobile UI can still attempt Node filesystem enumeration");
+  assert.match(source, /isLanSyncPathEligible\(`\$\{normalized\}\/__ntfy_scan__`, pathOptions\)\) pending\.push\(absolute\)/, "Desktop physical enumeration still enters excluded directory trees");
+  assert.match(source, /if \(isNtfyMobileRuntime\(\) \|\| !rootPath \|\| !normalized \|\| typeof require !== "function"\) return undefined;/, "Mobile UI can still attempt Node filesystem stat calls");
+  assert.match(source, /const mobileRuntime = isNtfyMobileRuntime\(\)/, "LAN storage does not freeze the effective mobile runtime at startup");
+  assert.match(source, /desktop: !mobileRuntime/, "Mobile emulation still starts a desktop LAN listener");
+  assert.match(source, /if \(!mobileRuntime && adapterBasePath && typeof require === "function"\)[\s\S]{0,300}require\("node:fs"\)/, "Index directory recovery can still load node:fs in mobile UI");
+  assert.match(source, /if \(result === adapterTimeout\) throw new Error\("adapter_stat_timeout"\)/, "Adapter stat timeouts can still be mistaken for deleted files");
+  assert.match(source, /if \(configLiveBuild === build\) configLiveBuild = null/, "Timed-out config scans can still overlap with the next fallback poll");
   assert.match(source, /const configFiles = await listNtfyLanConfigFiles\(adapter, configDir, identityRoot\);[\s\S]{0,300}file\.mtime >= since/, "Startup catch-up still omits configuration files changed while the plugin was stopped");
   assert.match(source, /while \(pending\.length\)/, "Configuration enumeration no longer walks every pending folder");
   assert.doesNotMatch(source, /pending\.length && paths\.length < 25_000|paths\.length >= 25_000/, "Configuration enumeration still truncates the Vault at 25,000 files");

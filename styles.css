@@ -296,6 +296,43 @@
   white-space: nowrap;
 }
 
+.obsidian-ntfy-lan-round-history-files {
+  border-top: 1px solid var(--background-modifier-border);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 8px;
+  max-height: 280px;
+  overflow: auto;
+  padding: 8px 0 2px;
+}
+
+.obsidian-ntfy-lan-round-history-files > strong {
+  color: var(--text-normal);
+  margin-bottom: 3px;
+}
+
+.obsidian-ntfy-lan-round-history-file {
+  align-items: baseline;
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.obsidian-ntfy-lan-round-history-file-direction {
+  color: var(--color-green, #15803d);
+  flex: 0 0 1em;
+  font-weight: 700;
+  text-align: center;
+}
+
+.obsidian-ntfy-lan-round-history-files-empty,
+.obsidian-ntfy-lan-round-history-files-more {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
 .obsidian-ntfy-lan-details-section-empty {
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
