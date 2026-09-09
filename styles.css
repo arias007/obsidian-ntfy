@@ -970,6 +970,41 @@
   padding: 4px 0;
 }
 
+.obsidian-ntfy-suggest-line-break-icon {
+  align-items: center;
+  display: inline-flex;
+  justify-content: center;
+  min-height: 20px;
+  min-width: 24px;
+}
+
+.obsidian-ntfy-suggest-line-break-icon svg {
+  height: 16px;
+  width: 16px;
+}
+
+.obsidian-ntfy-task-loading {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.obsidian-ntfy-task-loading-icon {
+  display: inline-flex;
+}
+
+.obsidian-ntfy-task-loading-icon svg {
+  animation: obsidian-ntfy-spin 0.9s linear infinite;
+  height: 16px;
+  width: 16px;
+}
+
+@keyframes obsidian-ntfy-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 .obsidian-ntfy-suggest-title {
   font-weight: 600;
 }

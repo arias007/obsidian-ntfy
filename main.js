@@ -796,6 +796,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.settings = this.normalizeSettings(storedSettings);
     this.localReminderTimer = null;
     this.isQueueHandoffRunning = false;
+    this.managerViewCache = null;
     if (!this.settings.agentProtocolToken) {
       this.settings.agentProtocolToken = this.generateLocalToken();
     }
@@ -5727,7 +5728,15 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
     // The new view paints an empty shell first, then fills its active panel
     // from the same background preload path used by an already-open view.
-    this.managerViewPreload = { notificationTasks: [], vaultTasks: [], scanError: "" };
+    this.managerViewPreload = this.managerViewCache
+      ? Object.assign({}, this.managerViewCache)
+      : {
+        notificationTasks: [],
+        vaultTasks: [],
+        scanError: "",
+        notificationTasksLoaded: false,
+        vaultTasksLoaded: false,
+      };
     this.managerViewPreloadTab = requestedTab;
     if (!leaf) {
       leaf = this.app.workspace.getLeaf("tab");
@@ -7159,6 +7168,8 @@ class NtfyManagerView extends ItemView {
     this.activeTab = "pending";
     this.notificationTasks = [];
     this.vaultTasks = [];
+    this.notificationTasksLoaded = false;
+    this.vaultTasksLoaded = false;
     this.remoteScheduled = [];
     this.scanError = "";
     this.bodyEl = null;
@@ -7343,6 +7354,8 @@ class NtfyManagerView extends ItemView {
     if (!data) return;
     this.notificationTasks = data.notificationTasks || [];
     this.vaultTasks = data.vaultTasks || [];
+    this.notificationTasksLoaded = data.notificationTasksLoaded === true;
+    this.vaultTasksLoaded = data.vaultTasksLoaded === true;
     this.remoteScheduled = data.remoteScheduled || this.remoteScheduled || [];
     this.scanError = data.scanError || "";
   }
@@ -7504,17 +7517,32 @@ class NtfyManagerView extends ItemView {
     const refresh = (async () => {
       const affectedTabs = this.affectedTabsForScope(scope);
       const previousSignatures = new Map(affectedTabs.map((id) => [id, this.tabDataSignature(id)]));
+      const wasLoaded = scope === "pending"
+        ? this.notificationTasksLoaded
+        : scope === "vault"
+        ? this.vaultTasksLoaded
+        : true;
       try {
         if (scope === "pending") {
           this.notificationTasks = await this.plugin.collectNotificationTasks();
           this.scanError = "";
+          this.notificationTasksLoaded = true;
         } else if (scope === "vault") {
           this.vaultTasks = await this.plugin.collectVaultTasks();
+          this.vaultTasksLoaded = true;
         } else if (scope === "inbox") {
           await this.plugin.runIncomingPoll();
         }
+        this.plugin.managerViewCache = {
+          notificationTasks: this.notificationTasks,
+          vaultTasks: this.vaultTasks,
+          scanError: this.scanError,
+          notificationTasksLoaded: this.notificationTasksLoaded,
+          vaultTasksLoaded: this.vaultTasksLoaded,
+        };
         const dataChanged = affectedTabs.some((id) => previousSignatures.get(id) !== this.tabDataSignature(id));
-        if (!dataChanged) return false;
+        if (!dataChanged && wasLoaded) return false;
+        if (!wasLoaded) for (const id of affectedTabs) this.tabSignatures.delete(id);
         if (scope === "pending") this.plugin.setStatusCountsFromNotificationTasks(this.notificationTasks);
         this.updateNavCounts();
         return this.syncTabPanels(affectedTabs);
@@ -7969,6 +7997,8 @@ class NtfyManagerView extends ItemView {
     try {
       this.notificationTasks = await this.plugin.collectNotificationTasks();
       this.vaultTasks = await this.plugin.collectVaultTasks();
+      this.notificationTasksLoaded = true;
+      this.vaultTasksLoaded = true;
       this.scanError = "";
       this.updateNavCounts();
       this.plugin.setStatusCountsFromNotificationTasks(this.notificationTasks);
@@ -8449,6 +8479,12 @@ class NtfyManagerView extends ItemView {
       group.createEl("p", { cls: "obsidian-ntfy-error", text: `扫描失败: ${this.scanError}` });
       return;
     }
+    if (!this.notificationTasksLoaded) {
+      const loading = group.createDiv({ cls: "obsidian-ntfy-muted obsidian-ntfy-task-loading" });
+      setIcon(loading.createSpan({ cls: "obsidian-ntfy-task-loading-icon" }), "loader-circle");
+      loading.createSpan({ text: "正在加载提醒…" });
+      return;
+    }
     if (!this.notificationTasks.length) {
       group.createEl("p", { cls: "obsidian-ntfy-muted", text: "暂无带时间的待办提醒。" });
       return;
@@ -8609,6 +8645,12 @@ class NtfyManagerView extends ItemView {
 
   renderVaultTasks(containerEl) {
     const group = containerEl.createDiv({ cls: "obsidian-ntfy-section" });
+    if (!this.vaultTasksLoaded) {
+      const loading = group.createDiv({ cls: "obsidian-ntfy-muted obsidian-ntfy-task-loading" });
+      setIcon(loading.createSpan({ cls: "obsidian-ntfy-task-loading-icon" }), "loader-circle");
+      loading.createSpan({ text: "正在加载待办…" });
+      return;
+    }
     const groups = this.groupVaultTasks();
     this.renderTaskGroup(group, "有时间", groups.openTimed, 80);
     this.renderTaskGroup(group, "没时间", groups.openUntimed, 80);
@@ -8806,6 +8848,14 @@ class NtfyReminderSuggest extends EditorSuggest {
 
   renderSuggestion(suggestion, el) {
     el.addClass("obsidian-ntfy-suggest-item");
+    if (suggestion && suggestion.isLineBreak) {
+      const icon = el.createSpan({
+        cls: "obsidian-ntfy-suggest-line-break-icon",
+        attr: { title: "换行", "aria-label": "换行" },
+      });
+      setIcon(icon, "corner-down-left");
+      return;
+    }
     el.createEl("div", { cls: "obsidian-ntfy-suggest-title", text: suggestion.label });
     el.createEl("div", { cls: "obsidian-ntfy-suggest-note", text: `${suggestion.hint || "到期"} / ${suggestion.note}` });
   }
@@ -8819,9 +8869,12 @@ class NtfyReminderSuggest extends EditorSuggest {
       const editor = this.context.editor;
       const cursor = editor.getCursor();
       const currentLine = editor.getLine(cursor.line);
-      const indent = (currentLine.match(/^\s*/) || [""])[0];
-      editor.replaceRange(`\n${indent}`, cursor, cursor);
-      editor.setCursor({ line: cursor.line + 1, ch: indent.length });
+      const taskMatch = currentLine.match(/^(\s*)([-*+])\s+\[[^\]]\]/);
+      const indent = taskMatch ? taskMatch[1] : (currentLine.match(/^\s*/) || [""])[0];
+      const bullet = taskMatch ? taskMatch[2] : "-";
+      const nextLine = taskMatch ? `${indent}${bullet} [ ] ` : indent;
+      editor.replaceRange(`\n${nextLine}`, cursor, cursor);
+      editor.setCursor({ line: cursor.line + 1, ch: nextLine.length });
       this.close();
       return;
     }

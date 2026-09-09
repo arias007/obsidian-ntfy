@@ -185,7 +185,7 @@ async function run() {
   assert.match(source, /this\.tabPanels = new Map\(\)/);
   assert.match(source, /this\.ensureTabPanel\(this\.activeTab\)/);
   assert.match(source, /refreshTabInBackground\(tabId\)/);
-  assert.match(source, /if \(!dataChanged\) return false/);
+  assert.match(source, /if \(!dataChanged && wasLoaded\) return false/);
   assert.match(source, /return this\.syncTabPanels\(affectedTabs\)/);
   assert.match(source, /tab\.addEventListener\("click", \(\) => this\.activateTab\(id\)\)/);
   assert.doesNotMatch(source, /tab\.addEventListener\("click", async \(\) => \{\s*this\.activeTab = id;\s*await this\.render\(\)/);
@@ -216,7 +216,9 @@ async function run() {
   assert.match(source, /dateNeedsTimeTrigger = line\.match\(\/\[📅⏰\][\s\S]*?\(\\s\*\)\$\/u\)/);
   assert.match(source, /cursor\.ch - dateNeedsTimeTrigger\[1\]\.length/);
   assert.match(source, /getSuggestions\(context\)[\s\S]*?isLineBreak: true[\s\S]*?\.\.\.suggestions/);
-  assert.match(source, /selectSuggestion\(suggestion, event\)[\s\S]*?suggestion && suggestion\.isLineBreak[\s\S]*?replaceRange\(`\\n\$\{indent\}`/);
+  assert.match(source, /selectSuggestion\(suggestion, event\)[\s\S]*?suggestion && suggestion\.isLineBreak[\s\S]*?taskMatch[\s\S]*?nextLine = taskMatch[\s\S]*?replaceRange\(`\\n\$\{nextLine\}`/);
+  assert.match(source, /suggestion\.isLineBreak[\s\S]*?corner-down-left/);
+  assert.match(source, /!this\.vaultTasksLoaded[\s\S]*?正在加载待办/);
   assert.match(source, /selected conversation first[\s\S]*?this\.renderTabPanel\("inbox"\)[\s\S]*?markConversationRead/);
   assert.match(source, /Array\.isArray\(parsed\)[\s\S]*?\{ messages: parsed, source: "ui", dryRun \}/, "array preview must retain dryRun");
   assert.match(source, /insertText: ` \$\{plugin\.formatLocalDateTime\(due\)\.slice\(11\)\}`/);
