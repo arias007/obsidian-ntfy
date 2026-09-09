@@ -1227,6 +1227,13 @@
   -webkit-user-select: text;
   user-select: text;
 }
+
+.obsidian-ntfy-chat-load-older {
+  align-self: center;
+  flex: 0 0 auto;
+  margin-bottom: 4px;
+}
+
 .obsidian-ntfy-chat-date {
   align-self: center;
   color: var(--text-faint);

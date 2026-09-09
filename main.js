@@ -834,6 +834,13 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       (leaf) => new NtfyManagerView(leaf, this)
     );
 
+    // Keep the most-used todo view one click away in Obsidian's ribbon.
+    this.addRibbonIcon(
+      "list-checks",
+      this.uiText("打开 ntfy 待办管理", "Open ntfy task manager"),
+      () => this.openNtfyManager("tasks")
+    );
+
     this.addSettingTab(new AndroidNtfyNotifierSettingTab(this.app, this));
     if (typeof EditorSuggest === "function") {
       this.registerEditorSuggest(new NtfyReminderSuggest(this.app, this));
@@ -867,6 +874,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       id: "open-ntfy-manager",
       name: this.uiText("打开 ntfy 通知管理器", "Open ntfy notification manager"),
       callback: async () => this.openNtfyManager(),
+    });
+
+    this.addCommand({
+      id: "open-ntfy-task-manager",
+      name: this.uiText("打开 ntfy 待办管理", "Open ntfy task manager"),
+      callback: async () => this.openNtfyManager("tasks"),
     });
 
     this.addCommand({
@@ -941,10 +954,22 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     }));
 
     this.app.workspace.onLayoutReady(() => {
-      this.queueStatusCountRefresh();
-      this.runAutoScan();
-      this.runIncomingPoll();
-      void this.cleanupIncomingAttachments();
+      // Let Obsidian paint its first workspace before expensive vault scans,
+      // provider handshakes, and attachment maintenance compete for the UI.
+      const runDeferredStartupWork = () => {
+        if (this.isUnloading) return;
+        this.queueStatusCountRefresh();
+        void this.runAutoScan();
+        void this.runIncomingPoll();
+        void this.cleanupIncomingAttachments();
+      };
+      if (typeof window !== "undefined" && typeof window.requestIdleCallback === "function") {
+        window.requestIdleCallback(runDeferredStartupWork, { timeout: 2000 });
+      } else if (typeof window !== "undefined" && typeof window.setTimeout === "function") {
+        window.setTimeout(runDeferredStartupWork, 350);
+      } else {
+        runDeferredStartupWork();
+      }
       this.scheduleNextObsidianReminderNotice();
       if (typeof this.app.workspace.trigger === "function") {
         this.app.workspace.trigger("notification-hub:ready", this.api);
@@ -5661,18 +5686,23 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return changed;
   }
 
-  async openNtfyManager() {
+  async openNtfyManager(tabId = "pending") {
+    const requestedTab = ["pending", "completed", "tasks", "inbox"].includes(String(tabId))
+      ? String(tabId)
+      : "pending";
     const preload = await this.collectManagerViewData();
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_NTFY_MANAGER);
     let leaf = leaves[0];
     if (leaf && leaf.view && typeof leaf.view.setPreloadedData === "function") {
       leaf.view.setPreloadedData(preload);
+      if (typeof leaf.view.activateTab === "function") leaf.view.activateTab(requestedTab);
       await leaf.view.render();
       this.app.workspace.revealLeaf(leaf);
       return;
     }
 
     this.managerViewPreload = preload;
+    this.managerViewPreloadTab = requestedTab;
     if (!leaf) {
       leaf = this.app.workspace.getLeaf("tab");
       await leaf.setViewState({ type: VIEW_TYPE_NTFY_MANAGER, active: true });
@@ -5699,6 +5729,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const data = this.managerViewPreload || null;
     this.managerViewPreload = null;
     return data;
+  }
+
+  consumeManagerViewPreloadTab() {
+    const tabId = this.managerViewPreloadTab || "pending";
+    this.managerViewPreloadTab = null;
+    return tabId;
   }
 
   hasDestination() {
@@ -7106,6 +7142,9 @@ class NtfyManagerView extends ItemView {
     this.mobileConversationOpen = false;
     this.selectedConversationFiles = [];
     this.conversationDrafts = new Map();
+    this.conversationVisibleCounts = new Map();
+    this.conversationContactsCache = null;
+    this.inboxRefreshHandle = null;
     this.viewportCleanup = null;
     this.largeFileProviders = new Map();
   }
@@ -7127,6 +7166,8 @@ class NtfyManagerView extends ItemView {
       this.registerEvent(this.app.workspace.on("notification-hub:incoming", () => this.refreshIncomingView()));
       this.registerEvent(this.app.workspace.on("notification-hub:conversations-changed", () => this.refreshIncomingView()));
     }
+    const preloadTab = this.plugin.consumeManagerViewPreloadTab?.();
+    if (this.managerTabIds().includes(preloadTab)) this.activeTab = preloadTab;
     const preload = this.plugin.consumeManagerViewPreload();
     if (preload) this.setPreloadedData(preload);
     await this.render();
@@ -7135,6 +7176,11 @@ class NtfyManagerView extends ItemView {
   }
 
   async onClose() {
+    if (this.inboxRefreshHandle !== null && typeof window !== "undefined") {
+      window.cancelAnimationFrame?.(this.inboxRefreshHandle);
+      window.clearTimeout?.(this.inboxRefreshHandle);
+      this.inboxRefreshHandle = null;
+    }
     this.viewportCleanup?.();
     this.viewportCleanup = null;
     this.viewContentEl().empty();
@@ -7144,15 +7190,62 @@ class NtfyManagerView extends ItemView {
     this.tabScrollPositions.clear();
     this.tabRefreshes.clear();
     this.conversationDrafts.clear();
+    this.conversationVisibleCounts.clear();
+    this.conversationContactsCache = null;
   }
 
   refreshIncomingView() {
-    this.updateNavCounts();
-    this.syncTabPanels(["inbox"]);
+    // Providers can emit several events in one poll. Coalesce them into one
+    // paint and do not render an inactive inbox panel at all.
+    if (this.activeTab !== "inbox") {
+      this.updateNavCounts();
+      return;
+    }
+    if (this.inboxRefreshHandle !== null) return;
+    const flush = () => {
+      this.inboxRefreshHandle = null;
+      this.updateNavCounts();
+      if (this.activeTab === "inbox") this.syncTabPanels(["inbox"]);
+    };
+    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+      this.inboxRefreshHandle = window.requestAnimationFrame(flush);
+    } else if (typeof window !== "undefined" && typeof window.setTimeout === "function") {
+      this.inboxRefreshHandle = window.setTimeout(flush, 50);
+    } else {
+      flush();
+    }
   }
 
   viewContentEl() {
     return this.contentEl || this.containerEl.children[1] || this.containerEl;
+  }
+
+  conversationContacts() {
+    const settings = this.plugin.settings || {};
+    const messages = settings.conversationMessages || [];
+    const preferences = settings.conversationPreferences || {};
+    const channels = settings.channelAccounts || [];
+    const health = settings.channelHealth || {};
+    const added = settings.addedChannelIds || [];
+    const cached = this.conversationContactsCache;
+    if (cached
+      && cached.messages === messages
+      && cached.preferences === preferences
+      && cached.channels === channels
+      && cached.health === health
+      && cached.added === added
+      && cached.socialHubEnabled === settings.socialHubEnabled) return cached.value;
+    const value = this.plugin.conversationContacts();
+    this.conversationContactsCache = {
+      messages,
+      preferences,
+      channels,
+      health,
+      added,
+      socialHubEnabled: settings.socialHubEnabled,
+      value,
+    };
+    return value;
   }
 
   installViewportSizing() {
@@ -7289,10 +7382,26 @@ class NtfyManagerView extends ItemView {
     let value = null;
     if (tabId === "pending") value = { tasks: this.notificationTasks, scanError: this.scanError };
     else if (tabId === "completed" || tabId === "tasks") value = this.vaultTasks;
-    else if (tabId === "inbox") value = {
-      messages: this.plugin.settings.conversationMessages || [],
-      preferences: this.plugin.settings.conversationPreferences || {},
-    };
+    else if (tabId === "inbox") {
+      const messages = this.plugin.settings.conversationMessages || [];
+      // Fingerprint only fields that affect the manager paint. Avoid
+      // serializing full bodies/attachments when the store is large.
+      const sample = messages.length <= 96
+        ? messages
+        : [...messages.slice(0, 2), ...messages.slice(-94)];
+      value = {
+        count: messages.length,
+        sample: sample.map((message) => [
+          message.id,
+          message.direction,
+          message.status,
+          message.timestamp,
+          message.text?.length || 0,
+          (message.attachments || []).map((attachment) => `${attachment.path || attachment.url || attachment.downloadKey || ""}:${attachment.downloadState || ""}`),
+        ]),
+        preferences: this.plugin.settings.conversationPreferences || {},
+      };
+    }
     else if (tabId === "queue") value = { queue: this.plugin.settings.queue || [], notices: this.plugin.settings.obsidianNotices || [] };
     else if (tabId === "connections") value = { channels: this.plugin.settings.channelAccounts || [], logs: this.plugin.settings.connectionLogs || [] };
     try {
@@ -7405,11 +7514,11 @@ class NtfyManagerView extends ItemView {
     this.renderNavItem(nav, "pending", "alarm-clock", "待处理", this.notificationTasks.length);
     this.renderNavItem(nav, "completed", "check-check", "已完成", taskGroups.done.length);
     this.renderNavItem(nav, "tasks", "library", "整库待办", taskGroups.openUntimed.length);
-    this.renderNavItem(nav, "inbox", "messages-square", "消息", this.plugin.conversationContacts().reduce((sum, contact) => sum + contact.unread, 0));
+    this.renderNavItem(nav, "inbox", "messages-square", "消息", this.conversationContacts().reduce((sum, contact) => sum + contact.unread, 0));
   }
 
   renderIncomingMessages(containerEl) {
-    const contacts = this.plugin.conversationContacts();
+    const contacts = this.conversationContacts();
     const compact = typeof window !== "undefined" && window.matchMedia && window.matchMedia("(max-width: 600px)").matches;
     if (this.activeConversationId && !contacts.some((contact) => contact.id === this.activeConversationId)) this.activeConversationId = "";
     if (!this.activeConversationId && contacts.length && !compact) this.activeConversationId = contacts[0].id;
@@ -7492,7 +7601,21 @@ class NtfyManagerView extends ItemView {
     });
 
     const messageList = conversation.createDiv({ cls: "obsidian-ntfy-chat-messages" });
-    const messages = this.plugin.conversationMessagesFor(active);
+    const allMessages = this.plugin.conversationMessagesFor(active);
+    const visibleLimit = Math.max(100, Number(this.conversationVisibleCounts.get(active.id) || 240));
+    const firstVisibleIndex = Math.max(0, allMessages.length - visibleLimit);
+    const messages = allMessages.slice(firstVisibleIndex);
+    if (firstVisibleIndex > 0) {
+      const loadOlder = messageList.createEl("button", {
+        cls: "obsidian-ntfy-button obsidian-ntfy-button-secondary obsidian-ntfy-chat-load-older",
+        text: this.uiText(`加载更早消息（还有 ${firstVisibleIndex} 条）`, `Load older messages (${firstVisibleIndex} remaining)`),
+        attr: { type: "button" },
+      });
+      loadOlder.addEventListener("click", () => {
+        this.conversationVisibleCounts.set(active.id, visibleLimit + 240);
+        this.renderTabPanel("inbox");
+      });
+    }
     if (!messages.length) {
       const empty = messageList.createDiv({ cls: "obsidian-ntfy-chat-empty is-compact" });
       setIcon(empty.createSpan(), active.icon || "message-circle");
@@ -7543,8 +7666,8 @@ class NtfyManagerView extends ItemView {
       });
     }
 
-    // New conversations should open at the newest message. The second pass
-    // accounts for attachment/layout measurements that settle after render.
+    // New conversations should open at the newest message. One animation
+    // frame is enough; delayed repeated scrolls made the message page jank.
     const alignToLatest = () => {
       if (!messageList.isConnected) return;
       messageList.scrollTop = messageList.scrollHeight;
@@ -7553,9 +7676,6 @@ class NtfyManagerView extends ItemView {
       alignToLatest();
       if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
         window.requestAnimationFrame(alignToLatest);
-      }
-      if (typeof window !== "undefined" && typeof window.setTimeout === "function") {
-        window.setTimeout(alignToLatest, 120);
       }
     };
 
@@ -7827,7 +7947,7 @@ class NtfyManagerView extends ItemView {
       if (id === "pending") badge.textContent = String(this.notificationTasks.length);
       if (id === "completed") badge.textContent = String(taskGroups.done.length);
       if (id === "tasks") badge.textContent = String(taskGroups.openUntimed.length);
-      if (id === "inbox") badge.textContent = String(this.plugin.conversationContacts().reduce((sum, contact) => sum + contact.unread, 0));
+      if (id === "inbox") badge.textContent = String(this.conversationContacts().reduce((sum, contact) => sum + contact.unread, 0));
     });
   }
 
@@ -8580,8 +8700,10 @@ class NtfyReminderSuggest extends EditorSuggest {
     const taskLine = /^\s*[-*+]\s+\[[^\]]\]/.test(line);
     const emojiTrigger = line.match(/(?:📅|⏰|➕|⏲)\s*$/u);
     const dateNeedsTimeTrigger = line.match(/[📅⏰]\s*\d{4}-\d{2}-\d{2}(\s*)$/u);
-    const taskTextTrigger = taskLine && /[\p{L}\p{N}\u4e00-\u9fff]$/u.test(line) && !/[📅⏰]\s*\d{4}-\d{2}-\d{2}/u.test(line);
-    if (!match && !(taskLine && emojiTrigger) && !taskTextTrigger && !dateNeedsTimeTrigger) return null;
+    // Do not open a suggestion popup for every ordinary task line. It steals
+    // the first Enter key and makes the next line look like another todo.
+    // Explicit ntfy keywords, Tasks emojis, and date-only lines still work.
+    if (!match && !(taskLine && emojiTrigger) && !dateNeedsTimeTrigger) return null;
     const trigger = match ? match[1] : emojiTrigger ? emojiTrigger[0].trim() : "";
     return {
       start: {
@@ -8634,6 +8756,9 @@ class NtfyReminderSuggest extends EditorSuggest {
   selectSuggestion(suggestion, event) {
     if (!this.context) return;
     if (String(event && event.key || "").toLowerCase() === "enter") {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      event.stopImmediatePropagation?.();
       const editor = this.context.editor;
       const cursor = editor.getCursor();
       const currentLine = editor.getLine(cursor.line);

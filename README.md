@@ -4,6 +4,13 @@ This is a lightweight Obsidian plugin for ntfy notifications and optional AI web
 
 Why ntfy: Obsidian mobile plugins cannot directly create Android system notifications. This plugin sends reminders to an ntfy topic, and the Android ntfy app shows the notification in the system notification shade.
 
+## 1.4.0
+
+- Added an Obsidian ribbon/command entry that opens the ntfy task manager directly on `整库待办`.
+- Ordinary todo lines no longer trigger a reminder popup, so the first Enter creates a normal new line without spawning a second todo suggestion.
+- Coalesced message refreshes, reduced message fingerprint work, and render only the newest message window first; older history remains available with `加载更早消息`.
+- Deferred the first vault scan, provider polling, and attachment cleanup until Obsidian has painted its initial workspace.
+
 ## Requirements
 
 1. Install the Android app `ntfy`.
