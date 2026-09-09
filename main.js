@@ -816,6 +816,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.isUnloading = false;
     this.api = this.createNotificationHubApi();
     this.isScanning = false;
+    // Do not start a full-vault status scan while Obsidian is still painting
+    // its initial workspace. The first status label is cheap; the detailed
+    // counts are populated after layout-ready startup work begins.
+    this.isLayoutReady = false;
+    this.statusCountRefreshPending = false;
     this.lastReminderScanFiles = new Set();
     this.doneDateWriteGuards = new Set();
     this.doneDateTimers = new Map();
@@ -954,14 +959,23 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     }));
 
     this.app.workspace.onLayoutReady(() => {
+      this.isLayoutReady = true;
+      this.statusCountRefreshPending = false;
       // Let Obsidian paint its first workspace before expensive vault scans,
       // provider handshakes, and attachment maintenance compete for the UI.
       const runDeferredStartupWork = () => {
         if (this.isUnloading) return;
-        this.queueStatusCountRefresh();
-        void this.runAutoScan();
+        const scanPromise = this.runAutoScan();
         void this.runIncomingPoll();
         void this.cleanupIncomingAttachments();
+        // A successful reminder scan already has the exact data needed for
+        // the status bar. Only fall back to a second read when scanning is
+        // disabled or could not run (for example, no destination configured).
+        Promise.resolve(scanPromise).catch((error) => {
+          console.warn(`${PLUGIN_NAME}: deferred startup scan failed`, error);
+        }).finally(() => {
+          if (!this.isUnloading && !this.statusCounts) this.queueStatusCountRefresh();
+        });
       };
       if (typeof window !== "undefined" && typeof window.requestIdleCallback === "function") {
         window.requestIdleCallback(runDeferredStartupWork, { timeout: 2000 });
@@ -994,9 +1008,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
   runAutoScan() {
     if (!this.settings.autoScanEnabled) {
       this.updateStatusCount("auto off");
-      return;
+      return Promise.resolve({ status: "auto off" });
     }
-    this.scanAndSchedule({ showNotice: false });
+    return this.scanAndSchedule({ showNotice: false });
   }
 
   clearDailyBatchScan() {
@@ -1016,9 +1030,19 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   queueStatusCountRefresh(file) {
     if (file && file.extension !== "md") return;
+    if (!this.isLayoutReady) {
+      this.statusCountRefreshPending = true;
+      return;
+    }
     this.clearStatusCountRefresh();
     this.statusCountTimer = window.setTimeout(() => {
       this.statusCountTimer = null;
+      if (this.isScanning) {
+        // The active reminder scan will publish exact counts when it finishes;
+        // avoid a second full-vault read competing with that scan.
+        this.queueStatusCountRefresh();
+        return;
+      }
       this.refreshStatusCounts().catch((error) => console.warn(`${PLUGIN_NAME}: status count refresh failed`, error));
     }, 800);
   }
@@ -5858,9 +5882,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     await this.saveSettings();
     this.isScanning = false;
 
-    const cacheCount = Object.keys(this.settings.sent || {}).length;
-    this.updateStatusCount(failed ? `(${failed} fail)` : "");
-    this.queueStatusCountRefresh();
+    // Reuse this scan's reminder list for the status bar instead of starting
+    // another full-vault read immediately after every scan.
+    this.clearStatusCountRefresh();
+    this.statusCountRefreshId = (this.statusCountRefreshId || 0) + 1;
+    this.setStatusCountsFromNotificationTasks(reminders, failed ? `(${failed} fail)` : "");
 
     if (showNotice) {
       new Notice(`${PLUGIN_NAME}: ${scheduled} sent/scheduled, ${queued} queued, ${skipped} skipped, ${failed} failed`);
