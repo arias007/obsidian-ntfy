@@ -11,6 +11,13 @@ Why ntfy: Obsidian mobile plugins cannot directly create Android system notifica
 - Coalesced message refreshes, reduced message fingerprint work, and render only the newest message window first; older history remains available with `加载更早消息`.
 - Deferred the first vault scan, provider polling, and attachment cleanup until Obsidian has painted its initial workspace.
 
+## 1.4.1
+
+- Opening a conversation now renders immediately; read-state persistence runs in the background to reduce message-page delay.
+- The first todo suggestion is an icon-only line-break action that preserves the current task marker and restores the next-line todo box.
+- The todo manager shows an explicit loading state and reuses its in-memory task cache, avoiding a transient empty list on first open.
+- Startup scanning and manager refresh work is deferred or reused to reduce Obsidian launch overhead.
+
 ## Requirements
 
 1. Install the Android app `ntfy`.
