@@ -5690,18 +5690,20 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const requestedTab = ["pending", "completed", "tasks", "inbox"].includes(String(tabId))
       ? String(tabId)
       : "pending";
-    const preload = await this.collectManagerViewData();
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_NTFY_MANAGER);
     let leaf = leaves[0];
     if (leaf && leaf.view && typeof leaf.view.setPreloadedData === "function") {
-      leaf.view.setPreloadedData(preload);
+      // Show the existing manager immediately. Refresh data in the background
+      // instead of blocking the click on a full-vault scan.
       if (typeof leaf.view.activateTab === "function") leaf.view.activateTab(requestedTab);
       await leaf.view.render();
       this.app.workspace.revealLeaf(leaf);
       return;
     }
 
-    this.managerViewPreload = preload;
+    // The new view paints an empty shell first, then fills its active panel
+    // from the same background preload path used by an already-open view.
+    this.managerViewPreload = { notificationTasks: [], vaultTasks: [], scanError: "" };
     this.managerViewPreloadTab = requestedTab;
     if (!leaf) {
       leaf = this.app.workspace.getLeaf("tab");
