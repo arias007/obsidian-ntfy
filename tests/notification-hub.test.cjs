@@ -215,7 +215,9 @@ async function run() {
   assert.match(source, /onChooseSuggestion\(suggestion\)[\s\S]*?replaceRange\([\s\S]*?setCursor\(/);
   assert.match(source, /dateNeedsTimeTrigger = line\.match\(\/\[📅⏰\][\s\S]*?\(\\s\*\)\$\/u\)/);
   assert.match(source, /cursor\.ch - dateNeedsTimeTrigger\[1\]\.length/);
-  assert.match(source, /selectSuggestion\(suggestion, event\)[\s\S]*?event\.key[\s\S]*?replaceRange\(`\\n\$\{indent\}`/);
+  assert.match(source, /getSuggestions\(context\)[\s\S]*?isLineBreak: true[\s\S]*?\.\.\.suggestions/);
+  assert.match(source, /selectSuggestion\(suggestion, event\)[\s\S]*?suggestion && suggestion\.isLineBreak[\s\S]*?replaceRange\(`\\n\$\{indent\}`/);
+  assert.match(source, /selected conversation first[\s\S]*?this\.renderTabPanel\("inbox"\)[\s\S]*?markConversationRead/);
   assert.match(source, /Array\.isArray\(parsed\)[\s\S]*?\{ messages: parsed, source: "ui", dryRun \}/, "array preview must retain dryRun");
   assert.match(source, /insertText: ` \$\{plugin\.formatLocalDateTime\(due\)\.slice\(11\)\}`/);
   assert.match(source, /openDateTimePicker\(dueValue, onSave\)/);

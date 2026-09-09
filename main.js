@@ -7595,12 +7595,20 @@ class NtfyManagerView extends ItemView {
       const meta = row.createSpan({ cls: "obsidian-ntfy-chat-contact-meta" });
       if (contact.latest) meta.createSpan({ text: this.chatTime(contact.latest.timestamp) });
       if (contact.unread) meta.createSpan({ cls: "obsidian-ntfy-chat-unread", text: String(Math.min(99, contact.unread)) });
-      row.addEventListener("click", async () => {
+      row.addEventListener("click", () => {
         this.activeConversationId = contact.id;
         this.mobileConversationOpen = true;
         this.selectedConversationFiles = [];
-        await this.plugin.markConversationRead(contact.id);
+        // Paint the selected conversation first. Persisting the read marker
+        // writes the whole settings payload and must not block the first view.
         this.renderTabPanel("inbox");
+        const persistRead = () => {
+          void this.plugin.markConversationRead(contact.id).catch((error) => {
+            console.warn(`${PLUGIN_NAME}: failed to mark conversation read`, error);
+          });
+        };
+        if (typeof window !== "undefined" && typeof window.setTimeout === "function") window.setTimeout(persistRead, 0);
+        else persistRead();
       });
     }
 
@@ -8757,7 +8765,22 @@ class NtfyReminderSuggest extends EditorSuggest {
 
   getSuggestions(context) {
     const line = context.editor.getLine(context.start.line);
-    return ntfyReminderSuggestions(this.plugin, line);
+    const suggestions = ntfyReminderSuggestions(this.plugin, line);
+    // For a Tasks todo, keep the first choice as a deliberate line break.
+    // Enter on that first row creates the next line; moving down to a real
+    // reminder and pressing Enter now selects the reminder instead.
+    if (/^\s*[-*+]\s+\[[^\]]\]/.test(line)) {
+      return [
+        {
+          label: "换行",
+          hint: "新建下一行",
+          note: "Enter",
+          isLineBreak: true,
+        },
+        ...suggestions,
+      ];
+    }
+    return suggestions;
   }
 
   suggestion(label, due, hint) {
@@ -8789,7 +8812,7 @@ class NtfyReminderSuggest extends EditorSuggest {
 
   selectSuggestion(suggestion, event) {
     if (!this.context) return;
-    if (String(event && event.key || "").toLowerCase() === "enter") {
+    if (suggestion && suggestion.isLineBreak) {
       event.preventDefault?.();
       event.stopPropagation?.();
       event.stopImmediatePropagation?.();
