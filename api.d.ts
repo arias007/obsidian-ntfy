@@ -239,16 +239,6 @@ export interface NotificationHubApi {
   };
   notifications: Record<string, (...args: any[]) => any>;
   reminders: Record<string, (...args: any[]) => any>;
-  lan: {
-    status(): Record<string, unknown>;
-    peers(): Array<Record<string, unknown>>;
-    activity(): Record<string, unknown>;
-    requestSync(): { ok: boolean; status: string };
-    sendMessage(deviceId: string, input: Record<string, unknown>): Promise<unknown>;
-    sendFile(deviceId: string, vaultPath: string): Promise<unknown>;
-    sendDeviceFile(deviceId: string, input: { name: string; type?: string; data: ArrayBuffer }): Promise<ConversationAttachment>;
-    cleanupInbox(): Promise<{ removed: number; checked: number }>;
-  };
   events: {
     readonly names: readonly string[];
     on(event: string, callback: (...args: any[]) => void): () => boolean;

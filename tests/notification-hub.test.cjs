@@ -225,8 +225,11 @@ async function run() {
   assert.equal(plugin.settings.backgroundReceiveEnabled, true);
   assert.equal(plugin.settings.showObsidianReminderNotices, true);
   assert.deepEqual(plugin.settings.channelHealth, {});
-  assert.equal(plugin.settings.lanSyncLargeFileMode, "wormhole");
-  assert.equal(plugin.settings.lanSyncSharedSecret, "");
+  assert.equal(plugin.settings.largeFileMode, "wormhole");
+  assert.equal(Object.keys(plugin.settings).some((key) => /^lanSync|^lanInbox/.test(key)), false);
+  const legacySettingsPlugin = createPlugin({ lanSyncLargeFileMode: "wormhole", lanSyncPort: 43190, lanInboxRetentionHours: 168 });
+  assert.equal(legacySettingsPlugin.settings.largeFileMode, "wormhole");
+  assert.equal(Object.keys(legacySettingsPlugin.settings).some((key) => /^lanSync|^lanInbox/.test(key)), false);
   assert.equal(typeof plugin.largeFileTransferPolicy, "function");
   assert.equal(plugin.largeFileTransferPolicy(50 * 1024 * 1024).mode, "ntfy");
   assert.equal(plugin.largeFileTransferPolicy(50 * 1024 * 1024 + 1).reason, "wormhole_noteweb_required");
@@ -246,7 +249,7 @@ async function run() {
   assert.equal(typeof conversationApi.messages.poll, "function");
   assert.equal(typeof conversationApi.messages.registerHandler, "function");
   assert.equal(typeof conversationApi.messages.unregisterHandler, "function");
-  assert.equal(typeof conversationApi.lan.requestSync, "function");
+  assert.equal("lan" in conversationApi, false);
   assert.equal(typeof conversationApi.events.on, "function");
   assert.equal(Object.hasOwn(conversationApi.channels.list()[0], "config"), false, "public channels must not expose credential-bearing config");
   assert.equal(JSON.stringify(conversationApi.getAgentConnectionInfo()).includes("agent-secret-must-not-leak"), false, "public API setup info must not expose the Agent token");
@@ -1065,7 +1068,7 @@ async function run() {
   assert.equal(ntfyAttachmentRequests[1].headers.Authorization, "Bearer attachment-token");
   await ntfyAttachmentPlugin.openConversationAttachment("ntfy-file-1", downloadedNtfyAttachment.path);
   assert.deepEqual(ntfyAttachmentVault.opened, [downloadedNtfyAttachment.path]);
-  assert.deepEqual(await ntfyAttachmentPlugin.cleanupLanInboxAttachments(), { removed: 0, checked: 0, disabled: true });
+  assert.deepEqual(await ntfyAttachmentPlugin.cleanupIncomingAttachments(), { removed: 0, checked: 0, disabled: true });
 
   const additionalTelegramPlugin = createPlugin({ topic: "multi-receive" });
   await additionalTelegramPlugin.addChannelToSettings("telegram", { accountId: "work", name: "Work Telegram" });

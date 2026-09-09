@@ -39,30 +39,13 @@ The original Chinese/English UI remains the complete baseline. Other languages c
 - Switching tabs shows cached content immediately, then refreshes that tab in the background.
 - Unchanged background results do not rebuild the visible list.
 
-## Automatic Nearby Vault Synchronization
-
-Nearby synchronization is enabled by default. Devices that share the same vault identity discover each other automatically through existing private IP interfaces and transfer files directly while the normal notification channels continue running. The plugin only reads existing interfaces; it never enables or changes Windows networking.
-
-- The default bidirectional mode keeps the most recently edited version at the original path and never creates renamed conflict copies.
-- Four additional mutually exclusive modes are available: incremental push, incremental pull, deletion push, and deletion pull.
-- Discovery covers Ethernet/LAN, Wi-Fi, phone hotspots, Bluetooth PAN/network tethering, and USB/RNDIS tethering. Bluetooth must already expose a private IP network; generic BLE/OBEX is intentionally not claimed as a high-speed Vault transport.
-- Private IPv4 peers can be entered manually for hotspots or USB links that block broadcast discovery. Public hosts, hostnames, URLs, and arbitrary ports are rejected before any connection attempt; the endpoint is bound to a real device ID only after the encrypted same-vault ping succeeds.
-- The full Vault is synchronized by default, including safe configuration files. Workspace state, LAN identity, Remotely Save data, caches, `.git`, `node_modules`, and the managed LAN inbox remain excluded. Desktop and mobile can both initiate manual and change-driven synchronization. File events are written to a durable path journal and survive plugin reloads; startup uses the last successful checkpoint to select only later changes from Obsidian's in-memory index. The last complete path/mtime/size manifest is also persisted, so even an older peer's full-list request refreshes only dirty paths instead of walking the filesystem. A disk-wide calibration runs in the background only as a daily fallback, when the index is invalid, or when requested manually; newly created or edited paths retain their real-time synchronization lane while that calibration is running.
-- The live check interval is configurable from 10 seconds to 1 hour, the per-file limit from 1 to 512 MB, and unchanged files reuse a persistent metadata-to-hash cache. A file that changes during transfer is deferred to the incremental retry queue without stopping unrelated files or restarting the full scan.
-- Rolling upgrades keep synchronization active: peers advertise v4 and the compatible v3 metadata session, negotiate the newest shared route, and reserve a blocking upgrade state for protocols that cannot safely exchange the original-path ledger.
-- Bidirectional conflicts use the latest modification time by default; the LAN settings can switch the winner to the larger file. The progress panel has an immediate scan-and-sync button, separate completed/total upload and download counters, and collapsed top-level folder groups for both scan and transfer activity.
-- Small files use a bounded 12-worker transfer pool, medium files use 8 workers, and large files remain capped at 6 concurrent transfers to improve LAN throughput without destabilizing mobile memory.
-- While a peer is connected, the status bar shows only a link icon (Wi-Fi, hotspot, Bluetooth, or USB) and live `completed/total` progress. It may temporarily use the Remotely Save status slot without changing Remotely Save settings or background execution.
-- Clicking the link progress opens live file activity. Existing Markdown notes can be opened directly from that view.
-- The previous Cancip LAN identity is copied on first migration when available, allowing devices to be upgraded one at a time. The old file is not deleted.
-
 ## Unified Message Center
 
-The manager's message tab uses a contact-and-conversation layout for configured ntfy, Feishu, other receive-capable channels, and authenticated nearby peers.
+The manager's message tab uses a contact-and-conversation layout for configured ntfy, Feishu, and other receive-capable channels.
 
 - Incoming and outgoing messages share a persistent conversation history with unread counts, pinning, mute controls, clear conversation, delete message, delivery status, retry, and file attachment actions.
-- The inbox only lists enabled, configured, and currently usable channels or authenticated nearby peers; disabled, unconfigured, failed, and offline connections stay out of the friend list.
-- Nearby peers show their private IP and detected link type. LAN messages and Vault files use the same encrypted authenticated channel as synchronization. Received ntfy, Feishu, and LAN files are downloaded and verified in the background, then opened from their local Vault path instead of a browser URL. Users choose the managed inbox folder, whether cleanup runs, its interval and retention time, and the permanent Save to Vault folder.
+- The inbox only lists enabled, configured, and currently usable channels; disabled, unconfigured, failed, and offline connections stay out of the friend list.
+- Received ntfy and Feishu files are downloaded and verified in the background, then opened from their local Vault path instead of a browser URL. Users choose the managed inbox folder, whether cleanup runs, its interval and retention time, and the permanent Save to Vault folder.
 - ntfy binary uploads and Feishu App file messages can send Vault files directly. Webhook-only channels remain text/URL-only so the UI never reports a local file as uploaded when the provider cannot accept it.
 - Each conversation keeps its message area scrollable while the text/file composer remains docked at the bottom for friend-style messaging.
 
@@ -214,7 +197,7 @@ For long-term reminders, keep them in the local queue and let later scans hand t
 
 ## Development
 
-The plugin ships as readable JavaScript. The LAN engine is maintained in TypeScript and embedded into `main.js` before checks and release packaging. Run the complete build and source checks with:
+The plugin ships as readable JavaScript. Run the complete build and source checks with:
 
 ```bash
 npm install
@@ -365,7 +348,7 @@ const unregister = hub?.registerIncomingHandler("cancip", async (message, contex
 
 If Cancip loads before Ntfy Notifications, it can listen for the workspace event `notification-hub:ready` and register when the API becomes available. Every accepted message also emits `notification-hub:incoming` for lightweight observers; the configured incoming consumer remains the authoritative model/session handler.
 
-The public API keeps the original flat methods and adds stable namespaces: `conversations`, `messages`, `channels`, `notifications`, `reminders`, `lan`, `events`, and `manager`. Other plugins can use either `app.plugins.plugins["android-ntfy-notifier"].api` or `app.plugins.getPlugin?.("android-ntfy-notifier")?.getApi?.()`. Public results are defensive copies, and public Channel descriptors omit credential-bearing configuration. The TypeScript contract is documented in [`api.d.ts`](api.d.ts).
+The public API keeps the original flat methods and adds stable namespaces: `conversations`, `messages`, `channels`, `notifications`, `reminders`, `events`, and `manager`. Other plugins can use either `app.plugins.plugins["android-ntfy-notifier"].api` or `app.plugins.getPlugin?.("android-ntfy-notifier")?.getApi?.()`. Public results are defensive copies, and public Channel descriptors omit credential-bearing configuration. The TypeScript contract is documented in [`api.d.ts`](api.d.ts).
 
 Chat history import accepts an array, one group-chat object, or `{ conversations: [...] }`. A Channel is optional: common fields such as `chatName`/`groupName`, `members`/`participants`, `author`/`sender`, `content`/`text`, and `time`/`timestamp` are normalized automatically. Top-level group information is applied to every message. Imports merge by source, conversation, message ID, and direction and never overwrite an existing message. Use `dryRun` to validate first. Messages without an ID receive a deterministic content-derived ID so repeated imports remain idempotent.
 

@@ -1,14 +1,13 @@
 {
   "name": "obsidian-ntfy",
-  "version": "1.3.9",
+  "version": "1.3.10",
   "private": true,
   "description": "Mobile notifications and a bidirectional channel hub for Obsidian.",
   "license": "MIT",
   "scripts": {
-    "build": "node scripts/build-lan-runtime.mjs && npm test && npm run check",
+    "build": "npm test && npm run check",
     "check": "node --check main.js",
-    "test": "node tests/notification-hub.test.cjs && node scripts/verify-lan-sync.mjs",
-    "verify:lan-sync": "node scripts/verify-lan-sync.mjs"
+    "test": "node tests/notification-hub.test.cjs"
   },
   "devDependencies": {
     "esbuild": "^0.25.8"
