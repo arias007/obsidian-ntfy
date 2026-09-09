@@ -7197,6 +7197,7 @@ class NtfyManagerView extends ItemView {
   refreshIncomingView() {
     // Providers can emit several events in one poll. Coalesce them into one
     // paint and do not render an inactive inbox panel at all.
+    this.conversationContactsCache = null;
     if (this.activeTab !== "inbox") {
       this.updateNavCounts();
       return;
@@ -7205,7 +7206,12 @@ class NtfyManagerView extends ItemView {
     const flush = () => {
       this.inboxRefreshHandle = null;
       this.updateNavCounts();
-      if (this.activeTab === "inbox") this.syncTabPanels(["inbox"]);
+      if (this.activeTab === "inbox") {
+        // The event itself is the invalidation signal. This also catches an
+        // edit/delete outside the lightweight signature sample.
+        this.tabSignatures.delete("inbox");
+        this.syncTabPanels(["inbox"]);
+      }
     };
     if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
       this.inboxRefreshHandle = window.requestAnimationFrame(flush);
