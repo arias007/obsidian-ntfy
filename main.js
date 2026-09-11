@@ -978,11 +978,25 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
           this.snapshotTaskCompletionFile(file).catch((error) => console.warn(`${PLUGIN_NAME}: failed to snapshot opened task file`, error));
         }
       }));
+      this.registerEvent(this.app.workspace.on("active-leaf-change", () => {
+        const file = typeof this.app.workspace.getActiveFile === "function"
+          ? this.app.workspace.getActiveFile()
+          : null;
+        if (file instanceof TFile) {
+          this.snapshotTaskCompletionFile(file).catch((error) => console.warn(`${PLUGIN_NAME}: failed to snapshot active task file`, error));
+        }
+      }));
     }
 
     this.app.workspace.onLayoutReady(() => {
       this.isLayoutReady = true;
       this.statusCountRefreshPending = false;
+      const activeFile = typeof this.app.workspace.getActiveFile === "function"
+        ? this.app.workspace.getActiveFile()
+        : null;
+      if (activeFile instanceof TFile) {
+        this.snapshotTaskCompletionFile(activeFile).catch((error) => console.warn(`${PLUGIN_NAME}: failed to snapshot initial task file`, error));
+      }
       // Let Obsidian paint its first workspace before expensive vault scans,
       // provider handshakes, and attachment maintenance compete for the UI.
       const runDeferredStartupWork = () => {
