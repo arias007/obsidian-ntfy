@@ -796,7 +796,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.settings = this.normalizeSettings(storedSettings);
     this.localReminderTimer = null;
     this.isQueueHandoffRunning = false;
-    this.managerViewCache = null;
+    this.managerViewCache = this.loadManagerViewCache();
+    this.managerViewCacheWriteTimer = null;
+    this.taskCacheRefreshId = 0;
     if (!this.settings.agentProtocolToken) {
       this.settings.agentProtocolToken = this.generateLocalToken();
     }
@@ -995,6 +997,11 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   onunload() {
     this.isUnloading = true;
+    if (this.managerViewCacheWriteTimer && typeof window !== "undefined") {
+      window.clearTimeout(this.managerViewCacheWriteTimer);
+      this.managerViewCacheWriteTimer = null;
+      this.persistManagerViewCache(this.managerViewCache);
+    }
     this.closeIncomingSockets();
     for (const session of this.notewebWormholeSessions?.values?.() || []) this.disposeNotewebBackgroundSurface(session?.surface);
     this.notewebWormholeSessions?.clear?.();
@@ -5763,10 +5770,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       notificationTasks: [],
       vaultTasks: [],
       scanError: "",
+      notificationTasksLoaded: false,
+      vaultTasksLoaded: false,
     };
     try {
       data.notificationTasks = await this.collectNotificationTasks();
       data.vaultTasks = await this.collectVaultTasks();
+      data.notificationTasksLoaded = true;
+      data.vaultTasksLoaded = true;
     } catch (error) {
       data.scanError = error.message || String(error);
     }
@@ -5783,6 +5794,96 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const tabId = this.managerViewPreloadTab || "pending";
     this.managerViewPreloadTab = null;
     return tabId;
+  }
+
+  loadManagerViewCache() {
+    if (typeof window === "undefined" || !window.localStorage) return null;
+    try {
+      const raw = window.localStorage.getItem(this.managerViewCacheStorageKey());
+      const parsed = JSON.parse(String(raw || ""));
+      if (!parsed || !Array.isArray(parsed.notificationTasks) || !Array.isArray(parsed.vaultTasks)) return null;
+      const reviveDate = (value) => {
+        if (!value) return null;
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? null : date;
+      };
+      const reviveNotification = (task) => Object.assign({}, task, { due: reviveDate(task.due) });
+      const reviveVault = (task) => Object.assign({}, task, {
+        due: reviveDate(task.due),
+        doneAt: reviveDate(task.doneAt),
+      });
+      this.managerViewCache = {
+        notificationTasks: parsed.notificationTasks.map(reviveNotification),
+        vaultTasks: parsed.vaultTasks.map(reviveVault),
+        scanError: String(parsed.scanError || ""),
+        notificationTasksLoaded: parsed.notificationTasksLoaded !== false,
+        vaultTasksLoaded: parsed.vaultTasksLoaded !== false,
+      };
+      return this.managerViewCache;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  scheduleManagerViewCacheSave(cache = this.managerViewCache) {
+    if (!cache || typeof window === "undefined" || !window.localStorage) return;
+    if (this.managerViewCacheWriteTimer) window.clearTimeout(this.managerViewCacheWriteTimer);
+    this.managerViewCacheWriteTimer = window.setTimeout(() => {
+      this.managerViewCacheWriteTimer = null;
+      this.persistManagerViewCache(cache);
+    }, 120);
+  }
+
+  managerViewCacheStorageKey() {
+    const basePath = this.app?.vault?.adapter?.getBasePath?.();
+    const vaultName = this.app?.vault?.getName?.();
+    const identity = String(basePath || vaultName || "default").replace(/\\/g, "/").toLowerCase();
+    return `android-ntfy-notifier.manager-view-cache:${identity}`;
+  }
+
+  persistManagerViewCache(cache = this.managerViewCache) {
+    if (!cache || typeof window === "undefined" || !window.localStorage) return;
+    const compact = {
+      notificationTasks: (cache.notificationTasks || []).map((task) => Object.assign({}, task, {
+        due: task.due instanceof Date ? task.due.toISOString() : task.due,
+        text: String(task.text || "").slice(0, 1000),
+      })),
+      vaultTasks: (cache.vaultTasks || []).map((task) => Object.assign({}, task, {
+        due: task.due instanceof Date ? task.due.toISOString() : task.due,
+        doneAt: task.doneAt instanceof Date ? task.doneAt.toISOString() : task.doneAt,
+        text: String(task.text || "").slice(0, 1000),
+      })),
+      scanError: String(cache.scanError || ""),
+      notificationTasksLoaded: cache.notificationTasksLoaded === true,
+      vaultTasksLoaded: cache.vaultTasksLoaded === true,
+      savedAt: new Date().toISOString(),
+    };
+    try {
+      let serialized = JSON.stringify(compact);
+      // Keep the cache bounded on very large vaults; it is only a warm-start
+      // snapshot and the live scan remains authoritative.
+      if (serialized.length > 3_000_000) {
+        compact.notificationTasks = compact.notificationTasks.slice(0, 800);
+        compact.vaultTasks = compact.vaultTasks.slice(0, 1600);
+        serialized = JSON.stringify(compact);
+      }
+      window.localStorage.setItem(this.managerViewCacheStorageKey(), serialized);
+    } catch (error) {
+      // A storage quota/security error must never affect the live manager.
+      console.warn(`${PLUGIN_NAME}: manager cache write failed`, error);
+    }
+  }
+
+  setManagerViewCache(data = {}) {
+    this.managerViewCache = {
+      notificationTasks: Array.isArray(data.notificationTasks) ? data.notificationTasks : [],
+      vaultTasks: Array.isArray(data.vaultTasks) ? data.vaultTasks : [],
+      scanError: String(data.scanError || ""),
+      notificationTasksLoaded: data.notificationTasksLoaded === true,
+      vaultTasksLoaded: data.vaultTasksLoaded === true,
+    };
+    this.scheduleManagerViewCacheSave(this.managerViewCache);
+    return this.managerViewCache;
   }
 
   hasDestination() {
@@ -7367,8 +7468,13 @@ class NtfyManagerView extends ItemView {
     if (!data) return;
     this.notificationTasks = data.notificationTasks || [];
     this.vaultTasks = data.vaultTasks || [];
-    this.notificationTasksLoaded = data.notificationTasksLoaded === true;
-    this.vaultTasksLoaded = data.vaultTasksLoaded === true;
+    // A non-empty cache is useful immediately even when an older producer did
+    // not persist the explicit loaded flags. The background refresh will still
+    // replace it atomically after the new scan completes.
+    this.notificationTasksLoaded = data.notificationTasksLoaded === true
+      || this.notificationTasks.length > 0;
+    this.vaultTasksLoaded = data.vaultTasksLoaded === true
+      || this.vaultTasks.length > 0;
     this.remoteScheduled = data.remoteScheduled || this.remoteScheduled || [];
     this.scanError = data.scanError || "";
   }
@@ -7546,13 +7652,13 @@ class NtfyManagerView extends ItemView {
         } else if (scope === "inbox") {
           await this.plugin.runIncomingPoll();
         }
-        this.plugin.managerViewCache = {
+        this.plugin.setManagerViewCache({
           notificationTasks: this.notificationTasks,
           vaultTasks: this.vaultTasks,
           scanError: this.scanError,
           notificationTasksLoaded: this.notificationTasksLoaded,
           vaultTasksLoaded: this.vaultTasksLoaded,
-        };
+        });
         const dataChanged = affectedTabs.some((id) => previousSignatures.get(id) !== this.tabDataSignature(id));
         if (!dataChanged && wasLoaded) return false;
         if (!wasLoaded) for (const id of affectedTabs) this.tabSignatures.delete(id);
@@ -8007,18 +8113,36 @@ class NtfyManagerView extends ItemView {
   }
 
   async refreshTaskCaches() {
+    const refreshId = ++this.taskCacheRefreshId;
     try {
-      this.notificationTasks = await this.plugin.collectNotificationTasks();
-      this.vaultTasks = await this.plugin.collectVaultTasks();
+      // Scan both sources into locals first. Commit only after both complete,
+      // so the manager never paints a half-old/half-new snapshot.
+      const [notificationTasks, vaultTasks] = await Promise.all([
+        this.plugin.collectNotificationTasks(),
+        this.plugin.collectVaultTasks(),
+      ]);
+      if (refreshId !== this.taskCacheRefreshId) return;
+      this.notificationTasks = notificationTasks;
+      this.vaultTasks = vaultTasks;
       this.notificationTasksLoaded = true;
       this.vaultTasksLoaded = true;
       this.scanError = "";
+      this.plugin.setManagerViewCache({
+        notificationTasks: this.notificationTasks,
+        vaultTasks: this.vaultTasks,
+        scanError: this.scanError,
+        notificationTasksLoaded: true,
+        vaultTasksLoaded: true,
+      });
       this.updateNavCounts();
       this.plugin.setStatusCountsFromNotificationTasks(this.notificationTasks);
       this.syncTabPanels(["pending", "completed", "tasks"]);
     } catch (error) {
+      if (refreshId !== this.taskCacheRefreshId) return;
       this.scanError = error.message || String(error);
-      this.syncTabPanels(["pending"]);
+      // Keep both old arrays intact and surface the error without blanking the
+      // completed/tasks panels while a later retry is pending.
+      this.syncTabPanels(["pending", "completed", "tasks"]);
       console.error(error);
     }
   }
@@ -8217,16 +8341,48 @@ class NtfyManagerView extends ItemView {
   renderTaskTime(containerEl, dueText, dueDate, onClick) {
     if (!dueText) return;
     const className = `obsidian-ntfy-task-time ${this.timeClass(dueDate)}${typeof onClick === "function" ? " is-editable" : ""}`;
-    const timeEl = typeof onClick === "function"
-      ? containerEl.createEl("button", { cls: className, text: dueText, attr: { type: "button", title: "修改时间", "aria-label": `修改时间 ${dueText}` } })
-      : containerEl.createSpan({ cls: className, text: dueText });
-    if (typeof onClick === "function") {
-      timeEl.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        onClick();
-      });
-    }
+    if (typeof onClick !== "function") return containerEl.createSpan({ cls: className, text: dueText });
+
+    // Keep the native datetime control in the document flow. Chromium/Electron
+    // only exposes its calendar/time picker for a real, visible input; hidden
+    // or screen-positioned inputs silently ignore showPicker(). Selecting a
+    // value commits immediately, so there is no extra Save/Cancel panel.
+    const timeEl = containerEl.createEl("input", {
+      cls: `${className} obsidian-ntfy-date-time-input`,
+      attr: { type: "datetime-local", title: "修改时间", "aria-label": `修改时间 ${dueText}` },
+    });
+    const due = dueDate instanceof Date ? dueDate : new Date(dueDate || 0);
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    if (!Number.isNaN(due.getTime())) timeEl.value = this.plugin.formatDateTimeLocal(due);
+    timeEl.min = this.plugin.formatDateTimeLocal(todayStart);
+    let previousValue = timeEl.value;
+    const openPicker = (event) => {
+      event.stopPropagation();
+      try {
+        if (typeof timeEl.showPicker === "function") timeEl.showPicker();
+      } catch (_) {
+        // The native control may already be opening from the same gesture.
+      }
+    };
+    timeEl.addEventListener("pointerdown", openPicker);
+    timeEl.addEventListener("click", openPicker);
+    timeEl.addEventListener("change", async (event) => {
+      const parsedDue = this.plugin.parseDateTimeLocal(timeEl.value);
+      if (!parsedDue) {
+        timeEl.value = previousValue;
+        new Notice(`${PLUGIN_NAME}: invalid date/time`);
+        return;
+      }
+      try {
+        await onClick(event, timeEl, parsedDue);
+        previousValue = timeEl.value;
+      } catch (error) {
+        timeEl.value = previousValue;
+        new Notice(`${PLUGIN_NAME}: time update failed`);
+        console.error(error);
+      }
+    });
     return timeEl;
   }
 
@@ -8431,14 +8587,14 @@ class NtfyManagerView extends ItemView {
       }, {
         dueDate: due,
         dueText: Number.isNaN(due.getTime()) ? "时间无效" : `${item.batchOnly ? "批次 " : ""}${this.plugin.formatLocalDateTime(due)}`,
-        onDueClick: Number.isNaN(due.getTime()) ? null : () => this.openSourceTimePicker({
+        onDueClick: Number.isNaN(due.getTime()) ? null : (_event, _anchorEl, parsedDue) => this.openSourceTimePicker({
           key: item.id,
           due,
           text: item.text,
           filePath: item.file,
           lineNumber: item.line || 1,
           source: item.source,
-        }),
+        }, null, parsedDue),
         renderActions: (actions) => {
           this.iconButton(actions, "bell-off", "不通知", "danger", async () => {
             await this.plugin.deleteQueueItem(item.id);
@@ -8455,7 +8611,7 @@ class NtfyManagerView extends ItemView {
         timeRow,
         Number.isNaN(due.getTime()) ? "时间无效" : this.plugin.formatLocalDateTime(due),
         due,
-        Number.isNaN(due.getTime()) ? null : () => this.openQueueTimePicker(item)
+        Number.isNaN(due.getTime()) ? null : (_event, _anchorEl, parsedDue) => this.openQueueTimePicker(item, null, parsedDue)
       );
     }
     if (item.batchOnly && item.originalDue) {
@@ -8488,9 +8644,14 @@ class NtfyManagerView extends ItemView {
 
   renderNotificationTasks(containerEl) {
     const group = containerEl.createDiv({ cls: "obsidian-ntfy-section" });
-    if (this.scanError) {
+    // Keep the last successful list visible when a replacement scan fails. A
+    // transient read error must not turn the manager into a blank panel.
+    if (this.scanError && !this.notificationTasks.length) {
       group.createEl("p", { cls: "obsidian-ntfy-error", text: `扫描失败: ${this.scanError}` });
       return;
+    }
+    if (this.scanError) {
+      group.createEl("p", { cls: "obsidian-ntfy-error", text: `刷新失败，仍显示上次结果：${this.scanError}` });
     }
     if (!this.notificationTasksLoaded) {
       const loading = group.createDiv({ cls: "obsidian-ntfy-muted obsidian-ntfy-task-loading" });
@@ -8520,7 +8681,7 @@ class NtfyManagerView extends ItemView {
     }, {
       dueDate: reminder.due,
       dueText: this.plugin.formatLocalDateTime(reminder.due),
-      onDueClick: () => this.openSourceTimePicker(reminder),
+      onDueClick: (_event, _anchorEl, parsedDue) => this.openSourceTimePicker(reminder, null, parsedDue),
       renderActions: (actions) => {
         this.renderNotificationToggle(actions, reminder, reminder.notificationState !== "ignored");
       },
@@ -8658,7 +8819,7 @@ class NtfyManagerView extends ItemView {
 
   renderVaultTasks(containerEl) {
     const group = containerEl.createDiv({ cls: "obsidian-ntfy-section" });
-    if (!this.vaultTasksLoaded) {
+    if (!this.vaultTasksLoaded && !this.vaultTasks.length) {
       const loading = group.createDiv({ cls: "obsidian-ntfy-muted obsidian-ntfy-task-loading" });
       setIcon(loading.createSpan({ cls: "obsidian-ntfy-task-loading-icon" }), "loader-circle");
       loading.createSpan({ text: "正在加载待办…" });
@@ -8696,7 +8857,7 @@ class NtfyManagerView extends ItemView {
         dueDate: displayDate,
         dueText: !task.completed && displayDate ? this.plugin.formatLocalDateTime(displayDate) : "无时间",
         completedText: task.completed && displayDate ? this.plugin.formatDoneDateTime(displayDate) : "无完成时间",
-        onDueClick: !task.completed && displayDate ? () => this.openSourceTimePicker(task) : null,
+        onDueClick: !task.completed && displayDate ? (_event, _anchorEl, parsedDue) => this.openSourceTimePicker(task, null, parsedDue) : null,
         renderActions: task.due && !task.completed ? (actions) => {
           this.renderNotificationToggle(actions, {
             key: task.key,
@@ -8712,8 +8873,8 @@ class NtfyManagerView extends ItemView {
     if (tasks.length > limit) block.createEl("p", { cls: "obsidian-ntfy-muted", text: `还有 ${tasks.length - limit} 条未显示。` });
   }
 
-  openDateTimePicker(dueValue, onSave) {
-    if (typeof Modal !== "function" || !this.app) {
+  openDateTimePicker(dueValue, onSave, anchorEl = null) {
+    if (typeof document === "undefined" || !document.body) {
       new Notice(`${PLUGIN_NAME}: time picker unavailable`);
       return;
     }
@@ -8722,68 +8883,92 @@ class NtfyManagerView extends ItemView {
     todayStart.setHours(0, 0, 0, 0);
     const fallbackDue = new Date(Date.now() + 30 * 60 * 1000);
     const currentDue = Number.isNaN(due.getTime()) || due.getTime() < todayStart.getTime() ? fallbackDue : due;
-    const modal = new Modal(this.app);
-    let saving = false;
-    modal.onOpen = () => {
-      const content = modal.contentEl;
-      content.empty();
-      content.addClass("obsidian-ntfy-date-time-modal");
-      content.createEl("h3", { text: "修改提醒时间" });
-      const input = content.createEl("input", {
-        cls: "obsidian-ntfy-date-time-input",
-        attr: { type: "datetime-local", "aria-label": "修改提醒时间" },
-      });
-      input.min = this.plugin.formatDateTimeLocal(todayStart);
-      input.value = this.plugin.formatDateTimeLocal(currentDue);
+    const input = document.createElement("input");
+    input.type = "datetime-local";
+    input.min = this.plugin.formatDateTimeLocal(todayStart);
+    input.value = this.plugin.formatDateTimeLocal(currentDue);
+    input.setAttribute("aria-label", "修改提醒时间");
+    const rect = anchorEl && typeof anchorEl.getBoundingClientRect === "function" ? anchorEl.getBoundingClientRect() : null;
+    input.className = anchorEl?.className || "obsidian-ntfy-task-time is-editable";
+    input.classList.add("obsidian-ntfy-date-time-editor");
+    Object.assign(input.style, {
+      boxSizing: "border-box",
+      color: "var(--text-normal)",
+      background: "var(--background-primary)",
+      border: "1px solid var(--interactive-accent)",
+      borderRadius: "999px",
+      minWidth: `${Math.max(160, Math.floor(rect?.width || 0))}px`,
+      minHeight: `${Math.max(28, Math.floor(rect?.height || 0))}px`,
+      padding: "3px 6px",
+      font: "inherit",
+      pointerEvents: "auto",
+    });
+    const originalAnchor = anchorEl && anchorEl.parentElement ? anchorEl : null;
+    if (originalAnchor) originalAnchor.replaceWith(input);
+    else document.body.appendChild(input);
 
-      const actions = content.createDiv({ cls: "modal-button-container" });
-      const cancel = actions.createEl("button", { text: "取消", attr: { type: "button" } });
-      cancel.addEventListener("click", () => modal.close());
-      const save = actions.createEl("button", { text: "保存", cls: "mod-cta", attr: { type: "button" } });
-      const saveValue = async () => {
-        if (saving) return;
-        const parsedDue = this.plugin.parseDateTimeLocal(input.value);
-        if (!parsedDue) {
-          new Notice(`${PLUGIN_NAME}: invalid date/time`);
-          input.focus();
-          return;
-        }
-        saving = true;
-        save.disabled = true;
-        try {
-          await onSave(parsedDue);
-          modal.close();
-        } catch (error) {
-          saving = false;
-          save.disabled = false;
-          new Notice(`${PLUGIN_NAME}: time update failed`);
-          console.error(error);
-        }
-      };
-      save.addEventListener("click", () => void saveValue());
-      input.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") {
-          event.preventDefault();
-          void saveValue();
-        }
-      });
-      window.setTimeout(() => input.focus({ preventScroll: true }), 0);
+    let cleaned = false;
+    let cleanupTimer = null;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      if (cleanupTimer !== null && typeof window !== "undefined") window.clearTimeout(cleanupTimer);
+      cleanupTimer = null;
+      if (originalAnchor && input.isConnected) input.replaceWith(originalAnchor);
+      else input.remove();
     };
-    modal.open();
+    input.addEventListener("change", async () => {
+      const parsedDue = this.plugin.parseDateTimeLocal(input.value);
+      if (!parsedDue) {
+        cleanup();
+        new Notice(`${PLUGIN_NAME}: invalid date/time`);
+        return;
+      }
+      try {
+        await onSave(parsedDue);
+      } catch (error) {
+        new Notice(`${PLUGIN_NAME}: time update failed`);
+        console.error(error);
+      } finally {
+        cleanup();
+      }
+    }, { once: true });
+    input.addEventListener("cancel", cleanup, { once: true });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") cleanup();
+    });
+    cleanupTimer = typeof window !== "undefined" ? window.setTimeout(cleanup, 5 * 60 * 1000) : null;
+    try {
+      input.focus({ preventScroll: true });
+      if (typeof input.showPicker === "function") input.showPicker();
+      else input.click();
+    } catch (error) {
+      try {
+        input.click();
+      } catch (_) {
+        cleanup();
+        new Notice(`${PLUGIN_NAME}: time picker unavailable`);
+        console.error(error);
+      }
+    }
   }
 
-  openSourceTimePicker(reminder) {
-    this.openDateTimePicker(reminder.due, async (nextDue) => {
+  openSourceTimePicker(reminder, anchorEl = null, parsedDue = null) {
+    const save = async (nextDue) => {
       await this.plugin.updateSourceReminderDue(reminder, nextDue);
       await this.refreshTaskCaches();
-    });
+    };
+    if (parsedDue instanceof Date && !Number.isNaN(parsedDue.getTime())) return save(parsedDue);
+    this.openDateTimePicker(reminder.due, save, anchorEl);
   }
 
-  openQueueTimePicker(item) {
-    this.openDateTimePicker(item.due, async (nextDue) => {
+  openQueueTimePicker(item, anchorEl = null, parsedDue = null) {
+    const save = async (nextDue) => {
       await this.plugin.rescheduleQueueItem(item.id, { due: nextDue.toISOString() });
       await this.render();
-    });
+    };
+    if (parsedDue instanceof Date && !Number.isNaN(parsedDue.getTime())) return save(parsedDue);
+    this.openDateTimePicker(item.due, save, anchorEl);
   }
 }
 

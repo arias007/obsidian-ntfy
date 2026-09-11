@@ -4,6 +4,11 @@ This is a lightweight Obsidian plugin for ntfy notifications and optional AI web
 
 Why ntfy: Obsidian mobile plugins cannot directly create Android system notifications. This plugin sends reminders to an ntfy topic, and the Android ntfy app shows the notification in the system notification shade.
 
+## 1.4.4
+
+- Increased the date/time control contrast, including its border, separators, editable fields, and calendar indicator, while preserving native picker behavior.
+- Aligned todo checkboxes with the first text line despite Obsidian's higher-specificity checkbox margin rule.
+
 ## 1.4.0
 
 - Added an Obsidian ribbon/command entry that opens the ntfy task manager directly on `整库待办`.

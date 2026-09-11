@@ -159,8 +159,8 @@ async function run() {
   const styles = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
   const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.equal(manifest.version, "1.4.2");
-  assert.equal(packageJson.version, "1.4.2");
+  assert.equal(manifest.version, "1.4.4");
+  assert.equal(packageJson.version, "1.4.4");
   const managerHeaderStart = source.indexOf("  renderHeader(containerEl) {");
   const managerHeaderEnd = source.indexOf("  renderIncomingMessages(containerEl)", managerHeaderStart);
   assert.ok(managerHeaderStart >= 0 && managerHeaderEnd > managerHeaderStart, "manager header should remain discoverable");
@@ -222,19 +222,37 @@ async function run() {
   assert.match(source, /selected conversation first[\s\S]*?this\.renderTabPanel\("inbox"\)[\s\S]*?markConversationRead/);
   assert.match(source, /Array\.isArray\(parsed\)[\s\S]*?\{ messages: parsed, source: "ui", dryRun \}/, "array preview must retain dryRun");
   assert.match(source, /insertText: ` \$\{plugin\.formatLocalDateTime\(due\)\.slice\(11\)\}`/);
-  assert.match(source, /openDateTimePicker\(dueValue, onSave\)/);
-  assert.match(source, /new Modal\(this\.app\)/);
-  assert.match(source, /obsidian-ntfy-date-time-modal/);
+  assert.match(source, /openDateTimePicker\(dueValue, onSave, anchorEl = null\)/);
+  assert.doesNotMatch(source, /new Modal\(this\.app\)/);
+  assert.doesNotMatch(source, /obsidian-ntfy-date-time-modal/);
+  assert.match(source, /pointerEvents: "auto"/);
+  assert.match(source, /obsidian-ntfy-date-time-input/);
+  assert.match(source, /timeEl\.addEventListener\("pointerdown", openPicker\)/);
+  assert.match(source, /input\.showPicker\(\)/);
   assert.match(source, /input\.min = this\.plugin\.formatDateTimeLocal\(todayStart\)/);
-  assert.match(source, /input\.min = this\.plugin\.formatDateTimeLocal\(todayStart\)/);
-  assert.match(source, /openSourceTimePicker\(reminder\)/);
-  assert.match(source, /openQueueTimePicker\(item\)/);
+  assert.match(source, /openSourceTimePicker\(reminder, anchorEl = null, parsedDue = null\)/);
+  assert.match(source, /openQueueTimePicker\(item, anchorEl = null, parsedDue = null\)/);
   assert.doesNotMatch(source, /openSourceTimeModal\(/);
   assert.match(source, /conversationChannelLabel\(channel, fallback = ""\)/);
   assert.match(source, /if \(String\(channel\.type \|\| ""\).*=== "ntfy"\) return "ntfy"/);
   assert.match(source, /const labels = \["今天", \.\.\.configuredLabels\.filter\(\(label\) => label !== "今天"\)\]/);
   assert.match(styles, /\.obsidian-ntfy-item-compact \{[\s\S]*?padding: 4px 8px/);
   assert.match(styles, /\.obsidian-ntfy-task-time \{[\s\S]*?padding: 3px 6px/);
+  const dateTimeInputStyleStart = styles.indexOf(".obsidian-ntfy-date-time-input {");
+  const dateTimeInputStyleEnd = styles.indexOf("}\n", dateTimeInputStyleStart);
+  assert.ok(dateTimeInputStyleStart >= 0 && dateTimeInputStyleEnd > dateTimeInputStyleStart, "date/time input style should remain discoverable");
+  const dateTimeInputStyle = styles.slice(dateTimeInputStyleStart, dateTimeInputStyleEnd);
+  assert.match(dateTimeInputStyle, /flex:\s*0 1 200px/);
+  assert.match(dateTimeInputStyle, /width:\s*min\(100%,\s*200px\)/);
+  assert.match(dateTimeInputStyle, /text-indent:\s*0/);
+  assert.match(dateTimeInputStyle, /background-color:\s*var\(--background-primary\)\s*!important/);
+  assert.match(dateTimeInputStyle, /border:\s*1px solid color-mix\([\s\S]*?\)\s*!important/);
+  assert.match(styles, /\.obsidian-ntfy-date-time-input::\-webkit-datetime-edit-text \{[\s\S]*?color:\s*var\(--text-normal\)\s*!important;[\s\S]*?opacity:\s*1/);
+  assert.match(styles, /\.obsidian-ntfy-date-time-input::\-webkit-calendar-picker-indicator \{[\s\S]*?opacity:\s*1/);
+  assert.match(styles, /\.obsidian-ntfy-date-time-input\.obsidian-ntfy-task-time-past \{[\s\S]*?background-color:\s*#dc2626\s*!important[\s\S]*?color:\s*#ffffff\s*!important/);
+  assert.match(styles, /\.obsidian-ntfy-date-time-input\.obsidian-ntfy-task-time-soon \{[\s\S]*?background-color:\s*#facc15\s*!important[\s\S]*?color:\s*#1f2937\s*!important/);
+  assert.match(styles, /\.obsidian-ntfy-date-time-input\.obsidian-ntfy-task-time-future \{[\s\S]*?background-color:\s*#16a34a\s*!important[\s\S]*?color:\s*#ffffff\s*!important/);
+  assert.match(styles, /\.obsidian-ntfy-task-line > \.obsidian-ntfy-task-checkbox \{[\s\S]*?margin:\s*3px 6px 0 0\s*!important/);
 
   const plugin = createPlugin({
     topic: "test-topic",
