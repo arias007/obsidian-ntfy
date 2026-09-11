@@ -1004,7 +1004,6 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         const scanPromise = this.runAutoScan();
         void this.runIncomingPoll();
         void this.cleanupIncomingAttachments();
-        void this.primeTaskCompletionSnapshots();
         // A successful reminder scan already has the exact data needed for
         // the status bar. Only fall back to a second read when scanning is
         // disabled or could not run (for example, no destination configured).
@@ -6256,22 +6255,6 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       // Obsidian emits the follow-up modify event asynchronously. Keep the
       // guard briefly so our own write cannot be interpreted as a new click.
       window.setTimeout(() => this.taskCompletionCascadeGuards.delete(path), 300);
-    }
-  }
-
-  async primeTaskCompletionSnapshots() {
-    if (!this.app?.vault?.getMarkdownFiles || !this.taskCompletionSnapshots || this.isUnloading) return;
-    const files = this.app.vault.getMarkdownFiles();
-    for (const file of files) {
-      if (this.isUnloading) break;
-      if (this.taskCompletionSnapshots.has(file.path)) continue;
-      try {
-        await this.snapshotTaskCompletionFile(file);
-      } catch (error) {
-        console.warn(`${PLUGIN_NAME}: failed to prime task snapshot ${file.path}`, error);
-      }
-      // Yield between files so a large vault does not monopolize the UI.
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
     }
   }
 
