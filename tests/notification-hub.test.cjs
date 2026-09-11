@@ -159,8 +159,8 @@ async function run() {
   const styles = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
   const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.equal(manifest.version, "1.4.4");
-  assert.equal(packageJson.version, "1.4.4");
+  assert.equal(manifest.version, "1.4.5");
+  assert.equal(packageJson.version, "1.4.5");
   const managerHeaderStart = source.indexOf("  renderHeader(containerEl) {");
   const managerHeaderEnd = source.indexOf("  renderIncomingMessages(containerEl)", managerHeaderStart);
   assert.ok(managerHeaderStart >= 0 && managerHeaderEnd > managerHeaderStart, "manager header should remain discoverable");
@@ -249,9 +249,11 @@ async function run() {
   assert.match(dateTimeInputStyle, /border:\s*1px solid color-mix\([\s\S]*?\)\s*!important/);
   assert.match(styles, /\.obsidian-ntfy-date-time-input::\-webkit-datetime-edit-text \{[\s\S]*?color:\s*var\(--text-normal\)\s*!important;[\s\S]*?opacity:\s*1/);
   assert.match(styles, /\.obsidian-ntfy-date-time-input::\-webkit-calendar-picker-indicator \{[\s\S]*?opacity:\s*1/);
-  assert.match(styles, /\.obsidian-ntfy-date-time-input\.obsidian-ntfy-task-time-past \{[\s\S]*?background-color:\s*#dc2626\s*!important[\s\S]*?color:\s*#ffffff\s*!important/);
-  assert.match(styles, /\.obsidian-ntfy-date-time-input\.obsidian-ntfy-task-time-soon \{[\s\S]*?background-color:\s*#facc15\s*!important[\s\S]*?color:\s*#1f2937\s*!important/);
-  assert.match(styles, /\.obsidian-ntfy-date-time-input\.obsidian-ntfy-task-time-future \{[\s\S]*?background-color:\s*#16a34a\s*!important[\s\S]*?color:\s*#ffffff\s*!important/);
+  assert.match(styles, /\.obsidian-ntfy-date-time-input\.obsidian-ntfy-task-time-past \{[\s\S]*?background-color:\s*var\(--background-primary\)\s*!important[\s\S]*?border-color:\s*#dc2626\s*!important[\s\S]*?color:\s*var\(--text-normal\)\s*!important/);
+  assert.match(styles, /\.obsidian-ntfy-date-time-input\.obsidian-ntfy-task-time-soon \{[\s\S]*?background-color:\s*var\(--background-primary\)\s*!important[\s\S]*?border-color:\s*#d4a900\s*!important[\s\S]*?color:\s*var\(--text-normal\)\s*!important/);
+  assert.match(styles, /\.obsidian-ntfy-date-time-input\.obsidian-ntfy-task-time-future \{[\s\S]*?background-color:\s*var\(--background-primary\)\s*!important[\s\S]*?border-color:\s*#16a34a\s*!important[\s\S]*?color:\s*var\(--text-normal\)\s*!important/);
+  assert.doesNotMatch(styles, /\.obsidian-ntfy-date-time-input\.obsidian-ntfy-task-time-past[^}]*background-color:\s*#dc2626/);
+  assert.doesNotMatch(styles, /\.obsidian-ntfy-date-time-input\.obsidian-ntfy-task-time-future[^}]*background-color:\s*#16a34a/);
   assert.match(styles, /\.obsidian-ntfy-task-line > \.obsidian-ntfy-task-checkbox \{[\s\S]*?margin:\s*3px 6px 0 0\s*!important/);
 
   const plugin = createPlugin({

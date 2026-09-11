@@ -4,6 +4,10 @@ This is a lightweight Obsidian plugin for ntfy notifications and optional AI web
 
 Why ntfy: Obsidian mobile plugins cannot directly create Android system notifications. This plugin sends reminders to an ntfy topic, and the Android ntfy app shows the notification in the system notification shade.
 
+## 1.4.5
+
+- Status colours now apply to the date/time control border only: expired is red, today is yellow, and future is green; the field interior remains neutral.
+
 ## 1.4.4
 
 - Increased the date/time control contrast, including its border, separators, editable fields, and calendar indicator, while preserving native picker behavior.

@@ -895,69 +895,24 @@
   opacity: 1;
 }
 
-/* Keep the date chip's semantic status colours visible on native inputs too.
-   These rules intentionally come after the generic input contrast rules so
-   the input cannot flatten expired/today/future states into one white box. */
+/* Use the semantic status colour on the frame only.  Keeping the interior
+   neutral preserves the date text and avoids an overly heavy filled chip. */
 .obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-past {
-  background-color: #dc2626 !important;
+  background-color: var(--background-primary) !important;
   border-color: #dc2626 !important;
-  color: #ffffff !important;
+  color: var(--text-normal) !important;
 }
 
 .obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-soon {
-  background-color: #facc15 !important;
+  background-color: var(--background-primary) !important;
   border-color: #d4a900 !important;
-  color: #1f2937 !important;
+  color: var(--text-normal) !important;
 }
 
 .obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-future {
-  background-color: #16a34a !important;
+  background-color: var(--background-primary) !important;
   border-color: #16a34a !important;
-  color: #ffffff !important;
-}
-
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-past::-webkit-datetime-edit,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-past::-webkit-datetime-edit-fields-wrapper,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-past::-webkit-datetime-edit-year-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-past::-webkit-datetime-edit-month-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-past::-webkit-datetime-edit-day-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-past::-webkit-datetime-edit-hour-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-past::-webkit-datetime-edit-minute-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-past::-webkit-datetime-edit-ampm-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-past::-webkit-datetime-edit-text,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-future::-webkit-datetime-edit,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-future::-webkit-datetime-edit-fields-wrapper,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-future::-webkit-datetime-edit-year-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-future::-webkit-datetime-edit-month-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-future::-webkit-datetime-edit-day-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-future::-webkit-datetime-edit-hour-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-future::-webkit-datetime-edit-minute-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-future::-webkit-datetime-edit-ampm-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-future::-webkit-datetime-edit-text {
-  color: #ffffff !important;
-  opacity: 1;
-}
-
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-soon::-webkit-datetime-edit,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-soon::-webkit-datetime-edit-fields-wrapper,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-soon::-webkit-datetime-edit-year-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-soon::-webkit-datetime-edit-month-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-soon::-webkit-datetime-edit-day-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-soon::-webkit-datetime-edit-hour-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-soon::-webkit-datetime-edit-minute-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-soon::-webkit-datetime-edit-ampm-field,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-soon::-webkit-datetime-edit-text {
-  color: #1f2937 !important;
-  opacity: 1;
-}
-
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-past::-webkit-calendar-picker-indicator,
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-future::-webkit-calendar-picker-indicator {
-  filter: brightness(0) invert(1);
-}
-
-.obsidian-ntfy-date-time-input.obsidian-ntfy-task-time-soon::-webkit-calendar-picker-indicator {
-  filter: none;
+  color: var(--text-normal) !important;
 }
 
 .obsidian-ntfy-task-time-past {
