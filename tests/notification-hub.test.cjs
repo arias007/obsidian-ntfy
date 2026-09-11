@@ -159,8 +159,8 @@ async function run() {
   const styles = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
   const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.equal(manifest.version, "1.4.5");
-  assert.equal(packageJson.version, "1.4.5");
+  assert.equal(manifest.version, "1.4.6");
+  assert.equal(packageJson.version, "1.4.6");
   const managerHeaderStart = source.indexOf("  renderHeader(containerEl) {");
   const managerHeaderEnd = source.indexOf("  renderIncomingMessages(containerEl)", managerHeaderStart);
   assert.ok(managerHeaderStart >= 0 && managerHeaderEnd > managerHeaderStart, "manager header should remain discoverable");
@@ -255,12 +255,66 @@ async function run() {
   assert.doesNotMatch(styles, /\.obsidian-ntfy-date-time-input\.obsidian-ntfy-task-time-past[^}]*background-color:\s*#dc2626/);
   assert.doesNotMatch(styles, /\.obsidian-ntfy-date-time-input\.obsidian-ntfy-task-time-future[^}]*background-color:\s*#16a34a/);
   assert.match(styles, /\.obsidian-ntfy-task-line > \.obsidian-ntfy-task-checkbox \{[\s\S]*?margin:\s*3px 6px 0 0\s*!important/);
+  assert.match(source, /const cascadedLineNumbers = \[\]/);
+  assert.match(source, /const parentIndent = this\.taskIndentWidth\(lines\[lineIndex\]\)/);
+  assert.match(source, /cascadedLineNumbers\.push\(index \+ 1\)/);
+  assert.match(source, /const taskHasContent = Boolean\(taskBody[\s\S]*?suggestion\.hint === "选择日期"[\s\S]*?this\.open\(\)/);
+  assert.match(source, /this\.reminderSuggest = new NtfyReminderSuggest\(this\.app, this\)/);
 
   const plugin = createPlugin({
     topic: "test-topic",
     authToken: "secret-ntfy-token",
     defaultChannelId: "ntfy",
   });
+
+  const cascadePlugin = createPlugin();
+  let cascadeContent = [
+    "- [ ] 父待办",
+    "  - [ ] 子待办一",
+    "    - [ ] 孙待办",
+    "  - [ ] 子待办二",
+    "- [ ] 同级待办",
+  ].join("\n");
+  const cascadeFile = { path: "Tasks.md", extension: "md" };
+  cascadePlugin.app = {
+    vault: {
+      getAbstractFileByPath(value) { return value === cascadeFile.path ? cascadeFile : null; },
+      async read() { return cascadeContent; },
+      async modify(_file, value) { cascadeContent = value; },
+    },
+  };
+  const cascadeResult = await cascadePlugin.toggleTaskCompletion("Tasks.md", 1);
+  assert.equal(cascadeResult.completed, true);
+  assert.deepEqual(cascadeResult.cascadedLineNumbers, [2, 3, 4]);
+  assert.match(cascadeContent, /^- \[x\] 父待办 ✅ \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/mu);
+  assert.match(cascadeContent, /^  - \[x\] 子待办一 ✅ \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/mu);
+  assert.match(cascadeContent, /^    - \[x\] 孙待办 ✅ \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/mu);
+  assert.match(cascadeContent, /^  - \[x\] 子待办二 ✅ \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/mu);
+  assert.match(cascadeContent, /^- \[ \] 同级待办$/mu);
+
+  // A native Markdown checkbox write arrives through vault.modify rather than
+  // the manager's toggleTaskCompletion callback. Verify that the transition
+  // watcher still cascades nested children in that path.
+  const nativeCascadePlugin = createPlugin();
+  nativeCascadePlugin.taskCompletionSnapshots = new Map();
+  nativeCascadePlugin.taskCompletionCascadeGuards = new Set();
+  const nativeCascadeFile = { path: "Native.md", extension: "md" };
+  let nativeCascadeContent = [
+    "- [ ] 父任务",
+    "  - [ ] 子任务",
+    "- [ ] 同级任务",
+  ].join("\n");
+  nativeCascadePlugin.app = {
+    vault: {
+      async cachedRead() { return nativeCascadeContent; },
+      async modify(_file, value) { nativeCascadeContent = value; },
+    },
+  };
+  await nativeCascadePlugin.snapshotTaskCompletionFile(nativeCascadeFile);
+  nativeCascadeContent = nativeCascadeContent.replace("- [ ] 父任务", "- [x] 父任务");
+  await nativeCascadePlugin.cascadeCompletedChildrenFromModify(nativeCascadeFile);
+  assert.match(nativeCascadeContent, /^  - \[x\] 子任务 ✅ \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/mu);
+  assert.match(nativeCascadeContent, /^- \[ \] 同级任务$/mu);
 
   const status = plugin.getNotificationHubStatus();
   assert.equal(status.ready, true);

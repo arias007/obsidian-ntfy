@@ -827,6 +827,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.lastReminderScanFiles = new Set();
     this.doneDateWriteGuards = new Set();
     this.doneDateTimers = new Map();
+    this.taskCompletionSnapshots = new Map();
+    this.taskCompletionCascadeTimers = new Map();
+    this.taskCompletionCascadeGuards = new Set();
     this.reminderScanTimer = null;
     this.statusCountTimer = null;
     this.dailyBatchTimer = null;
@@ -851,7 +854,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
     this.addSettingTab(new AndroidNtfyNotifierSettingTab(this.app, this));
     if (typeof EditorSuggest === "function") {
-      this.registerEditorSuggest(new NtfyReminderSuggest(this.app, this));
+      this.reminderSuggest = new NtfyReminderSuggest(this.app, this);
+      this.registerEditorSuggest(this.reminderSuggest);
     }
 
     this.addCommand({
@@ -951,15 +955,30 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       this.clearQueuedReminderScan();
       this.clearStatusCountRefresh();
       this.clearObsidianReminderTimer();
+      for (const timer of this.taskCompletionCascadeTimers.values()) window.clearTimeout(timer);
+      this.taskCompletionCascadeTimers.clear();
+      this.taskCompletionSnapshots.clear();
+      this.taskCompletionCascadeGuards.clear();
     });
     this.registerEvent(this.app.vault.on("create", (file) => {
-      if (file instanceof TFile) this.queueReminderScan(file);
+      if (file instanceof TFile) {
+        this.queueReminderScan(file);
+        this.snapshotTaskCompletionFile(file).catch((error) => console.warn(`${PLUGIN_NAME}: failed to snapshot task file`, error));
+      }
     }));
     this.registerEvent(this.app.vault.on("modify", (file) => {
       this.queueEnsureDoneDates(file);
       this.queueReminderScan(file);
       this.queueStatusCountRefresh(file);
+      this.queueTaskCompletionCascade(file);
     }));
+    if (this.app.workspace && typeof this.app.workspace.on === "function") {
+      this.registerEvent(this.app.workspace.on("file-open", (file) => {
+        if (file instanceof TFile) {
+          this.snapshotTaskCompletionFile(file).catch((error) => console.warn(`${PLUGIN_NAME}: failed to snapshot opened task file`, error));
+        }
+      }));
+    }
 
     this.app.workspace.onLayoutReady(() => {
       this.isLayoutReady = true;
@@ -971,6 +990,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
         const scanPromise = this.runAutoScan();
         void this.runIncomingPoll();
         void this.cleanupIncomingAttachments();
+        void this.primeTaskCompletionSnapshots();
         // A successful reminder scan already has the exact data needed for
         // the status bar. Only fall back to a second read when scanning is
         // disabled or could not run (for example, no destination configured).
@@ -6110,8 +6130,135 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const doneAt = nextMark === "x" ? new Date() : null;
     const body = nextMark === "x" ? this.addTasksDoneDate(match[3], doneAt) : this.removeTasksDoneDate(match[3]);
     lines[lineIndex] = `${match[1]}${nextMark}${body}`;
+    // Completing a parent task completes every nested task below it. The
+    // cascade stops at the first same-level/ancestor task, so siblings and
+    // later sections remain untouched. Unchecking only changes the parent;
+    // it must not erase a child's independently recorded completion state.
+    const cascadedLineNumbers = nextMark === "x"
+      ? this.cascadeCompletedTaskChildren(lines, lineIndex, doneAt)
+      : [];
     await this.app.vault.modify(file, lines.join("\n"));
-    return { completed: nextMark === "x", doneAt };
+    return { completed: nextMark === "x", doneAt, cascadedLineNumbers };
+  }
+
+  taskIndentWidth(line) {
+    const indent = String(line || "").match(/^\s*/)?.[0] || "";
+    return indent.replace(/\t/g, "    ").length;
+  }
+
+  cascadeCompletedTaskChildren(lines, lineIndex, doneAt = new Date()) {
+    const cascadedLineNumbers = [];
+    const parentIndent = this.taskIndentWidth(lines[lineIndex]);
+    for (let index = lineIndex + 1; index < lines.length; index += 1) {
+      const childMatch = String(lines[index] || "").match(/^(\s*[-*+]\s+\[)([^\]])(\]\s+.*)$/);
+      if (!childMatch) {
+        const raw = String(lines[index] || "");
+        if (raw.trim() && this.taskIndentWidth(raw) <= parentIndent) break;
+        continue;
+      }
+      if (this.taskIndentWidth(lines[index]) <= parentIndent) break;
+      if (childMatch[2] === "x" || childMatch[2] === "X") continue;
+      const childBody = this.addTasksDoneDate(childMatch[3], doneAt);
+      lines[index] = `${childMatch[1]}x${childBody}`;
+      cascadedLineNumbers.push(index + 1);
+    }
+    return cascadedLineNumbers;
+  }
+
+  taskCompletionSnapshot(lines) {
+    return lines.map((line) => {
+      const match = String(line || "").match(/^(\s*[-*+]\s+\[)([^\]])(\]\s+.*)$/);
+      if (!match) return null;
+      return {
+        completed: match[2] === "x" || match[2] === "X",
+        // Keep a stable identity for the line so an insertion/reorder does
+        // not make an unrelated task look like a completion transition.
+        signature: `${match[1]} ${match[3]}`,
+      };
+    });
+  }
+
+  async snapshotTaskCompletionFile(file, content = null) {
+    if (!file || file.extension !== "md" || !this.taskCompletionSnapshots) return;
+    const path = String(file.path || "");
+    if (!path) return;
+    const source = content === null
+      ? await this.app.vault.cachedRead(file)
+      : String(content || "");
+    this.taskCompletionSnapshots.set(path, this.taskCompletionSnapshot(source.split(/\r?\n/)));
+  }
+
+  queueTaskCompletionCascade(file) {
+    if (!file || file.extension !== "md" || !this.taskCompletionSnapshots || this.isUnloading) return;
+    const path = String(file.path || "");
+    if (!path) return;
+    const existing = this.taskCompletionCascadeTimers.get(path);
+    if (existing) window.clearTimeout(existing);
+    const timer = window.setTimeout(() => {
+      this.taskCompletionCascadeTimers.delete(path);
+      this.cascadeCompletedChildrenFromModify(file).catch((error) => {
+        console.warn(`${PLUGIN_NAME}: failed to cascade completed task children`, error);
+      });
+    }, 45);
+    this.taskCompletionCascadeTimers.set(path, timer);
+  }
+
+  async cascadeCompletedChildrenFromModify(file) {
+    if (!file || file.extension !== "md" || !this.taskCompletionSnapshots || this.isUnloading) return;
+    const path = String(file.path || "");
+    if (!path || this.taskCompletionCascadeGuards.has(path)) return;
+    const source = await this.app.vault.cachedRead(file);
+    const lines = String(source || "").split(/\r?\n/);
+    const previous = this.taskCompletionSnapshots.get(path);
+    const current = this.taskCompletionSnapshot(lines);
+    // Always advance the snapshot, including for internal writes and edits
+    // that do not complete a task. This keeps later native checkbox clicks
+    // cheap and prevents stale line-state comparisons.
+    this.taskCompletionSnapshots.set(path, current);
+    if (!previous) return;
+
+    const completedTransitions = [];
+    for (let index = 0; index < current.length; index += 1) {
+      const before = previous[index];
+      const after = current[index];
+      if (!before || !after || before.signature !== after.signature) continue;
+      if (!before.completed && after.completed) completedTransitions.push(index);
+    }
+    if (!completedTransitions.length) return;
+
+    let changed = false;
+    const doneAt = new Date();
+    for (const lineIndex of completedTransitions) {
+      const cascaded = this.cascadeCompletedTaskChildren(lines, lineIndex, doneAt);
+      if (cascaded.length) changed = true;
+    }
+    if (!changed) return;
+
+    this.taskCompletionCascadeGuards.add(path);
+    this.taskCompletionSnapshots.set(path, this.taskCompletionSnapshot(lines));
+    try {
+      await this.app.vault.modify(file, lines.join("\n"));
+    } finally {
+      // Obsidian emits the follow-up modify event asynchronously. Keep the
+      // guard briefly so our own write cannot be interpreted as a new click.
+      window.setTimeout(() => this.taskCompletionCascadeGuards.delete(path), 300);
+    }
+  }
+
+  async primeTaskCompletionSnapshots() {
+    if (!this.app?.vault?.getMarkdownFiles || !this.taskCompletionSnapshots || this.isUnloading) return;
+    const files = this.app.vault.getMarkdownFiles();
+    for (const file of files) {
+      if (this.isUnloading) break;
+      if (this.taskCompletionSnapshots.has(file.path)) continue;
+      try {
+        await this.snapshotTaskCompletionFile(file);
+      } catch (error) {
+        console.warn(`${PLUGIN_NAME}: failed to prime task snapshot ${file.path}`, error);
+      }
+      // Yield between files so a large vault does not monopolize the UI.
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    }
   }
 
   queueEnsureDoneDates(file) {
@@ -9079,12 +9226,29 @@ class NtfyReminderSuggest extends EditorSuggest {
       return;
     }
     const currentLine = this.context.editor.getLine(this.context.start.line);
+    const taskBody = currentLine.match(/^\s*[-*+]\s+\[[^\]]\]\s+(.*)$/)?.[1] || "";
+    const taskHasContent = Boolean(taskBody
+      .replace(/(?:^|\s)(?:ntfy|提醒|notify|remind|todo|task|待办|今天|明天|后天|下周|今晚|早八|上午|中午|下午|30分钟|1小时|📅|⏰|➕|⏲)\s*$/iu, "")
+      .trim());
     const text = suggestion.insertText || this.tasksFields(suggestion.due, currentLine);
     this.context.editor.replaceRange(text, this.context.start, this.context.end);
     this.context.editor.setCursor({
       line: this.context.start.line,
       ch: this.context.start.ch + text.length,
     });
+    // Choosing a date for a non-empty todo should immediately continue into
+    // the time choices. Without reopening the editor suggest, Obsidian keeps
+    // the inserted date and waits for another keystroke before the time list
+    // appears.
+    if (taskHasContent && suggestion && suggestion.hint === "选择日期" && typeof this.open === "function") {
+      window.setTimeout(() => {
+        try {
+          this.open();
+        } catch (error) {
+          console.warn(`${PLUGIN_NAME}: failed to reopen time suggestions`, error);
+        }
+      }, 0);
+    }
   }
 }
 
