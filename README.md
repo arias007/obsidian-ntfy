@@ -11,6 +11,12 @@ Why ntfy: Obsidian mobile plugins cannot directly create Android system notifica
 - Coalesced message refreshes, reduced message fingerprint work, and render only the newest message window first; older history remains available with `加载更早消息`.
 - Deferred the first vault scan, provider polling, and attachment cleanup until Obsidian has painted its initial workspace.
 
+## 1.4.2
+
+- ntfy conversation titles and subtitles now show only `ntfy`; topics are never used as conversation labels.
+- Todo time chips match the adjacent bell action height, and date editing opens a visible Obsidian panel reliably.
+- Date/time choices start at today, with past due values clamped to a selectable time from today onward.
+
 ## 1.4.1
 
 - Opening a conversation now renders immediately; read-state persistence runs in the background to reduce message-page delay.

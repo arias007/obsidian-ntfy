@@ -159,8 +159,8 @@ async function run() {
   const styles = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
   const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.equal(manifest.version, "1.4.1");
-  assert.equal(packageJson.version, "1.4.1");
+  assert.equal(manifest.version, "1.4.2");
+  assert.equal(packageJson.version, "1.4.2");
   const managerHeaderStart = source.indexOf("  renderHeader(containerEl) {");
   const managerHeaderEnd = source.indexOf("  renderIncomingMessages(containerEl)", managerHeaderStart);
   assert.ok(managerHeaderStart >= 0 && managerHeaderEnd > managerHeaderStart, "manager header should remain discoverable");
@@ -223,10 +223,18 @@ async function run() {
   assert.match(source, /Array\.isArray\(parsed\)[\s\S]*?\{ messages: parsed, source: "ui", dryRun \}/, "array preview must retain dryRun");
   assert.match(source, /insertText: ` \$\{plugin\.formatLocalDateTime\(due\)\.slice\(11\)\}`/);
   assert.match(source, /openDateTimePicker\(dueValue, onSave\)/);
-  assert.match(source, /typeof input\.showPicker === "function"/);
+  assert.match(source, /new Modal\(this\.app\)/);
+  assert.match(source, /obsidian-ntfy-date-time-modal/);
+  assert.match(source, /input\.min = this\.plugin\.formatDateTimeLocal\(todayStart\)/);
+  assert.match(source, /input\.min = this\.plugin\.formatDateTimeLocal\(todayStart\)/);
   assert.match(source, /openSourceTimePicker\(reminder\)/);
   assert.match(source, /openQueueTimePicker\(item\)/);
   assert.doesNotMatch(source, /openSourceTimeModal\(/);
+  assert.match(source, /conversationChannelLabel\(channel, fallback = ""\)/);
+  assert.match(source, /if \(String\(channel\.type \|\| ""\).*=== "ntfy"\) return "ntfy"/);
+  assert.match(source, /const labels = \["今天", \.\.\.configuredLabels\.filter\(\(label\) => label !== "今天"\)\]/);
+  assert.match(styles, /\.obsidian-ntfy-item-compact \{[\s\S]*?padding: 4px 8px/);
+  assert.match(styles, /\.obsidian-ntfy-task-time \{[\s\S]*?padding: 3px 6px/);
 
   const plugin = createPlugin({
     topic: "test-topic",
@@ -242,6 +250,35 @@ async function run() {
   assert.equal(plugin.settings.showObsidianReminderNotices, true);
   assert.deepEqual(plugin.settings.channelHealth, {});
   assert.equal(plugin.settings.largeFileMode, "wormhole");
+  assert.equal(plugin.conversationChannelLabel({ type: "ntfy", name: "private-sensitive-topic" }, "fallback"), "ntfy");
+  assert.equal(plugin.conversationChannelLabel({ type: "telegram", name: "Work" }, "fallback"), "Work");
+  const privateTopicPlugin = createPlugin({
+    topic: "do-not-show-topic",
+    channelAccounts: [{
+      id: "ntfy",
+      type: "ntfy",
+      accountId: "default",
+      name: "do-not-show-topic",
+      enabled: true,
+      config: { serverUrl: "https://ntfy.sh", topic: "do-not-show-topic" },
+    }],
+  });
+  const privateTopicContact = privateTopicPlugin.conversationContacts().find((contact) => contact.channelId === "ntfy");
+  assert.equal(privateTopicContact?.name, "ntfy");
+  assert.equal(privateTopicContact?.subtitle, "ntfy");
+  privateTopicPlugin.settings.conversationMessages = [{
+    id: "topic-message",
+    channelId: "ntfy",
+    conversationId: "do-not-show-topic",
+    sender: "do-not-show-topic",
+    direction: "incoming",
+    text: "private message",
+    timestamp: new Date().toISOString(),
+    metadata: { groupTopic: true },
+  }];
+  const privatePeerContact = privateTopicPlugin.conversationContacts().find((contact) => contact.kind === "ntfy-peer");
+  assert.equal(privatePeerContact?.name, "ntfy");
+  assert.equal(privatePeerContact?.subtitle, "ntfy · 私信入口");
   assert.equal(Object.keys(plugin.settings).some((key) => /^lanSync|^lanInbox/.test(key)), false);
   const legacySettingsPlugin = createPlugin({ lanSyncLargeFileMode: "wormhole", lanSyncPort: 43190, lanInboxRetentionHours: 168 });
   assert.equal(legacySettingsPlugin.settings.largeFileMode, "wormhole");

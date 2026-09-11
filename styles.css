@@ -656,7 +656,7 @@
 }
 
 .obsidian-ntfy-item-compact {
-  padding: 5px 8px;
+  padding: 4px 8px;
 }
 
 .obsidian-ntfy-item.is-done {
@@ -695,7 +695,7 @@
   align-items: flex-start;
   display: flex;
   gap: 7px;
-  line-height: 1.45;
+  line-height: 1.35;
   min-width: 0;
   width: 100%;
 }
@@ -740,9 +740,13 @@
   align-items: center;
   display: flex;
   flex-wrap: wrap;
-  gap: 5px;
+  gap: 4px;
   justify-content: flex-start;
-  margin: 6px 0 0;
+  margin: 3px 0 0;
+}
+
+.obsidian-ntfy-item-compact .obsidian-ntfy-task-actions {
+  margin-top: 2px;
 }
 
 .obsidian-ntfy-task-actions .obsidian-ntfy-icon-button {
@@ -808,12 +812,18 @@
   border: 1px solid transparent;
   border-radius: 999px;
   font-family: inherit;
-  font-size: 0.86em;
+  font-size: 0.82em;
   font-weight: 650;
   line-height: 1;
   max-width: 100%;
   overflow: hidden;
-  padding: 4px 7px;
+  align-items: center;
+  box-sizing: border-box;
+  display: inline-flex;
+  height: 28px;
+  justify-content: center;
+  min-height: 28px;
+  padding: 3px 6px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -968,6 +978,13 @@
 
 .obsidian-ntfy-suggest-item {
   padding: 4px 0;
+}
+
+.obsidian-ntfy-date-time-modal .obsidian-ntfy-date-time-input {
+  box-sizing: border-box;
+  display: block;
+  margin: 12px 0 16px;
+  width: 100%;
 }
 
 .obsidian-ntfy-suggest-line-break-icon {

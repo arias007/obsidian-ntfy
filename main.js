@@ -2483,6 +2483,15 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return [];
   }
 
+  conversationChannelLabel(channel, fallback = "") {
+    if (!channel || typeof channel !== "object") return fallback;
+    // An ntfy topic is a credential-like routing secret. Never use the
+    // account's editable name in the conversation UI, because older settings
+    // may have stored the topic there.
+    if (String(channel.type || "").trim().toLowerCase() === "ntfy") return "ntfy";
+    return String(channel.name || channel.type || fallback || channel.id || "").trim() || fallback;
+  }
+
   conversationContacts() {
     const messages = this.settings.conversationMessages || [];
     const contacts = new Map();
@@ -2491,13 +2500,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     for (const channel of channels) {
       if (!this.conversationChannelIsActive(channel)) continue;
       const key = this.conversationKey(channel.id, "default");
+      const channelLabel = this.conversationChannelLabel(channel, channel.id);
       contacts.set(key, {
         id: key,
         kind: "channel",
         channelId: channel.id,
         conversationId: "default",
-        name: channel.name || channel.id,
-        subtitle: channel.type || channel.id,
+        name: channelLabel,
+        subtitle: channel.type === "ntfy" ? "ntfy" : channel.type || channel.id,
         icon: iconByType[channel.type] || "message-circle",
         online: channel.deliveryReady === true || ["connected", "poll"].includes(String(channel.connectionStatus || "").toLowerCase()),
         available: true,
@@ -2511,13 +2521,15 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       const channel = channels.find((item) => item.id === message.channelId);
       const active = Boolean(channel && this.conversationChannelIsActive(channel));
       const conversationName = String(message.metadata && message.metadata.conversationName || "").trim();
+      const channelLabel = this.conversationChannelLabel(channel, message.channelId);
+      const isNtfy = String(channel?.type || message.channelId || "").trim().toLowerCase() === "ntfy";
       contacts.set(key, {
         id: key,
         kind: "history",
         channelId: message.channelId,
         conversationId: message.conversationId,
-        name: conversationName || message.title || channel?.name || message.sender || message.channelId,
-        subtitle: channel ? `${channel.type} · history` : `${message.channelId} · imported history`,
+        name: isNtfy ? "ntfy" : conversationName || message.title || channelLabel || message.sender || message.channelId,
+        subtitle: isNtfy ? "ntfy · history" : channel ? `${channel.type} · history` : `${message.channelId} · imported history`,
         icon: iconByType[channel?.type] || "message-circle",
         online: active && (channel.deliveryReady === true || ["connected", "poll"].includes(String(channel.connectionStatus || "").toLowerCase())),
         available: active,
@@ -2532,14 +2544,15 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       if (contacts.has(peerKey)) continue;
       const channel = channels.find((item) => item.id === message.channelId);
       const active = Boolean(channel && this.conversationChannelIsActive(channel));
+      const channelLabel = this.conversationChannelLabel(channel, "ntfy");
       contacts.set(peerKey, {
         id: peerKey,
         kind: "ntfy-peer",
         channelId: "ntfy",
         conversationId: message.conversationId,
         sender,
-        name: sender,
-        subtitle: `${channel?.name || "ntfy"} · 私信入口`,
+        name: "ntfy",
+        subtitle: `${channelLabel} · 私信入口`,
         icon: "user",
         online: active,
         available: active,
@@ -8700,61 +8713,63 @@ class NtfyManagerView extends ItemView {
   }
 
   openDateTimePicker(dueValue, onSave) {
-    if (typeof document === "undefined" || !document.body) {
+    if (typeof Modal !== "function" || !this.app) {
       new Notice(`${PLUGIN_NAME}: time picker unavailable`);
       return;
     }
     const due = dueValue instanceof Date ? dueValue : new Date(dueValue);
-    const currentDue = Number.isNaN(due.getTime()) ? new Date(Date.now() + 30 * 60 * 1000) : due;
-    const input = document.createElement("input");
-    input.type = "datetime-local";
-    input.value = this.plugin.formatDateTimeLocal(currentDue);
-    input.setAttribute("aria-label", "修改提醒时间");
-    Object.assign(input.style, {
-      position: "fixed",
-      left: "-10000px",
-      top: "0",
-      width: "1px",
-      height: "1px",
-      opacity: "0",
-      pointerEvents: "none",
-    });
-    document.body.appendChild(input);
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const fallbackDue = new Date(Date.now() + 30 * 60 * 1000);
+    const currentDue = Number.isNaN(due.getTime()) || due.getTime() < todayStart.getTime() ? fallbackDue : due;
+    const modal = new Modal(this.app);
+    let saving = false;
+    modal.onOpen = () => {
+      const content = modal.contentEl;
+      content.empty();
+      content.addClass("obsidian-ntfy-date-time-modal");
+      content.createEl("h3", { text: "修改提醒时间" });
+      const input = content.createEl("input", {
+        cls: "obsidian-ntfy-date-time-input",
+        attr: { type: "datetime-local", "aria-label": "修改提醒时间" },
+      });
+      input.min = this.plugin.formatDateTimeLocal(todayStart);
+      input.value = this.plugin.formatDateTimeLocal(currentDue);
 
-    let cleanupTimer = null;
-    const cleanup = () => {
-      if (cleanupTimer !== null) window.clearTimeout(cleanupTimer);
-      cleanupTimer = null;
-      input.remove();
+      const actions = content.createDiv({ cls: "modal-button-container" });
+      const cancel = actions.createEl("button", { text: "取消", attr: { type: "button" } });
+      cancel.addEventListener("click", () => modal.close());
+      const save = actions.createEl("button", { text: "保存", cls: "mod-cta", attr: { type: "button" } });
+      const saveValue = async () => {
+        if (saving) return;
+        const parsedDue = this.plugin.parseDateTimeLocal(input.value);
+        if (!parsedDue) {
+          new Notice(`${PLUGIN_NAME}: invalid date/time`);
+          input.focus();
+          return;
+        }
+        saving = true;
+        save.disabled = true;
+        try {
+          await onSave(parsedDue);
+          modal.close();
+        } catch (error) {
+          saving = false;
+          save.disabled = false;
+          new Notice(`${PLUGIN_NAME}: time update failed`);
+          console.error(error);
+        }
+      };
+      save.addEventListener("click", () => void saveValue());
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          void saveValue();
+        }
+      });
+      window.setTimeout(() => input.focus({ preventScroll: true }), 0);
     };
-    input.addEventListener("change", async () => {
-      const parsedDue = this.plugin.parseDateTimeLocal(input.value);
-      if (!parsedDue) {
-        cleanup();
-        new Notice(`${PLUGIN_NAME}: invalid date/time`);
-        return;
-      }
-      try {
-        await onSave(parsedDue);
-      } catch (error) {
-        new Notice(`${PLUGIN_NAME}: time update failed`);
-        console.error(error);
-      } finally {
-        cleanup();
-      }
-    }, { once: true });
-    input.addEventListener("cancel", cleanup, { once: true });
-    cleanupTimer = window.setTimeout(cleanup, 5 * 60 * 1000);
-
-    try {
-      input.focus({ preventScroll: true });
-      if (typeof input.showPicker === "function") input.showPicker();
-      else input.click();
-    } catch (error) {
-      cleanup();
-      new Notice(`${PLUGIN_NAME}: time picker unavailable`);
-      console.error(error);
-    }
+    modal.open();
   }
 
   openSourceTimePicker(reminder) {
@@ -8931,10 +8946,13 @@ function ntfyReminderSuggestions(plugin, currentLine = "") {
 }
 
 function ntfyDateSuggestions(plugin, now) {
-  const labels = String(plugin.settings.suggestionDates || DEFAULT_SETTINGS.suggestionDates)
+  const configuredLabels = String(plugin.settings.suggestionDates || DEFAULT_SETTINGS.suggestionDates)
     .split(/[,，]/)
     .map((item) => item.trim())
     .filter(Boolean);
+  // Always start the date panel at today. Keep user-configured choices after
+  // it, while removing duplicates if the setting already contains 今天.
+  const labels = ["今天", ...configuredLabels.filter((label) => label !== "今天")];
   const dateForLabel = (label) => {
     if (/^今天$/u.test(label)) return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
     if (/^明天$/u.test(label)) return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0, 0);
