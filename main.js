@@ -978,7 +978,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.addRibbonIcon(
       "list-checks",
       this.uiText("打开 ntfy 待办管理", "Open ntfy task manager"),
-      () => this.openNtfyManager("tasks")
+      () => this.openNtfyManager("pending")
     );
 
     this.addSettingTab(new AndroidNtfyNotifierSettingTab(this.app, this));
@@ -1020,7 +1020,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.addCommand({
       id: "open-ntfy-task-manager",
       name: this.uiText("打开 ntfy 待办管理", "Open ntfy task manager"),
-      callback: async () => this.openNtfyManager("tasks"),
+      callback: async () => this.openNtfyManager("pending"),
     });
 
     this.addCommand({
@@ -5876,10 +5876,15 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_NTFY_MANAGER);
     let leaf = leaves[0];
     if (leaf && leaf.view && typeof leaf.view.setPreloadedData === "function") {
-      // Show the existing manager immediately. Refresh data in the background
-      // instead of blocking the click on a full-vault scan.
-      if (typeof leaf.view.activateTab === "function") leaf.view.activateTab(requestedTab);
-      await leaf.view.render();
+      // Reuse the mounted shell synchronously. activateTab() paints the
+      // cached snapshot and starts the authoritative scan in the background;
+      // calling render() again here only duplicates that work on every click.
+      if (leaf.view.bodyEl && typeof leaf.view.activateTab === "function") {
+        leaf.view.activateTab(requestedTab);
+      } else {
+        leaf.view.activeTab = requestedTab;
+        await leaf.view.render();
+      }
       this.app.workspace.revealLeaf(leaf);
       return;
     }
@@ -7600,6 +7605,10 @@ class NtfyManagerView extends ItemView {
     this.bodyEl = null;
     this.tabPanels = new Map();
     this.tabSignatures = new Map();
+    this.tabRenderHandles = new Map();
+    this.panelBatchStates = new Map();
+    this.tabDataRevisions = { pending: 0, vault: 0, inbox: 0, queue: 0, connections: 0 };
+    this.groupedVaultTasksCache = { source: null, value: null };
     this.tabScrollPositions = new Map();
     this.tabRefreshes = new Map();
     this.activeConversationId = "";
@@ -7653,6 +7662,14 @@ class NtfyManagerView extends ItemView {
     this.tabSignatures.clear();
     this.tabScrollPositions.clear();
     this.tabRefreshes.clear();
+    for (const handle of this.tabRenderHandles.values()) this.cancelScheduledHandle(handle);
+    this.tabRenderHandles.clear();
+    for (const state of this.panelBatchStates.values()) {
+      state.cancelled = true;
+      for (const handle of state.timers) this.cancelScheduledHandle(handle);
+      state.timers.clear();
+    }
+    this.panelBatchStates.clear();
     this.conversationDrafts.clear();
     this.conversationVisibleCounts.clear();
     this.conversationContactsCache = null;
@@ -7662,6 +7679,7 @@ class NtfyManagerView extends ItemView {
     // Providers can emit several events in one poll. Coalesce them into one
     // paint and do not render an inactive inbox panel at all.
     this.conversationContactsCache = null;
+    this.tabDataRevisions.inbox += 1;
     if (this.activeTab !== "inbox") {
       this.updateNavCounts();
       return;
@@ -7834,8 +7852,116 @@ class NtfyManagerView extends ItemView {
       attr: { "data-panel-id": tabId },
     });
     this.tabPanels.set(tabId, panel);
+    // Paint the first viewport synchronously. The row renderer itself yields
+    // after the initial batch, so opening the manager never waits for a timer
+    // before showing cached or already-loaded content.
     this.renderTabPanel(tabId);
     return panel;
+  }
+
+  beginPanelRender(panel) {
+    const previous = this.panelBatchStates.get(panel);
+    if (previous) {
+      previous.cancelled = true;
+      for (const handle of previous.timers) this.cancelScheduledHandle(handle);
+      previous.timers.clear();
+    }
+    const state = { cancelled: false, timers: new Set() };
+    this.panelBatchStates.set(panel, state);
+    return state;
+  }
+
+  cancelScheduledHandle(scheduled) {
+    if (scheduled === null || scheduled === undefined) return;
+    const isObject = typeof scheduled === "object";
+    const kind = isObject ? scheduled.kind : "timeout";
+    const handle = isObject ? scheduled.handle : scheduled;
+    if (handle === null || handle === undefined) return;
+    if (kind === "frame") {
+      if (typeof window !== "undefined" && typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(handle);
+      else if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(handle);
+      return;
+    }
+    if (typeof window !== "undefined" && typeof window.clearTimeout === "function") window.clearTimeout(handle);
+    else if (typeof clearTimeout === "function") clearTimeout(handle);
+  }
+
+  renderRowsBatched(containerEl, items, renderItem, state, options = {}) {
+    const list = Array.isArray(items) ? items : [];
+    const initialCount = Math.max(1, Number(options.initialCount || 24));
+    const batchSize = Math.max(1, Number(options.batchSize || 32));
+    const onComplete = typeof options.onComplete === "function" ? options.onComplete : null;
+    let index = 0;
+    const append = (end) => {
+      if (!state || state.cancelled) return false;
+      const stop = Math.min(list.length, end);
+      while (index < stop) renderItem(list[index++]);
+      return true;
+    };
+    if (!append(initialCount)) return;
+    if (index >= list.length) {
+      onComplete?.();
+      return;
+    }
+    const schedule = (callback) => {
+      if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+        return { kind: "frame", handle: window.requestAnimationFrame(callback) };
+      }
+      if (typeof window !== "undefined" && typeof window.setTimeout === "function") {
+        return { kind: "timeout", handle: window.setTimeout(callback, 0) };
+      }
+      if (typeof setTimeout === "function") return { kind: "timeout", handle: setTimeout(callback, 0) };
+      return null;
+    };
+    const pump = () => {
+      if (!state || state.cancelled) return;
+      append(index + batchSize);
+      if (index < list.length) {
+        let scheduled = null;
+        scheduled = schedule(() => { state.timers.delete(scheduled); pump(); });
+        if (scheduled) state.timers.add(scheduled);
+      } else {
+        onComplete?.();
+      }
+    };
+    let scheduled = null;
+    scheduled = schedule(() => { state.timers.delete(scheduled); pump(); });
+    if (scheduled) state.timers.add(scheduled);
+    else pump();
+  }
+
+  cancelTabRender(tabId) {
+    const scheduled = this.tabRenderHandles.get(tabId);
+    if (!scheduled) return;
+    this.cancelScheduledHandle(scheduled);
+    this.tabRenderHandles.delete(tabId);
+  }
+
+  renderTabPlaceholder(panel, tabId) {
+    if (!panel) return;
+    panel.empty();
+    panel.setAttr("aria-busy", "true");
+    const loading = panel.createDiv({ cls: "obsidian-ntfy-muted obsidian-ntfy-task-loading obsidian-ntfy-tab-loading" });
+    setIcon(loading.createSpan({ cls: "obsidian-ntfy-task-loading-icon" }), "loader-circle");
+    const labels = { pending: "正在打开待处理…", completed: "正在打开已完成…", tasks: "正在打开整库待办…", inbox: "正在打开消息…", queue: "正在打开队列…", connections: "正在打开连接…" };
+    loading.createSpan({ text: labels[tabId] || "正在打开…" });
+    this.tabSignatures.delete(tabId);
+  }
+
+  scheduleTabRender(tabId) {
+    const panel = this.tabPanels.get(tabId);
+    if (!panel) return;
+    this.cancelTabRender(tabId);
+    const render = () => {
+      this.tabRenderHandles.delete(tabId);
+      if (!this.tabPanels.has(tabId) || (panel.isConnected === false && !panel.parentElement)) return;
+      this.renderTabPanel(tabId);
+    };
+    const handle = typeof window !== "undefined" && typeof window.setTimeout === "function"
+      ? window.setTimeout(render, 0)
+      : typeof setTimeout === "function" ? setTimeout(render, 0) : null;
+    if (handle !== null) this.tabRenderHandles.set(tabId, { kind: "timeout", handle });
+    else render();
   }
 
   renderTabPanel(tabId) {
@@ -7843,12 +7969,15 @@ class NtfyManagerView extends ItemView {
     if (!panel) return;
     const scrollTop = this.activeTab === tabId && this.bodyEl ? this.bodyEl.scrollTop : null;
     const inputState = tabId === "inbox" ? this.captureConversationInputState() : null;
+    const batchState = this.beginPanelRender(panel);
+    this.cancelTabRender(tabId);
     panel.empty();
-    if (tabId === "pending") this.renderNotificationTasks(panel);
-    if (tabId === "queue") this.renderQueueWorkspace(panel);
-    if (tabId === "completed") this.renderCompletedTasks(panel);
-    if (tabId === "tasks") this.renderVaultTasks(panel);
-    if (tabId === "inbox") this.renderIncomingMessages(panel);
+    panel.removeAttribute("aria-busy");
+    if (tabId === "pending") this.renderNotificationTasks(panel, batchState);
+    if (tabId === "queue") this.renderQueueWorkspace(panel, batchState);
+    if (tabId === "completed") this.renderCompletedTasks(panel, batchState);
+    if (tabId === "tasks") this.renderVaultTasks(panel, batchState);
+    if (tabId === "inbox") this.renderIncomingMessages(panel, batchState);
     if (tabId === "connections") this.renderConnectionStatus(panel);
     this.tabSignatures.set(tabId, this.tabDataSignature(tabId));
     if (scrollTop !== null && this.bodyEl) this.bodyEl.scrollTop = scrollTop;
@@ -7856,37 +7985,39 @@ class NtfyManagerView extends ItemView {
   }
 
   tabDataSignature(tabId) {
-    let value = null;
-    if (tabId === "pending") value = { tasks: this.notificationTasks, scanError: this.scanError };
-    else if (tabId === "completed" || tabId === "tasks") value = this.vaultTasks;
-    else if (tabId === "inbox") {
+    if (tabId === "pending") return `pending:${this.tabDataRevisions.pending}:${this.notificationTasks.length}:${this.scanError}`;
+    if (tabId === "completed" || tabId === "tasks") return `vault:${this.tabDataRevisions.vault}:${this.vaultTasks.length}`;
+    if (tabId === "inbox") {
       const messages = this.plugin.settings.conversationMessages || [];
-      // Fingerprint only fields that affect the manager paint. Avoid
-      // serializing full bodies/attachments when the store is large.
-      const sample = messages.length <= 96
-        ? messages
-        : [...messages.slice(0, 2), ...messages.slice(-94)];
-      value = {
-        count: messages.length,
-        sample: sample.map((message) => [
-          message.id,
-          message.direction,
-          message.status,
-          message.timestamp,
-          message.text?.length || 0,
-          (message.attachments || []).map((attachment) => `${attachment.path || attachment.url || attachment.downloadKey || ""}:${attachment.downloadState || ""}`),
-        ]),
-        preferences: this.plugin.settings.conversationPreferences || {},
-      };
+      const first = messages[0] || {};
+      const last = messages[messages.length - 1] || {};
+      const preferences = this.plugin.settings.conversationPreferences || {};
+      return `inbox:${this.tabDataRevisions.inbox}:${messages.length}:${first.id || ""}:${last.id || ""}:${last.status || ""}:${this.activeConversationId}:${Object.keys(preferences).length}`;
     }
-    else if (tabId === "queue") value = { queue: this.plugin.settings.queue || [], notices: this.plugin.settings.obsidianNotices || [] };
-    else if (tabId === "connections") value = { channels: this.plugin.settings.channelAccounts || [], logs: this.plugin.settings.connectionLogs || [] };
-    try {
-      return JSON.stringify(value);
-    } catch (error) {
-      console.warn(`${PLUGIN_NAME}: failed to fingerprint manager cache`, error);
-      return String(Date.now());
+    if (tabId === "queue") return `queue:${this.tabDataRevisions.queue}:${(this.plugin.settings.queue || []).length}:${(this.plugin.settings.obsidianNotices || []).length}`;
+    if (tabId === "connections") return `connections:${this.tabDataRevisions.connections}:${(this.plugin.settings.channelAccounts || []).length}:${(this.plugin.settings.connectionLogs || []).length}`;
+    return String(tabId || "");
+  }
+
+  taskSnapshotsEqual(previous, next, kind = "vault") {
+    if (previous === next) return true;
+    if (!Array.isArray(previous) || !Array.isArray(next) || previous.length !== next.length) return false;
+    const fields = kind === "pending"
+      ? ["key", "filePath", "lineNumber", "text", "due", "source", "notificationState"]
+      : ["key", "filePath", "lineNumber", "text", "due", "doneAt", "completed", "source"];
+    const valueKey = (value) => {
+      if (value instanceof Date) return String(value.getTime());
+      if (value === null || value === undefined) return "";
+      return String(value);
+    };
+    for (let index = 0; index < previous.length; index++) {
+      const left = previous[index] || {};
+      const right = next[index] || {};
+      for (const field of fields) {
+        if (valueKey(left[field]) !== valueKey(right[field])) return false;
+      }
     }
+    return true;
   }
 
   syncTabPanels(tabIds) {
@@ -7895,7 +8026,8 @@ class NtfyManagerView extends ItemView {
       if (!this.tabPanels.has(tabId)) continue;
       const signature = this.tabDataSignature(tabId);
       if (this.tabSignatures.get(tabId) === signature) continue;
-      this.renderTabPanel(tabId);
+      if (tabId === this.activeTab) this.renderTabPanel(tabId);
+      else this.scheduleTabRender(tabId);
       changed = true;
     }
     return changed;
@@ -7917,8 +8049,11 @@ class NtfyManagerView extends ItemView {
   activateTab(tabId) {
     if (!this.managerTabIds().includes(tabId)) return;
     if (this.bodyEl) this.tabScrollPositions.set(this.activeTab, this.bodyEl.scrollTop || 0);
-    this.ensureTabPanel(tabId);
     this.activeTab = tabId;
+    const panel = this.ensureTabPanel(tabId);
+    if (panel && this.tabSignatures.get(tabId) !== this.tabDataSignature(tabId)) {
+      this.renderTabPanel(tabId);
+    }
     this.updateNavSelection();
     this.showActiveTabPanel();
     if (this.bodyEl) this.bodyEl.scrollTop = this.tabScrollPositions.get(tabId) || 0;
@@ -7954,14 +8089,23 @@ class NtfyManagerView extends ItemView {
         : true;
       try {
         if (scope === "pending") {
-          this.notificationTasks = await this.plugin.collectNotificationTasks();
+          const nextTasks = await this.plugin.collectNotificationTasks();
+          if (!this.taskSnapshotsEqual(this.notificationTasks, nextTasks, "pending")) {
+            this.notificationTasks = nextTasks;
+            this.tabDataRevisions.pending += 1;
+          }
           this.scanError = "";
           this.notificationTasksLoaded = true;
         } else if (scope === "vault") {
-          this.vaultTasks = await this.plugin.collectVaultTasks();
+          const nextTasks = await this.plugin.collectVaultTasks();
+          if (!this.taskSnapshotsEqual(this.vaultTasks, nextTasks, "vault")) {
+            this.vaultTasks = nextTasks;
+            this.tabDataRevisions.vault += 1;
+          }
           this.vaultTasksLoaded = true;
         } else if (scope === "inbox") {
-          await this.plugin.runIncomingPoll();
+          const pollResult = await this.plugin.runIncomingPoll();
+          if (pollResult?.changed) this.tabDataRevisions.inbox += 1;
         }
         this.plugin.setManagerViewCache({
           notificationTasks: this.notificationTasks,
@@ -8010,6 +8154,7 @@ class NtfyManagerView extends ItemView {
   }
 
   renderIncomingMessages(containerEl) {
+    const batchState = arguments[1];
     const contacts = this.conversationContacts();
     const compact = typeof window !== "undefined" && window.matchMedia && window.matchMedia("(max-width: 600px)").matches;
     if (this.activeConversationId && !contacts.some((contact) => contact.id === this.activeConversationId)) this.activeConversationId = "";
@@ -8121,7 +8266,7 @@ class NtfyManagerView extends ItemView {
       setIcon(empty.createSpan(), active.icon || "message-circle");
     }
     let lastDate = "";
-    for (const message of messages) {
+    this.renderRowsBatched(messageList, messages, (message) => {
       const date = new Date(message.timestamp);
       const dateKey = Number.isNaN(date.getTime()) ? "" : date.toLocaleDateString();
       if (dateKey && dateKey !== lastDate) {
@@ -8164,7 +8309,7 @@ class NtfyManagerView extends ItemView {
         await this.plugin.removeConversationMessage(message.id, message.direction);
         this.renderTabPanel("inbox");
       });
-    }
+    }, batchState, { initialCount: 48, batchSize: 64 });
 
     // New conversations should open at the newest message. One animation
     // frame is enough; delayed repeated scrolls made the message page jank.
@@ -8433,8 +8578,14 @@ class NtfyManagerView extends ItemView {
         this.plugin.collectVaultTasks(),
       ]);
       if (refreshId !== this.taskCacheRefreshId) return;
-      this.notificationTasks = notificationTasks;
-      this.vaultTasks = vaultTasks;
+      if (!this.taskSnapshotsEqual(this.notificationTasks, notificationTasks, "pending")) {
+        this.notificationTasks = notificationTasks;
+        this.tabDataRevisions.pending += 1;
+      }
+      if (!this.taskSnapshotsEqual(this.vaultTasks, vaultTasks, "vault")) {
+        this.vaultTasks = vaultTasks;
+        this.tabDataRevisions.vault += 1;
+      }
       this.notificationTasksLoaded = true;
       this.vaultTasksLoaded = true;
       this.scanError = "";
@@ -8866,12 +9017,12 @@ class NtfyManagerView extends ItemView {
     });
   }
 
-  renderQueueWorkspace(containerEl) {
-    this.renderQueue(containerEl);
-    this.renderObsidianNotices(containerEl);
+  renderQueueWorkspace(containerEl, batchState) {
+    this.renderQueue(containerEl, batchState);
+    this.renderObsidianNotices(containerEl, batchState);
   }
 
-  renderQueue(containerEl) {
+  renderQueue(containerEl, batchState) {
     const group = containerEl.createDiv({ cls: "obsidian-ntfy-section" });
     const queue = [...(this.plugin.settings.queue || [])].sort((a, b) => this.plugin.queueSortTime(a) - this.plugin.queueSortTime(b));
     this.renderSectionHeader(group, "排队中", queue.length, "本地队列，仍可编辑、发送或删除；无分时和过期待办在每日批次集中推送。");
@@ -8880,9 +9031,7 @@ class NtfyManagerView extends ItemView {
       return;
     }
 
-    for (const item of queue) {
-      this.renderQueueItem(group, item);
-    }
+    this.renderRowsBatched(group, queue, (item) => this.renderQueueItem(group, item), batchState, { initialCount: 20, batchSize: 24 });
   }
 
   renderQueueItem(containerEl, item) {
@@ -8953,7 +9102,7 @@ class NtfyManagerView extends ItemView {
     }
   }
 
-  renderNotificationTasks(containerEl) {
+  renderNotificationTasks(containerEl, batchState) {
     const group = containerEl.createDiv({ cls: "obsidian-ntfy-section" });
     // Keep the last successful list visible when a replacement scan fails. A
     // transient read error must not turn the manager into a blank panel.
@@ -8974,9 +9123,7 @@ class NtfyManagerView extends ItemView {
       group.createEl("p", { cls: "obsidian-ntfy-muted", text: "暂无带时间的待办提醒。" });
       return;
     }
-    for (const reminder of this.notificationTasks) {
-      this.renderReminderItem(group, reminder);
-    }
+    this.renderRowsBatched(group, this.notificationTasks, (reminder) => this.renderReminderItem(group, reminder), batchState, { initialCount: 24, batchSize: 32 });
   }
 
   renderReminderItem(containerEl, reminder) {
@@ -9006,7 +9153,7 @@ class NtfyManagerView extends ItemView {
     return "待处理";
   }
 
-  renderObsidianNotices(containerEl) {
+  renderObsidianNotices(containerEl, batchState) {
     const group = containerEl.createDiv({ cls: "obsidian-ntfy-section" });
     const notices = this.plugin.settings.obsidianNotices || [];
     this.renderSectionHeader(group, "插件通知", notices.length, "Obsidian 或其他插件弹出的 Notice，按需转发到手机。");
@@ -9019,9 +9166,10 @@ class NtfyManagerView extends ItemView {
       await this.plugin.clearObsidianNotices();
       await this.render();
     });
-    for (const notice of notices.slice(0, 50)) {
-      this.renderNoticeItem(group, notice);
-    }
+    this.renderRowsBatched(group, notices.slice(0, 50), (notice) => this.renderNoticeItem(group, notice), batchState, {
+      initialCount: 20,
+      batchSize: 24,
+    });
   }
 
   renderNoticeItem(containerEl, notice) {
@@ -9119,16 +9267,19 @@ class NtfyManagerView extends ItemView {
 
   groupVaultTasks() {
     const tasks = this.vaultTasks || [];
-    return {
+    if (this.groupedVaultTasksCache.source === tasks && this.groupedVaultTasksCache.value) return this.groupedVaultTasksCache.value;
+    const value = {
       openTimed: tasks.filter((task) => !task.completed && task.due),
       openUntimed: tasks.filter((task) => !task.completed && !task.due),
       doneTimed: tasks.filter((task) => task.completed && task.due),
       doneUntimed: tasks.filter((task) => task.completed && !task.due),
       done: tasks.filter((task) => task.completed),
     };
+    this.groupedVaultTasksCache = { source: tasks, value };
+    return value;
   }
 
-  renderVaultTasks(containerEl) {
+  renderVaultTasks(containerEl, batchState) {
     const group = containerEl.createDiv({ cls: "obsidian-ntfy-section" });
     if (!this.vaultTasksLoaded && !this.vaultTasks.length) {
       const loading = group.createDiv({ cls: "obsidian-ntfy-muted obsidian-ntfy-task-loading" });
@@ -9137,27 +9288,28 @@ class NtfyManagerView extends ItemView {
       return;
     }
     const groups = this.groupVaultTasks();
-    this.renderTaskGroup(group, "有时间", groups.openTimed, 80);
-    this.renderTaskGroup(group, "没时间", groups.openUntimed, 80);
-    this.renderTaskGroup(group, "已完成 有时间", groups.doneTimed, 40);
-    this.renderTaskGroup(group, "已完成 没时间", groups.doneUntimed, 40);
+    this.renderTaskGroup(group, "有时间", groups.openTimed, 80, batchState);
+    this.renderTaskGroup(group, "没时间", groups.openUntimed, 80, batchState);
+    this.renderTaskGroup(group, "已完成 有时间", groups.doneTimed, 40, batchState);
+    this.renderTaskGroup(group, "已完成 没时间", groups.doneUntimed, 40, batchState);
   }
 
-  renderCompletedTasks(containerEl) {
+  renderCompletedTasks(containerEl, batchState) {
     const group = containerEl.createDiv({ cls: "obsidian-ntfy-section" });
     const groups = this.groupVaultTasks();
-    this.renderTaskGroup(group, "已完成 有时间", groups.doneTimed, 80);
-    this.renderTaskGroup(group, "已完成 没时间", groups.doneUntimed, 80);
+    this.renderTaskGroup(group, "已完成 有时间", groups.doneTimed, 80, batchState);
+    this.renderTaskGroup(group, "已完成 没时间", groups.doneUntimed, 80, batchState);
   }
 
-  renderTaskGroup(containerEl, title, tasks, limit) {
+  renderTaskGroup(containerEl, title, tasks, limit, batchState) {
     const block = containerEl.createDiv({ cls: "obsidian-ntfy-task-group" });
     this.renderSectionHeader(block, title, tasks.length, "");
     if (!tasks.length) {
       block.createEl("p", { cls: "obsidian-ntfy-muted", text: "暂无。" });
       return;
     }
-    for (const task of tasks.slice(0, limit)) {
+    const visibleTasks = tasks.slice(0, limit);
+    this.renderRowsBatched(block, visibleTasks, (task) => {
       const state = task.completed ? "done" : (task.due ? "pending" : "untimed");
       const displayDate = task.completed ? task.doneAt : task.due;
       const row = block.createDiv({
@@ -9180,8 +9332,9 @@ class NtfyManagerView extends ItemView {
           }, true);
         } : null,
       });
-    }
-    if (tasks.length > limit) block.createEl("p", { cls: "obsidian-ntfy-muted", text: `还有 ${tasks.length - limit} 条未显示。` });
+    }, batchState, { initialCount: 20, batchSize: 24, onComplete: () => {
+      if (tasks.length > limit && block.isConnected !== false) block.createEl("p", { cls: "obsidian-ntfy-muted", text: `还有 ${tasks.length - limit} 条未显示。` });
+    } });
   }
 
   openDateTimePicker(dueValue, onSave, anchorEl = null) {

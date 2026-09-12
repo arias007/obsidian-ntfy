@@ -159,8 +159,8 @@ async function run() {
   const styles = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
   const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.equal(manifest.version, "1.4.10");
-  assert.equal(packageJson.version, "1.4.10");
+  assert.equal(manifest.version, "1.5.0");
+  assert.equal(packageJson.version, "1.5.0");
   const managerHeaderStart = source.indexOf("  renderHeader(containerEl) {");
   const managerHeaderEnd = source.indexOf("  renderIncomingMessages(containerEl)", managerHeaderStart);
   assert.ok(managerHeaderStart >= 0 && managerHeaderEnd > managerHeaderStart, "manager header should remain discoverable");
@@ -174,7 +174,7 @@ async function run() {
   assert.match(source, /callback\/ws\/endpoint/);
   assert.match(source, /notification-hub:incoming/);
   assert.match(source, /refreshIncomingView\(\)/);
-  assert.match(source, /addRibbonIcon\([\s\S]*openNtfyManager\("tasks"\)/);
+  assert.match(source, /addRibbonIcon\([\s\S]*openNtfyManager\("pending"\)/);
   assert.match(source, /openNtfyManager\(tabId = "pending"\)/);
   assert.match(source, /consumeManagerViewPreloadTab\(\)/);
   assert.match(source, /requestIdleCallback\(runDeferredStartupWork/);
