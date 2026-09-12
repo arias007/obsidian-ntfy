@@ -6159,6 +6159,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return indent.replace(/\t/g, "    ").length;
   }
 
+  taskLineHasReminderContent(line) {
+    const match = String(line || "").match(/^\s*[-*+]\s+\[([^\]])\]\s*(.*)$/u);
+    if (!match || match[1] === "x" || match[1] === "X") return false;
+    return Boolean(String(match[2] || "").trim());
+  }
+
   cascadeCompletedTaskChildren(lines, lineIndex, doneAt = new Date()) {
     const cascadedLineNumbers = [];
     const parentIndent = this.taskIndentWidth(lines[lineIndex]);
@@ -9126,13 +9132,21 @@ class NtfyReminderSuggest extends EditorSuggest {
     const line = editor.getLine(cursor.line).slice(0, cursor.ch);
     const match = line.match(/(?:^|\s)(ntfy|提醒|notify|remind|todo|task|待办|今天|明天|后天|下周|今晚|早八|上午|中午|下午|30分钟|1小时|📅|⏰|➕|⏲)$/i);
     const taskLine = /^\s*[-*+]\s+\[[^\]]\]/.test(line);
+    const taskContentTrigger = this.plugin.taskLineHasReminderContent(line);
     const emojiTrigger = line.match(/(?:📅|⏰|➕|⏲)\s*$/u);
     const dateNeedsTimeTrigger = line.match(/[📅⏰]\s*\d{4}-\d{2}-\d{2}(\s*)$/u);
-    // Do not open a suggestion popup for every ordinary task line. It steals
-    // the first Enter key and makes the next line look like another todo.
-    // Explicit ntfy keywords, Tasks emojis, and date-only lines still work.
-    if (!match && !(taskLine && emojiTrigger) && !dateNeedsTimeTrigger) return null;
-    const trigger = match ? match[1] : emojiTrigger ? emojiTrigger[0].trim() : "";
+    // Any non-empty unfinished task should offer reminder choices, even when
+    // its content is only one character. Empty and completed tasks stay quiet.
+    // The first suggestion remains the explicit line-break action, so Enter
+    // keeps the normal create-next-task workflow.
+    if (!match && !(taskLine && emojiTrigger) && !dateNeedsTimeTrigger && !taskContentTrigger) return null;
+    const trigger = match
+      ? match[1]
+      : emojiTrigger
+      ? emojiTrigger[0].trim()
+      : taskContentTrigger
+      ? "__task_content__"
+      : "";
     return {
       start: {
         line: cursor.line,
@@ -9223,11 +9237,12 @@ class NtfyReminderSuggest extends EditorSuggest {
       return;
     }
     const currentLine = this.context.editor.getLine(this.context.start.line);
-    const taskBody = currentLine.match(/^\s*[-*+]\s+\[[^\]]\]\s+(.*)$/)?.[1] || "";
-    const taskHasContent = Boolean(taskBody
-      .replace(/(?:^|\s)(?:ntfy|提醒|notify|remind|todo|task|待办|今天|明天|后天|下周|今晚|早八|上午|中午|下午|30分钟|1小时|📅|⏰|➕|⏲)\s*$/iu, "")
-      .trim());
-    const text = suggestion.insertText || this.tasksFields(suggestion.due, currentLine);
+    const taskHasContent = this.plugin.taskLineHasReminderContent(currentLine);
+    let text = suggestion.insertText || this.tasksFields(suggestion.due, currentLine);
+    if (this.context.query === "__task_content__" && text && !/^\s/u.test(text)) {
+      const before = currentLine.slice(Math.max(0, this.context.start.ch - 1), this.context.start.ch);
+      if (before && !/\s/u.test(before)) text = ` ${text}`;
+    }
     this.context.editor.replaceRange(text, this.context.start, this.context.end);
     this.context.editor.setCursor({
       line: this.context.start.line,

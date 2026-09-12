@@ -159,8 +159,8 @@ async function run() {
   const styles = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
   const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.equal(manifest.version, "1.4.6");
-  assert.equal(packageJson.version, "1.4.6");
+  assert.equal(manifest.version, "1.4.7");
+  assert.equal(packageJson.version, "1.4.7");
   const managerHeaderStart = source.indexOf("  renderHeader(containerEl) {");
   const managerHeaderEnd = source.indexOf("  renderIncomingMessages(containerEl)", managerHeaderStart);
   assert.ok(managerHeaderStart >= 0 && managerHeaderEnd > managerHeaderStart, "manager header should remain discoverable");
@@ -180,7 +180,8 @@ async function run() {
   assert.match(source, /requestIdleCallback\(runDeferredStartupWork/);
   assert.match(source, /conversationVisibleCounts/);
   assert.match(source, /加载更早消息/);
-  assert.doesNotMatch(source, /const taskTextTrigger =/);
+  assert.match(source, /const taskContentTrigger = this\.plugin\.taskLineHasReminderContent\(line\)/);
+  assert.match(source, /taskContentTrigger\s*\? "__task_content__"/);
   assert.match(source, /event\.preventDefault\?\.\(\)/);
   assert.match(source, /this\.tabPanels = new Map\(\)/);
   assert.match(source, /this\.ensureTabPanel\(this\.activeTab\)/);
@@ -258,7 +259,7 @@ async function run() {
   assert.match(source, /const cascadedLineNumbers = \[\]/);
   assert.match(source, /const parentIndent = this\.taskIndentWidth\(lines\[lineIndex\]\)/);
   assert.match(source, /cascadedLineNumbers\.push\(index \+ 1\)/);
-  assert.match(source, /const taskHasContent = Boolean\(taskBody[\s\S]*?suggestion\.hint === "选择日期"[\s\S]*?this\.open\(\)/);
+  assert.match(source, /const taskHasContent = this\.plugin\.taskLineHasReminderContent\(currentLine\)[\s\S]*?suggestion\.hint === "选择日期"[\s\S]*?this\.open\(\)/);
   assert.match(source, /this\.reminderSuggest = new NtfyReminderSuggest\(this\.app, this\)/);
 
   const plugin = createPlugin({
@@ -266,6 +267,70 @@ async function run() {
     authToken: "secret-ntfy-token",
     defaultChannelId: "ntfy",
   });
+  assert.equal(plugin.taskLineHasReminderContent("- [ ] 不"), true, "a one-character todo must trigger reminder choices");
+  assert.equal(plugin.taskLineHasReminderContent("  - [ ] 你到家"), true);
+  assert.equal(plugin.taskLineHasReminderContent("- [ ] "), false, "an empty todo must stay quiet");
+  assert.equal(plugin.taskLineHasReminderContent("- [x] 已完成"), false, "a completed todo must stay quiet");
+
+  const reminderSuggestStart = source.indexOf("class NtfyReminderSuggest extends EditorSuggest");
+  const reminderSuggestEnd = source.indexOf("\nclass NtfyReminderInsertModal", reminderSuggestStart);
+  assert.ok(reminderSuggestStart >= 0 && reminderSuggestEnd > reminderSuggestStart, "reminder suggest class should remain testable");
+  const dateChoice = { label: "今天", hint: "选择日期", insertText: "📅 2026-09-12 " };
+  const timeChoice = { label: "08:00", hint: "选择时间", insertText: " 08:00" };
+  class TestEditorSuggest {
+    constructor(app) {
+      this.app = app;
+      this.openCount = 0;
+    }
+
+    open() {
+      this.openCount += 1;
+    }
+
+    close() {}
+  }
+  const TestReminderSuggest = new Function(
+    "EditorSuggest",
+    "ntfyReminderSuggestions",
+    "ntfyTasksFields",
+    "setIcon",
+    "PLUGIN_NAME",
+    `"use strict";\n${source.slice(reminderSuggestStart, reminderSuggestEnd)}\nreturn NtfyReminderSuggest;`,
+  )(
+    TestEditorSuggest,
+    (_testPlugin, currentLine) => /📅\s*\d{4}-\d{2}-\d{2}/u.test(currentLine) ? [timeChoice] : [dateChoice],
+    () => "",
+    () => {},
+    "Ntfy Notifications",
+  );
+  let oneCharacterTaskLine = "- [ ] 不";
+  let oneCharacterTaskCursor = { line: 0, ch: oneCharacterTaskLine.length };
+  const oneCharacterTaskEditor = {
+    getLine() { return oneCharacterTaskLine; },
+    getCursor() { return oneCharacterTaskCursor; },
+    replaceRange(text, start, end) {
+      oneCharacterTaskLine = `${oneCharacterTaskLine.slice(0, start.ch)}${text}${oneCharacterTaskLine.slice(end.ch)}`;
+    },
+    setCursor(cursor) { oneCharacterTaskCursor = cursor; },
+  };
+  const testReminderSuggest = new TestReminderSuggest({}, plugin);
+  const oneCharacterTrigger = testReminderSuggest.onTrigger(oneCharacterTaskCursor, oneCharacterTaskEditor);
+  assert.deepEqual(oneCharacterTrigger, {
+    start: { line: 0, ch: "- [ ] 不".length },
+    end: { line: 0, ch: "- [ ] 不".length },
+    query: "__task_content__",
+  }, "typing the single character '不' must immediately open reminder choices");
+  const oneCharacterChoices = testReminderSuggest.getSuggestions({ ...oneCharacterTrigger, editor: oneCharacterTaskEditor });
+  assert.equal(oneCharacterChoices[0].isLineBreak, true, "the first choice must keep Enter as create-next-todo");
+  assert.equal(oneCharacterChoices[1].hint, "选择日期");
+  testReminderSuggest.context = { ...oneCharacterTrigger, editor: oneCharacterTaskEditor };
+  testReminderSuggest.selectSuggestion(oneCharacterChoices[1], {});
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(oneCharacterTaskLine, "- [ ] 不 📅 2026-09-12 ");
+  assert.equal(testReminderSuggest.openCount, 1, "choosing a date must immediately reopen the time choices");
+  const timeTrigger = testReminderSuggest.onTrigger(oneCharacterTaskCursor, oneCharacterTaskEditor);
+  const timeChoices = testReminderSuggest.getSuggestions({ ...timeTrigger, editor: oneCharacterTaskEditor });
+  assert.equal(timeChoices[1].hint, "选择时间", "the reopened picker must offer times after the date");
 
   const cascadePlugin = createPlugin();
   let cascadeContent = [
