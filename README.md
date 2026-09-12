@@ -4,6 +4,11 @@ This is a lightweight Obsidian plugin for ntfy notifications and optional AI web
 
 Why ntfy: Obsidian mobile plugins cannot directly create Android system notifications. This plugin sends reminders to an ntfy topic, and the Android ntfy app shows the notification in the system notification shade.
 
+## 1.4.8
+
+- Completing a parent todo now reliably completes every nested descendant even when the checkbox update also adds a completion timestamp.
+- The hierarchy invariant is repaired from the modified file only, preserving fast startup without any full-vault snapshot warmup.
+
 ## 1.4.7
 
 - Any non-empty unfinished todo, including a single-character todo, immediately offers date choices; choosing a date continues into time choices.

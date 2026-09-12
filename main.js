@@ -827,7 +827,6 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.lastReminderScanFiles = new Set();
     this.doneDateWriteGuards = new Set();
     this.doneDateTimers = new Map();
-    this.taskCompletionSnapshots = new Map();
     this.taskCompletionCascadeTimers = new Map();
     this.taskCompletionCascadeGuards = new Set();
     this.reminderScanTimer = null;
@@ -957,14 +956,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       this.clearObsidianReminderTimer();
       for (const timer of this.taskCompletionCascadeTimers.values()) window.clearTimeout(timer);
       this.taskCompletionCascadeTimers.clear();
-      this.taskCompletionSnapshots.clear();
       this.taskCompletionCascadeGuards.clear();
     });
     this.registerEvent(this.app.vault.on("create", (file) => {
-      if (file instanceof TFile) {
-        this.queueReminderScan(file);
-        this.snapshotTaskCompletionFile(file).catch((error) => console.warn(`${PLUGIN_NAME}: failed to snapshot task file`, error));
-      }
+      if (file instanceof TFile) this.queueReminderScan(file);
     }));
     this.registerEvent(this.app.vault.on("modify", (file) => {
       this.queueEnsureDoneDates(file);
@@ -972,31 +967,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       this.queueStatusCountRefresh(file);
       this.queueTaskCompletionCascade(file);
     }));
-    if (this.app.workspace && typeof this.app.workspace.on === "function") {
-      this.registerEvent(this.app.workspace.on("file-open", (file) => {
-        if (file instanceof TFile) {
-          this.snapshotTaskCompletionFile(file).catch((error) => console.warn(`${PLUGIN_NAME}: failed to snapshot opened task file`, error));
-        }
-      }));
-      this.registerEvent(this.app.workspace.on("active-leaf-change", () => {
-        const file = typeof this.app.workspace.getActiveFile === "function"
-          ? this.app.workspace.getActiveFile()
-          : null;
-        if (file instanceof TFile) {
-          this.snapshotTaskCompletionFile(file).catch((error) => console.warn(`${PLUGIN_NAME}: failed to snapshot active task file`, error));
-        }
-      }));
-    }
-
     this.app.workspace.onLayoutReady(() => {
       this.isLayoutReady = true;
       this.statusCountRefreshPending = false;
-      const activeFile = typeof this.app.workspace.getActiveFile === "function"
-        ? this.app.workspace.getActiveFile()
-        : null;
-      if (activeFile instanceof TFile) {
-        this.snapshotTaskCompletionFile(activeFile).catch((error) => console.warn(`${PLUGIN_NAME}: failed to snapshot initial task file`, error));
-      }
       // Let Obsidian paint its first workspace before expensive vault scans,
       // provider handshakes, and attachment maintenance compete for the UI.
       const runDeferredStartupWork = () => {
@@ -6184,31 +6157,8 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return cascadedLineNumbers;
   }
 
-  taskCompletionSnapshot(lines) {
-    return lines.map((line) => {
-      const match = String(line || "").match(/^(\s*[-*+]\s+\[)([^\]])(\]\s+.*)$/);
-      if (!match) return null;
-      return {
-        completed: match[2] === "x" || match[2] === "X",
-        // Keep a stable identity for the line so an insertion/reorder does
-        // not make an unrelated task look like a completion transition.
-        signature: `${match[1]} ${match[3]}`,
-      };
-    });
-  }
-
-  async snapshotTaskCompletionFile(file, content = null) {
-    if (!file || file.extension !== "md" || !this.taskCompletionSnapshots) return;
-    const path = String(file.path || "");
-    if (!path) return;
-    const source = content === null
-      ? await this.app.vault.cachedRead(file)
-      : String(content || "");
-    this.taskCompletionSnapshots.set(path, this.taskCompletionSnapshot(source.split(/\r?\n/)));
-  }
-
   queueTaskCompletionCascade(file) {
-    if (!file || file.extension !== "md" || !this.taskCompletionSnapshots || this.isUnloading) return;
+    if (!file || file.extension !== "md" || this.isUnloading) return;
     const path = String(file.path || "");
     if (!path) return;
     const existing = this.taskCompletionCascadeTimers.get(path);
@@ -6222,39 +6172,44 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.taskCompletionCascadeTimers.set(path, timer);
   }
 
+  cascadeCompletedTaskHierarchy(lines, doneAt = new Date()) {
+    const cascadedLineNumbers = [];
+    let completedAncestorIndent = null;
+    for (let index = 0; index < lines.length; index += 1) {
+      const raw = String(lines[index] || "");
+      const taskMatch = raw.match(/^(\s*[-*+]\s+\[)([^\]])(\]\s+.*)$/);
+      const indent = this.taskIndentWidth(raw);
+      if (completedAncestorIndent !== null) {
+        const leftCompletedParent = taskMatch
+          ? indent <= completedAncestorIndent
+          : Boolean(raw.trim()) && indent <= completedAncestorIndent;
+        if (leftCompletedParent) completedAncestorIndent = null;
+      }
+      if (!taskMatch) continue;
+
+      let completed = taskMatch[2] === "x" || taskMatch[2] === "X";
+      if (completedAncestorIndent !== null && indent > completedAncestorIndent && !completed) {
+        const childBody = this.addTasksDoneDate(taskMatch[3], doneAt);
+        lines[index] = `${taskMatch[1]}x${childBody}`;
+        cascadedLineNumbers.push(index + 1);
+        completed = true;
+      }
+      if (completed && completedAncestorIndent === null) completedAncestorIndent = indent;
+    }
+    return cascadedLineNumbers;
+  }
+
   async cascadeCompletedChildrenFromModify(file) {
-    if (!file || file.extension !== "md" || !this.taskCompletionSnapshots || this.isUnloading) return;
+    if (!file || file.extension !== "md" || this.isUnloading) return;
     const path = String(file.path || "");
     if (!path || this.taskCompletionCascadeGuards.has(path)) return;
     const source = await this.app.vault.cachedRead(file);
     const lines = String(source || "").split(/\r?\n/);
-    const previous = this.taskCompletionSnapshots.get(path);
-    const current = this.taskCompletionSnapshot(lines);
-    // Always advance the snapshot, including for internal writes and edits
-    // that do not complete a task. This keeps later native checkbox clicks
-    // cheap and prevents stale line-state comparisons.
-    this.taskCompletionSnapshots.set(path, current);
-    if (!previous) return;
-
-    const completedTransitions = [];
-    for (let index = 0; index < current.length; index += 1) {
-      const before = previous[index];
-      const after = current[index];
-      if (!before || !after || before.signature !== after.signature) continue;
-      if (!before.completed && after.completed) completedTransitions.push(index);
-    }
-    if (!completedTransitions.length) return;
-
-    let changed = false;
     const doneAt = new Date();
-    for (const lineIndex of completedTransitions) {
-      const cascaded = this.cascadeCompletedTaskChildren(lines, lineIndex, doneAt);
-      if (cascaded.length) changed = true;
-    }
-    if (!changed) return;
+    const cascadedLineNumbers = this.cascadeCompletedTaskHierarchy(lines, doneAt);
+    if (!cascadedLineNumbers.length) return;
 
     this.taskCompletionCascadeGuards.add(path);
-    this.taskCompletionSnapshots.set(path, this.taskCompletionSnapshot(lines));
     try {
       await this.app.vault.modify(file, lines.join("\n"));
     } finally {

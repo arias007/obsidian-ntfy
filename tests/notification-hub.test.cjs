@@ -159,8 +159,8 @@ async function run() {
   const styles = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
   const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.equal(manifest.version, "1.4.7");
-  assert.equal(packageJson.version, "1.4.7");
+  assert.equal(manifest.version, "1.4.8");
+  assert.equal(packageJson.version, "1.4.8");
   const managerHeaderStart = source.indexOf("  renderHeader(containerEl) {");
   const managerHeaderEnd = source.indexOf("  renderIncomingMessages(containerEl)", managerHeaderStart);
   assert.ok(managerHeaderStart >= 0 && managerHeaderEnd > managerHeaderStart, "manager header should remain discoverable");
@@ -357,11 +357,11 @@ async function run() {
   assert.match(cascadeContent, /^  - \[x\] 子待办二 ✅ \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/mu);
   assert.match(cascadeContent, /^- \[ \] 同级待办$/mu);
 
-  // A native Markdown checkbox write arrives through vault.modify rather than
-  // the manager's toggleTaskCompletion callback. Verify that the transition
-  // watcher still cascades nested children in that path.
+  // A native checkbox write arrives through the debounced vault.modify path.
+  // Its completion timestamp may be written in the same mutation and must not
+  // change the task identity or suppress the child cascade.
   const nativeCascadePlugin = createPlugin();
-  nativeCascadePlugin.taskCompletionSnapshots = new Map();
+  nativeCascadePlugin.taskCompletionCascadeTimers = new Map();
   nativeCascadePlugin.taskCompletionCascadeGuards = new Set();
   const nativeCascadeFile = { path: "Native.md", extension: "md" };
   let nativeCascadeContent = [
@@ -375,11 +375,31 @@ async function run() {
       async modify(_file, value) { nativeCascadeContent = value; },
     },
   };
-  await nativeCascadePlugin.snapshotTaskCompletionFile(nativeCascadeFile);
-  nativeCascadeContent = nativeCascadeContent.replace("- [ ] 父任务", "- [x] 父任务");
-  await nativeCascadePlugin.cascadeCompletedChildrenFromModify(nativeCascadeFile);
+  nativeCascadeContent = nativeCascadeContent.replace("- [ ] 父任务", "- [x] 父任务 ✅ 2026-09-12 08:30");
+  nativeCascadePlugin.queueTaskCompletionCascade(nativeCascadeFile);
+  await new Promise((resolve) => setTimeout(resolve, 120));
   assert.match(nativeCascadeContent, /^  - \[x\] 子任务 ✅ \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/mu);
   assert.match(nativeCascadeContent, /^- \[ \] 同级任务$/mu);
+
+  // The hierarchy invariant is repaired directly from the modified file,
+  // without requiring a costly full-vault startup snapshot warmup.
+  const missingSnapshotPlugin = createPlugin();
+  missingSnapshotPlugin.taskCompletionCascadeGuards = new Set();
+  const missingSnapshotFile = { path: "Missing-snapshot.md", extension: "md" };
+  let missingSnapshotContent = [
+    "- [x] 父任务 ✅ 2026-09-12 08:30",
+    "  - [ ] 子任务",
+    "- [ ] 同级任务",
+  ].join("\n");
+  missingSnapshotPlugin.app = {
+    vault: {
+      async cachedRead() { return missingSnapshotContent; },
+      async modify(_file, value) { missingSnapshotContent = value; },
+    },
+  };
+  await missingSnapshotPlugin.cascadeCompletedChildrenFromModify(missingSnapshotFile);
+  assert.match(missingSnapshotContent, /^  - \[x\] 子任务 ✅ \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/mu);
+  assert.match(missingSnapshotContent, /^- \[ \] 同级任务$/mu);
 
   const status = plugin.getNotificationHubStatus();
   assert.equal(status.ready, true);
