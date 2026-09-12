@@ -782,6 +782,8 @@ const DEFAULT_SETTINGS = {
   includeTasksPluginDates: true,
   captureObsidianNotices: true,
   showObsidianReminderNotices: true,
+  // Keep completion markers consistent across native, parent, and child tasks.
+  writeCompletionTime: true,
   internalReminderNoticeSince: "",
   scheduleFutureWithNtfy: true,
   maxFutureDays: 3,
@@ -1342,6 +1344,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     settings.autoScanEnabled = settings.autoScanEnabled !== false;
     settings.captureObsidianNotices = settings.captureObsidianNotices !== false;
     settings.showObsidianReminderNotices = settings.showObsidianReminderNotices !== false;
+    settings.writeCompletionTime = settings.writeCompletionTime !== false;
     settings.socialHubEnabled = settings.socialHubEnabled !== false;
     settings.ntfyChannelEnabled = settings.ntfyChannelEnabled !== false;
     settings.ntfyReceiveEnabled = settings.ntfyReceiveEnabled !== false;
@@ -6434,15 +6437,28 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   tasksDoneDateText(date = new Date()) {
     const pad = (value) => String(value).padStart(2, "0");
-    return `✅ ${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    const dateText = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+    if (this.settings?.writeCompletionTime === false) return `✅ ${dateText}`;
+    return `✅ ${dateText} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
   }
 
   addTasksDoneDate(taskBody, date = new Date()) {
     const body = String(taskBody || "");
-    const existing = body.match(/(?:✅|✓)\s*\d{4}-\d{2}-\d{2}(?:[\sT　]\d{1,2}:\d{2})?/u)?.[0]
-      ?.replace(/^\s*/, "").replace(/^✓/u, "✅").replace(/\s+/gu, " ").trim();
+    const existing = body.match(/(?:✅|✓)\s*(\d{4})-(\d{2})-(\d{2})(?:[\sT　]+(\d{1,2}):(\d{2}))?/u);
+    const fallbackDate = date instanceof Date && !Number.isNaN(date.getTime()) ? date : new Date();
+    const markerDate = existing
+      ? new Date(
+        Number(existing[1]),
+        Number(existing[2]) - 1,
+        Number(existing[3]),
+        existing[4] ? Number(existing[4]) : fallbackDate.getHours(),
+        existing[5] ? Number(existing[5]) : fallbackDate.getMinutes(),
+        0,
+        0
+      )
+      : fallbackDate;
     const clean = this.removeTasksDoneDate(body);
-    return `${clean} ${existing || this.tasksDoneDateText(date)}`.trim();
+    return `${clean} ${this.tasksDoneDateText(markerDate)}`.trim();
   }
 
   removeTasksDoneDate(taskBody) {
@@ -10693,6 +10709,18 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.dailyBatchTime = this.plugin.normalizeClockTime(value, DEFAULT_SETTINGS.dailyBatchTime);
             this.plugin.scheduleDailyBatchScan();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(timeGroup)
+      .setName(this.uiText("完成时写入小时和分钟", "Include hour and minute when completing tasks"))
+      .setDesc(this.uiText("完成普通待办、父待办或子待办时，在完成标记中写入小时和分钟；默认开启。", "Include the hour and minute in completion markers for regular, parent, and child tasks; enabled by default."))
+      .addToggle((toggle) =>
+        toggle
+          .setValue(Boolean(this.plugin.settings.writeCompletionTime))
+          .onChange(async (value) => {
+            this.plugin.settings.writeCompletionTime = value;
             await this.plugin.saveSettings();
           })
       );

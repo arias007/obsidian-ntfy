@@ -4,6 +4,11 @@ This is a lightweight Obsidian plugin for ntfy notifications and optional AI web
 
 Why ntfy: Obsidian mobile plugins cannot directly create Android system notifications. This plugin sends reminders to an ntfy topic, and the Android ntfy app shows the notification in the system notification shade.
 
+## 1.4.10
+
+- 普通待办、父待办和子待办的完成标记统一支持小时和分钟；旧的仅日期标记会在下一次写回时自动补齐。
+- 设置新增“完成时写入小时和分钟”，默认开启，也可关闭为仅写入日期。
+
 ## 1.4.9
 
 - 待办管理面板优先显示缓存，后台扫描不阻塞打开；待办与提醒扫描采用有限并发读取，降低大库首屏等待。

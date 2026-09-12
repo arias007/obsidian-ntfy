@@ -159,8 +159,8 @@ async function run() {
   const styles = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
   const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.equal(manifest.version, "1.4.9");
-  assert.equal(packageJson.version, "1.4.9");
+  assert.equal(manifest.version, "1.4.10");
+  assert.equal(packageJson.version, "1.4.10");
   const managerHeaderStart = source.indexOf("  renderHeader(containerEl) {");
   const managerHeaderEnd = source.indexOf("  renderIncomingMessages(containerEl)", managerHeaderStart);
   assert.ok(managerHeaderStart >= 0 && managerHeaderEnd > managerHeaderStart, "manager header should remain discoverable");
@@ -262,6 +262,8 @@ async function run() {
   assert.match(source, /const cascadedLineNumbers = \[\]/);
   assert.match(source, /const parentIndent = this\.taskIndentWidth\(lines\[lineIndex\]\)/);
   assert.match(source, /cascadedLineNumbers\.push\(index \+ 1\)/);
+  assert.match(source, /完成时写入小时和分钟/);
+  assert.match(source, /Include hour and minute when completing tasks/);
   assert.match(source, /const taskHasContent = this\.plugin\.taskLineHasReminderContent\(currentLine\)[\s\S]*?suggestion\.kind === "date"[\s\S]*?this\.open\(\)/);
   assert.match(source, /this\.reminderSuggest = new NtfyReminderSuggest\(this\.app, this\)/);
 
@@ -274,6 +276,26 @@ async function run() {
   assert.equal(plugin.taskLineHasReminderContent("  - [ ] 你到家"), true);
   assert.equal(plugin.taskLineHasReminderContent("- [ ] "), false, "an empty todo must stay quiet");
   assert.equal(plugin.taskLineHasReminderContent("- [x] 已完成"), false, "a completed todo must stay quiet");
+  assert.equal(plugin.settings.writeCompletionTime, true, "completion time should be enabled by default");
+  const completionAt = new Date(2026, 8, 12, 14, 5, 0, 0);
+  assert.equal(plugin.tasksDoneDateText(completionAt), "✅ 2026-09-12 14:05");
+  assert.equal(
+    plugin.addTasksDoneDate("- [x] 普通待办 ✅ 2026-09-10", completionAt),
+    "- [x] 普通待办 ✅ 2026-09-10 14:05",
+    "legacy date-only markers should gain hour and minute"
+  );
+  assert.equal(
+    plugin.addTasksDoneDate("- [x] 父待办 ✅ 2026-09-10 08:30", completionAt),
+    "- [x] 父待办 ✅ 2026-09-10 08:30",
+    "existing completion time should be preserved"
+  );
+  const dateOnlyPlugin = createPlugin({ writeCompletionTime: false });
+  assert.equal(dateOnlyPlugin.tasksDoneDateText(completionAt), "✅ 2026-09-12");
+  assert.equal(
+    dateOnlyPlugin.addTasksDoneDate("- [x] 待办 ✅ 2026-09-10", completionAt),
+    "- [x] 待办 ✅ 2026-09-10",
+    "disabling completion time should keep date-only markers"
+  );
 
   const reminderSuggestStart = source.indexOf("class NtfyReminderSuggest extends EditorSuggest");
   const reminderSuggestEnd = source.indexOf("\nclass NtfyReminderInsertModal", reminderSuggestStart);
