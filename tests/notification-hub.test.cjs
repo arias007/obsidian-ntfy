@@ -159,8 +159,8 @@ async function run() {
   const styles = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
   const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.equal(manifest.version, "1.4.8");
-  assert.equal(packageJson.version, "1.4.8");
+  assert.equal(manifest.version, "1.4.9");
+  assert.equal(packageJson.version, "1.4.9");
   const managerHeaderStart = source.indexOf("  renderHeader(containerEl) {");
   const managerHeaderEnd = source.indexOf("  renderIncomingMessages(containerEl)", managerHeaderStart);
   assert.ok(managerHeaderStart >= 0 && managerHeaderEnd > managerHeaderStart, "manager header should remain discoverable");
@@ -236,7 +236,10 @@ async function run() {
   assert.doesNotMatch(source, /openSourceTimeModal\(/);
   assert.match(source, /conversationChannelLabel\(channel, fallback = ""\)/);
   assert.match(source, /if \(String\(channel\.type \|\| ""\).*=== "ntfy"\) return "ntfy"/);
-  assert.match(source, /const labels = \["今天", \.\.\.configuredLabels\.filter\(\(label\) => label !== "今天"\)\]/);
+  assert.match(source, /const configuredEntries = String\(plugin\.settings\.suggestionDates \|\| DEFAULT_SETTINGS\.suggestionDates\)/);
+  assert.match(source, /const tokens = entries\.length[\s\S]*?new Set\(\["today"/);
+  assert.match(source, /kind: "date"/);
+  assert.match(source, /kind: "time"/);
   assert.match(styles, /\.obsidian-ntfy-item-compact \{[\s\S]*?padding: 4px 8px/);
   assert.match(styles, /\.obsidian-ntfy-task-time \{[\s\S]*?padding: 3px 6px/);
   const dateTimeInputStyleStart = styles.indexOf(".obsidian-ntfy-date-time-input {");
@@ -259,7 +262,7 @@ async function run() {
   assert.match(source, /const cascadedLineNumbers = \[\]/);
   assert.match(source, /const parentIndent = this\.taskIndentWidth\(lines\[lineIndex\]\)/);
   assert.match(source, /cascadedLineNumbers\.push\(index \+ 1\)/);
-  assert.match(source, /const taskHasContent = this\.plugin\.taskLineHasReminderContent\(currentLine\)[\s\S]*?suggestion\.hint === "选择日期"[\s\S]*?this\.open\(\)/);
+  assert.match(source, /const taskHasContent = this\.plugin\.taskLineHasReminderContent\(currentLine\)[\s\S]*?suggestion\.kind === "date"[\s\S]*?this\.open\(\)/);
   assert.match(source, /this\.reminderSuggest = new NtfyReminderSuggest\(this\.app, this\)/);
 
   const plugin = createPlugin({
@@ -275,8 +278,8 @@ async function run() {
   const reminderSuggestStart = source.indexOf("class NtfyReminderSuggest extends EditorSuggest");
   const reminderSuggestEnd = source.indexOf("\nclass NtfyReminderInsertModal", reminderSuggestStart);
   assert.ok(reminderSuggestStart >= 0 && reminderSuggestEnd > reminderSuggestStart, "reminder suggest class should remain testable");
-  const dateChoice = { label: "今天", hint: "选择日期", insertText: "📅 2026-09-12 " };
-  const timeChoice = { label: "08:00", hint: "选择时间", insertText: " 08:00" };
+  const dateChoice = { label: "今天", hint: "选择日期", kind: "date", insertText: "📅 2026-09-12 " };
+  const timeChoice = { label: "08:00", hint: "选择时间", kind: "time", insertText: " 08:00" };
   class TestEditorSuggest {
     constructor(app) {
       this.app = app;
@@ -295,6 +298,8 @@ async function run() {
     "ntfyTasksFields",
     "setIcon",
     "PLUGIN_NAME",
+    "reminderTriggerPattern",
+    "reminderUiText",
     `"use strict";\n${source.slice(reminderSuggestStart, reminderSuggestEnd)}\nreturn NtfyReminderSuggest;`,
   )(
     TestEditorSuggest,
@@ -302,6 +307,8 @@ async function run() {
     () => "",
     () => {},
     "Ntfy Notifications",
+    () => /(?:^|\s)(ntfy|提醒|notify|remind|todo|task|待办|today|tomorrow)$/iu,
+    (_plugin, key) => ({ lineBreak: "换行", newLine: "新建下一行", due: "到期", chooseDate: "选择日期", chooseTime: "选择时间" }[key] || key),
   );
   let oneCharacterTaskLine = "- [ ] 不";
   let oneCharacterTaskCursor = { line: 0, ch: oneCharacterTaskLine.length };
@@ -400,6 +407,49 @@ async function run() {
   await missingSnapshotPlugin.cascadeCompletedChildrenFromModify(missingSnapshotFile);
   assert.match(missingSnapshotContent, /^  - \[x\] 子任务 ✅ \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/mu);
   assert.match(missingSnapshotContent, /^- \[ \] 同级任务$/mu);
+
+  // Completion timestamps are idempotent: one cancel clears every legacy or
+  // duplicated marker, and a later complete adds exactly one marker again.
+  const doneDatePlugin = createPlugin();
+  const doneDateFile = { path: "Done-date.md", extension: "md" };
+  let doneDateContent = "- [x] 任务 ✅ 2026-09-12 08:00 ✅ 2026-09-12 09:00";
+  doneDatePlugin.app = {
+    vault: {
+      getAbstractFileByPath(value) { return value === doneDateFile.path ? doneDateFile : null; },
+      async read() { return doneDateContent; },
+      async modify(_file, value) { doneDateContent = value; },
+    },
+  };
+  const cancelledDoneDate = await doneDatePlugin.toggleTaskCompletion(doneDateFile.path, 1);
+  assert.equal(cancelledDoneDate.completed, false);
+  assert.equal(doneDateContent, "- [ ] 任务");
+  const completedAgain = await doneDatePlugin.toggleTaskCompletion(doneDateFile.path, 1);
+  assert.equal(completedAgain.completed, true);
+  assert.equal((doneDateContent.match(/✅/gu) || []).length, 1);
+  await doneDatePlugin.toggleTaskCompletion(doneDateFile.path, 1);
+  assert.equal(doneDateContent, "- [ ] 任务");
+
+  // Vault task discovery uses bounded parallel reads so a large vault does not
+  // serialize every file before the manager can refresh its cached snapshot.
+  const scanPlugin = createPlugin();
+  const scanFiles = Array.from({ length: 24 }, (_, index) => ({ path: "Scan-" + index + ".md" }));
+  let activeReads = 0;
+  let maxActiveReads = 0;
+  scanPlugin.app = {
+    vault: {
+      getMarkdownFiles() { return scanFiles; },
+      async cachedRead(file) {
+        activeReads += 1;
+        maxActiveReads = Math.max(maxActiveReads, activeReads);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        activeReads -= 1;
+        return "- [ ] " + file.path;
+      },
+    },
+  };
+  const scannedTasks = await scanPlugin.collectVaultTasks();
+  assert.equal(scannedTasks.length, scanFiles.length);
+  assert.ok(maxActiveReads > 1 && maxActiveReads <= 16);
 
   const status = plugin.getNotificationHubStatus();
   assert.equal(status.ready, true);

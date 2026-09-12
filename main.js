@@ -402,6 +402,130 @@ const UI_TRANSLATIONS = {
     "Disabled": "Disabilitato",
   },
 };
+const REMINDER_TRANSLATIONS = Object.freeze({
+  en: {
+    today: "Today", tomorrow: "Tomorrow", dayAfterTomorrow: "Day after tomorrow",
+    nextMonday: "Next Monday", nextFriday: "Next Friday", nextSunday: "Next Sunday", tonight: "Tonight",
+    in30Minutes: "In 30 minutes", in1Hour: "In 1 hour", chooseDate: "Choose date", chooseTime: "Choose time",
+    due: "Due", lineBreak: "Line break", newLine: "Create next task",
+  },
+  zh: {
+    today: "今天", tomorrow: "明天", dayAfterTomorrow: "后天", nextMonday: "下周一", nextFriday: "下周五", nextSunday: "下周日", tonight: "今晚",
+    in30Minutes: "30分钟后", in1Hour: "1小时后", chooseDate: "选择日期", chooseTime: "选择时间", due: "到期", lineBreak: "换行", newLine: "新建下一行",
+  },
+  es: {
+    today: "Hoy", tomorrow: "Mañana", dayAfterTomorrow: "Pasado mañana", nextMonday: "Próximo lunes", nextFriday: "Próximo viernes", nextSunday: "Próximo domingo", tonight: "Esta noche",
+    in30Minutes: "En 30 minutos", in1Hour: "En 1 hora", chooseDate: "Elegir fecha", chooseTime: "Elegir hora", due: "Vencimiento", lineBreak: "Salto de línea", newLine: "Crear tarea siguiente",
+  },
+  fr: {
+    today: "Aujourd'hui", tomorrow: "Demain", dayAfterTomorrow: "Après-demain", nextMonday: "Lundi prochain", nextFriday: "Vendredi prochain", nextSunday: "Dimanche prochain", tonight: "Ce soir",
+    in30Minutes: "Dans 30 minutes", in1Hour: "Dans 1 heure", chooseDate: "Choisir une date", chooseTime: "Choisir une heure", due: "Échéance", lineBreak: "Saut de ligne", newLine: "Créer la tâche suivante",
+  },
+  de: {
+    today: "Heute", tomorrow: "Morgen", dayAfterTomorrow: "Übermorgen", nextMonday: "Nächsten Montag", nextFriday: "Nächsten Freitag", nextSunday: "Nächsten Sonntag", tonight: "Heute Abend",
+    in30Minutes: "In 30 Minuten", in1Hour: "In 1 Stunde", chooseDate: "Datum wählen", chooseTime: "Zeit wählen", due: "Fällig", lineBreak: "Zeilenumbruch", newLine: "Nächste Aufgabe erstellen",
+  },
+  ja: {
+    today: "今日", tomorrow: "明日", dayAfterTomorrow: "明後日", nextMonday: "来週月曜", nextFriday: "来週金曜", nextSunday: "来週日曜", tonight: "今夜",
+    in30Minutes: "30分後", in1Hour: "1時間後", chooseDate: "日付を選択", chooseTime: "時刻を選択", due: "期限", lineBreak: "改行", newLine: "次のタスクを作成",
+  },
+  ko: {
+    today: "오늘", tomorrow: "내일", dayAfterTomorrow: "모레", nextMonday: "다음 주 월요일", nextFriday: "다음 주 금요일", nextSunday: "다음 주 일요일", tonight: "오늘 밤",
+    in30Minutes: "30분 후", in1Hour: "1시간 후", chooseDate: "날짜 선택", chooseTime: "시간 선택", due: "기한", lineBreak: "줄바꿈", newLine: "다음 작업 만들기",
+  },
+  ru: {
+    today: "Сегодня", tomorrow: "Завтра", dayAfterTomorrow: "Послезавтра", nextMonday: "Следующий понедельник", nextFriday: "Следующая пятница", nextSunday: "Следующее воскресенье", tonight: "Сегодня вечером",
+    in30Minutes: "Через 30 минут", in1Hour: "Через 1 час", chooseDate: "Выбрать дату", chooseTime: "Выбрать время", due: "Срок", lineBreak: "Перенос строки", newLine: "Создать следующую задачу",
+  },
+  pt: {
+    today: "Hoje", tomorrow: "Amanhã", dayAfterTomorrow: "Depois de amanhã", nextMonday: "Próxima segunda-feira", nextFriday: "Próxima sexta-feira", nextSunday: "Próximo domingo", tonight: "Esta noite",
+    in30Minutes: "Em 30 minutos", in1Hour: "Em 1 hora", chooseDate: "Escolher data", chooseTime: "Escolher hora", due: "Vencimento", lineBreak: "Quebra de linha", newLine: "Criar próxima tarefa",
+  },
+  ar: {
+    today: "اليوم", tomorrow: "غداً", dayAfterTomorrow: "بعد غد", nextMonday: "الاثنين القادم", nextFriday: "الجمعة القادمة", nextSunday: "الأحد القادم", tonight: "هذه الليلة",
+    in30Minutes: "خلال 30 دقيقة", in1Hour: "خلال ساعة", chooseDate: "اختيار التاريخ", chooseTime: "اختيار الوقت", due: "الاستحقاق", lineBreak: "فاصل سطر", newLine: "إنشاء مهمة تالية",
+  },
+  tr: {
+    today: "Bugün", tomorrow: "Yarın", dayAfterTomorrow: "Öbür gün", nextMonday: "Gelecek pazartesi", nextFriday: "Gelecek cuma", nextSunday: "Gelecek pazar", tonight: "Bu gece",
+    in30Minutes: "30 dakika içinde", in1Hour: "1 saat içinde", chooseDate: "Tarih seç", chooseTime: "Saat seç", due: "Son tarih", lineBreak: "Satır sonu", newLine: "Sonraki görevi oluştur",
+  },
+  it: {
+    today: "Oggi", tomorrow: "Domani", dayAfterTomorrow: "Dopodomani", nextMonday: "Lunedì prossimo", nextFriday: "Venerdì prossimo", nextSunday: "Domenica prossima", tonight: "Stasera",
+    in30Minutes: "Tra 30 minuti", in1Hour: "Tra 1 ora", chooseDate: "Scegli data", chooseTime: "Scegli ora", due: "Scadenza", lineBreak: "Interruzione di riga", newLine: "Crea attività successiva",
+  },
+});
+const DATE_SUGGESTION_ALIASES = Object.freeze({
+  today: ["today", "今天", "hoy", "aujourd'hui", "aujourd’hui", "heute", "сегодня", "hoje", "اليوم", "bugün", "oggi", "今日", "오늘"],
+  tomorrow: ["tomorrow", "明天", "mañana", "demain", "morgen", "завтра", "amanhã", "غداً", "yarın", "domani", "明日", "내일"],
+  dayAfterTomorrow: ["dayaftertomorrow", "day after tomorrow", "后天", "pasado mañana", "après-demain", "übermorgen", "послезавтра", "depois de amanhã", "بعد غد", "öbür gün", "dopodomani", "明後日", "모레"],
+  nextMonday: ["nextmonday", "next monday", "下周一", "下週一", "próximo lunes", "proximo lunes", "lundi prochain", "nächsten montag", "следующий понедельник", "próxima segunda-feira", "الاثنين القادم", "gelecek pazartesi", "lunedì prossimo", "来週月曜", "다음 주 월요일"],
+  nextFriday: ["nextfriday", "next friday", "下周五", "下週五", "próximo viernes", "proximo viernes", "vendredi prochain", "nächsten freitag", "следующая пятница", "próxima sexta-feira", "الجمعة القادمة", "gelecek cuma", "venerdì prossimo", "来週金曜", "다음 주 금요일"],
+  nextSunday: ["nextsunday", "next sunday", "下周日", "下周天", "下週日", "下週天", "próximo domingo", "proximo domingo", "dimanche prochain", "nächsten sonntag", "следующее воскресенье", "próximo domingo", "الأحد القادم", "gelecek pazar", "domenica prossima", "来週日曜", "다음 주 일요일"],
+  tonight: ["tonight", "今晚", "今夜", "esta noche", "ce soir", "heute abend", "сегодня вечером", "esta noite", "هذه الليلة", "bu gece", "stasera"],
+  in30Minutes: ["in30minutes", "in 30 minutes", "30分钟后", "30 分钟后", "en 30 minutos", "dans 30 minutes", "in 30 minuten", "через 30 минут", "em 30 minutos", "خلال 30 دقيقة", "30 dakika içinde", "tra 30 minuti", "30分後", "30분 후"],
+  in1Hour: ["in1hour", "in 1 hour", "1小时后", "1 小时后", "en 1 hora", "dans 1 heure", "in 1 stunde", "через 1 час", "em 1 hora", "خلال ساعة", "1 saat içinde", "tra 1 ora", "1時間後", "1시간 후"],
+});
+const DATE_SUGGESTION_DAY_INDEX = Object.freeze({ nextMonday: 1, nextFriday: 5, nextSunday: 0 });
+
+function reminderUiText(plugin, key) {
+  const language = typeof plugin?.currentUiLanguage === "function" ? plugin.currentUiLanguage() : "en";
+  return REMINDER_TRANSLATIONS[language]?.[key] || REMINDER_TRANSLATIONS.en[key] || key;
+}
+
+function normalizeReminderAlias(value) {
+  return String(value || "").trim().toLocaleLowerCase().normalize("NFKC").replace(/[.…。]+$/u, "").replace(/\s+/gu, " ");
+}
+
+function dateSuggestionToken(value) {
+  const candidate = normalizeReminderAlias(String(value || "").split(/[|=]/u, 1)[0]);
+  if (!candidate) return null;
+  for (const [token, aliases] of Object.entries(DATE_SUGGESTION_ALIASES)) {
+    if (aliases.some((alias) => normalizeReminderAlias(alias) === candidate)) return token;
+  }
+  return null;
+}
+
+function parseDateSuggestionEntry(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const separator = raw.search(/[|=]/u);
+  const token = dateSuggestionToken(separator >= 0 ? raw.slice(0, separator) : raw);
+  if (!token) return null;
+  const label = separator >= 0 ? raw.slice(separator + 1).trim() : "";
+  return { token, label: label || null };
+}
+
+function dateForSuggestionToken(token, now) {
+  const base = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+  if (token === "today") return base;
+  if (token === "tomorrow") return new Date(base.getFullYear(), base.getMonth(), base.getDate() + 1);
+  if (token === "dayAfterTomorrow") return new Date(base.getFullYear(), base.getMonth(), base.getDate() + 2);
+  const target = DATE_SUGGESTION_DAY_INDEX[token];
+  if (target === undefined) return null;
+  const diff = ((target - now.getDay() + 7) % 7) + 7;
+  return new Date(base.getFullYear(), base.getMonth(), base.getDate() + diff);
+}
+
+function localizeSuggestionLabel(plugin, value) {
+  const raw = String(value || "").trim();
+  if (!raw) return raw;
+  const normalized = normalizeReminderAlias(raw);
+  for (const token of ["tonight", "in30Minutes", "in1Hour", "today", "tomorrow", "dayAfterTomorrow", "nextMonday", "nextFriday", "nextSunday"]) {
+    if (DATE_SUGGESTION_ALIASES[token].some((alias) => normalizeReminderAlias(alias) === normalized)) return reminderUiText(plugin, token);
+    const prefix = DATE_SUGGESTION_ALIASES[token].map(normalizeReminderAlias).find((alias) => normalized.startsWith(`${alias} `));
+    if (prefix) return `${reminderUiText(plugin, token)}${raw.slice(prefix.length)}`;
+  }
+  return raw;
+}
+
+function reminderTriggerPattern() {
+  const aliases = Object.values(DATE_SUGGESTION_ALIASES).flat();
+  const escaped = aliases
+    .map((value) => String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .filter(Boolean)
+    .join("|");
+  return new RegExp(`(?:^|\\s)(ntfy|提醒|notify|remind|todo|task|待办|今晚|早八|上午|中午|下午|30分钟|1小时|📅|⏰|➕|⏲|${escaped})$`, "iu");
+}
 const CHANNEL_PROVIDER_DEFINITIONS = Object.freeze([
   { id: "ntfy", name: "ntfy", description: "ntfy topic" },
   { id: "telegram", name: "Telegram Bot", description: "直接连接 Telegram Bot API" },
@@ -646,9 +770,12 @@ const DEFAULT_SETTINGS = {
   scanIntervalMinutes: 15,
   defaultTime: "08:00",
   dailyBatchTime: "08:00",
-  suggestionDates: "今天,明天,后天,下周一,下周五,下周日",
+  // Stable values are used as the date-choice protocol. Display labels are
+  // localized at render time, so changing the UI language never breaks the
+  // date calculation. Legacy localized labels remain accepted below.
+  suggestionDates: "today,tomorrow,dayAfterTomorrow,nextMonday,nextFriday,nextSunday",
   suggestionTimes: "08:00,09:00,12:00,18:00,22:00,08:00,09:00,00:30,01:00",
-  suggestionLabels: "今天 08:00,今天 09:00,今天 12:00,今天 18:00,今晚 22:00,明天 08:00,明天 09:00,30分钟后,1小时后",
+  suggestionLabels: "today 08:00,today 09:00,today 12:00,today 18:00,tonight 22:00,tomorrow 08:00,tomorrow 09:00,in30Minutes,in1Hour",
   includeFileName: true,
   includeFullPath: false,
   includeTaskText: true,
@@ -829,6 +956,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     this.doneDateTimers = new Map();
     this.taskCompletionCascadeTimers = new Map();
     this.taskCompletionCascadeGuards = new Set();
+    this.taskCompletionWriteQueues = new Map();
     this.reminderScanTimer = null;
     this.statusCountTimer = null;
     this.dailyBatchTimer = null;
@@ -957,6 +1085,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       for (const timer of this.taskCompletionCascadeTimers.values()) window.clearTimeout(timer);
       this.taskCompletionCascadeTimers.clear();
       this.taskCompletionCascadeGuards.clear();
+      this.taskCompletionWriteQueues.clear();
     });
     this.registerEvent(this.app.vault.on("create", (file) => {
       if (file instanceof TFile) this.queueReminderScan(file);
@@ -5780,8 +5909,12 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       vaultTasksLoaded: false,
     };
     try {
-      data.notificationTasks = await this.collectNotificationTasks();
-      data.vaultTasks = await this.collectVaultTasks();
+      const [notificationTasks, vaultTasks] = await Promise.all([
+        this.collectNotificationTasks(),
+        this.collectVaultTasks(),
+      ]);
+      data.notificationTasks = notificationTasks;
+      data.vaultTasks = vaultTasks;
       data.notificationTasksLoaded = true;
       data.vaultTasksLoaded = true;
     } catch (error) {
@@ -6056,18 +6189,31 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const files = this.app.vault.getMarkdownFiles();
     const tasks = [];
 
-    for (const file of files) {
-      try {
-        const content = await this.app.vault.cachedRead(file);
-        const lines = content.split(/\r?\n/);
-        for (let i = 0; i < lines.length; i++) {
-          const parsed = this.parseTaskLine(lines[i], file.path, i + 1);
-          if (parsed) tasks.push(parsed);
+    // Read a bounded number of files in parallel. A large vault should not
+    // serialize thousands of cachedRead() calls, while unbounded Promise.all
+    // would create avoidable memory and I/O pressure on mobile Obsidian.
+    const workerCount = Math.min(16, Math.max(1, files.length));
+    let nextIndex = 0;
+    const readFile = async () => {
+      while (true) {
+        const index = nextIndex++;
+        if (index >= files.length) return;
+        const file = files[index];
+        try {
+          const content = await this.app.vault.cachedRead(file);
+          const lines = content.split(/\r?\n/);
+          const parsedTasks = [];
+          for (let i = 0; i < lines.length; i++) {
+            const parsed = this.parseTaskLine(lines[i], file.path, i + 1);
+            if (parsed) parsedTasks.push(parsed);
+          }
+          tasks.push(...parsedTasks);
+        } catch (error) {
+          console.warn(`${PLUGIN_NAME}: skipped unreadable file ${file.path}`, error);
         }
-      } catch (error) {
-        console.warn(`${PLUGIN_NAME}: skipped unreadable file ${file.path}`, error);
       }
-    }
+    };
+    await Promise.all(Array.from({ length: workerCount }, () => readFile()));
 
     tasks.sort((a, b) => {
       if (a.completed !== b.completed) return a.completed ? 1 : -1;
@@ -6104,27 +6250,48 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   async toggleTaskCompletion(filePath, lineNumber) {
     const path = String(filePath || "").replace(/\\/g, "/");
-    const file = this.app.vault.getAbstractFileByPath(path);
-    if (!file) throw new Error("source not found");
-    const lineIndex = Math.max(0, Number(lineNumber || 1) - 1);
-    const content = await this.app.vault.read(file);
-    const lines = content.split(/\r?\n/);
-    if (!lines[lineIndex]) throw new Error("line not found");
-    const match = lines[lineIndex].match(/^(\s*[-*+]\s+\[)([^\]])(\]\s+.*)$/);
-    if (!match) throw new Error("line is not a task");
-    const nextMark = match[2] === "x" || match[2] === "X" ? " " : "x";
-    const doneAt = nextMark === "x" ? new Date() : null;
-    const body = nextMark === "x" ? this.addTasksDoneDate(match[3], doneAt) : this.removeTasksDoneDate(match[3]);
-    lines[lineIndex] = `${match[1]}${nextMark}${body}`;
-    // Completing a parent task completes every nested task below it. The
-    // cascade stops at the first same-level/ancestor task, so siblings and
-    // later sections remain untouched. Unchecking only changes the parent;
-    // it must not erase a child's independently recorded completion state.
-    const cascadedLineNumbers = nextMark === "x"
-      ? this.cascadeCompletedTaskChildren(lines, lineIndex, doneAt)
-      : [];
-    await this.app.vault.modify(file, lines.join("\n"));
-    return { completed: nextMark === "x", doneAt, cascadedLineNumbers };
+    if (!path) throw new Error("source not found");
+    return this.enqueueTaskFileWrite(path, async () => {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!file) throw new Error("source not found");
+      const lineIndex = Math.max(0, Number(lineNumber || 1) - 1);
+      const content = await this.app.vault.read(file);
+      const lines = content.split(/\r?\n/);
+      if (!lines[lineIndex]) throw new Error("line not found");
+      const match = lines[lineIndex].match(/^(\s*[-*+]\s+\[)([^\]])(\]\s+.*)$/);
+      if (!match) throw new Error("line is not a task");
+      const nextMark = match[2] === "x" || match[2] === "X" ? " " : "x";
+      const doneAt = nextMark === "x" ? new Date() : null;
+      const body = this.setTaskCompletionState(match[3], nextMark === "x", doneAt);
+      lines[lineIndex] = `${match[1]}${nextMark}${body}`;
+      // Completing a parent task completes every nested task below it. The
+      // cascade stops at the first same-level/ancestor task, so siblings and
+      // later sections remain untouched. Unchecking only changes the parent;
+      // it must not erase a child's independently recorded completion state.
+      const cascadedLineNumbers = nextMark === "x"
+        ? this.cascadeCompletedTaskChildren(lines, lineIndex, doneAt)
+        : [];
+      await this.app.vault.modify(file, lines.join("\n"));
+      return { completed: nextMark === "x", doneAt, cascadedLineNumbers };
+    });
+  }
+
+  enqueueTaskFileWrite(filePath, operation) {
+    const path = String(filePath || "").replace(/\\/g, "/");
+    if (!path || typeof operation !== "function") return Promise.resolve(undefined);
+    if (!(this.taskCompletionWriteQueues instanceof Map)) this.taskCompletionWriteQueues = new Map();
+    const previous = this.taskCompletionWriteQueues.get(path) || Promise.resolve();
+    const next = previous.catch(() => undefined).then(operation);
+    this.taskCompletionWriteQueues.set(path, next);
+    void next.then(
+      () => {
+        if (this.taskCompletionWriteQueues.get(path) === next) this.taskCompletionWriteQueues.delete(path);
+      },
+      () => {
+        if (this.taskCompletionWriteQueues.get(path) === next) this.taskCompletionWriteQueues.delete(path);
+      },
+    );
+    return next;
   }
 
   taskIndentWidth(line) {
@@ -6150,7 +6317,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       }
       if (this.taskIndentWidth(lines[index]) <= parentIndent) break;
       if (childMatch[2] === "x" || childMatch[2] === "X") continue;
-      const childBody = this.addTasksDoneDate(childMatch[3], doneAt);
+      const childBody = this.setTaskCompletionState(childMatch[3], true, doneAt);
       lines[index] = `${childMatch[1]}x${childBody}`;
       cascadedLineNumbers.push(index + 1);
     }
@@ -6189,7 +6356,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
       let completed = taskMatch[2] === "x" || taskMatch[2] === "X";
       if (completedAncestorIndent !== null && indent > completedAncestorIndent && !completed) {
-        const childBody = this.addTasksDoneDate(taskMatch[3], doneAt);
+        const childBody = this.setTaskCompletionState(taskMatch[3], true, doneAt);
         lines[index] = `${taskMatch[1]}x${childBody}`;
         cascadedLineNumbers.push(index + 1);
         completed = true;
@@ -6203,20 +6370,26 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (!file || file.extension !== "md" || this.isUnloading) return;
     const path = String(file.path || "");
     if (!path || this.taskCompletionCascadeGuards.has(path)) return;
-    const source = await this.app.vault.cachedRead(file);
-    const lines = String(source || "").split(/\r?\n/);
-    const doneAt = new Date();
-    const cascadedLineNumbers = this.cascadeCompletedTaskHierarchy(lines, doneAt);
-    if (!cascadedLineNumbers.length) return;
+    return this.enqueueTaskFileWrite(path, async () => {
+      if (this.taskCompletionCascadeGuards.has(path)) return;
+      const source = typeof this.app.vault.read === "function"
+        ? await this.app.vault.read(file)
+        : await this.app.vault.cachedRead(file);
+      const lines = String(source || "").split(/\r?\n/);
+      const doneAt = new Date();
+      const cascadedLineNumbers = this.cascadeCompletedTaskHierarchy(lines, doneAt);
+      if (!cascadedLineNumbers.length) return;
 
-    this.taskCompletionCascadeGuards.add(path);
-    try {
-      await this.app.vault.modify(file, lines.join("\n"));
-    } finally {
-      // Obsidian emits the follow-up modify event asynchronously. Keep the
-      // guard briefly so our own write cannot be interpreted as a new click.
-      window.setTimeout(() => this.taskCompletionCascadeGuards.delete(path), 300);
-    }
+      this.taskCompletionCascadeGuards.add(path);
+      try {
+        await this.app.vault.modify(file, lines.join("\n"));
+      } finally {
+        // Obsidian emits the follow-up modify event asynchronously. Keep the
+        // guard briefly so our own write cannot be interpreted as a new click.
+        window.setTimeout(() => this.taskCompletionCascadeGuards.delete(path), 300);
+      }
+      return cascadedLineNumbers;
+    });
   }
 
   queueEnsureDoneDates(file) {
@@ -6235,25 +6408,28 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (!file || file.extension !== "md") return;
     const path = file.path;
     if (this.doneDateWriteGuards.has(path)) return;
-    const content = await this.app.vault.read(file);
-    const lines = content.split(/\r?\n/);
-    let changed = false;
-    const nextLines = lines.map((line) => {
-      const match = String(line || "").match(/^(\s*[-*+]\s+\[([^\]])\]\s+)(.*)$/);
-      if (!match) return line;
-      const isDone = match[2] === "x" || match[2] === "X";
-      const nextBody = isDone ? this.addTasksDoneDate(match[3]) : this.removeTasksDoneDate(match[3]);
-      if (nextBody === match[3]) return line;
-      changed = true;
-      return `${match[1]}${nextBody}`;
+    return this.enqueueTaskFileWrite(path, async () => {
+      if (this.doneDateWriteGuards.has(path)) return;
+      const content = await this.app.vault.read(file);
+      const lines = content.split(/\r?\n/);
+      let changed = false;
+      const nextLines = lines.map((line) => {
+        const match = String(line || "").match(/^(\s*[-*+]\s+\[([^\]])\]\s+)(.*)$/);
+        if (!match) return line;
+        const isDone = match[2] === "x" || match[2] === "X";
+        const nextBody = this.setTaskCompletionState(match[3], isDone);
+        if (nextBody === match[3]) return line;
+        changed = true;
+        return `${match[1]}${nextBody}`;
+      });
+      if (!changed) return;
+      this.doneDateWriteGuards.add(path);
+      try {
+        await this.app.vault.modify(file, nextLines.join("\n"));
+      } finally {
+        window.setTimeout(() => this.doneDateWriteGuards.delete(path), 1000);
+      }
     });
-    if (!changed) return;
-    this.doneDateWriteGuards.add(path);
-    try {
-      await this.app.vault.modify(file, nextLines.join("\n"));
-    } finally {
-      window.setTimeout(() => this.doneDateWriteGuards.delete(path), 1000);
-    }
   }
 
   tasksDoneDateText(date = new Date()) {
@@ -6263,16 +6439,18 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   addTasksDoneDate(taskBody, date = new Date()) {
     const body = String(taskBody || "");
-    const doneText = this.tasksDoneDateText(date);
-    if (/(?:✅|✓)\s*\d{4}-\d{2}-\d{2}[\sT　]\d{1,2}:\d{2}/u.test(body)) return body;
-    if (/(?:✅|✓)\s*\d{4}-\d{2}-\d{2}/u.test(body)) {
-      return body.replace(DONE_DATE_RE, ` ${doneText}`).replace(/\s{2,}/g, " ").trim();
-    }
-    return `${body.trimEnd()} ${doneText}`.trim();
+    const existing = body.match(/(?:✅|✓)\s*\d{4}-\d{2}-\d{2}(?:[\sT　]\d{1,2}:\d{2})?/u)?.[0]
+      ?.replace(/^\s*/, "").replace(/^✓/u, "✅").replace(/\s+/gu, " ").trim();
+    const clean = this.removeTasksDoneDate(body);
+    return `${clean} ${existing || this.tasksDoneDateText(date)}`.trim();
   }
 
   removeTasksDoneDate(taskBody) {
     return String(taskBody || "").replace(DONE_DATE_RE, "").trimEnd();
+  }
+
+  setTaskCompletionState(taskBody, completed, date = new Date()) {
+    return completed ? this.addTasksDoneDate(taskBody, date) : this.removeTasksDoneDate(taskBody);
   }
 
   formatDoneDateTime(date) {
@@ -6623,19 +6801,31 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const reminders = [];
     const scannedFiles = new Set();
 
-    for (const file of files) {
-      try {
-        const content = await this.app.vault.cachedRead(file);
-        scannedFiles.add(file.path);
-        const lines = content.split(/\r?\n/);
-        for (let i = 0; i < lines.length; i++) {
-          const parsed = this.parseReminderLine(lines[i], file.path, i + 1);
-          if (parsed) reminders.push(parsed);
+    // Keep reminder discovery responsive on large vaults without creating
+    // an unbounded Promise.all burst on desktop or mobile.
+    const workerCount = Math.min(16, Math.max(1, files.length));
+    let nextIndex = 0;
+    const readFile = async () => {
+      while (true) {
+        const index = nextIndex++;
+        if (index >= files.length) return;
+        const file = files[index];
+        try {
+          const content = await this.app.vault.cachedRead(file);
+          scannedFiles.add(file.path);
+          const lines = content.split(/\r?\n/);
+          const parsedReminders = [];
+          for (let i = 0; i < lines.length; i++) {
+            const parsed = this.parseReminderLine(lines[i], file.path, i + 1);
+            if (parsed) parsedReminders.push(parsed);
+          }
+          reminders.push(...parsedReminders);
+        } catch (error) {
+          console.warn(`${PLUGIN_NAME}: skipped unreadable file ${file.path}`, error);
         }
-      } catch (error) {
-        console.warn(`${PLUGIN_NAME}: skipped unreadable file ${file.path}`, error);
       }
-    }
+    };
+    await Promise.all(Array.from({ length: workerCount }, () => readFile()));
 
     this.lastReminderScanFiles = scannedFiles;
     reminders.sort((a, b) => a.due.getTime() - b.due.getTime());
@@ -9085,7 +9275,7 @@ class NtfyReminderSuggest extends EditorSuggest {
 
   onTrigger(cursor, editor) {
     const line = editor.getLine(cursor.line).slice(0, cursor.ch);
-    const match = line.match(/(?:^|\s)(ntfy|提醒|notify|remind|todo|task|待办|今天|明天|后天|下周|今晚|早八|上午|中午|下午|30分钟|1小时|📅|⏰|➕|⏲)$/i);
+    const match = line.match(reminderTriggerPattern());
     const taskLine = /^\s*[-*+]\s+\[[^\]]\]/.test(line);
     const taskContentTrigger = this.plugin.taskLineHasReminderContent(line);
     const emojiTrigger = line.match(/(?:📅|⏰|➕|⏲)\s*$/u);
@@ -9127,8 +9317,8 @@ class NtfyReminderSuggest extends EditorSuggest {
     if (/^\s*[-*+]\s+\[[^\]]\]/.test(line)) {
       return [
         {
-          label: "换行",
-          hint: "新建下一行",
+          label: reminderUiText(this.plugin, "lineBreak"),
+          hint: reminderUiText(this.plugin, "newLine"),
           note: "Enter",
           isLineBreak: true,
         },
@@ -9164,13 +9354,13 @@ class NtfyReminderSuggest extends EditorSuggest {
     if (suggestion && suggestion.isLineBreak) {
       const icon = el.createSpan({
         cls: "obsidian-ntfy-suggest-line-break-icon",
-        attr: { title: "换行", "aria-label": "换行" },
+        attr: { title: reminderUiText(this.plugin, "lineBreak"), "aria-label": reminderUiText(this.plugin, "lineBreak") },
       });
       setIcon(icon, "corner-down-left");
       return;
     }
     el.createEl("div", { cls: "obsidian-ntfy-suggest-title", text: suggestion.label });
-    el.createEl("div", { cls: "obsidian-ntfy-suggest-note", text: `${suggestion.hint || "到期"} / ${suggestion.note}` });
+    el.createEl("div", { cls: "obsidian-ntfy-suggest-note", text: `${suggestion.hint || reminderUiText(this.plugin, "due")} / ${suggestion.note}` });
   }
 
   selectSuggestion(suggestion, event) {
@@ -9207,7 +9397,7 @@ class NtfyReminderSuggest extends EditorSuggest {
     // the time choices. Without reopening the editor suggest, Obsidian keeps
     // the inserted date and waits for another keystroke before the time list
     // appears.
-    if (taskHasContent && suggestion && suggestion.hint === "选择日期" && typeof this.open === "function") {
+    if (taskHasContent && suggestion && suggestion.kind === "date" && typeof this.open === "function") {
       window.setTimeout(() => {
         try {
           this.open();
@@ -9224,7 +9414,7 @@ class NtfyReminderInsertModal extends SuggestModal {
     super(app);
     this.plugin = plugin;
     this.editor = editor;
-    this.setPlaceholder("选择 ntfy / Tasks 到期时间");
+    this.setPlaceholder(reminderUiText(plugin, "chooseDate") + " / " + reminderUiText(plugin, "chooseTime"));
   }
 
   getSuggestions(query) {
@@ -9237,7 +9427,7 @@ class NtfyReminderInsertModal extends SuggestModal {
   renderSuggestion(suggestion, el) {
     el.addClass("obsidian-ntfy-suggest-item");
     el.createEl("div", { cls: "obsidian-ntfy-suggest-title", text: suggestion.label });
-    el.createEl("div", { cls: "obsidian-ntfy-suggest-note", text: `${suggestion.hint || "到期"} / ${suggestion.note}` });
+    el.createEl("div", { cls: "obsidian-ntfy-suggest-note", text: `${suggestion.hint || reminderUiText(this.plugin, "due")} / ${suggestion.note}` });
   }
 
   onChooseSuggestion(suggestion) {
@@ -9262,42 +9452,36 @@ function ntfyReminderSuggestions(plugin, currentLine = "") {
 }
 
 function ntfyDateSuggestions(plugin, now) {
-  const configuredLabels = String(plugin.settings.suggestionDates || DEFAULT_SETTINGS.suggestionDates)
+  const configuredEntries = String(plugin.settings.suggestionDates || DEFAULT_SETTINGS.suggestionDates)
     .split(/[,，]/)
     .map((item) => item.trim())
     .filter(Boolean);
-  // Always start the date panel at today. Keep user-configured choices after
-  // it, while removing duplicates if the setting already contains 今天.
-  const labels = ["今天", ...configuredLabels.filter((label) => label !== "今天")];
-  const dateForLabel = (label) => {
-    if (/^今天$/u.test(label)) return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
-    if (/^明天$/u.test(label)) return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0, 0);
-    if (/^后天$/u.test(label)) return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 2, 0, 0, 0, 0);
-    const weekMatch = label.match(/^下周([一二三四五六日天])$/u);
-    if (weekMatch) {
-      const map = { "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 0, "天": 0 };
-      const target = map[weekMatch[1]];
-      const current = now.getDay();
-      const diff = ((target - current + 7) % 7) + 7;
-      return new Date(now.getFullYear(), now.getMonth(), now.getDate() + diff, 0, 0, 0, 0);
-    }
-    return null;
-  };
-  return labels.map((label) => {
-    const date = dateForLabel(label);
+  const entries = configuredEntries.map(parseDateSuggestionEntry).filter(Boolean);
+  const tokens = entries.length
+    ? [...new Set(["today", ...entries.map((entry) => entry.token)])]
+    : ["today", "tomorrow", "dayAfterTomorrow", "nextMonday", "nextFriday", "nextSunday"];
+  const labelByToken = new Map(entries.map((entry) => [entry.token, entry.label]));
+  return tokens.map((token) => {
+    const date = dateForSuggestionToken(token, now);
     if (!date) return null;
     const dateText = `${date.getFullYear()}-${plugin.pad2(date.getMonth() + 1)}-${plugin.pad2(date.getDate())}`;
     return {
-      label,
-      hint: "选择日期",
+      label: localizeSuggestionLabel(plugin, labelByToken.get(token) || token),
+      hint: reminderUiText(plugin, "chooseDate"),
       note: dateText,
+      kind: "date",
       insertText: `📅 ${dateText} `,
     };
   }).filter(Boolean);
 }
 
 function ntfyTimeSuggestions(plugin, currentLine, now) {
-  const times = String(plugin.settings.suggestionTimes || DEFAULT_SETTINGS.suggestionTimes)
+  const configuredTimes = String(plugin.settings.suggestionTimes || DEFAULT_SETTINGS.suggestionTimes)
+    .split(/[,，]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const times = configuredTimes.length ? configuredTimes : String(DEFAULT_SETTINGS.suggestionTimes).split(",");
+  const labels = String(plugin.settings.suggestionLabels || DEFAULT_SETTINGS.suggestionLabels)
     .split(/[,，]/)
     .map((item) => item.trim())
     .filter(Boolean);
@@ -9314,10 +9498,11 @@ function ntfyTimeSuggestions(plugin, currentLine, now) {
   return times.slice(0, 12).map((time, index) => {
     const due = makeDate(pickTime(index, time));
     return {
-      label: plugin.formatLocalDateTime(due).slice(11),
+      label: localizeSuggestionLabel(plugin, labels[index] || plugin.formatLocalDateTime(due).slice(11)),
       due,
       note: plugin.formatLocalDateTime(due),
-      hint: "选择时间",
+      hint: reminderUiText(plugin, "chooseTime"),
+      kind: "time",
       insertText: ` ${plugin.formatLocalDateTime(due).slice(11)}`,
     };
   });
