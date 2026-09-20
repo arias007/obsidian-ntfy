@@ -51,6 +51,10 @@ function createPlugin(settings = {}) {
   plugin.incomingSocketStates = new Map();
   plugin.incomingReconnectAttempts = new Map();
   plugin.isUnloading = false;
+  // Notice-text assertions are written in English. Pin the UI language so the
+  // results do not depend on the machine locale running the tests ("auto"
+  // resolves to the OS language, which may be zh on the author's machine).
+  if (settings.uiLanguage === undefined) settings.uiLanguage = "en";
   plugin.settings = plugin.normalizeSettings(settings);
   plugin.saveData = async () => {};
   plugin.saveSettings = async () => {};
@@ -159,8 +163,8 @@ async function run() {
   const styles = fs.readFileSync(path.join(__dirname, "..", "styles.css"), "utf8");
   const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
   const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
-  assert.equal(manifest.version, "1.5.0");
-  assert.equal(packageJson.version, "1.5.0");
+  assert.equal(manifest.version, packageJson.version);
+  assert.ok(/^\d+\.\d+\.\d+$/.test(manifest.version), "version should be semver");
   const managerHeaderStart = source.indexOf("  renderHeader(containerEl) {");
   const managerHeaderEnd = source.indexOf("  renderIncomingMessages(containerEl)", managerHeaderStart);
   assert.ok(managerHeaderStart >= 0 && managerHeaderEnd > managerHeaderStart, "manager header should remain discoverable");
