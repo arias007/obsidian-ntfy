@@ -7892,13 +7892,13 @@ class NtfyManagerView extends ItemView {
     const available = Math.floor(viewBottom - measuredTop);
     const height = Math.max(160, Math.min(available, visibleHeight, Math.round(layoutHeight)));
     root.style.setProperty("--obsidian-ntfy-viewport-height", `${height}px`);
-    // If the browser scrolled the page to reveal the focused input, the
-    // container top can sit above the visible band. The clamped height above
-    // already keeps the composer inside the visible area in that state; this
-    // pull-back restores the panel head without fighting the keyboard.
-    if (rect.top < viewTop - 1 && typeof root.scrollIntoView === "function") {
-      root.scrollIntoView({ block: "nearest", inline: "nearest" });
-    }
+    // Deliberately NO scroll correction here. While the keyboard is open the
+    // browser pans the page to keep the focused input visible; scrolling the
+    // container back fought that pan on every measurement, and the scroll war
+    // cancelled the active IME composition — on mobile the input stopped
+    // accepting text about a second after the keyboard opened until it was
+    // toggled again. The clamped height above already keeps the composer
+    // inside the visible band, which is all this function needs to guarantee.
     const keyboardInset = Math.max(0, Math.round(layoutHeight - viewBottom));
     root.style.setProperty("--obsidian-ntfy-keyboard-inset", `${keyboardInset}px`);
     root.toggleClass("is-keyboard-open", keyboardInset > 96 && this.activeTab === "inbox");
@@ -7915,6 +7915,12 @@ class NtfyManagerView extends ItemView {
     if (this.activeTab !== "inbox") return;
     const input = this.bodyEl?.querySelector(".obsidian-ntfy-chat-input");
     if (!input) return;
+    // While the user is typing, the browser keeps the focused input visible
+    // by itself. scrollIntoView here fought that focus scroll and cancelled
+    // the active IME composition — the input stopped accepting text about a
+    // second after the keyboard opened until it was toggled again. Only act
+    // when the input is NOT focused (e.g. right after opening the view).
+    if (document.activeElement === input) return;
     const viewport = window.visualViewport;
     const viewTop = viewport ? viewport.offsetTop : 0;
     const viewBottom = viewport ? viewport.offsetTop + viewport.height : window.innerHeight;
