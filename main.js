@@ -7678,6 +7678,9 @@ class NtfyManagerView extends ItemView {
     this.viewportHeartbeat = null;
     this.lastFullViewportHeight = 0;
     this.lastKeyboardInset = 0;
+    // cancip 式浮动输入栏状态（1.7.4）：键盘期 composer 被搬到 document.body，
+    // 这里记住原位以便键盘收起后放回。
+    this.composerFloatState = null;
     // KEYBOARD MODE SWITCH (1.7.2): native mode is the default — the soft
     // keyboard belongs to Obsidian/Android and none of the viewport machinery
     // runs. Set localStorage["ntfy-kb-native"] = "0" to switch back to the
@@ -7746,6 +7749,8 @@ class NtfyManagerView extends ItemView {
       this.keyboardScrollGuard = null;
     }
     this.realignConversationScroll = null;
+    // 面板关闭时若输入栏还浮在 body 上，先归位/回收再清空面板 DOM。
+    this.unfloatComposer();
     this.viewContentEl().empty();
     this.bodyEl = null;
     this.tabPanels.clear();
@@ -7838,11 +7843,21 @@ class NtfyManagerView extends ItemView {
     window.addEventListener("orientationchange", schedule, { passive: true });
     viewport?.addEventListener("resize", schedule, { passive: true });
     viewport?.addEventListener("scroll", schedule, { passive: true });
+    // cancip 同款：Capacitor 移动端的原生键盘事件比 visualViewport 更早到达，
+    // 键盘动画一开始就能先量一次，不用等视口事件补拍。
+    window.addEventListener("keyboardWillShow", schedule, { passive: true });
+    window.addEventListener("keyboardDidShow", schedule, { passive: true });
+    window.addEventListener("keyboardWillHide", schedule, { passive: true });
+    window.addEventListener("keyboardDidHide", schedule, { passive: true });
     this.viewportCleanup = () => {
       window.removeEventListener("resize", schedule);
       window.removeEventListener("orientationchange", schedule);
       viewport?.removeEventListener("resize", schedule);
       viewport?.removeEventListener("scroll", schedule);
+      window.removeEventListener("keyboardWillShow", schedule);
+      window.removeEventListener("keyboardDidShow", schedule);
+      window.removeEventListener("keyboardWillHide", schedule);
+      window.removeEventListener("keyboardDidHide", schedule);
       if (this.viewportFrame !== null) {
         if (this.viewportFrameKind === "frame") window.cancelAnimationFrame?.(this.viewportFrame);
         else window.clearTimeout?.(this.viewportFrame);
@@ -7972,6 +7987,13 @@ class NtfyManagerView extends ItemView {
     // 布局视口；输入框之前困在流式布局里，随容器位移被推出屏幕。键盘收起后
     // 自动还原为常规 flex 布局，其余一切不变。
     root.toggleClass("is-composer-fixed", keyboardInset > 96 && this.activeTab === "inbox");
+    // 1.7.4 cancip 式：输入栏若已浮动到 body，随每拍测量更新几何（键盘 inset、
+    // 面板左右边界）；键盘收起就地归位。浮动是 1.7.3 原地 fixed 的升级——彻底
+    // 脱离面板滚动树，浏览器平移面板也碰不到它。
+    if (this.composerFloatState) {
+      if (keyboardInset > 96) this.updateFloatingComposerGeometry(keyboardInset);
+      else this.unfloatComposer();
+    }
     // Remember the settled keyboard height so the next focus can pre-shrink
     // the container before the browser runs its own focus scroll. Persisted
     // per device: the very first focus after a cold start must work too.
@@ -8064,6 +8086,54 @@ class NtfyManagerView extends ItemView {
     this.keyboardScrollGuard = window.requestAnimationFrame(step);
   }
 
+  // cancip 式浮动输入栏（1.7.4）。审核模块的 footer 输入栏在手机上稳如磐石，
+  // 靠的不是算高度，而是三件事：① pointerdown（focus 落地之前）把输入栏整个
+  // appendChild 到 document.body，彻底脱离 Obsidian 的滚动/位移容器——焦点落
+  // 在已搬家的元素上，不会因 DOM 移动丢焦点或打断 IME；② position:fixed 贴
+  // 布局视口底，bottom 用键盘 inset 变量修正（resize 模式下视口已缩小则 inset
+  // ≈0，pan 模式下视口未缩则 inset = 键盘高度，两种模式都恰好停在键盘上沿，
+  // 与 kb-debug 水印同机制）；③ left/right 用面板 rect 实时对齐，面板被平移
+  // 时每拍重算。键盘收起（inset ≤ 96）后放回原位，flex 布局原样还原。
+  floatComposer(composer) {
+    if (!composer || typeof document === "undefined") return;
+    if (this.composerFloatState || composer.parentElement === document.body) return;
+    const parent = composer.parentElement;
+    if (!parent) return;
+    this.composerFloatState = { composer, parent, nextSibling: composer.nextSibling };
+    composer.addClass("is-viewport-floating");
+    document.body.appendChild(composer);
+    this.updateFloatingComposerGeometry(this.lastKeyboardInset || 0);
+  }
+
+  unfloatComposer() {
+    const state = this.composerFloatState;
+    if (!state) return;
+    this.composerFloatState = null;
+    const composer = state.composer;
+    if (!composer || !composer.isConnected) return;
+    composer.removeClass("is-viewport-floating");
+    composer.style.removeProperty("--ntfy-composer-bottom");
+    composer.style.removeProperty("--ntfy-composer-left");
+    composer.style.removeProperty("--ntfy-composer-right");
+    if (state.parent && state.parent.isConnected) {
+      state.parent.insertBefore(composer, state.nextSibling);
+    } else {
+      // 面板已关闭：原位不存在，直接丢弃浮动节点，避免泄漏在 body 上。
+      composer.remove();
+    }
+  }
+
+  updateFloatingComposerGeometry(keyboardInset) {
+    const composer = this.composerFloatState?.composer;
+    if (!composer || typeof document === "undefined") return;
+    const root = this.viewContentEl();
+    if (!root) return;
+    const rect = root.getBoundingClientRect();
+    const width = Math.max(document.documentElement.clientWidth, window.innerWidth || 0);
+    composer.style.setProperty("--ntfy-composer-bottom", `${Math.max(0, keyboardInset || 0)}px`);
+    composer.style.setProperty("--ntfy-composer-left", `${Math.max(0, Math.floor(rect.left))}px`);
+    composer.style.setProperty("--ntfy-composer-right", `${Math.max(0, Math.floor(width - rect.right))}px`);
+  }
   // Undo a browser focus scroll that pushed the container top above the
   // visible band. Taken out of the nearest scrollable ancestors directly —
   // scrollIntoView here would fight the keyboard handling that caused the
@@ -9121,6 +9191,13 @@ class NtfyManagerView extends ItemView {
     // leaving a blank gap once our measurement shrinks the container. The
     // scroll guard then undoes any residual displacement frame by frame
     // during the keyboard animation, before text composition can start.
+    // cancip 式（1.7.4）：在 focus 落地之前（pointerdown）就把输入栏搬到
+    // document.body 浮动，焦点落在已搬家的元素上——DOM 移动不丢焦点、不打断
+    // IME。仅干预模式 + 手机启用，原生键盘模式完全不碰。
+    input.addEventListener("pointerdown", () => {
+      if (this.keyboardNativeMode || !Platform.isMobile) return;
+      this.floatComposer(composer);
+    });
     input.addEventListener("focus", () => {
       this.preShrinkForKeyboard();
       this.startKeyboardScrollGuard();
@@ -9132,6 +9209,18 @@ class NtfyManagerView extends ItemView {
         this.keyboardScrollGuard = null;
       }
       this.scheduleViewportSizing();
+      // 键盘随失焦收起后把输入栏放回原位。延迟判定：键盘收起动画期间
+      // inset 还有残余值，等它落底再回收，避免收起瞬间输入栏闪跳。
+      if (typeof window !== "undefined" && typeof window.setTimeout === "function") {
+        window.setTimeout(() => {
+          if (this.keyboardNativeMode) return;
+          const viewport = window.visualViewport;
+          const layoutHeight = window.innerHeight || 0;
+          if (!layoutHeight) return;
+          const inset = Math.max(0, layoutHeight - Math.min(viewport ? Math.round(viewport.offsetTop + viewport.height) : layoutHeight, layoutHeight));
+          if (inset <= 96) this.unfloatComposer();
+        }, 320);
+      }
     });
     if (!active.available) {
       input.disabled = true;

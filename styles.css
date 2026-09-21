@@ -1542,6 +1542,19 @@
   padding-bottom: 64px;
 }
 
+/* 1.7.4 cancip 式浮动输入栏：键盘期输入栏被搬到 document.body（脱离面板滚动树），
+   fixed 钉在布局视口底；bottom 用键盘 inset 修正（resize 模式 inset≈0、pan 模式
+   inset=键盘高度，两种模式都恰好停在键盘上沿），left/right 每拍按面板 rect 对齐。
+   变量直接写在输入栏元素上（搬到 body 后继承不到面板根的变量）。 */
+.obsidian-ntfy-chat-composer.is-viewport-floating {
+  position: fixed;
+  bottom: var(--ntfy-composer-bottom, 0px);
+  left: var(--ntfy-composer-left, 0px);
+  right: var(--ntfy-composer-right, 0px);
+  z-index: 99;
+  box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.18);
+}
+
 .obsidian-ntfy-chat-compose-row {
   align-items: flex-end;
   display: flex;
