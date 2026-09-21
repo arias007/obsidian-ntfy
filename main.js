@@ -8172,6 +8172,72 @@ class NtfyManagerView extends ItemView {
     else pump();
   }
 
+  // Render conversation rows so the FIRST paint shows the newest message.
+  // The old top-down batching rendered the oldest rows first and pinned the
+  // viewport to the bottom of that small batch, so every appended batch
+  // dragged the view forward through history — the "opens mid-history, then
+  // slides to the bottom" complaint. Here the newest `tailCount` rows are
+  // built synchronously (they are the last children of the list, so the
+  // bottom of the tail IS the newest message), and older rows are then
+  // prepended in batches while growing scrollTop by the height that was
+  // added above the viewport, so the visible messages never move until the
+  // user scrolls themselves.
+  renderMessagesTailFirst(containerEl, items, renderItem, state, options = {}) {
+    const list = Array.isArray(items) ? items : [];
+    const total = list.length;
+    if (!total) return;
+    if (options.synchronous) {
+      for (let i = 0; i < total; i++) renderItem(containerEl, list[i], i > 0 ? list[i - 1] : null);
+      return;
+    }
+    const tailCount = Math.min(total, Math.max(1, Number(options.tailCount || 48)));
+    const batchSize = Math.max(1, Number(options.batchSize || 64));
+    const tailStart = total - tailCount;
+    for (let i = tailStart; i < total; i++) renderItem(containerEl, list[i], i > tailStart ? list[i - 1] : null);
+    if (tailStart === 0) return;
+    let index = tailStart;
+    // Older batches are inserted before the first rendered row (after any
+    // leading widgets such as the load-older button).
+    let insertBeforeNode = containerEl.querySelector(".obsidian-ntfy-chat-date, .obsidian-ntfy-chat-message");
+    const prepend = () => {
+      if (!state || state.cancelled || !containerEl.isConnected) return false;
+      const start = Math.max(0, index - batchSize);
+      const beforeCount = containerEl.childNodes.length;
+      const beforeHeight = containerEl.scrollHeight;
+      for (let i = start; i < index; i++) renderItem(containerEl, list[i], i > 0 ? list[i - 1] : null);
+      // Obsidian's createDiv helpers only exist on HTMLElement, so the batch
+      // is appended and then moved above the viewport in one pass.
+      const added = Array.prototype.slice.call(containerEl.childNodes, beforeCount);
+      for (const node of added) containerEl.insertBefore(node, insertBeforeNode);
+      if (added.length) insertBeforeNode = added[0];
+      const delta = containerEl.scrollHeight - beforeHeight;
+      if (delta > 0) containerEl.scrollTop += delta;
+      index = start;
+      return index > 0;
+    };
+    const schedule = (callback) => {
+      if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+        return { kind: "frame", handle: window.requestAnimationFrame(callback) };
+      }
+      if (typeof window !== "undefined" && typeof window.setTimeout === "function") {
+        return { kind: "timeout", handle: window.setTimeout(callback, 0) };
+      }
+      if (typeof setTimeout === "function") return { kind: "timeout", handle: setTimeout(callback, 0) };
+      return null;
+    };
+    const pump = () => {
+      if (!prepend()) return;
+      if (index > 0) {
+        const scheduled = schedule(() => { state.timers.delete(scheduled); pump(); });
+        if (scheduled) state.timers.add(scheduled);
+        else pump();
+      }
+    };
+    const scheduled = schedule(() => { state.timers.delete(scheduled); pump(); });
+    if (scheduled) state.timers.add(scheduled);
+    else pump();
+  }
+
   cancelTabRender(tabId) {
     const scheduled = this.tabRenderHandles.get(tabId);
     if (!scheduled) return;
@@ -8645,12 +8711,11 @@ class NtfyManagerView extends ItemView {
       const empty = messageList.createDiv({ cls: "obsidian-ntfy-chat-empty is-compact" });
       setIcon(empty.createSpan(), active.icon || "message-circle");
     }
-    // Opening a conversation must land on the newest message. The list is
-    // filled in batches, so rows keep being appended after the first paint;
-    // a single scroll-to-bottom at first paint used to leave the view stuck in
-    // the middle of the history. Track a "stick to newest" flag and re-align
-    // after every batch instead.
-    let lastDate = "";
+    // Opening a conversation must land on the newest message at the first
+    // paint: rows stream in tail-first (see renderMessagesTailFirst), so the
+    // newest messages are already the last children of the list. Keyboard and
+    // viewport resizes keep re-flowing the list afterwards, so a "stick to
+    // newest" flag keeps re-anchoring the bottom until the user scrolls away.
     let stickToLatest = true;
     let lastScrollInteractionAt = 0;
     const markScrollInteraction = () => { lastScrollInteractionAt = Date.now(); };
@@ -8713,14 +8778,15 @@ class NtfyManagerView extends ItemView {
     };
     const afterBatch = preservedAnchor ? maintainAnchor : keepLatest;
     this.realignConversationScroll = afterBatch;
-    this.renderRowsBatched(messageList, messages, (message) => {
+    const renderMessageInto = (container, message, previousMessage) => {
       const date = new Date(message.timestamp);
       const dateKey = Number.isNaN(date.getTime()) ? "" : date.toLocaleDateString();
-      if (dateKey && dateKey !== lastDate) {
-        messageList.createDiv({ cls: "obsidian-ntfy-chat-date", text: dateKey });
-        lastDate = dateKey;
+      const previousDate = previousMessage ? new Date(previousMessage.timestamp) : null;
+      const previousKey = previousDate && !Number.isNaN(previousDate.getTime()) ? previousDate.toLocaleDateString() : "";
+      if (dateKey && dateKey !== previousKey) {
+        container.createDiv({ cls: "obsidian-ntfy-chat-date", text: dateKey });
       }
-      const row = messageList.createDiv({ cls: `obsidian-ntfy-chat-message is-${message.direction}` });
+      const row = container.createDiv({ cls: `obsidian-ntfy-chat-message is-${message.direction}` });
       const bubble = row.createDiv({ cls: "obsidian-ntfy-chat-bubble" });
       if (message.text) bubble.createDiv({ cls: "obsidian-ntfy-chat-text", text: message.text });
       for (const attachment of message.attachments || []) this.renderConversationAttachment(bubble, attachment, message);
@@ -8756,7 +8822,15 @@ class NtfyManagerView extends ItemView {
         await this.plugin.removeConversationMessage(message.id, message.direction);
         this.renderTabPanel("inbox");
       });
-    }, batchState, { initialCount: 48, batchSize: 64, onBatch: keepLatest, onComplete: keepLatest });
+    };
+    this.renderMessagesTailFirst(messageList, messages, renderMessageInto, batchState, {
+      tailCount: 48,
+      batchSize: 64,
+      // A "load older" re-render must restore an exact reading position that
+      // lives in the not-yet-streamed region, so build the whole window at
+      // once instead of streaming it above the viewport.
+      synchronous: Boolean(preservedAnchor),
+    });
 
     const composer = conversation.createDiv({ cls: "obsidian-ntfy-chat-composer" });
     const selected = composer.createDiv({ cls: "obsidian-ntfy-chat-selected-files" });
