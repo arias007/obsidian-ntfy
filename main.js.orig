@@ -8165,9 +8165,7 @@ class NtfyManagerView extends ItemView {
     root.removeClass("is-native-keyboard");
     root.style.removeProperty("--ntfy-keyboard-lock-height");
     root.style.removeProperty("--ntfy-keyboard-lock-pad");
-    root.style.removeProperty("--ntfy-composer-left");
-    root.style.removeProperty("--ntfy-composer-right");
-    root.style.removeProperty("--ntfy-composer-bottom");
+    root.style.removeProperty("--ntfy-composer-lift");
     root.style.removeProperty("--obsidian-ntfy-keyboard-inset");
   }
 
@@ -8205,14 +8203,13 @@ class NtfyManagerView extends ItemView {
       : window.setTimeout(() => this.tickNativeKeyboardGuard(), 200);
   }
 
-  // ② Park the composer on the keyboard edge (1.7.10). 1.7.8's `50%` anchor sat
-  // too high and lifting it by "the hidden part of the frozen panel" only moved
-  // it the wrong way, so the composer is now FIXED to the layout-viewport bottom
-  // instead of being positioned relative to a frozen box:
-  //   resize mode (this device) → the window already ends just above the
-  //     keyboard, so the measured inset is 0 and `bottom: 0` is the keyboard edge;
-  //   pan mode → the inset is real, so the same value lifts it onto the edge.
-  // Left/right follow the panel rect so the bar keeps the chat's width.
+  // ② Park the composer exactly on the keyboard's top edge. The anchor is not a
+  // guess at the keyboard height (unmeasurable in the resize mode Obsidian uses,
+  // where window and visual viewport shrink together and the "inset" reads 0):
+  // it is how much of the FROZEN panel sticks out below the visible band. A
+  // frozen panel that already ends above the keyboard lifts the composer by 0 —
+  // it hugs the keyboard; a frozen panel taller than the visible band lifts it by
+  // exactly the hidden part — it still hugs the keyboard.
   applyNativeKeyboardInset() {
     if (typeof window === "undefined") return;
     const root = this.viewContentEl();
@@ -8224,11 +8221,12 @@ class NtfyManagerView extends ItemView {
     const measured = Math.max(0, Math.round(layoutHeight - viewBottom));
     root.style.setProperty("--obsidian-ntfy-keyboard-inset", `${measured}px`);
     const rect = root.getBoundingClientRect();
-    const width = Math.max(document.documentElement ? document.documentElement.clientWidth : 0, window.innerWidth || 0);
-    root.style.setProperty("--ntfy-composer-left", `${Math.max(0, Math.floor(rect.left))}px`);
-    root.style.setProperty("--ntfy-composer-right", `${Math.max(0, Math.floor(width - rect.right))}px`);
-    root.style.setProperty("--ntfy-composer-bottom", `${measured}px`);
-    this.syncLockedComposerPadding();
+    const hiddenBelow = Math.max(0, Math.round(rect.bottom - viewBottom));
+    if (Math.abs(hiddenBelow - (this.nativeKeyboardPadAnchor || 0)) > 4) {
+      this.nativeKeyboardPadAnchor = hiddenBelow;
+      root.style.setProperty("--ntfy-composer-lift", `${hiddenBelow}px`);
+      this.syncLockedComposerPadding();
+    }
     if (measured > 96) {
       this.lastKeyboardInset = measured;
       try {

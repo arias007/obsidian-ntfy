@@ -1857,19 +1857,20 @@
   position: relative;
 }
 
-/* 1.7.9：输入栏抬升量由 JS 按"冻结面板溢出可见区的高度"给出 —— 面板本来就贴到键盘
-   上沿时抬升 0（紧贴键盘），面板比可见区高时抬升被藏住的那一段（仍旧紧贴键盘）。
-   不再用 50% 这类猜测值。 */
+/* 1.7.10：输入栏固定在布局视口底部（= 键盘上沿），不再锚在冻结面板的中部。
+   本机是 resize 模式：窗口本身就止于键盘上方，measured inset = 0 → bottom: 0
+   就是键盘上沿；pan 模式下 inset 为真实键盘高度，同一个值把它抬到键盘上沿。
+   左右边界跟随面板 rect，保持聊天区宽度。 */
 .obsidian-ntfy-manager.is-keyboard-layout-locked .obsidian-ntfy-chat-composer {
-  position: absolute;
-  right: 0;
-  bottom: var(--ntfy-composer-lift, 0px);
-  left: 0;
+  position: fixed;
+  right: var(--ntfy-composer-right, 0px);
+  bottom: var(--ntfy-composer-bottom, 0px);
+  left: var(--ntfy-composer-left, 0px);
   z-index: 40;
   box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.18);
 }
 
 /* 输入栏脱流后给消息区补底部留白，最新消息停在输入栏上方而不是键盘后面 */
 .obsidian-ntfy-manager.is-keyboard-layout-locked .obsidian-ntfy-chat-messages {
-  padding-bottom: calc(var(--ntfy-composer-lift, 0px) + var(--ntfy-keyboard-lock-pad, 64px));
+  padding-bottom: calc(var(--ntfy-composer-bottom, 0px) + var(--ntfy-keyboard-lock-pad, 64px));
 }
