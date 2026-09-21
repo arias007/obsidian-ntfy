@@ -7675,6 +7675,8 @@ class NtfyManagerView extends ItemView {
     this.viewportFrameKind = "";
     this.viewportSettleTimer = null;
     this.keyboardScrollGuard = null;
+    this.viewportHeartbeat = null;
+    this.lastFullViewportHeight = 0;
     this.lastKeyboardInset = 0;
     // The remembered keyboard height survives view recreation and app
     // restarts via localStorage, so even the FIRST focus after a cold start
@@ -7725,6 +7727,10 @@ class NtfyManagerView extends ItemView {
     }
     this.viewportCleanup?.();
     this.viewportCleanup = null;
+    if (this.viewportHeartbeat && typeof window !== "undefined" && typeof window.clearTimeout === "function") {
+      window.clearTimeout(this.viewportHeartbeat);
+      this.viewportHeartbeat = null;
+    }
     if (this.keyboardScrollGuard && typeof window !== "undefined" && typeof window.cancelAnimationFrame === "function") {
       window.cancelAnimationFrame(this.keyboardScrollGuard);
       this.keyboardScrollGuard = null;
@@ -7890,7 +7896,16 @@ class NtfyManagerView extends ItemView {
     // Android's (late) window resize lands, a stale visual viewport can still
     // report the pre-keyboard height, which used to let the container grow
     // past the real window bottom and pushed the composer under the keyboard.
-    const viewBottom = Math.min(viewport ? Math.round(viewport.offsetTop + viewport.height) : layoutHeight, layoutHeight);
+    let viewBottom = Math.min(viewport ? Math.round(viewport.offsetTop + viewport.height) : layoutHeight, layoutHeight);
+    // Some Android WebViews transiently report a COLLAPSED visual viewport
+    // while the keyboard animation settles. If that value arrives with the
+    // last keyboard event, nothing ever re-measures and the whole panel
+    // stays collapsed to a sliver below the nav — the "blank after a second"
+    // report. Floor the bottom at the remembered full-window height minus
+    // the remembered keyboard inset: that is where the keyboard top can
+    // actually be, and a glitched smaller value must not shrink the layout.
+    const insetFloor = Math.max(0, (this.lastFullViewportHeight || 0) - (this.lastKeyboardInset || 0));
+    if (insetFloor > 0) viewBottom = Math.max(viewBottom, Math.min(insetFloor, layoutHeight));
     const rect = root.getBoundingClientRect();
     // PIN the container bottom to the visible bottom. The height is simply
     // "visible bottom minus wherever the container top actually is", with no
@@ -7928,6 +7943,26 @@ class NtfyManagerView extends ItemView {
       } catch (error) {
         /* private mode / storage disabled — the in-memory value still helps */
       }
+    } else {
+      this.lastFullViewportHeight = layoutHeight;
+    }
+    // Heartbeat: while the keyboard is open, re-measure every 300 ms. If the
+    // last keyboard event carried a glitched viewport value, this is what
+    // un-collapses the panel instead of leaving it blank until the keyboard
+    // closes. Cheap: one rect read plus a CSS variable write.
+    if (keyboardInset > 96 && !this.viewportHeartbeat && typeof window !== "undefined" && typeof window.setTimeout === "function") {
+      this.viewportHeartbeat = window.setTimeout(() => {
+        this.viewportHeartbeat = null;
+        if (this.bodyEl) this.updateViewportSizing();
+      }, 300);
+    } else if (keyboardInset <= 96 && this.viewportHeartbeat) {
+      window.clearTimeout(this.viewportHeartbeat);
+      this.viewportHeartbeat = null;
+    }
+    // Live diagnostic readout (temporary, 1.6.8 debugging aid): shows the raw
+    // numbers so a reproducible blank state can be reported precisely.
+    if (this.debugChip) {
+      this.debugChip.textContent = `H${height} T${Math.round(rect.top)} VH${viewport ? Math.round(viewport.height) : 0} VO${viewport ? Math.round(viewport.offsetTop) : 0} IH${Math.round(layoutHeight)} KB${keyboardInset}`;
     }
     // A keyboard-driven resize changes the message area height. Re-anchor the
     // conversation to its newest message so the visible message does not drift.
@@ -8187,6 +8222,7 @@ class NtfyManagerView extends ItemView {
     this.tabPanels.clear();
     this.tabSignatures.clear();
     this.renderHeader(contentEl);
+    this.debugChip = contentEl.createDiv({ cls: "obsidian-ntfy-kb-debug" });
     this.bodyEl = contentEl.createDiv({ cls: "obsidian-ntfy-window-body" });
     // Track the scroll offset passively. Reading bodyEl.scrollTop inside
     // activateTab() forced a synchronous layout of the panel that was just

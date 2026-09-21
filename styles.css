@@ -1782,3 +1782,26 @@
     width: 100%;
   }
 }
+
+/* Temporary 1.6.8 keyboard debugging aid: live viewport readout. */
+.obsidian-ntfy-manager {
+  position: relative;
+}
+
+.obsidian-ntfy-kb-debug {
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  bottom: calc(2px + env(safe-area-inset-bottom));
+  color: var(--text-faint);
+  font-family: var(--font-monospace);
+  font-size: 9px;
+  left: 4px;
+  line-height: 1.2;
+  opacity: 0.8;
+  padding: 2px 5px;
+  pointer-events: none;
+  position: fixed;
+  white-space: nowrap;
+  z-index: 99;
+}
