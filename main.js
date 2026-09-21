@@ -7704,14 +7704,15 @@ class NtfyManagerView extends ItemView {
     // cancip 式浮动输入栏状态（1.7.4）：键盘期 composer 被搬到 document.body，
     // 这里记住原位以便键盘收起后放回。
     this.composerFloatState = null;
-    // 1.7.7 原生模式键盘守护：键盘期把面板钉在可视视口带内的状态。
+    // 1.7.8 原生模式键盘守护（学 cancip 审核模块）：聚焦时冻结面板高度 + 输入栏
+    // 锚在屏幕中部；这里保存冻结状态与循环句柄。
     this.nativeKeyboardGuard = null;
     this.nativeKeyboardGuardKind = "frame";
     this.nativeKeyboardGuardStartedAt = 0;
-    this.nativeKeyboardPinned = false;
     this.nativeKeyboardIdleHandle = null;
-    this.nativeKeyboardLastCorrectionAt = 0;
-    this.nativeKeyboardGeometryKey = "";
+    this.nativeKeyboardLocked = false;
+    this.nativeKeyboardLockHeight = 0;
+    this.nativeKeyboardPinned = false;
     // KEYBOARD MODE SWITCH (1.7.2): native mode is the default — the soft
     // keyboard belongs to Obsidian/Android and none of the viewport machinery
     // runs. Set localStorage["ntfy-kb-native"] = "0" to switch back to the
@@ -7902,26 +7903,27 @@ class NtfyManagerView extends ItemView {
     };
   }
 
-  // NATIVE KEYBOARD GUARD (1.7.7)
-  // Native mode leaves the soft keyboard to Obsidian/Android, but the WebView
-  // still scrolls/offsets the workspace to keep the focused textarea visible.
-  // The chat panel is height:100%, so that displacement pushes the header and
-  // most of the conversation above the visible band — the "聊天界面跑出屏幕外"
-  // report (the messages list looks like it left the screen while typing).
+  // NATIVE KEYBOARD GUARD v2 — cancip review-module recipe (1.7.8)
+  // The review correction bar in cancip stays rock solid on the phone because it
+  // never measures the keyboard and never fights a scroll. It does two things:
+  //   ① on focus it FREEZES the panel height (captured px + class), so the
+  //      shrinking WebView cannot reflow or collapse the layout;
+  //   ② the input row floats inside that frozen panel at
+  //      `bottom: max(50%, <keyboard inset>)` — i.e. it is ALREADY sitting in the
+  //      upper half of the screen when focus lands, so the browser / Android has
+  //      no reason to scroll or pan the panel in the first place.
+  // That last part is exactly what the reactive attempts (1.7.3–1.7.7 pin /
+  // scroll war) could never win: they chased a displacement that had already
+  // happened, while this removes the trigger for it.
   //
-  // Instead of resizing the panel against a moving layout (which is what
-  // fought the IME in 1.6.x), the guard pins the manager element to the VISUAL
-  // viewport band with inline fixed geometry for as long as the chat input has
-  // focus. `top` uses visualViewport.offsetTop, which makes the pin correct in
-  // both soft-keyboard modes:
-  //   resize mode → offsetTop≈0, height already shrunk to the band above the keyboard
-  //   pan mode    → offsetTop>0 (page panned), height still full → the pin
-  //                 compensates the pan so the header stays on screen
-  // The pin is removed on blur, so the normal flex layout returns as soon as
-  // the keyboard closes. No height juggling, no frame-by-frame scroll war.
+  // So the guard is deliberately tiny: lock the layout, keep the inset variable
+  // roughly in step with the keyboard (best effort — it only lifts the composer
+  // when the keyboard is taller than half the screen), unlock on blur. All
+  // geometry lives in styles.css.
   startNativeKeyboardGuard() {
     if (!this.keyboardNativeMode || !Platform.isMobile) return;
     if (typeof window === "undefined" || typeof document === "undefined") return;
+    this.lockNativeKeyboardLayout();
     if (this.nativeKeyboardIdleHandle !== null) {
       window.clearTimeout?.(this.nativeKeyboardIdleHandle);
       this.nativeKeyboardIdleHandle = null;
@@ -7945,19 +7947,60 @@ class NtfyManagerView extends ItemView {
       this.nativeKeyboardGuard = null;
       this.nativeKeyboardGuardKind = "frame";
     }
-    this.clearNativeKeyboardPin();
+    this.unlockNativeKeyboardLayout();
+  }
+
+  // ① Freeze the panel at the height it had BEFORE the keyboard opened. Measured
+  // once per focus session: re-measuring while the keyboard is up would capture
+  // the already-shrunk height and defeat the whole point.
+  lockNativeKeyboardLayout() {
+    if (!Platform.isMobile) return;
+    const root = this.viewContentEl();
+    if (!root || this.nativeKeyboardLocked) return;
+    const height = Math.max(0, Math.floor(root.getBoundingClientRect().height || 0));
+    if (!height) return;
+    this.nativeKeyboardLockHeight = height;
+    this.nativeKeyboardLocked = true;
+    root.addClass("is-keyboard-layout-locked");
+    root.style.setProperty("--ntfy-keyboard-lock-height", `${height}px`);
+    this.syncLockedComposerPadding(height * 0.5);
+  }
+
+  // 消息区底部留白 = 输入栏锚点 + 输入栏自身高度，这样 realignConversationScroll()
+  // 滚到底时，最新消息正好停在浮动输入栏上方，而不是停在键盘后面。
+  syncLockedComposerPadding(anchorFromBottom) {
+    const root = this.viewContentEl();
+    if (!root) return;
+    const composer = this.bodyEl?.querySelector(".obsidian-ntfy-chat-composer");
+    const composerHeight = Math.max(44, Math.round(composer ? composer.getBoundingClientRect().height || 0 : 0));
+    const pad = Math.max(48, Math.round(anchorFromBottom) + composerHeight + 8);
+    root.style.setProperty("--ntfy-keyboard-lock-pad", `${pad}px`);
+  }
+
+  unlockNativeKeyboardLayout() {
+    this.nativeKeyboardLocked = false;
+    this.nativeKeyboardLockHeight = 0;
+    this.nativeKeyboardPinned = false;
+    this.nativeKeyboardPadAnchor = 0;
+    const root = this.viewContentEl();
+    if (!root) return;
+    root.removeClass("is-keyboard-layout-locked");
+    root.removeClass("is-native-keyboard");
+    root.style.removeProperty("--ntfy-keyboard-lock-height");
+    root.style.removeProperty("--ntfy-keyboard-lock-pad");
+    root.style.removeProperty("--obsidian-ntfy-keyboard-inset");
   }
 
   tickNativeKeyboardGuard() {
     this.nativeKeyboardGuard = null;
     if (typeof window === "undefined" || typeof document === "undefined") return;
     const input = this.bodyEl?.querySelector(".obsidian-ntfy-chat-input");
-    // Stand down once the chat input really lost focus. A re-render replaces
-    // the input node and silently moves focus to body for a frame; dropping the
-    // pin right there would let the WebView displace the panel again while the
-    // keyboard is still open, so keep the pin and re-check shortly instead.
+    // Stand down once the chat input really lost focus. A re-render replaces the
+    // input node and silently moves focus to body for a frame; unlocking right
+    // there would let the panel reflow with the keyboard still open, so keep the
+    // lock and re-check shortly instead.
     if (!input || document.activeElement !== input) {
-      if (!input || !this.nativeKeyboardPinned) {
+      if (!this.nativeKeyboardLocked) {
         this.stopNativeKeyboardGuard();
         return;
       }
@@ -7970,11 +8013,11 @@ class NtfyManagerView extends ItemView {
       }
       return;
     }
-    const elapsed = Date.now() - (this.nativeKeyboardGuardStartedAt || Date.now());
-    this.applyNativeKeyboardPin();
+    this.applyNativeKeyboardInset();
     if (typeof this.realignConversationScroll === "function") this.realignConversationScroll();
-    // rAF while the keyboard animates (smooth tracking), then a 200 ms poll for
-    // the late window resize Android delivers long after the animation ended.
+    const elapsed = Date.now() - (this.nativeKeyboardGuardStartedAt || Date.now());
+    // rAF while the keyboard animates, then a 200 ms poll for the late resize
+    // Android delivers long after the animation ended.
     const useFrame = elapsed < 900 && typeof window.requestAnimationFrame === "function";
     this.nativeKeyboardGuardKind = useFrame ? "frame" : "timeout";
     this.nativeKeyboardGuard = useFrame
@@ -7982,92 +8025,40 @@ class NtfyManagerView extends ItemView {
       : window.setTimeout(() => this.tickNativeKeyboardGuard(), 200);
   }
 
-  clearNativeKeyboardPin() {
-    this.nativeKeyboardPinned = false;
-    this.nativeKeyboardGeometryKey = "";
+  // ② Publish the keyboard inset for `bottom: max(50%, <inset>)`. The inset is
+  // only a floor for unusually tall keyboards: when the WebView never reports
+  // one (pan mode / Obsidian-owned keyboard) the remembered value is used, and
+  // half a screen stays the default anchor either way.
+  applyNativeKeyboardInset() {
+    if (typeof window === "undefined") return;
     const root = this.viewContentEl();
     if (!root) return;
-    root.removeClass("is-native-keyboard");
-    for (const property of ["position", "top", "left", "width", "height", "max-height", "box-sizing"]) {
-      root.style.removeProperty(property);
-    }
-  }
-
-  // Returns true when the panel is pinned. When it is not, it also undoes the
-  // browser's focus-scroll displacement (rate-limited: every frame while the
-  // keyboard animates, at most once every 400 ms afterwards). A single
-  // correction is safe for the IME; a per-frame scroll war against the
-  // keyboard pan is what used to cancel the composition in 1.6.x.
-  applyNativeKeyboardPin() {
-    if (typeof window === "undefined") return false;
-    const root = this.viewContentEl();
-    if (!root || this.activeTab !== "inbox") return false;
     const viewport = window.visualViewport;
     const layoutHeight = window.innerHeight || (document.documentElement ? document.documentElement.clientHeight : 0) || 0;
-    const layoutWidth = window.innerWidth || (document.documentElement ? document.documentElement.clientWidth : 0) || 0;
-    if (!layoutHeight) return false;
-    let top = viewport ? Math.max(0, Math.round(viewport.offsetTop)) : 0;
-    const left = viewport ? Math.max(0, Math.round(viewport.offsetLeft)) : 0;
-    let height = viewport ? Math.round(viewport.height) : layoutHeight;
-    const width = viewport ? Math.round(viewport.width) : layoutWidth;
-    let keyboardInset = Math.max(0, Math.round(layoutHeight - Math.min(top + height, layoutHeight)));
-    // Keyboard signs: the visual viewport shrank (resize mode) or was panned
-    // away from the layout origin (pan mode).
-    let pinned = keyboardInset > 96 || top > 8;
-    if (!pinned) {
-      // Measuring the rect forces a layout, so only do it when the cheap signs
-      // were inconclusive.
-      const rect = root.getBoundingClientRect();
-      const displaced = rect.top < -8;
-      if (displaced && this.lastKeyboardInset > 96 && this.lastFullViewportHeight > 0) {
-        // Displaced while remembering a keyboard: the WebView is in a mode that
-        // never reports the keyboard. Reserve the remembered band so the
-        // composer is not left underneath it.
-        keyboardInset = this.lastKeyboardInset;
-        top = 0;
-        height = Math.max(160, this.lastFullViewportHeight - this.lastKeyboardInset);
-        pinned = true;
-      } else {
-        // Nothing on screen says "keyboard": keep the plain flex layout, remember
-        // the real window height for the next pin, and undo a focus scroll that
-        // pushed the header out of the visible band.
-        this.lastFullViewportHeight = layoutHeight;
-        if (this.nativeKeyboardPinned) this.clearNativeKeyboardPin();
-        root.style.setProperty("--obsidian-ntfy-keyboard-inset", "0px");
-        if (displaced) {
-          const elapsed = Date.now() - (this.nativeKeyboardGuardStartedAt || Date.now());
-          const since = Date.now() - (this.nativeKeyboardLastCorrectionAt || 0);
-          if (elapsed < 900 || since > 400) {
-            this.nativeKeyboardLastCorrectionAt = Date.now();
-            this.restoreContainerIntoView();
-          }
-        }
-        return false;
-      }
+    if (!layoutHeight) return;
+    const viewBottom = Math.min(viewport ? Math.round(viewport.offsetTop + viewport.height) : layoutHeight, layoutHeight);
+    const measured = Math.max(0, Math.round(layoutHeight - viewBottom));
+    const remembered = Math.max(0, Number(this.lastKeyboardInset) || 0);
+    // Never exceed ~70% of the screen: past that the composer would sit higher
+    // than any real keyboard and cover the conversation.
+    const inset = Math.min(Math.max(measured, remembered), Math.round(layoutHeight * 0.7));
+    root.style.setProperty("--obsidian-ntfy-keyboard-inset", `${inset}px`);
+    // The composer anchors at max(50%, inset); keep the message padding in step
+    // when a tall keyboard lifts it above the halfway line.
+    const effectiveAnchor = Math.max(layoutHeight * 0.5, inset);
+    if (Math.abs(effectiveAnchor - (this.nativeKeyboardPadAnchor || 0)) > 8) {
+      this.nativeKeyboardPadAnchor = effectiveAnchor;
+      this.syncLockedComposerPadding(effectiveAnchor);
     }
-    root.style.setProperty("--obsidian-ntfy-keyboard-inset", `${keyboardInset}px`);
-    root.addClass("is-native-keyboard");
-    const geometryKey = `${top},${left},${Math.max(160, width)},${Math.max(160, height)}`;
-    if (this.nativeKeyboardGeometryKey !== geometryKey) {
-      this.nativeKeyboardGeometryKey = geometryKey;
-      root.style.setProperty("position", "fixed");
-      root.style.setProperty("top", `${top}px`);
-      root.style.setProperty("left", `${left}px`);
-      root.style.setProperty("width", `${Math.max(160, width)}px`);
-      root.style.setProperty("height", `${Math.max(160, height)}px`);
-      root.style.setProperty("max-height", `${Math.max(160, height)}px`);
-      root.style.setProperty("box-sizing", "border-box");
-    }
-    this.nativeKeyboardPinned = true;
-    if (keyboardInset > 96) {
-      this.lastKeyboardInset = keyboardInset;
+    if (measured > 96) {
+      this.lastKeyboardInset = measured;
       try {
-        localStorage.setItem("ntfy-keyboard-inset", String(keyboardInset));
+        localStorage.setItem("ntfy-keyboard-inset", String(measured));
       } catch (error) {
         /* private mode / storage disabled — the in-memory value still helps */
       }
     }
-    return true;
+    this.nativeKeyboardPinned = true;
   }
 
   // A soft keyboard fires a burst of resize/scroll events while it animates.
@@ -9413,7 +9404,8 @@ class NtfyManagerView extends ItemView {
       this.preShrinkForKeyboard();
       this.startKeyboardScrollGuard();
       this.scheduleViewportSizing();
-      // 1.7.7 原生模式：不算高度、不对抗滚动，直接把面板钉在可视视口带内。
+      // 1.7.8 原生模式（学 cancip 审核模块）：聚焦时冻结面板高度，输入栏由 CSS
+      // 锚在屏幕中部——不去追已经发生的位移，而是让它压根不会发生。
       this.startNativeKeyboardGuard();
     });
     input.addEventListener("blur", () => {
@@ -9422,7 +9414,7 @@ class NtfyManagerView extends ItemView {
         this.keyboardScrollGuard = null;
       }
       this.scheduleViewportSizing();
-      // 原生模式：失焦即解除 pin，键盘收起后自动回到普通 flex 布局。
+      // 原生模式：失焦即解除布局冻结，键盘收起后自动回到普通 flex 布局。
       this.stopNativeKeyboardGuard();
       // 键盘随失焦收起后把输入栏放回原位。延迟判定：键盘收起动画期间
       // inset 还有残余值，等它落底再回收，避免收起瞬间输入栏闪跳。

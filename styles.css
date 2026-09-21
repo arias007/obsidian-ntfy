@@ -1836,9 +1836,37 @@
   z-index: 99;
 }
 
-/* 1.7.7 原生键盘守护：面板被钉在可视视口带内时（键盘弹出，聊天输入框聚焦），
-   底部安全区内边距没有意义——键盘已经占了那块屏幕，留着只会平白多一条空隙。
-   顶部的固定几何由 JS 写在元素上，这里只负责清掉底部留白。 */
-.obsidian-ntfy-manager.is-native-keyboard {
-  padding-bottom: 0;
+/* 1.7.8 原生键盘守护（学 cancip 审核模块的指正输入框）：
+   ① 聚焦时冻结面板高度——键盘让 WebView 缩小时布局不重排、不塌缩、不被推走；
+   ② 输入栏在冻结面板内绝对定位到 max(50%, 键盘高度)——聚焦落地时它已经在屏幕
+      上半部分，浏览器/Android 没有理由再滚动或平移面板，于是"顶出屏幕"的触发
+      条件从根上消失（1.7.3–1.7.7 的追打式修正赢不了这个）。 */
+.obsidian-ntfy-manager.obsidian-ntfy-inbox-active.is-keyboard-layout-locked {
+  height: var(--ntfy-keyboard-lock-height);
+  max-height: var(--ntfy-keyboard-lock-height);
+  min-height: var(--ntfy-keyboard-lock-height);
+  overflow: hidden;
+}
+
+.obsidian-ntfy-manager.is-keyboard-layout-locked .obsidian-ntfy-window-body {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.obsidian-ntfy-manager.is-keyboard-layout-locked .obsidian-ntfy-chat-conversation {
+  position: relative;
+}
+
+.obsidian-ntfy-manager.is-keyboard-layout-locked .obsidian-ntfy-chat-composer {
+  position: absolute;
+  right: 0;
+  bottom: max(50%, var(--obsidian-ntfy-keyboard-inset, 0px));
+  left: 0;
+  z-index: 40;
+  box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.18);
+}
+
+/* 输入栏脱流后给消息区补底部留白，最新消息停在输入栏上方而不是键盘后面 */
+.obsidian-ntfy-manager.is-keyboard-layout-locked .obsidian-ntfy-chat-messages {
+  padding-bottom: var(--ntfy-keyboard-lock-pad, 64px);
 }
