@@ -7678,6 +7678,16 @@ class NtfyManagerView extends ItemView {
     this.viewportHeartbeat = null;
     this.lastFullViewportHeight = 0;
     this.lastKeyboardInset = 0;
+    // KEYBOARD MODE SWITCH (1.7.2): native mode is the default — the soft
+    // keyboard belongs to Obsidian/Android and none of the viewport machinery
+    // runs. Set localStorage["ntfy-kb-native"] = "0" to switch back to the
+    // full intervention stack (pin-to-keyboard height, pre-shrink, heartbeat,
+    // scroll guard) without touching code.
+    try {
+      this.keyboardNativeMode = localStorage.getItem("ntfy-kb-native") !== "0";
+    } catch (error) {
+      this.keyboardNativeMode = true;
+    }
     // The remembered keyboard height survives view recreation and app
     // restarts via localStorage, so even the FIRST focus after a cold start
     // can pre-shrink instead of letting the browser scroll.
@@ -7817,10 +7827,10 @@ class NtfyManagerView extends ItemView {
   }
 
   installViewportSizing() {
-    // NATIVE KEYBOARD MODE was tested in 1.7.0 and reverted: the machinery
-    // below is active again. To re-test the native behaviour, re-insert an
-    // early `return;` at the top of installViewportSizing AND
-    // scheduleViewportSizing.
+    // NATIVE KEYBOARD MODE (1.7.2 default): the keyboard is owned by
+    // Obsidian/Android; the machinery below only runs in intervention mode
+    // (localStorage["ntfy-kb-native"] = "0"). Kept intact for instant toggle.
+    if (this.keyboardNativeMode) return;
     if (this.viewportCleanup || typeof window === "undefined") return;
     const viewport = window.visualViewport;
     const schedule = () => this.scheduleViewportSizing();
@@ -7848,8 +7858,9 @@ class NtfyManagerView extends ItemView {
   // Coalesce them into one measurement per frame and measure again once the
   // keyboard has settled, so the composer ends up in a stable position.
   scheduleViewportSizing() {
-    // NATIVE KEYBOARD MODE was tested in 1.7.0 and reverted — machinery is
-    // active again (see installViewportSizing).
+    // NATIVE KEYBOARD MODE (1.7.2 default): inert unless intervention mode is
+    // enabled via localStorage["ntfy-kb-native"] = "0".
+    if (this.keyboardNativeMode) return;
     if (typeof window === "undefined") return;
     if (this.viewportFrame === null) {
       if (typeof window.requestAnimationFrame === "function") {
@@ -8005,6 +8016,7 @@ class NtfyManagerView extends ItemView {
   // composer is already inside the future visible band and the browser never
   // scrolls at all.
   preShrinkForKeyboard() {
+    if (this.keyboardNativeMode) return;
     if (typeof window === "undefined") return;
     if (!this.lastKeyboardInset || this.lastKeyboardInset <= 96) return;
     const root = this.viewContentEl();
@@ -8028,6 +8040,7 @@ class NtfyManagerView extends ItemView {
   // what cancels the IME. In the healthy path (pre-shrink worked) this loop
   // never finds anything and is a no-op.
   startKeyboardScrollGuard() {
+    if (this.keyboardNativeMode) return;
     if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") return;
     if (this.keyboardScrollGuard) window.cancelAnimationFrame(this.keyboardScrollGuard);
     const start = Date.now();
@@ -8105,6 +8118,7 @@ class NtfyManagerView extends ItemView {
   // example after a keyboard animation the WebView handled itself), nudge it
   // back into view instead of leaving the user typing blind.
   ensureComposerVisible() {
+    if (this.keyboardNativeMode) return;
     if (typeof window === "undefined" || typeof document === "undefined") return;
     if (this.activeTab !== "inbox") return;
     const input = this.bodyEl?.querySelector(".obsidian-ntfy-chat-input");
@@ -8257,7 +8271,9 @@ class NtfyManagerView extends ItemView {
     this.tabPanels.clear();
     this.tabSignatures.clear();
     this.renderHeader(contentEl);
-    this.debugChip = contentEl.createDiv({ cls: "obsidian-ntfy-kb-debug" });
+    // Diagnostic readout: only meaningful in intervention mode (it is fed by
+    // updateViewportSizing, which never runs in native mode).
+    if (!this.keyboardNativeMode) this.debugChip = contentEl.createDiv({ cls: "obsidian-ntfy-kb-debug" });
     this.bodyEl = contentEl.createDiv({ cls: "obsidian-ntfy-window-body" });
     // Track the scroll offset passively. Reading bodyEl.scrollTop inside
     // activateTab() forced a synchronous layout of the panel that was just
