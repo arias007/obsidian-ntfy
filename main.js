@@ -6046,6 +6046,32 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return this.managerViewCache;
   }
 
+  // Update one scope of the warm-start cache without discarding the other.
+  // A background refresh only ever owns a single scope, and the sibling scope
+  // may legitimately still be empty because it has not been scanned yet.
+  patchManagerViewCache(patch = {}) {
+    const base = this.managerViewCache || {};
+    const next = {
+      notificationTasks: Array.isArray(base.notificationTasks) ? base.notificationTasks : [],
+      vaultTasks: Array.isArray(base.vaultTasks) ? base.vaultTasks : [],
+      scanError: String(base.scanError || ""),
+      notificationTasksLoaded: base.notificationTasksLoaded === true,
+      vaultTasksLoaded: base.vaultTasksLoaded === true,
+    };
+    if (Array.isArray(patch.notificationTasks)) {
+      next.notificationTasks = patch.notificationTasks;
+      next.notificationTasksLoaded = patch.notificationTasksLoaded === true;
+    }
+    if (Array.isArray(patch.vaultTasks)) {
+      next.vaultTasks = patch.vaultTasks;
+      next.vaultTasksLoaded = patch.vaultTasksLoaded === true;
+    }
+    if (patch.scanError !== undefined) next.scanError = String(patch.scanError || "");
+    this.managerViewCache = next;
+    this.scheduleManagerViewCacheSave(next);
+    return next;
+  }
+
   hasDestination() {
     const channelId = String(this.settings.defaultChannelId || "ntfy");
     const channel = this.listNotificationChannels().find((item) => item.id === channelId);
@@ -7633,6 +7659,10 @@ class NtfyManagerView extends ItemView {
     this.groupedVaultTasksCache = { source: null, value: null };
     this.tabScrollPositions = new Map();
     this.tabRefreshes = new Map();
+    this.lastScopeRefreshAt = {};
+    this.tabRefreshScheduled = false;
+    this.warmScopesScheduled = false;
+    this.bodyScrollTop = 0;
     this.activeConversationId = "";
     this.mobileConversationOpen = false;
     this.selectedConversationFiles = [];
@@ -7641,6 +7671,11 @@ class NtfyManagerView extends ItemView {
     this.conversationContactsCache = null;
     this.inboxRefreshHandle = null;
     this.viewportCleanup = null;
+    this.viewportFrame = null;
+    this.viewportFrameKind = "";
+    this.viewportSettleTimer = null;
+    this.realignConversationScroll = null;
+    this.conversationPreserveAnchor = null;
     this.largeFileProviders = new Map();
   }
 
@@ -7667,7 +7702,9 @@ class NtfyManagerView extends ItemView {
     if (preload) this.setPreloadedData(preload);
     await this.render();
     this.installViewportSizing();
-    this.updateViewportSizing();
+    // render() already queued a coalesced measurement; scheduling again would
+    // only add a second forced layout to the same open frame.
+    this.scheduleViewportSizing();
   }
 
   async onClose() {
@@ -7678,6 +7715,7 @@ class NtfyManagerView extends ItemView {
     }
     this.viewportCleanup?.();
     this.viewportCleanup = null;
+    this.realignConversationScroll = null;
     this.viewContentEl().empty();
     this.bodyEl = null;
     this.tabPanels.clear();
@@ -7761,28 +7799,128 @@ class NtfyManagerView extends ItemView {
   installViewportSizing() {
     if (this.viewportCleanup || typeof window === "undefined") return;
     const viewport = window.visualViewport;
-    const update = () => this.updateViewportSizing();
-    window.addEventListener("resize", update, { passive: true });
-    window.addEventListener("orientationchange", update, { passive: true });
-    viewport?.addEventListener("resize", update, { passive: true });
-    viewport?.addEventListener("scroll", update, { passive: true });
+    const schedule = () => this.scheduleViewportSizing();
+    window.addEventListener("resize", schedule, { passive: true });
+    window.addEventListener("orientationchange", schedule, { passive: true });
+    viewport?.addEventListener("resize", schedule, { passive: true });
+    viewport?.addEventListener("scroll", schedule, { passive: true });
     this.viewportCleanup = () => {
-      window.removeEventListener("resize", update);
-      window.removeEventListener("orientationchange", update);
-      viewport?.removeEventListener("resize", update);
-      viewport?.removeEventListener("scroll", update);
+      window.removeEventListener("resize", schedule);
+      window.removeEventListener("orientationchange", schedule);
+      viewport?.removeEventListener("resize", schedule);
+      viewport?.removeEventListener("scroll", schedule);
+      if (this.viewportFrame !== null) {
+        if (this.viewportFrameKind === "frame") window.cancelAnimationFrame?.(this.viewportFrame);
+        else window.clearTimeout?.(this.viewportFrame);
+      }
+      if (this.viewportSettleTimer !== null) window.clearTimeout?.(this.viewportSettleTimer);
+      this.viewportFrame = null;
+      this.viewportFrameKind = "";
+      this.viewportSettleTimer = null;
     };
+  }
+
+  // A soft keyboard fires a burst of resize/scroll events while it animates.
+  // Coalesce them into one measurement per frame and measure again once the
+  // keyboard has settled, so the composer ends up in a stable position.
+  scheduleViewportSizing() {
+    if (typeof window === "undefined") return;
+    if (this.viewportFrame === null) {
+      if (typeof window.requestAnimationFrame === "function") {
+        this.viewportFrameKind = "frame";
+        this.viewportFrame = window.requestAnimationFrame(() => {
+          this.viewportFrame = null;
+          this.viewportFrameKind = "";
+          this.updateViewportSizing();
+        });
+      } else {
+        this.viewportFrameKind = "timeout";
+        this.viewportFrame = window.setTimeout(() => {
+          this.viewportFrame = null;
+          this.viewportFrameKind = "";
+          this.updateViewportSizing();
+        }, 16);
+      }
+    }
+    if (this.viewportSettleTimer !== null) window.clearTimeout?.(this.viewportSettleTimer);
+    this.viewportSettleTimer = window.setTimeout(() => {
+      this.viewportSettleTimer = null;
+      this.updateViewportSizing();
+      this.ensureComposerVisible();
+      // Android delivers the window resize (and sometimes the final visual
+      // viewport settle) long after the keyboard animation started — on some
+      // devices close to a second later. A second, later measurement keeps
+      // the composer anchored through that late resize instead of letting it
+      // drift off screen once the early events have already been handled.
+      this.viewportSettleTimer = window.setTimeout(() => {
+        this.viewportSettleTimer = null;
+        this.updateViewportSizing();
+        this.ensureComposerVisible();
+      }, 420);
+    }, 280);
   }
 
   updateViewportSizing() {
     if (typeof window === "undefined") return;
     const root = this.viewContentEl();
+    if (!root) return;
     const viewport = window.visualViewport;
-    if (!root || !viewport) return;
+    const layoutHeight = window.innerHeight || (typeof document !== "undefined" && document.documentElement ? document.documentElement.clientHeight : 0) || 0;
+    if (!layoutHeight) return;
+    // Measure in visual-viewport coordinates: "visible on screen" is what
+    // matters once a soft keyboard is open. The previous formula subtracted the
+    // visual-viewport offset from the container top, so the panel grew taller
+    // than the visible area and pushed the composer out of the screen.
+    const viewTop = viewport ? viewport.offsetTop : 0;
+    const viewBottom = viewport ? viewport.offsetTop + viewport.height : layoutHeight;
+    // The visible band between the top and bottom of the visual viewport is a
+    // hard ceiling: no matter what the keyboard, the browser pan, or a late
+    // Android resize reports, the container must never become taller than what
+    // the user can actually see.
+    const visibleHeight = Math.max(160, Math.round(viewBottom - viewTop));
     const rect = root.getBoundingClientRect();
-    const top = Math.max(0, rect.top - Number(viewport.offsetTop || 0));
-    const height = Math.max(240, Math.floor(viewport.height - top));
+    // While the keyboard opens, Android scrolls the page (or pans the visual
+    // viewport) to reveal the focused input, which can push the container top
+    // above the visible area (rect.top < viewTop). The old clamp
+    // `layoutHeight + max(0, -rect.top)` compensated for that by letting the
+    // container grow taller than the screen; the next viewport scroll event
+    // measured an even more negative top and grew it again — a feedback loop
+    // that visibly shot the composer off the top of the screen about a second
+    // after the keyboard opened. Clamping the measured top to the visible area
+    // breaks the loop: the height can only ever fill the visible band.
+    const measuredTop = Math.max(rect.top, viewTop);
+    const available = Math.floor(viewBottom - measuredTop);
+    const height = Math.max(160, Math.min(available, visibleHeight, Math.round(layoutHeight)));
     root.style.setProperty("--obsidian-ntfy-viewport-height", `${height}px`);
+    // If the browser scrolled the page to reveal the focused input, the
+    // container top can sit above the visible band. The clamped height above
+    // already keeps the composer inside the visible area in that state; this
+    // pull-back restores the panel head without fighting the keyboard.
+    if (rect.top < viewTop - 1 && typeof root.scrollIntoView === "function") {
+      root.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+    const keyboardInset = Math.max(0, Math.round(layoutHeight - viewBottom));
+    root.style.setProperty("--obsidian-ntfy-keyboard-inset", `${keyboardInset}px`);
+    root.toggleClass("is-keyboard-open", keyboardInset > 96 && this.activeTab === "inbox");
+    // A keyboard-driven resize changes the message area height. Re-anchor the
+    // conversation to its newest message so the visible message does not drift.
+    if (typeof this.realignConversationScroll === "function") this.realignConversationScroll();
+  }
+
+  // Safety net: if the composer still ends up outside the visible area (for
+  // example after a keyboard animation the WebView handled itself), nudge it
+  // back into view instead of leaving the user typing blind.
+  ensureComposerVisible() {
+    if (typeof window === "undefined" || typeof document === "undefined") return;
+    if (this.activeTab !== "inbox") return;
+    const input = this.bodyEl?.querySelector(".obsidian-ntfy-chat-input");
+    if (!input) return;
+    const viewport = window.visualViewport;
+    const viewTop = viewport ? viewport.offsetTop : 0;
+    const viewBottom = viewport ? viewport.offsetTop + viewport.height : window.innerHeight;
+    const rect = input.getBoundingClientRect();
+    if (rect.bottom <= viewBottom - 4 && rect.top >= viewTop - 4) return;
+    if (typeof input.scrollIntoView === "function") input.scrollIntoView({ block: "nearest", inline: "nearest" });
   }
 
   captureConversationInputState() {
@@ -7846,8 +7984,65 @@ class NtfyManagerView extends ItemView {
       this.syncTabPanels(this.managerTabIds());
     }
 
-    this.updateViewportSizing();
-    this.refreshTabInBackground(this.activeTab);
+    // Measuring the visual viewport has to call getBoundingClientRect(), which
+    // forces a synchronous layout of the subtree that was just built. That was
+    // the last remaining block of the open frame (22-34ms on a 1362-file
+    // vault). The CSS falls back to 100% height, so deferring the measurement
+    // by one frame is invisible while removing the reflow from the tap.
+    this.scheduleViewportSizing();
+    // Opening the panel from the status bar used to run the authoritative scan
+    // (and the inactive-scope warm-up) synchronously inside this call, so the
+    // freshly painted panel was immediately blocked by a cold vault scan. Both
+    // now start after the first frame, which is what makes a status-bar click
+    // feel instant.
+    this.scheduleTabRefresh();
+    this.scheduleWarmInactiveTabScopes();
+  }
+
+  // Scanning only on tab activation made a switch look slow: the panel opened
+  // on a "loading" placeholder until the scan finished. Warm the scopes that
+  // have no cached data yet while the user is still on the first tab. Panels
+  // stay cheap because inactive tabs are only marked dirty, never rendered.
+  // The warm-up itself must not run inside the open/tap frame, so it is always
+  // invoked through this scheduler.
+  scheduleWarmInactiveTabScopes(delay = 0) {
+    if (this.warmScopesScheduled) return;
+    this.warmScopesScheduled = true;
+    const run = () => {
+      this.warmScopesScheduled = false;
+      if (!this.bodyEl) return;
+      this.warmInactiveTabScopes();
+    };
+    if (typeof window !== "undefined" && typeof window.setTimeout === "function") window.setTimeout(run, delay);
+    else run();
+  }
+
+  warmInactiveTabScopes() {
+    const pendingScopes = [];
+    for (const tabId of this.managerTabIds()) {
+      if (tabId === this.activeTab) continue;
+      const scope = this.refreshScopeForTab(tabId);
+      if (!scope || pendingScopes.includes(scope)) continue;
+      const loaded = scope === "pending"
+        ? this.notificationTasksLoaded
+        : scope === "vault"
+        ? this.vaultTasksLoaded
+        : true;
+      if (!loaded) pendingScopes.push(scope);
+    }
+    // Warm a single scope per tick. A cold vault scan enumerates every markdown
+    // file synchronously before its first await, and running the pending and
+    // vault warm-ups back to back is exactly what made the first panel open
+    // stutter. The scopes share one vault scan job, so total work is unchanged.
+    const step = () => {
+      const scope = pendingScopes.shift();
+      if (!scope) return;
+      const tabId = this.affectedTabsForScope(scope)[0];
+      if (tabId) void this.refreshTabInBackground(tabId);
+      if (typeof window !== "undefined" && typeof window.setTimeout === "function") window.setTimeout(step, 60);
+    };
+    if (typeof window !== "undefined" && typeof window.setTimeout === "function") window.setTimeout(step, 60);
+    else step();
   }
 
   managerTabIds() {
@@ -7861,6 +8056,15 @@ class NtfyManagerView extends ItemView {
     this.tabSignatures.clear();
     this.renderHeader(contentEl);
     this.bodyEl = contentEl.createDiv({ cls: "obsidian-ntfy-window-body" });
+    // Track the scroll offset passively. Reading bodyEl.scrollTop inside
+    // activateTab() forced a synchronous layout of the panel that was just
+    // painted, which showed up as input lag on the tap that switched tabs.
+    this.bodyScrollTop = 0;
+    if (this.bodyEl && typeof this.bodyEl.addEventListener === "function") {
+      this.bodyEl.addEventListener("scroll", () => {
+        this.bodyScrollTop = this.bodyEl ? this.bodyEl.scrollTop || 0 : 0;
+      }, { passive: true });
+    }
     this.ensureTabPanel(this.activeTab);
     this.showActiveTabPanel();
   }
@@ -7874,10 +8078,19 @@ class NtfyManagerView extends ItemView {
       attr: { "data-panel-id": tabId },
     });
     this.tabPanels.set(tabId, panel);
-    // Paint the first viewport synchronously. The row renderer itself yields
-    // after the initial batch, so opening the manager never waits for a timer
-    // before showing cached or already-loaded content.
-    this.renderTabPanel(tabId);
+    // Deliberately does NOT build the row markup here. The first viewport of
+    // rows costs tens of milliseconds on a large vault (44ms for 24 reminder
+    // rows on a 1362-file vault), and doing it inline meant the panel chrome
+    // could only appear once that markup existed. That single synchronous
+    // render is what made both "tap a tab" and "open from the status bar" feel
+    // slow. The chrome is painted now; the rows land one frame later, which
+    // reads as instant. When the deferred render is skipped because the user
+    // switched away, the missing signature makes the next activation render it.
+    // The lightweight "opening…" placeholder covers the (usually single) frame
+    // in between, so a delayed frame shows a status line instead of a blank
+    // panel rather than an apparently empty page.
+    this.renderTabPlaceholder(panel, tabId);
+    this.scheduleTabRender(tabId, { afterPaint: true, onlyIfActive: true });
     return panel;
   }
 
@@ -7913,11 +8126,16 @@ class NtfyManagerView extends ItemView {
     const initialCount = Math.max(1, Number(options.initialCount || 24));
     const batchSize = Math.max(1, Number(options.batchSize || 32));
     const onComplete = typeof options.onComplete === "function" ? options.onComplete : null;
+    // onBatch runs after every appended batch (including the first one) so
+    // paged lists can keep a "stick to the newest row" position while the
+    // remaining rows are still being appended.
+    const onBatch = typeof options.onBatch === "function" ? options.onBatch : null;
     let index = 0;
     const append = (end) => {
       if (!state || state.cancelled) return false;
       const stop = Math.min(list.length, end);
       while (index < stop) renderItem(list[index++]);
+      if (onBatch) onBatch();
       return true;
     };
     if (!append(initialCount)) return;
@@ -7970,20 +8188,52 @@ class NtfyManagerView extends ItemView {
     this.tabSignatures.delete(tabId);
   }
 
-  scheduleTabRender(tabId) {
+  scheduleTabRender(tabId, options = {}) {
     const panel = this.tabPanels.get(tabId);
     if (!panel) return;
     this.cancelTabRender(tabId);
-    const render = () => {
+    const run = () => {
       this.tabRenderHandles.delete(tabId);
       if (!this.tabPanels.has(tabId) || (panel.isConnected === false && !panel.parentElement)) return;
+      if (options.onlyIfActive && this.activeTab !== tabId) {
+        // The user switched away before this deferred paint ran. Keep the
+        // panel marked dirty so the next activation renders it once.
+        this.tabSignatures.delete(tabId);
+        return;
+      }
       this.renderTabPanel(tabId);
     };
+    // afterPaint waits for one painted frame before rendering, so the tab
+    // switch itself is already visible when the (possibly large) panel is
+    // rebuilt. That removes the "tap feels laggy" pause on mobile.
+    if (options.afterPaint && typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+      const frame = window.requestAnimationFrame(() => {
+        this.tabRenderHandles.delete(tabId);
+        if (typeof window.setTimeout === "function") {
+          const handle = window.setTimeout(run, 0);
+          this.tabRenderHandles.set(tabId, { kind: "timeout", handle });
+        } else {
+          run();
+        }
+      });
+      this.tabRenderHandles.set(tabId, { kind: "frame", handle: frame });
+      // Safety net for a throttled or occluded window, where the frame callback
+      // can be delayed indefinitely. Whichever of the two fires first renders
+      // the panel; renderTabPanel() cancels the other. The handle identity check
+      // keeps a stale timer from disturbing a newer scheduled render.
+      if (typeof window.setTimeout === "function") {
+        window.setTimeout(() => {
+          const pending = this.tabRenderHandles.get(tabId);
+          if (pending && pending.kind === "frame" && pending.handle === frame) run();
+        }, 150);
+      }
+      return;
+    }
     const handle = typeof window !== "undefined" && typeof window.setTimeout === "function"
-      ? window.setTimeout(render, 0)
-      : typeof setTimeout === "function" ? setTimeout(render, 0) : null;
+      ? window.setTimeout(run, 0)
+      : typeof setTimeout === "function" ? setTimeout(run, 0) : null;
     if (handle !== null) this.tabRenderHandles.set(tabId, { kind: "timeout", handle });
-    else render();
+    else run();
   }
 
   renderTabPanel(tabId) {
@@ -7993,6 +8243,9 @@ class NtfyManagerView extends ItemView {
     const inputState = tabId === "inbox" ? this.captureConversationInputState() : null;
     const batchState = this.beginPanelRender(panel);
     this.cancelTabRender(tabId);
+    // The conversation scroll anchor dies with the old DOM; renderIncomingMessages
+    // re-registers it when a conversation is on screen.
+    if (tabId === "inbox") this.realignConversationScroll = null;
     panel.empty();
     panel.removeAttribute("aria-busy");
     if (tabId === "pending") this.renderNotificationTasks(panel, batchState);
@@ -8002,7 +8255,13 @@ class NtfyManagerView extends ItemView {
     if (tabId === "inbox") this.renderIncomingMessages(panel, batchState);
     if (tabId === "connections") this.renderConnectionStatus(panel);
     this.tabSignatures.set(tabId, this.tabDataSignature(tabId));
-    if (scrollTop !== null && this.bodyEl) this.bodyEl.scrollTop = scrollTop;
+    if (scrollTop !== null && this.bodyEl) {
+      this.bodyEl.scrollTop = scrollTop;
+      // Keep the passive tracker in step: a later scroll event may not fire for
+      // a programmatic write, and a stale value would make activateTab() skip a
+      // restore it should have performed.
+      this.bodyScrollTop = scrollTop;
+    }
     this.restoreConversationInputState(inputState);
   }
 
@@ -8048,8 +8307,19 @@ class NtfyManagerView extends ItemView {
       if (!this.tabPanels.has(tabId)) continue;
       const signature = this.tabDataSignature(tabId);
       if (this.tabSignatures.get(tabId) === signature) continue;
-      if (tabId === this.activeTab) this.renderTabPanel(tabId);
-      else this.scheduleTabRender(tabId);
+      if (tabId === this.activeTab) {
+        // A data refresh must not freeze the pointer either: rebuilding the
+        // visible panel used to run synchronously right after a background
+        // scan finished, which is exactly when the user is tapping around.
+        this.scheduleTabRender(tabId, { afterPaint: true, onlyIfActive: true });
+      } else {
+        // Never spend frames on a panel the user cannot see. Mark it dirty and
+        // drop any queued render for it; activateTab() rebuilds it on demand.
+        // Previously a background scan queued renders for every open panel,
+        // and those queued renders were what made tab switching feel delayed.
+        this.cancelTabRender(tabId);
+        this.tabSignatures.delete(tabId);
+      }
       changed = true;
     }
     return changed;
@@ -8070,16 +8340,77 @@ class NtfyManagerView extends ItemView {
 
   activateTab(tabId) {
     if (!this.managerTabIds().includes(tabId)) return;
-    if (this.bodyEl) this.tabScrollPositions.set(this.activeTab, this.bodyEl.scrollTop || 0);
+    if (this.bodyEl) this.tabScrollPositions.set(this.activeTab, this.bodyScrollTop);
+    const mounted = this.tabPanels.has(tabId);
     this.activeTab = tabId;
+    // Paint the switch before doing any content work: the panel toggle and the
+    // nav highlight happen first, so a tap responds immediately even when the
+    // target panel needs a rebuild. A panel that was never mounted is created
+    // empty and filled on the next frame by ensureTabPanel().
     const panel = this.ensureTabPanel(tabId);
-    if (panel && this.tabSignatures.get(tabId) !== this.tabDataSignature(tabId)) {
-      this.renderTabPanel(tabId);
-    }
     this.updateNavSelection();
     this.showActiveTabPanel();
-    if (this.bodyEl) this.bodyEl.scrollTop = this.tabScrollPositions.get(tabId) || 0;
-    this.refreshTabInBackground(tabId);
+    // Restoring the shared scroller is the one step that can force a layout in
+    // the tap frame, and on a panel holding hundreds of rows that measured
+    // 425ms — the real source of the "switching tabs feels laggy" complaint.
+    // this.bodyScrollTop tracks the live offset passively, so the very common
+    // case (both panels sitting at the top) now writes nothing at all. Only a
+    // switch that genuinely has to move the scroller still pays for it. A panel
+    // that was never mounted starts at 0, and an empty panel cannot be scrolled
+    // anyway, so the target is 0 for it.
+    const restoreTop = mounted ? this.tabScrollPositions.get(tabId) || 0 : 0;
+    if (this.bodyEl && restoreTop !== this.bodyScrollTop) {
+      // The restore write used to run inside the tap frame. Writing scrollTop
+      // right after the display flip forces a synchronous layout of the
+      // incoming panel in the same frame as the tap — measured at 425 ms on a
+      // long list, which is exactly the residual "switching tabs feels laggy"
+      // complaint. Defer it one frame: the switch paints instantly at the top,
+      // the saved offset lands on the next frame, and the passive scroll
+      // tracker keeps bodyScrollTop honest in between.
+      const restore = () => {
+        if (!this.bodyEl || this.activeTab !== tabId) return;
+        const target = this.tabScrollPositions.get(tabId) || 0;
+        if (this.bodyEl.scrollTop !== target) {
+          this.bodyEl.scrollTop = target;
+          this.bodyScrollTop = target;
+        }
+      };
+      if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+        window.requestAnimationFrame(() => window.setTimeout(restore, 0));
+      } else if (typeof window !== "undefined" && typeof window.setTimeout === "function") {
+        window.setTimeout(restore, 0);
+      } else {
+        restore();
+      }
+    }
+    if (mounted && panel && this.tabSignatures.get(tabId) !== this.tabDataSignature(tabId)) {
+      this.scheduleTabRender(tabId, { afterPaint: true, onlyIfActive: true });
+    }
+    this.scheduleTabRefresh();
+  }
+
+  // Run the scan prefix of the refresh outside the tap frame. collectVaultTasks()
+  // / collectNotificationTasks() start with synchronous vault enumeration and
+  // sorting, which is what occasionally made a plain tab tap cost hundreds of
+  // milliseconds. Rapid taps coalesce into a single refresh for whichever tab is
+  // active when it runs.
+  scheduleTabRefresh() {
+    if (this.tabRefreshScheduled) return;
+    // A refresh that just finished (warm-up or the previous tap) already has
+    // current data. Re-collecting on every tap still burns the synchronous
+    // vault-enumeration prefix right after the switch frame and reads as a
+    // second wave of lag, so skip taps landing within this cooldown window.
+    const scope = this.refreshScopeForTab(this.activeTab);
+    const lastAt = scope && this.lastScopeRefreshAt ? this.lastScopeRefreshAt[scope] || 0 : 0;
+    if (scope && lastAt && Date.now() - lastAt < 900) return;
+    this.tabRefreshScheduled = true;
+    const run = () => {
+      this.tabRefreshScheduled = false;
+      if (!this.bodyEl) return;
+      void this.refreshTabInBackground(this.activeTab);
+    };
+    if (typeof window !== "undefined" && typeof window.setTimeout === "function") window.setTimeout(run, 0);
+    else run();
   }
 
   refreshScopeForTab(tabId) {
@@ -8129,13 +8460,25 @@ class NtfyManagerView extends ItemView {
           const pollResult = await this.plugin.runIncomingPoll();
           if (pollResult?.changed) this.tabDataRevisions.inbox += 1;
         }
-        this.plugin.setManagerViewCache({
-          notificationTasks: this.notificationTasks,
-          vaultTasks: this.vaultTasks,
-          scanError: this.scanError,
-          notificationTasksLoaded: this.notificationTasksLoaded,
-          vaultTasksLoaded: this.vaultTasksLoaded,
-        });
+        // Persist only the scope this refresh actually owns. Writing the whole
+        // cache from the view used to stamp the other scope's placeholder
+        // (an empty array, loaded=false) over the warm-start snapshot, so the
+        // next cold open showed "loading…" for a tab whose data was already
+        // cached — the tab that opens by default, which is exactly what the
+        // status-bar open felt slow about.
+        if (scope === "pending") {
+          this.plugin.patchManagerViewCache({
+            notificationTasks: this.notificationTasks,
+            notificationTasksLoaded: this.notificationTasksLoaded,
+            scanError: this.scanError,
+          });
+        } else if (scope === "vault") {
+          this.plugin.patchManagerViewCache({
+            vaultTasks: this.vaultTasks,
+            vaultTasksLoaded: this.vaultTasksLoaded,
+            scanError: this.scanError,
+          });
+        }
         const dataChanged = affectedTabs.some((id) => previousSignatures.get(id) !== this.tabDataSignature(id));
         if (!dataChanged && wasLoaded) return false;
         if (!wasLoaded) for (const id of affectedTabs) this.tabSignatures.delete(id);
@@ -8152,6 +8495,8 @@ class NtfyManagerView extends ItemView {
       }
     })().finally(() => {
       this.tabRefreshes.delete(scope);
+      this.lastScopeRefreshAt = this.lastScopeRefreshAt || {};
+      this.lastScopeRefreshAt[scope] = Date.now();
     });
     this.tabRefreshes.set(scope, refresh);
     return refresh;
@@ -8224,6 +8569,10 @@ class NtfyManagerView extends ItemView {
         this.activeConversationId = contact.id;
         this.mobileConversationOpen = true;
         this.selectedConversationFiles = [];
+        // A fresh open must land on the newest message. A leftover reading
+        // anchor from a previous "load older" tap in this conversation would
+        // otherwise restore the old mid-history position instead.
+        this.conversationPreserveAnchor = null;
         // Paint the selected conversation first. Persisting the read marker
         // writes the whole settings payload and must not block the first view.
         this.renderTabPanel("inbox");
@@ -8280,6 +8629,13 @@ class NtfyManagerView extends ItemView {
       });
       loadOlder.addEventListener("click", () => {
         this.conversationVisibleCounts.set(active.id, visibleLimit + 240);
+        // Remember the reading position: loading older rows must not throw the
+        // user back to the newest message.
+        this.conversationPreserveAnchor = {
+          conversationId: active.id,
+          scrollHeight: messageList.scrollHeight,
+          scrollTop: messageList.scrollTop,
+        };
         this.renderTabPanel("inbox");
       });
     }
@@ -8287,7 +8643,74 @@ class NtfyManagerView extends ItemView {
       const empty = messageList.createDiv({ cls: "obsidian-ntfy-chat-empty is-compact" });
       setIcon(empty.createSpan(), active.icon || "message-circle");
     }
+    // Opening a conversation must land on the newest message. The list is
+    // filled in batches, so rows keep being appended after the first paint;
+    // a single scroll-to-bottom at first paint used to leave the view stuck in
+    // the middle of the history. Track a "stick to newest" flag and re-align
+    // after every batch instead.
     let lastDate = "";
+    let stickToLatest = true;
+    let lastScrollInteractionAt = 0;
+    const markScrollInteraction = () => { lastScrollInteractionAt = Date.now(); };
+    const alignToLatest = () => {
+      if (!messageList.isConnected) return;
+      messageList.scrollTop = messageList.scrollHeight;
+    };
+    // Batched appends keep arriving for several frames after the first paint,
+    // and each append changes the scroll geometry. A single synchronous write
+    // can be superseded by the next layout pass (keyboard resize, viewport
+    // settle), so mirror scrollToLatest's double-frame re-alignment here too.
+    const keepLatest = () => {
+      if (!stickToLatest) return;
+      alignToLatest();
+      if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+        window.requestAnimationFrame(() => {
+          if (!stickToLatest) return;
+          alignToLatest();
+          window.requestAnimationFrame(alignToLatest);
+        });
+      }
+    };
+    messageList.addEventListener("scroll", () => {
+      const maxScroll = messageList.scrollHeight - messageList.clientHeight;
+      const distance = maxScroll - messageList.scrollTop;
+      if (distance <= 48) {
+        stickToLatest = true;
+        return;
+      }
+      // Only a recent user gesture may detach the list from the newest row.
+      // Batched appends also increase the distance, and they must not count.
+      if (Date.now() - lastScrollInteractionAt < 400) stickToLatest = false;
+    }, { passive: true });
+    messageList.addEventListener("touchstart", markScrollInteraction, { passive: true });
+    messageList.addEventListener("pointerdown", markScrollInteraction, { passive: true });
+    messageList.addEventListener("wheel", markScrollInteraction, { passive: true });
+    const scrollToLatest = () => {
+      stickToLatest = true;
+      alignToLatest();
+      if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+        window.requestAnimationFrame(() => {
+          alignToLatest();
+          window.requestAnimationFrame(alignToLatest);
+        });
+      }
+    };
+    // Let the viewport sizing code re-anchor the list after a keyboard resize.
+    const preservedAnchor = this.conversationPreserveAnchor && this.conversationPreserveAnchor.conversationId === active.id
+      ? this.conversationPreserveAnchor
+      : null;
+    this.conversationPreserveAnchor = null;
+    if (preservedAnchor) stickToLatest = false;
+    // Older rows are prepended, so the previous reading position moves down by
+    // exactly the height that was added. Re-apply it after every batch.
+    const maintainAnchor = () => {
+      if (!preservedAnchor || !messageList.isConnected) return;
+      const current = messageList.scrollHeight;
+      if (current <= preservedAnchor.scrollHeight) return;
+      messageList.scrollTop = preservedAnchor.scrollTop + (current - preservedAnchor.scrollHeight);
+    };
+    const afterBatch = preservedAnchor ? maintainAnchor : keepLatest;
+    this.realignConversationScroll = afterBatch;
     this.renderRowsBatched(messageList, messages, (message) => {
       const date = new Date(message.timestamp);
       const dateKey = Number.isNaN(date.getTime()) ? "" : date.toLocaleDateString();
@@ -8331,20 +8754,7 @@ class NtfyManagerView extends ItemView {
         await this.plugin.removeConversationMessage(message.id, message.direction);
         this.renderTabPanel("inbox");
       });
-    }, batchState, { initialCount: 48, batchSize: 64 });
-
-    // New conversations should open at the newest message. One animation
-    // frame is enough; delayed repeated scrolls made the message page jank.
-    const alignToLatest = () => {
-      if (!messageList.isConnected) return;
-      messageList.scrollTop = messageList.scrollHeight;
-    };
-    const scrollToLatest = () => {
-      alignToLatest();
-      if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
-        window.requestAnimationFrame(alignToLatest);
-      }
-    };
+    }, batchState, { initialCount: 48, batchSize: 64, onBatch: keepLatest, onComplete: keepLatest });
 
     const composer = conversation.createDiv({ cls: "obsidian-ntfy-chat-composer" });
     const selected = composer.createDiv({ cls: "obsidian-ntfy-chat-selected-files" });
@@ -8406,11 +8816,26 @@ class NtfyManagerView extends ItemView {
         send.click();
       }
     });
+    // Opening and closing the soft keyboard resizes the visual viewport; both
+    // directions need a re-measure so the composer never drifts off screen.
+    input.addEventListener("focus", () => this.scheduleViewportSizing());
+    input.addEventListener("blur", () => this.scheduleViewportSizing());
     if (!active.available) {
       input.disabled = true;
       send.disabled = true;
     }
-    scrollToLatest();
+    if (preservedAnchor) maintainAnchor();
+    else scrollToLatest();
+    // Safety net for mobile: the keyboard and the viewport settle land a few
+    // hundred milliseconds after the open, and each of them resizes the
+    // message area. One late re-anchor keeps the newest message on screen even
+    // if the user has not touched the list yet.
+    if (typeof window !== "undefined" && typeof window.setTimeout === "function") {
+      window.setTimeout(() => {
+        if (!preservedAnchor) keepLatest();
+        else maintainAnchor();
+      }, 320);
+    }
   }
 
   chatTime(value, includeSeconds = false) {

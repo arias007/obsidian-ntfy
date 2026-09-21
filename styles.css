@@ -149,8 +149,12 @@
 }
 
 .obsidian-ntfy-manager.obsidian-ntfy-inbox-active {
-  height: min(100%, var(--obsidian-ntfy-viewport-height, 100%));
-  max-height: min(100%, var(--obsidian-ntfy-viewport-height, 100%));
+  /* The height is measured against the visual viewport so the composer stays
+     visible while a soft keyboard is open. Do not clamp it to 100% of the
+     parent: on mobile the parent still reports the pre-keyboard height, which
+     used to push the composer below the keyboard. */
+  height: var(--obsidian-ntfy-viewport-height, 100%);
+  max-height: var(--obsidian-ntfy-viewport-height, 100%);
 }
 
 .obsidian-ntfy-manager.obsidian-ntfy-inbox-active .obsidian-ntfy-tab-panel.is-active {
@@ -606,6 +610,13 @@
   margin: 6px 0;
   min-width: 0;
   padding: 6px 8px;
+  /* Skip layout/paint work for rows that are off screen. Tab switches flip a
+     whole long list from display:none to display:block in one frame; without
+     this the browser lays out every row during the flip, which showed up as
+     switch lag on mobile. `auto` keeps the last rendered size remembered, so
+     scroll position restores stay accurate. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 56px;
 }
 
 .obsidian-ntfy-item-state-pending {
