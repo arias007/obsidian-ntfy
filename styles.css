@@ -1835,3 +1835,10 @@
   white-space: nowrap;
   z-index: 99;
 }
+
+/* 1.7.7 原生键盘守护：面板被钉在可视视口带内时（键盘弹出，聊天输入框聚焦），
+   底部安全区内边距没有意义——键盘已经占了那块屏幕，留着只会平白多一条空隙。
+   顶部的固定几何由 JS 写在元素上，这里只负责清掉底部留白。 */
+.obsidian-ntfy-manager.is-native-keyboard {
+  padding-bottom: 0;
+}
