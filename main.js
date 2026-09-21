@@ -7674,6 +7674,7 @@ class NtfyManagerView extends ItemView {
     this.viewportFrame = null;
     this.viewportFrameKind = "";
     this.viewportSettleTimer = null;
+    this.lastKeyboardInset = 0;
     this.realignConversationScroll = null;
     this.conversationPreserveAnchor = null;
     this.largeFileProviders = new Map();
@@ -7871,24 +7872,23 @@ class NtfyManagerView extends ItemView {
     // matters once a soft keyboard is open. The previous formula subtracted the
     // visual-viewport offset from the container top, so the panel grew taller
     // than the visible area and pushed the composer out of the screen.
-    const viewTop = viewport ? viewport.offsetTop : 0;
-    const viewBottom = viewport ? viewport.offsetTop + viewport.height : layoutHeight;
+    const viewTop = viewport ? Math.max(0, Math.round(viewport.offsetTop)) : 0;
+    // Never trust a visual-viewport bottom that lies below the window: after
+    // Android's (late) window resize lands, a stale visual viewport can still
+    // report the pre-keyboard height, which used to let the container grow
+    // past the real window bottom and pushed the composer under the keyboard.
+    const viewBottom = Math.min(viewport ? Math.round(viewport.offsetTop + viewport.height) : layoutHeight, layoutHeight);
     // The visible band between the top and bottom of the visual viewport is a
     // hard ceiling: no matter what the keyboard, the browser pan, or a late
     // Android resize reports, the container must never become taller than what
     // the user can actually see.
-    const visibleHeight = Math.max(160, Math.round(viewBottom - viewTop));
+    const visibleHeight = Math.max(160, viewBottom - viewTop);
     const rect = root.getBoundingClientRect();
-    // While the keyboard opens, Android scrolls the page (or pans the visual
-    // viewport) to reveal the focused input, which can push the container top
-    // above the visible area (rect.top < viewTop). The old clamp
-    // `layoutHeight + max(0, -rect.top)` compensated for that by letting the
-    // container grow taller than the screen; the next viewport scroll event
-    // measured an even more negative top and grew it again — a feedback loop
-    // that visibly shot the composer off the top of the screen about a second
-    // after the keyboard opened. Clamping the measured top to the visible area
-    // breaks the loop: the height can only ever fill the visible band.
-    const measuredTop = Math.max(rect.top, viewTop);
+    // rect.top is viewport-relative. If a browser focus scroll pushed the
+    // container above the visible band (negative top), the best we can do
+    // without scrolling is fill the visible band from its top; the leftover
+    // scroll offset is undone by restoreContainerIntoView() at settle time.
+    const measuredTop = Math.max(Math.round(rect.top), 0);
     const available = Math.floor(viewBottom - measuredTop);
     const height = Math.max(160, Math.min(available, visibleHeight, Math.round(layoutHeight)));
     root.style.setProperty("--obsidian-ntfy-viewport-height", `${height}px`);
@@ -7902,9 +7902,65 @@ class NtfyManagerView extends ItemView {
     const keyboardInset = Math.max(0, Math.round(layoutHeight - viewBottom));
     root.style.setProperty("--obsidian-ntfy-keyboard-inset", `${keyboardInset}px`);
     root.toggleClass("is-keyboard-open", keyboardInset > 96 && this.activeTab === "inbox");
+    // Remember the settled keyboard height so the next focus can pre-shrink
+    // the container before the browser runs its own focus scroll.
+    if (keyboardInset > 96) this.lastKeyboardInset = keyboardInset;
     // A keyboard-driven resize changes the message area height. Re-anchor the
     // conversation to its newest message so the visible message does not drift.
     if (typeof this.realignConversationScroll === "function") this.realignConversationScroll();
+  }
+
+  // Reserve the remembered keyboard height BEFORE the browser runs its own
+  // focus scroll. At focus time the container still has its full (pre-keyboard)
+  // height, so the composer sits below the future visible band; the browser
+  // then scrolls the workspace down to reveal it, our measurement shrinks the
+  // container afterwards, and the leftover scroll offset leaves the composer
+  // stranded high up with a blank gap below it. Shrinking first means the
+  // composer is already inside the future visible band and the browser never
+  // scrolls at all.
+  preShrinkForKeyboard() {
+    if (typeof window === "undefined") return;
+    if (!this.lastKeyboardInset || this.lastKeyboardInset <= 96) return;
+    const root = this.viewContentEl();
+    if (!root) return;
+    const viewport = window.visualViewport;
+    const layoutHeight = window.innerHeight || 0;
+    if (!layoutHeight) return;
+    // If the keyboard is already reflected in the layout, the regular
+    // measurement handles it — pre-shrinking again would double-subtract.
+    const currentInset = layoutHeight - (viewport ? Math.round(viewport.offsetTop + viewport.height) : layoutHeight);
+    if (currentInset > 96) return;
+    const rect = root.getBoundingClientRect();
+    const height = Math.max(160, layoutHeight - this.lastKeyboardInset - Math.max(0, Math.round(rect.top)));
+    root.style.setProperty("--obsidian-ntfy-viewport-height", `${height}px`);
+  }
+
+  // Undo a browser focus scroll that pushed the container top above the
+  // visible band. Taken out of the nearest scrollable ancestors directly —
+  // scrollIntoView here would fight the keyboard handling that caused the
+  // offset in the first place.
+  restoreContainerIntoView() {
+    if (typeof window === "undefined" || typeof document === "undefined") return;
+    const root = this.viewContentEl();
+    if (!root || !root.isConnected) return;
+    const viewport = window.visualViewport;
+    const viewTop = viewport ? Math.max(0, Math.round(viewport.offsetTop)) : 0;
+    const rect = root.getBoundingClientRect();
+    const overflow = Math.ceil(viewTop - rect.top);
+    if (overflow <= 8) return;
+    let remaining = overflow;
+    let node = root.parentElement;
+    while (node && node !== document.body && node !== document.documentElement && remaining > 0) {
+      if (node.scrollTop > 0 && node.scrollHeight > node.clientHeight) {
+        const give = Math.min(node.scrollTop, remaining);
+        if (give > 0) {
+          node.scrollTop -= give;
+          remaining -= give;
+        }
+      }
+      node = node.parentElement;
+    }
+    if (remaining > 0 && window.scrollY > 0) window.scrollTo(0, Math.max(0, window.scrollY - remaining));
   }
 
   // Safety net: if the composer still ends up outside the visible area (for
@@ -7913,6 +7969,9 @@ class NtfyManagerView extends ItemView {
   ensureComposerVisible() {
     if (typeof window === "undefined" || typeof document === "undefined") return;
     if (this.activeTab !== "inbox") return;
+    // A leftover focus-scroll offset blanks out everything below the container
+    // once the container is shrunk to the visible band; undo it first.
+    this.restoreContainerIntoView();
     const input = this.bodyEl?.querySelector(".obsidian-ntfy-chat-input");
     if (!input) return;
     // While the user is typing, the browser keeps the focused input visible
@@ -7923,7 +7982,7 @@ class NtfyManagerView extends ItemView {
     if (document.activeElement === input) return;
     const viewport = window.visualViewport;
     const viewTop = viewport ? viewport.offsetTop : 0;
-    const viewBottom = viewport ? viewport.offsetTop + viewport.height : window.innerHeight;
+    const viewBottom = Math.min(viewport ? viewport.offsetTop + viewport.height : window.innerHeight, window.innerHeight);
     const rect = input.getBoundingClientRect();
     if (rect.bottom <= viewBottom - 4 && rect.top >= viewTop - 4) return;
     // behavior "auto" explicitly: smooth scrolling (global CSS or UA default)
@@ -8900,7 +8959,13 @@ class NtfyManagerView extends ItemView {
     });
     // Opening and closing the soft keyboard resizes the visual viewport; both
     // directions need a re-measure so the composer never drifts off screen.
-    input.addEventListener("focus", () => this.scheduleViewportSizing());
+    // Pre-shrink first: at focus time the container still has its full height
+    // and the browser would scroll the workspace to reveal the composer,
+    // leaving a blank gap once our measurement shrinks the container.
+    input.addEventListener("focus", () => {
+      this.preShrinkForKeyboard();
+      this.scheduleViewportSizing();
+    });
     input.addEventListener("blur", () => this.scheduleViewportSizing());
     if (!active.available) {
       input.disabled = true;
