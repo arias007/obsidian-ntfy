@@ -7863,8 +7863,13 @@ class NtfyManagerView extends ItemView {
       }
     }
     if (this.viewportSettleTimer !== null) window.clearTimeout?.(this.viewportSettleTimer);
+    // Settle order matters: undo any leftover focus-scroll FIRST, then
+    // measure. The reverse order computed the height from the displaced
+    // position and left a stale grown height behind — the whole frame looked
+    // "bigger" with the scrollbar overshooting its real position.
     this.viewportSettleTimer = window.setTimeout(() => {
       this.viewportSettleTimer = null;
+      this.restoreContainerIntoView();
       this.updateViewportSizing();
       this.ensureComposerVisible();
       // Android delivers the window resize (and sometimes the final visual
@@ -7874,6 +7879,7 @@ class NtfyManagerView extends ItemView {
       // drift off screen once the early events have already been handled.
       this.viewportSettleTimer = window.setTimeout(() => {
         this.viewportSettleTimer = null;
+        this.restoreContainerIntoView();
         this.updateViewportSizing();
         this.ensureComposerVisible();
       }, 420);
@@ -7906,6 +7912,17 @@ class NtfyManagerView extends ItemView {
     // actually be, and a glitched smaller value must not shrink the layout.
     const insetFloor = Math.max(0, (this.lastFullViewportHeight || 0) - (this.lastKeyboardInset || 0));
     if (insetFloor > 0) viewBottom = Math.max(viewBottom, Math.min(insetFloor, layoutHeight));
+    // While typing, reserve the remembered keyboard space no matter what the
+    // raw numbers claim: in WebViews whose window never resizes (pan mode) or
+    // before the late resize lands, they still claim the full window and the
+    // composer ends up under the keyboard with a long scrollbar overshooting
+    // into it.
+    if (this.lastKeyboardInset > 96 && this.lastFullViewportHeight > 0) {
+      const chatInput = this.bodyEl?.querySelector(".obsidian-ntfy-chat-input");
+      if (chatInput && typeof document !== "undefined" && document.activeElement === chatInput) {
+        viewBottom = Math.min(viewBottom, Math.max(160, this.lastFullViewportHeight - this.lastKeyboardInset));
+      }
+    }
     const rect = root.getBoundingClientRect();
     // PIN the container bottom to the visible bottom. The height is simply
     // "visible bottom minus wherever the container top actually is", with no
@@ -7953,7 +7970,11 @@ class NtfyManagerView extends ItemView {
     if (keyboardInset > 96 && !this.viewportHeartbeat && typeof window !== "undefined" && typeof window.setTimeout === "function") {
       this.viewportHeartbeat = window.setTimeout(() => {
         this.viewportHeartbeat = null;
-        if (this.bodyEl) this.updateViewportSizing();
+        if (this.bodyEl) {
+          // Undo first, measure second — same order contract as the settle.
+          this.restoreContainerIntoView();
+          this.updateViewportSizing();
+        }
       }, 300);
     } else if (keyboardInset <= 96 && this.viewportHeartbeat) {
       window.clearTimeout(this.viewportHeartbeat);
@@ -7962,7 +7983,7 @@ class NtfyManagerView extends ItemView {
     // Live diagnostic readout (temporary, 1.6.8 debugging aid): shows the raw
     // numbers so a reproducible blank state can be reported precisely.
     if (this.debugChip) {
-      this.debugChip.textContent = `H${height} T${Math.round(rect.top)} VH${viewport ? Math.round(viewport.height) : 0} VO${viewport ? Math.round(viewport.offsetTop) : 0} IH${Math.round(layoutHeight)} KB${keyboardInset}`;
+      this.debugChip.textContent = `H${height} T${Math.round(rect.top)} VB${Math.round(viewBottom)} VH${viewport ? Math.round(viewport.height) : 0} VO${viewport ? Math.round(viewport.offsetTop) : 0} IH${Math.round(layoutHeight)} KB${keyboardInset}`;
     }
     // A keyboard-driven resize changes the message area height. Re-anchor the
     // conversation to its newest message so the visible message does not drift.
@@ -8009,7 +8030,11 @@ class NtfyManagerView extends ItemView {
       if (Date.now() - start > 800) return;
       const input = this.bodyEl?.querySelector(".obsidian-ntfy-chat-input");
       if (!input || document.activeElement !== input) return; // focus lost — stand down
-      this.restoreContainerIntoView();
+      const corrected = this.restoreContainerIntoView();
+      // A correction invalidates the height that was computed from the
+      // displaced position; re-measure in the same frame or the frame stays
+      // grown (scrollbar overshooting its real position).
+      if (corrected) this.updateViewportSizing();
       this.keyboardScrollGuard = window.requestAnimationFrame(step);
     };
     this.keyboardScrollGuard = window.requestAnimationFrame(step);
@@ -8019,17 +8044,21 @@ class NtfyManagerView extends ItemView {
   // visible band. Taken out of the nearest scrollable ancestors directly —
   // scrollIntoView here would fight the keyboard handling that caused the
   // offset in the first place. Multi-pass: correcting one ancestor can change
-  // what the next one reports.
+  // what the next one reports. Returns true when a correction was applied —
+  // callers MUST re-measure afterwards, because the height that was computed
+  // from the displaced position is now stale (a stale grown height is what
+  // made the whole frame look "bigger" with the scrollbar overshooting).
   restoreContainerIntoView() {
-    if (typeof window === "undefined" || typeof document === "undefined") return;
+    if (typeof window === "undefined" || typeof document === "undefined") return false;
     const root = this.viewContentEl();
-    if (!root || !root.isConnected) return;
+    if (!root || !root.isConnected) return false;
     const viewport = window.visualViewport;
     const viewTop = viewport ? Math.max(0, Math.round(viewport.offsetTop)) : 0;
     const rect = root.getBoundingClientRect();
     const overflow = Math.ceil(viewTop - rect.top);
-    if (overflow <= 8) return;
+    if (overflow <= 8) return false;
     let remaining = overflow;
+    let corrected = false;
     for (let pass = 0; pass < 3 && remaining > 8; pass++) {
       const chain = [];
       let node = root.parentElement;
@@ -8047,12 +8076,14 @@ class NtfyManagerView extends ItemView {
         if (give > 0) {
           candidate.scrollTop -= give;
           remaining -= give;
+          corrected = true;
         }
       }
       if (typeof window.scrollY === "number" && window.scrollY > 0 && remaining > 8) {
         const give = Math.min(window.scrollY, remaining);
         window.scrollTo(0, window.scrollY - give);
         remaining -= give;
+        corrected = true;
       }
       // Recompute: correcting one container may have moved the others.
       if (remaining > 8) {
@@ -8061,6 +8092,7 @@ class NtfyManagerView extends ItemView {
         if (remaining <= 8) break;
       }
     }
+    return corrected;
   }
 
   // Safety net: if the composer still ends up outside the visible area (for
@@ -8069,9 +8101,6 @@ class NtfyManagerView extends ItemView {
   ensureComposerVisible() {
     if (typeof window === "undefined" || typeof document === "undefined") return;
     if (this.activeTab !== "inbox") return;
-    // A leftover focus-scroll offset blanks out everything below the container
-    // once the container is shrunk to the visible band; undo it first.
-    this.restoreContainerIntoView();
     const input = this.bodyEl?.querySelector(".obsidian-ntfy-chat-input");
     if (!input) return;
     // While the user is typing, the browser keeps the focused input visible
