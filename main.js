@@ -7817,6 +7817,14 @@ class NtfyManagerView extends ItemView {
   }
 
   installViewportSizing() {
+    // NATIVE KEYBOARD MODE (1.7.0 experiment): the soft keyboard is left
+    // entirely to Obsidian and Android. None of the viewport machinery below
+    // is installed — no height variable, no settle timers, no heartbeat, no
+    // scroll guard, no corrections. The container falls back to its natural
+    // 100% height and the system resize flow owns the layout. All the
+    // machinery is kept intact so a single revert of this early return brings
+    // it back if the native behaviour proves worse.
+    return;
     if (this.viewportCleanup || typeof window === "undefined") return;
     const viewport = window.visualViewport;
     const schedule = () => this.scheduleViewportSizing();
@@ -7844,6 +7852,10 @@ class NtfyManagerView extends ItemView {
   // Coalesce them into one measurement per frame and measure again once the
   // keyboard has settled, so the composer ends up in a stable position.
   scheduleViewportSizing() {
+    // NATIVE KEYBOARD MODE: see installViewportSizing — the whole viewport
+    // machinery is switched off and the keyboard is owned by Obsidian. Every
+    // call site becomes inert through this single early return.
+    return;
     if (typeof window === "undefined") return;
     if (this.viewportFrame === null) {
       if (typeof window.requestAnimationFrame === "function") {
@@ -8251,7 +8263,6 @@ class NtfyManagerView extends ItemView {
     this.tabPanels.clear();
     this.tabSignatures.clear();
     this.renderHeader(contentEl);
-    this.debugChip = contentEl.createDiv({ cls: "obsidian-ntfy-kb-debug" });
     this.bodyEl = contentEl.createDiv({ cls: "obsidian-ntfy-window-body" });
     // Track the scroll offset passively. Reading bodyEl.scrollTop inside
     // activateTab() forced a synchronous layout of the panel that was just
@@ -9087,25 +9098,9 @@ class NtfyManagerView extends ItemView {
         send.click();
       }
     });
-    // Opening and closing the soft keyboard resizes the visual viewport; both
-    // directions need a re-measure so the composer never drifts off screen.
-    // Pre-shrink first: at focus time the container still has its full height
-    // and the browser would scroll the workspace to reveal the composer,
-    // leaving a blank gap once our measurement shrinks the container. The
-    // scroll guard then undoes any residual displacement frame by frame
-    // during the keyboard animation, before text composition can start.
-    input.addEventListener("focus", () => {
-      this.preShrinkForKeyboard();
-      this.startKeyboardScrollGuard();
-      this.scheduleViewportSizing();
-    });
-    input.addEventListener("blur", () => {
-      if (this.keyboardScrollGuard && typeof window !== "undefined" && typeof window.cancelAnimationFrame === "function") {
-        window.cancelAnimationFrame(this.keyboardScrollGuard);
-        this.keyboardScrollGuard = null;
-      }
-      this.scheduleViewportSizing();
-    });
+    // NATIVE KEYBOARD MODE: no focus/blur interventions — the keyboard is
+    // owned by Obsidian/Android. The old pre-shrink / scroll-guard /
+    // re-measure hooks were the entire viewport machinery and are gone.
     if (!active.available) {
       input.disabled = true;
       send.disabled = true;
