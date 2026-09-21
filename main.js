@@ -8967,7 +8967,10 @@ class NtfyManagerView extends ItemView {
       await this.plugin.updateConversationPreference(active.id, { pinned: !active.preference.pinned });
       this.renderTabPanel("inbox");
     });
-    this.iconButton(actions, active.preference.muted ? "bell" : "bell-off", active.preference.muted ? this.uiText("恢复通知", "Unmute") : this.uiText("静音通知", "Mute"), "secondary", async () => {
+    // Bell icon must encode the CURRENT STATE, matching the contact list
+    // (list shows bell-off only when muted). Action-encoding here (bell-off
+    // while unmuted) read as "notifications off" and contradicted the list.
+    this.iconButton(actions, active.preference.muted ? "bell-off" : "bell", active.preference.muted ? this.uiText("已静音，点击恢复通知", "Muted, tap to unmute") : this.uiText("通知中，点击静音", "Notifications on, tap to mute"), active.preference.muted ? "danger" : "secondary", async () => {
       await this.plugin.updateConversationPreference(active.id, { muted: !active.preference.muted });
       this.renderTabPanel("inbox");
     });
