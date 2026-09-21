@@ -7920,7 +7920,9 @@ class NtfyManagerView extends ItemView {
     const viewBottom = viewport ? viewport.offsetTop + viewport.height : window.innerHeight;
     const rect = input.getBoundingClientRect();
     if (rect.bottom <= viewBottom - 4 && rect.top >= viewTop - 4) return;
-    if (typeof input.scrollIntoView === "function") input.scrollIntoView({ block: "nearest", inline: "nearest" });
+    // behavior "auto" explicitly: smooth scrolling (global CSS or UA default)
+    // would animate this safety-net nudge instead of snapping it into place.
+    if (typeof input.scrollIntoView === "function") input.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "auto" });
   }
 
   captureConversationInputState() {

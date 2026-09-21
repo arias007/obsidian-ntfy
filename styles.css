@@ -1188,6 +1188,12 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
+  /* Obsidian's global styles enable smooth scrolling, which turns the
+     plugin's programmatic scrollTop writes into animated scrolls. Opening a
+     conversation then visibly slides from mid-history to the newest message
+     instead of landing there instantly. Force instant positioning: the
+     align-to-latest writes are meant to be invisible, not animated. */
+  scroll-behavior: auto !important;
 }
 
 .obsidian-ntfy-chat-contact {
