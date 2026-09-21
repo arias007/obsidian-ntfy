@@ -1857,10 +1857,13 @@
   position: relative;
 }
 
+/* 1.7.9：输入栏抬升量由 JS 按"冻结面板溢出可见区的高度"给出 —— 面板本来就贴到键盘
+   上沿时抬升 0（紧贴键盘），面板比可见区高时抬升被藏住的那一段（仍旧紧贴键盘）。
+   不再用 50% 这类猜测值。 */
 .obsidian-ntfy-manager.is-keyboard-layout-locked .obsidian-ntfy-chat-composer {
   position: absolute;
   right: 0;
-  bottom: max(50%, var(--obsidian-ntfy-keyboard-inset, 0px));
+  bottom: var(--ntfy-composer-lift, 0px);
   left: 0;
   z-index: 40;
   box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.18);
@@ -1868,5 +1871,5 @@
 
 /* 输入栏脱流后给消息区补底部留白，最新消息停在输入栏上方而不是键盘后面 */
 .obsidian-ntfy-manager.is-keyboard-layout-locked .obsidian-ntfy-chat-messages {
-  padding-bottom: var(--ntfy-keyboard-lock-pad, 64px);
+  padding-bottom: calc(var(--ntfy-composer-lift, 0px) + var(--ntfy-keyboard-lock-pad, 64px));
 }
