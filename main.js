@@ -2597,6 +2597,29 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     return Object.assign({ muted: false, pinned: false, lastReadAt: "" }, this.settings.conversationPreferences && this.settings.conversationPreferences[key] || {});
   }
 
+  // Mute must be resolved through the CONTACT hierarchy, not the raw message
+  // key. Channel contacts fold every conversation of the channel into one
+  // chat (see conversationMessagesFor), so muting the visible chat stores the
+  // "<channelId>::default" key while an incoming ntfy message carries
+  // "<channelId>::<topic>". Checking the message key alone made the mute
+  // toggle a no-op. A conversation counts as muted when the channel-level
+  // contact, its own conversation key, or the ntfy private-peer contact is
+  // muted.
+  conversationIsMuted(message) {
+    if (!message) return false;
+    const keys = new Set([String(message.conversationKey || "")]);
+    const channel = (this.listNotificationChannels() || []).find((item) => item.id === message.channelId);
+    if (channel) keys.add(this.conversationKey(channel.id, "default"));
+    const sender = String(message.sender || "").trim();
+    if (sender && sender !== "me" && String(message.channelId) === "ntfy" && message.metadata && message.metadata.groupTopic === true) {
+      keys.add(this.conversationKey("ntfy-peer", `${message.conversationId}:${sender}`));
+    }
+    for (const key of keys) {
+      if (key && this.conversationPreference(key).muted) return true;
+    }
+    return false;
+  }
+
   async updateConversationPreference(key, patch) {
     if (!String(key || "").includes("::")) return;
     this.settings.conversationPreferences = Object.assign({}, this.settings.conversationPreferences || {}, {
@@ -3486,7 +3509,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       lastInboundAt: new Date().toISOString(),
       lastError: "",
     });
-    const muted = conversationMessage ? this.conversationPreference(conversationMessage.conversationKey).muted : false;
+    const muted = conversationMessage ? this.conversationIsMuted(conversationMessage) : false;
     const quiet = this.isQuietHours() || muted;
     if (!quiet) new Notice(`[${message.channelId}] ${message.sender}: ${message.text || message.title}`);
 
