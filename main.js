@@ -7967,6 +7967,11 @@ class NtfyManagerView extends ItemView {
     const keyboardInset = Math.max(0, Math.round(layoutHeight - viewBottom));
     root.style.setProperty("--obsidian-ntfy-keyboard-inset", `${keyboardInset}px`);
     root.toggleClass("is-keyboard-open", keyboardInset > 96 && this.activeTab === "inbox");
+    // 1.7.3: 键盘弹出时把输入栏固定（fixed）到布局视口底部——与 kb-debug 水印
+    // 完全相同的定位机制。水印能稳稳贴在键盘上沿，是因为 fixed 元素锚定缩小的
+    // 布局视口；输入框之前困在流式布局里，随容器位移被推出屏幕。键盘收起后
+    // 自动还原为常规 flex 布局，其余一切不变。
+    root.toggleClass("is-composer-fixed", keyboardInset > 96 && this.activeTab === "inbox");
     // Remember the settled keyboard height so the next focus can pre-shrink
     // the container before the browser runs its own focus scroll. Persisted
     // per device: the very first focus after a cold start must work too.

@@ -1525,6 +1525,23 @@
   z-index: 2;
 }
 
+/* 1.7.3: 键盘弹出时把输入栏从流式布局拉出，fixed 钉在布局视口底部——
+   与 .obsidian-ntfy-kb-debug 水印同一机制（fixed 跟随缩小的视口，所以
+   水印能稳在键盘上沿，输入框之前却会被容器位移推出屏幕）。
+   键盘收起（is-composer-fixed 移除）后自动还原为常规 flex 布局。 */
+.obsidian-ntfy-manager.is-composer-fixed .obsidian-ntfy-chat-composer {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 98;
+}
+
+/* 输入栏脱流后，给消息滚动区留出等高底部内边距，最后一条消息不被输入栏遮住 */
+.obsidian-ntfy-manager.is-composer-fixed .obsidian-ntfy-chat-messages {
+  padding-bottom: 64px;
+}
+
 .obsidian-ntfy-chat-compose-row {
   align-items: flex-end;
   display: flex;
