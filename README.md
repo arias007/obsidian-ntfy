@@ -1,5 +1,13 @@
 # Ntfy Notifications
 
+![Ntfy 演示 · 待办 / 通知 / 聊天 / 群组](assets/ntfy-demo.gif)
+
+轻量级 Obsidian 通知枢纽 —— 把待办、提醒、聊天、群组收成一条主动推送通道，打通 ntfy、Telegram、飞书、企业微信、Discord、Slack、Matrix、QQ Bot 与邮件。完全开源，永久免费。
+
+Lightweight Obsidian notification hub — todos, reminders, chat and groups in one proactive channel across ntfy, Telegram, Feishu, WeCom, Discord, Slack, Matrix, QQ Bot and email. Open source, free forever.
+
+宣传片 · Promo — [中文版](assets/ntfy-promo-cn.mp4) · [English](assets/ntfy-promo-en.mp4)
+
 This is a lightweight Obsidian plugin for ntfy notifications and optional AI webhooks.
 
 Why ntfy: Obsidian mobile plugins cannot directly create Android system notifications. This plugin sends reminders to an ntfy topic, and the Android ntfy app shows the notification in the system notification shade.
