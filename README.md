@@ -1,5 +1,8 @@
 # Ntfy Notifications
 
+<!-- hire-line -->
+> **Need this adapted, extended, or built from scratch?** I wrote this plugin — [custom work available](https://github.com/arias007/arias007#hire-me). Working proof first, payment after.
+
 ![Ntfy 演示 · 待办 / 通知 / 聊天 / 群组](assets/ntfy-demo.gif)
 
 轻量级 Obsidian 通知枢纽 —— 把待办、提醒、聊天、群组收成一条主动推送通道，打通 ntfy、Telegram、飞书、企业微信、Discord、Slack、Matrix、QQ Bot 与邮件。完全开源，永久免费。
