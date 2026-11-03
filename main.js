@@ -7091,19 +7091,39 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     let nextLine = currentLine;
     const wantedSignifier = String(reminder.signifier || "").trim();
     if (tasksDate) {
-      // v1.9.0: 指定标记（阅读视图点 🛫 就只改 🛫），没指定则沿用原来的优先级行为
-      const preferred = wantedSignifier && new RegExp(`${wantedSignifier}\\s*\\d{4}-\\d{2}-\\d{2}`, "u").test(currentLine)
-        ? wantedSignifier
-        : tasksDate.signifier;
-      // v1.9.0: 目标标记和原标记不同 = 换语义（🛫 ↔ 📅）
-      const targetSignifier = String(reminder.signifier || preferred).trim() || preferred;
-      const pattern = new RegExp(`(${preferred}\\s*)\\d{4}-\\d{2}-\\d{2}(?:[\\sT　]\\d{1,2}:\\d{2})?`, "u");
-      const keep = targetSignifier === preferred ? preferred : targetSignifier;
-      // prefix 是「原标记 + 空白」，换语义时只替换标记，空白保留原样
-      nextLine = currentLine.replace(pattern, (whole, prefix) => {
-        const gap = (String(prefix).match(/\s*$/) || [""])[0] || " ";
-        return `${keep}${gap}${dateTimeText}`;
-      });
+      // v2.0.0 标记选择规则：
+      //   ① reminder.signifier 明确指定且行里确实有 → 只改它（起始/截止各改各的）
+      //   ② 明确指定但行里没有 → **追加**该标记，绝不偷改另一个
+      //   ③ 完全没指定 → 沿用优先级（⏳ > 📅 > 🛫）
+      const hasMark = (sig) => Boolean(sig) && new RegExp(`${sig}\\s*\\d{4}-\\d{2}-\\d{2}`, "u").test(currentLine);
+      const markPattern = (sig) =>
+        new RegExp(`(${sig}\\s*)\\d{4}-\\d{2}-\\d{2}(?:[\\sT　]\\d{1,2}:\\d{2})?`, "u");
+      const put = (line, sig) =>
+        line.replace(markPattern(sig), (whole, prefix) => {
+          const gap = (String(prefix).match(/\s*$/) || [""])[0] || " ";
+          return `${sig}${gap}${dateTimeText}`;
+        });
+
+      // ★ retagFrom = 用户在弹层里主动切换了「起始/截止」，这是**转换**：
+      //   把旧标记整个换成新标记（🛫 2026-11-01 → 📅 2026-11-01），不是追加。
+      //   面板上点起始/截止胶囊不带 retagFrom，那是各自独立改。
+      const retagFrom = String(reminder.retagFrom || "").trim();
+      const isConvert = Boolean(retagFrom) && Boolean(wantedSignifier) && retagFrom !== wantedSignifier;
+
+      if (isConvert && hasMark(retagFrom)) {
+        // 转换：把 retagFrom 那个标记整段换成 wantedSignifier + 新时间
+        nextLine = currentLine.replace(markPattern(retagFrom), (whole, prefix) => {
+          const gap = (String(prefix).match(/\s*$/) || [""])[0] || " ";
+          return `${wantedSignifier}${gap}${dateTimeText}`;
+        });
+      } else if (wantedSignifier && hasMark(wantedSignifier)) {
+        nextLine = put(currentLine, wantedSignifier);
+      } else if (wantedSignifier) {
+        // 行里没有这个标记 → 追加，原有标记一字不动（面板改「起始」不该动「截止」）
+        nextLine = `${currentLine.trimEnd()} ${wantedSignifier} ${dateTimeText}`;
+      } else {
+        nextLine = put(currentLine, tasksDate.signifier);
+      }
     } else if (delayedLine) {
       const indent = (currentLine.match(/^\s*/) || [""])[0];
       nextLine = `${indent}ntfy:: ${dateTimeText} ${delayedLine.text || "Obsidian reminder"}`;
@@ -7138,6 +7158,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       };
     }
     await this.saveSettings();
+    // v2.0.0: 让扫描缓存失效 —— scanVaultTaskData 有 2 秒快照，
+    // 不 bump 的话紧接着的重绘读到的是旧数据，表现就是「改了没生效」。
+    this.bumpVaultScanRevision();
     if (!wasIgnored) await this.scanAndSchedule({ showNotice: false });
     return updatedReminder;
   }
@@ -10467,9 +10490,19 @@ class NtfyManagerView extends ItemView {
       event.preventDefault();
       event.stopPropagation();
       const due = dueDate instanceof Date ? dueDate : new Date(dueDate || 0);
-      this.openDateTimePicker(due, async (nextDue) => {
-        await onClick(event, displaySpan, nextDue);
-      }, displaySpan);
+      const currentText = Number.isNaN(due.getTime())
+        ? this.plugin.formatDateTimeLocal(new Date())
+        : this.plugin.formatDateTimeLocal(due);
+      // ★ v2.0.0: 不再把胶囊换成原生 <input>（它自带一个「⌄」按钮，且有 ~26px 固有宽度，
+      //   一编辑就把这一行撑变形）。改成弹层，胶囊本身永远保持原样。
+      new NtfyReadingDateModal(this.app, (zh, en) => this.uiText(zh, en), currentText, async (value) => {
+        const parsed = this.plugin.parseDateTimeLocal(value);
+        if (!parsed) {
+          new Notice(`${PLUGIN_NAME}: ${this.uiText("日期或时间无效", "invalid date/time")}`);
+          return;
+        }
+        await onClick(event, displaySpan, parsed);
+      }, kind === "start" ? "🛫" : "📅").open();
     });
     return displaySpan;
   }
@@ -11033,13 +11066,13 @@ class NtfyManagerView extends ItemView {
       return;
     }
     const due = dueValue instanceof Date ? dueValue : new Date(dueValue);
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    // v2.0.0: 允许把日期改到过去（补记历史、纠正录错的日期都要用）。
+    // 只有值本身无效时才退回「现在 + 30 分钟」。
     const fallbackDue = new Date(Date.now() + 30 * 60 * 1000);
-    const currentDue = Number.isNaN(due.getTime()) || due.getTime() < todayStart.getTime() ? fallbackDue : due;
+    const currentDue = Number.isNaN(due.getTime()) ? fallbackDue : due;
     const input = document.createElement("input");
     input.type = "datetime-local";
-    input.min = this.plugin.formatDateTimeLocal(todayStart);
+    // 不再设 input.min —— 设了就只能选今天以后
     input.value = this.plugin.formatDateTimeLocal(currentDue);
     input.setAttribute("aria-label", "修改提醒时间");
     const rect = anchorEl && typeof anchorEl.getBoundingClientRect === "function" ? anchorEl.getBoundingClientRect() : null;
@@ -11110,7 +11143,12 @@ class NtfyManagerView extends ItemView {
   openSourceTimePicker(reminder, anchorEl = null, parsedDue = null) {
     const save = async (nextDue) => {
       await this.plugin.updateSourceReminderDue(reminder, nextDue);
+      // v2.0.0: 等一拍让 vault.modify 的 modify 事件落地，再失效缓存 + 重扫 + 重绘，
+      // 否则当前行显示的还是旧值，看着像「没生效」。
+      await new Promise((resolve) => window.setTimeout(resolve, 60));
+      this.plugin.bumpVaultScanRevision();
       await this.refreshTaskCaches();
+      await this.render();
     };
     if (parsedDue instanceof Date && !Number.isNaN(parsedDue.getTime())) return save(parsedDue);
     this.openDateTimePicker(reminder.due, save, anchorEl);

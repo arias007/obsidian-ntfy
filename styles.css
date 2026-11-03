@@ -2148,12 +2148,21 @@ input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-minute-field {
   opacity: 1 !important;
   font-weight: 600 !important;
 }
-/* 日历图标跟着字色反白，避免在实心底色上变成一块黑点 */
+/* ★ 隐藏原生的日历/下拉按钮。
+   它在 Android WebView 上渲染成一个「⌄」箭头，既拉宽了框（比胶囊宽 27px），
+   又和胶囊外观不一致。插件在打开时已经自动调 showPicker()，不需要这个按钮。 */
 input.obsidian-ntfy-date-time-editor::-webkit-calendar-picker-indicator {
-  filter: brightness(0) invert(1);
-  opacity: 0.8;
-  padding: 0;
-  margin-left: -4px;
-  width: 11px;
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+/* 去掉原生控件为箭头预留的额外内边距 */
+input.obsidian-ntfy-date-time-editor {
+  -webkit-appearance: none !important;
+  appearance: none !important;
 }
 

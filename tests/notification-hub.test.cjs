@@ -266,9 +266,17 @@ async function run() {
   // 7) 行号定位（DOM 文字和源码不一致，必须靠序号）
   assert.match(source, /span\.dataset\.ordinal/);
   assert.match(source, /span\.dataset\.sectionStart/);
-  assert.match(source, /displaySpan\.addEventListener\("click"[\s\S]*?this\.openDateTimePicker\(due/);
+  // 2.0.0：面板点胶囊改成弹层（胶囊不再被换成 <input>，避免撑变形、也支持改到过去）
+  assert.match(source, /displaySpan\.addEventListener\("click"[\s\S]*?new NtfyReadingDateModal\(/);
+  // 2.0.0：允许把日期改到过去，因此不再设 input.min
+  assert.doesNotMatch(source, /^\s*input\.min = this\.plugin\.formatDateTimeLocal/m);
+  // 2.0.0：写回必须失效扫描缓存（否则 2 秒快照导致「改了没生效」）
+  assert.match(source, /this\.bumpVaultScanRevision\(\);\n    if \(!wasIgnored\) await this\.scanAndSchedule/);
+  // 2.0.0：面板改完要重绘当前页
+  assert.match(source, /await this\.refreshTaskCaches\(\);\n      await this\.render\(\);/);
+  // 2.0.0：明确指定的标记优先，行里没有就追加（不偷改另一个）
+  assert.match(source, /const isConvert = Boolean\(retagFrom\)/);
   assert.match(source, /input\.showPicker\(\)/);
-  assert.match(source, /input\.min = this\.plugin\.formatDateTimeLocal\(todayStart\)/);
   assert.match(source, /openSourceTimePicker\(reminder, anchorEl = null, parsedDue = null\)/);
   assert.match(source, /openQueueTimePicker\(item, anchorEl = null, parsedDue = null\)/);
   assert.doesNotMatch(source, /openSourceTimeModal\(/);

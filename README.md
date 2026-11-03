@@ -15,6 +15,17 @@ This is a lightweight Obsidian plugin for ntfy notifications and optional AI web
 
 Why ntfy: Obsidian mobile plugins cannot directly create Android system notifications. This plugin sends reminders to an ntfy topic, and the Android ntfy app shows the notification in the system notification shade.
 
+## 2.0.0
+
+### 修复
+- **可以改到过去了**：原先日期选择器设了 `min=今天`，且遇到过去时间会自动改成「现在+30 分钟」。现在两个限制都去掉，补记历史、纠正录错的日期都能用。
+- **改起始/截止不再有时不生效**，三处原因一起修：
+  - 写回后没有让扫描缓存失效（2 秒快照），紧接着重绘读到旧数据 → 现在写回即 `bumpVaultScanRevision()`
+  - 面板上点「起始」时，如果这一行还没有 🛫，会退回改 📅（等于改错）→ 现在**追加**该标记，原有标记一字不动
+  - 改完只刷新缓存不重绘 → 现在会 `render()` 当前页
+- **面板点日期改成弹层编辑**：胶囊不再被替换成原生 `<input>`（它自带一个「⌄」按钮且有约 26px 固有宽度，一编辑就把这一行撑变形），胶囊本身永远保持原样。
+- **弹层里的起始/截止切换是「转换」**：把旧标记整个换成新的；而面板上分别点两个胶囊是「各自独立改」。
+
 ## 1.9.2
 
 - **修复**：面板里点日期的编辑框外观与旁边的胶囊统一 —— 同样的 22px 高度、999px 圆角、以及按状态来的红/琥珀/绿底色配白字，不再是一个突兀的白底大框。
