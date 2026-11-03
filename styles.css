@@ -2082,3 +2082,35 @@
 .obsidian-ntfy-task-time.obsidian-ntfy-time-due {
   color: #fff !important;
 }
+
+/* ★ v1.9.0 修复：面板里点日期进入编辑态时，input 的 className 是从锚点复制过来的，
+   会带上 obsidian-ntfy-time-due，于是被「截止文字一律白色」的规则打成白底白字 → 看着是空白框。
+   这里用更高优先级把编辑态强制改回深色字。 */
+input.obsidian-ntfy-date-time-editor,
+input.obsidian-ntfy-task-time.obsidian-ntfy-date-time-editor,
+input.obsidian-ntfy-date-time-editor.obsidian-ntfy-time-due {
+  color: var(--text-normal) !important;
+  -webkit-text-fill-color: var(--text-normal) !important;
+  background-color: var(--background-primary) !important;
+  border-color: var(--interactive-accent) !important;
+  min-width: 168px !important;
+  width: auto !important;
+  max-width: min(100%, 22rem) !important;
+  height: 30px !important;
+  min-height: 30px !important;
+  font-size: 0.82em !important;
+  padding: 3px 8px !important;
+  field-sizing: content;
+}
+input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit,
+input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-fields-wrapper,
+input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-text,
+input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-year-field,
+input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-month-field,
+input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-day-field,
+input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-hour-field,
+input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-minute-field {
+  color: var(--text-normal) !important;
+  -webkit-text-fill-color: var(--text-normal) !important;
+  opacity: 1 !important;
+}
