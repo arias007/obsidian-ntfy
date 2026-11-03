@@ -868,12 +868,17 @@
   border-radius: 8px !important;
   box-sizing: border-box;
   color: var(--text-normal) !important;
-  flex: 0 1 200px;
-  height: 28px;
+  flex: 0 0 auto;
+  height: 22px !important;
+  min-height: 22px !important;
   cursor: pointer;
   min-width: 0 !important;
-  max-width: 100%;
-  width: min(100%, 200px);
+  max-width: 150px;
+  -webkit-appearance: auto !important;
+  width: auto;
+  field-sizing: content;
+  padding: 2px 4px;
+  font-size: 0.76em;
   /* The native datetime control already reserves space for its calendar
      indicator.  A text-indent on top of that reservation clips the time
      segments on narrow/mobile panes and leaves an unnecessary blank gutter. */
@@ -904,6 +909,9 @@
 .obsidian-ntfy-date-time-input::-webkit-calendar-picker-indicator {
   cursor: pointer;
   opacity: 1;
+  margin-left: -2px;
+  padding: 0 2px;
+  width: 14px;
 }
 
 /* Use the semantic status colour on the frame only.  Keeping the interior
@@ -933,9 +941,9 @@
 }
 
 .obsidian-ntfy-task-time-soon {
-  background: #facc15;
-  border-color: #facc15;
-  color: #1f2937;
+  background: #d99e00;
+  border-color: #d99e00;
+  color: #fff !important;
 }
 
 .obsidian-ntfy-task-time-future {
@@ -1873,4 +1881,204 @@
 /* 输入栏脱流后给消息区补底部留白，最新消息停在输入栏上方而不是键盘后面 */
 .obsidian-ntfy-manager.is-keyboard-layout-locked .obsidian-ntfy-chat-messages {
   padding-bottom: calc(var(--ntfy-composer-bottom, 0px) + var(--ntfy-keyboard-lock-pad, 64px));
+}
+
+/* ===== v1.9.0 待办增强 ===== */
+
+/* v1.9.0: 语义着色统一由文件末尾那段管（截止白字、起始绿字、无描边） */
+
+/* 排序切换条 */
+.obsidian-ntfy-sortbar {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  margin: 0 0 6px;
+  flex-wrap: wrap;
+}
+.obsidian-ntfy-sortbtn {
+  font-size: 11.5px !important;
+  padding: 0 11px !important;
+  min-height: 0 !important;
+  height: 25px !important;
+  line-height: 25px !important;
+  border-radius: 999px !important;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  cursor: pointer;
+  line-height: 1.5;
+}
+.obsidian-ntfy-sortbtn:hover {
+  color: var(--text-normal);
+  border-color: var(--interactive-accent);
+}
+.obsidian-ntfy-sortbtn.is-active {
+  background: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+  color: var(--text-on-accent, #fff);
+  font-weight: 600;
+}
+
+/* 阅读视图里可点击的日期 */
+/* v1.9.0: 阅读视图里只有图标可点，日期文字原样保留给别的插件用 */
+.obsidian-ntfy-reading-date {
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 0 2px;
+  margin: 0 1px;
+  background: var(--background-modifier-hover);
+  transition: background 0.12s ease;
+}
+.obsidian-ntfy-reading-date::after {
+  content: "✎";
+  font-size: 0.72em;
+  margin-left: 2px;
+  opacity: 0.55;
+}
+.obsidian-ntfy-reading-date:hover {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent, #fff);
+}
+.obsidian-ntfy-reading-date:hover::after {
+  opacity: 1;
+}
+.obsidian-ntfy-reading-date-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+  left: 0;
+  top: 0;
+}
+
+/* v1.9.0: 起始时间 —— 小号 inline 文字，不能跟截止的可编辑胶囊一样大 */
+.obsidian-ntfy-task-start {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 10.5px;
+  line-height: 1.4;
+  padding: 0 5px;
+  margin-right: 6px;
+  border-radius: 6px;
+  background: var(--background-modifier-hover);
+  white-space: nowrap;
+  vertical-align: middle;
+}
+/* v1.9.0: 起始时间统一标绿（「开始」语义），不随排序基准变 */
+.obsidian-ntfy-task-start,
+.obsidian-ntfy-task-start.is-green {
+  color: var(--text-success, #3fb950);
+  font-weight: 600;
+}
+.obsidian-ntfy-task-start::before {
+  content: "🛫";
+  font-size: 9px;
+  opacity: 0.75;
+}
+.obsidian-ntfy-task-start.is-editable {
+  cursor: pointer;
+}
+.obsidian-ntfy-task-start.is-editable:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-border);
+}
+
+/* v1.9.0: 截止时间文字一律白色（不管底色），不加任何描边/阴影 —— 简洁优先。
+   底色仍然按 过期红 / 临近黄 / 未来绿 区分。 */
+.obsidian-ntfy-task-time.obsidian-ntfy-time-due,
+.obsidian-ntfy-item .obsidian-ntfy-time-due {
+  color: #fff !important;
+  font-weight: 600;
+}
+/* 黄色底也统一白字（用户要求：文字统一白色，不用管背景） */
+.obsidian-ntfy-task-time.obsidian-ntfy-task-time-soon.obsidian-ntfy-time-due {
+  color: #fff !important;
+}
+/* 起始时间常绿 */
+.obsidian-ntfy-task-start,
+.obsidian-ntfy-task-start.is-green {
+  color: var(--text-success, #3fb950);
+  font-weight: 600;
+}
+
+/* 截止时间前面也加 📅，跟起始的 🛫 对称 */
+.obsidian-ntfy-task-time.obsidian-ntfy-time-due::before {
+  content: "📅 ";
+  font-size: 0.9em;
+  font-weight: 400;
+}
+.obsidian-ntfy-task-time.obsidian-ntfy-time-start::before {
+  content: none;
+}
+
+/* v1.9.0: 时间胶囊用紧凑文本后，整行不该再换行。
+   只收紧 gap 和允许收缩，不强制 nowrap —— 屏幕太窄时仍能优雅换行。 */
+.obsidian-ntfy-task-actions {
+  min-width: 0;
+  gap: 4px;
+}
+.obsidian-ntfy-task-actions .obsidian-ntfy-task-time {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.76em;
+  height: 22px;
+  min-height: 22px;
+  padding: 2px 7px;
+}
+
+/* v1.9.0: 阅读视图时间选择弹层 */
+.obsidian-ntfy-reading-picker h3 {
+  margin: 0 0 12px;
+  font-size: 16px;
+}
+.obsidian-ntfy-reading-picker-input {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 15px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+}
+.obsidian-ntfy-reading-picker-bar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/* v1.9.0: 弹层里的「起始/截止」切换按钮 */
+.obsidian-ntfy-reading-picker-kind {
+  display: flex;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+.obsidian-ntfy-reading-kind-btn {
+  flex: 1;
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+.obsidian-ntfy-reading-kind-btn.is-active {
+  background: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+  color: var(--text-on-accent, #fff);
+  font-weight: 600;
+}
+
+/* ★ 用户要求：截止时间文字一律白色，不随底色变化 */
+.obsidian-ntfy-time-due,
+.obsidian-ntfy-time-due *,
+.obsidian-ntfy-task-time.obsidian-ntfy-time-due {
+  color: #fff !important;
 }

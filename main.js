@@ -700,6 +700,10 @@ const DEFAULT_SETTINGS = {
   socialHubEnabled: true,
   defaultChannelId: "ntfy",
   addedChannelIds: ["ntfy"],
+  // v1.9.0: 待办排序基准（start 默认）、someday 标签名、标签→渠道规则
+  taskSortBasis: "start",
+  somedayTag: "someday",
+  tagChannelRules: "",
   channelAccounts: [],
   retiredChannelAccounts: [],
   ntfyChannelEnabled: true,
@@ -919,8 +923,275 @@ function ntfyBase64ToBytes(value) {
   return bytes;
 }
 
+
+// v1.9.0: 阅读视图专用时间选择弹层。
+// 不在正文里塞 <input>，正文一行都不动，改的是文件内容。
+class NtfyReadingDateModal extends Modal {
+  constructor(app, uiText, currentValue, onSave, initialSignifier = "📅") {
+    super(app);
+    this.uiText = uiText;
+    this.currentValue = currentValue;
+    this.onSave = onSave;
+    this.input = null;
+    this.signifier = initialSignifier || "📅";
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("obsidian-ntfy-reading-picker");
+    contentEl.createEl("h3", { text: this.uiText("修改日期时间", "Edit date and time") });
+    const input = contentEl.createEl("input", {
+      cls: "obsidian-ntfy-reading-picker-input",
+      attr: { type: "datetime-local" },
+    });
+    input.value = this.currentValue;
+    this.input = input;
+
+    // v1.9.0: 起始 🛫 / 截止 📅 切换 —— 允许把这个日期在两种语义之间转换
+    const kindBar = contentEl.createDiv({ cls: "obsidian-ntfy-reading-picker-kind" });
+    const kindButtons = [];
+    for (const option of [
+      { sig: "🛫", zh: "起始", en: "Start" },
+      { sig: "📅", zh: "截止", en: "Due" },
+    ]) {
+      const btn = kindBar.createEl("button", {
+        cls: `obsidian-ntfy-reading-kind-btn${this.signifier === option.sig ? " is-active" : ""}`,
+        text: `${option.sig} ${this.uiText(option.zh, option.en)}`,
+      });
+      kindButtons.push({ btn, sig: option.sig });
+      btn.addEventListener("click", () => {
+        this.signifier = option.sig;
+        for (const item of kindButtons) item.btn.toggleClass("is-active", item.sig === option.sig);
+      });
+    }
+
+    const bar = contentEl.createDiv({ cls: "obsidian-ntfy-reading-picker-bar" });
+    const saveBtn = bar.createEl("button", { cls: "mod-cta", text: this.uiText("保存", "Save") });
+    const cancelBtn = bar.createEl("button", { text: this.uiText("取消", "Cancel") });
+    const submit = async () => {
+      const value = input.value;
+      if (!value) return;
+      const target = this.signifier;
+      this.close();
+      try {
+        await this.onSave(value, target);
+      } catch (error) {
+        console.error(`${PLUGIN_NAME}: reading date save failed`, error);
+        new Notice(`${PLUGIN_NAME}: ${this.uiText("日期更新失败", "date update failed")}`);
+      }
+    };
+    saveBtn.addEventListener("click", submit);
+    cancelBtn.addEventListener("click", () => this.close());
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") submit();
+      if (event.key === "Escape") this.close();
+    });
+    window.setTimeout(() => {
+      try {
+        input.focus({ preventScroll: true });
+      } catch (_) { /* 有的 WebView 不给 focus */ }
+    }, 50);
+  }
+
+  onClose() {
+    this.contentEl.empty();
+  }
+}
+
 module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
+  // v1.9.0: 取「标题」= 第一个日期标记之前的内容，并归一化成「渲染后的样子」。
+  // ★ 日期不是唯一键（同一个 🛫 2026-10-20 可能出现在好几条待办里），标题才是。
+  // ★★ 必须去掉 checkbox / markdown 标记：DOM 里这些都不存在，
+  //    不归一化的话「- [ ] 周2 #日记 **早**报」永远对不上「周2 #日记 早报」。
+  taskTitleOf(text) {
+    return String(text || "")
+      .split(/[🛫📅⏳➕✅✓❌]/u)[0]
+      .replace(/^\s*[-*+]\s+\[[^\]]\]\s*/u, "")   // 去 checkbox 前缀
+      .replace(/!?\[([^\]]*)\]\([^)]*\)/gu, "$1")  // [文字](链接) / ![图](路径) -> 文字
+      .replace(/[*_~`]/gu, "")                        // 去 markdown 强调符
+      .replace(/\s+/gu, " ")                          // 空白归一
+      .trim();
+  }
+
+  // v1.9.0: 把阅读视图里的日期标记包成可点 span（真编辑器里不动，避免和实时预览抢编辑）
+  decorateReadingDates(el, ctx) {
+    try {
+      const path = String((ctx && ctx.sourcePath) || "").replace(/\\/g, "/");
+      if (!path || !/\.md$/i.test(path)) return;
+      if (!this.app.vault.getAbstractFileByPath(path)) return;
+      // v1.9.0: 只把图标包成可点，日期文字原样留着（virtual-linker 等要用）
+      const pattern = /(🛫|📅|⏳)(?=\s*\d{4}-\d{2}-\d{2})/gu;
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+      const nodes = [];
+      while (walker.nextNode()) {
+        const node = walker.currentNode;
+        if (!node.nodeValue) continue;
+        pattern.lastIndex = 0;
+        if (pattern.test(node.nodeValue)) nodes.push(node);
+      }
+      // ★ 行号直出：本块起始行 + 本块内第几个日期标记 = 绝对行号
+      let sectionStart = -1;
+      try {
+        const info = typeof ctx.getSectionInfo === "function" ? ctx.getSectionInfo(el) : null;
+        if (info && Number.isFinite(info.lineStart)) sectionStart = info.lineStart;
+      } catch (_) { /* 非文件视图 */ }
+      let ordinal = 0;   // 本块内第几个日期标记（跨文本节点累计）
+
+      for (const node of nodes) {
+        const text = node.nodeValue;
+        const frag = document.createDocumentFragment();
+        let last = 0;
+        pattern.lastIndex = 0;
+        for (const match of text.matchAll(pattern)) {
+          if (match.index > last) frag.appendText(text.slice(last, match.index));
+          const span = document.createElement("span");
+          span.className = "obsidian-ntfy-reading-date";
+          span.textContent = match[1];
+          span.dataset.signifier = match[1];
+          span.dataset.bound = "0";
+          span.title = "点击修改这个日期";
+          // ★ 记「本块第几个日期标记 + 本块起始行」，点击时直接算出绝对行号。
+          //   比拿标题猜可靠得多（DOM 里 **粗体** 和 [链接]() 都被渲染掉了，跟源码对不上）。
+          span.dataset.ordinal = String(ordinal);
+          span.dataset.sectionStart = String(sectionStart);
+          ordinal += 1;
+          frag.appendChild(span);
+          last = match.index + match[0].length;
+        }
+        if (last < text.length) frag.appendText(text.slice(last));
+        const parent = node.parentNode;
+        if (!parent) continue;
+        parent.replaceChild(frag, node);
+        for (const span of parent.querySelectorAll(".obsidian-ntfy-reading-date")) {
+          if (span.dataset.bound === "1") continue;
+          span.dataset.bound = "1";
+          span.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            this.openReadingDatePicker(path, span);
+          });
+        }
+      }
+    } catch (error) {
+      console.warn(`${PLUGIN_NAME}: reading date decorate failed`, error);
+    }
+  }
+
+  async openReadingDatePicker(path, span) {
+    try {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!file) return;
+      const content = await this.app.vault.read(file);
+      const lines = content.split(/\r?\n/);
+      const signifier = span.dataset.signifier || "📅";
+      // 图标后面那段时间文本就是定位依据
+      const anchor = span.nextSibling && span.nextSibling.nodeValue ? String(span.nextSibling.nodeValue) : "";
+      const dateMatch = anchor.match(/^\s*(\d{4}-\d{2}-\d{2}(?:[\sT　]\d{1,2}:\d{2})?)/);
+      const raw = dateMatch ? dateMatch[1] : "";
+      const sameLine = raw
+        ? new RegExp(`${signifier}\\s*${raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "u")
+        : new RegExp(`${signifier}\\s*\\d{4}-\\d{2}-\\d{2}`, "u");
+      // ★★ 行号直出：本块起始行之后，数「第 ordinal 个日期标记」落在哪一行。
+      //   渲染顺序等于源码顺序，这个对应关系最稳。
+      const ordinal = Number(span.dataset.ordinal);
+      const sectionStart = Number(span.dataset.sectionStart);
+      const hasOrdinal = Number.isFinite(ordinal) && ordinal >= 0 && Number.isFinite(sectionStart) && sectionStart >= 0;
+      let lineIndex = -1;
+      if (hasOrdinal) {
+        const markRe = new RegExp(`(?:🛫|📅|⏳)\\s*\\d{4}-\\d{2}-\\d{2}`, "gu");
+        let count = 0;
+        for (let i = sectionStart; i < lines.length; i += 1) {
+          const found = lines[i].match(markRe);
+          if (found) {
+            if (count + found.length > ordinal) { lineIndex = i; break; }
+            count += found.length;
+          }
+          // 已经越过本块范围（往下 60 行还没数到就放弃）
+          if (i - sectionStart > 60) break;
+        }
+        // ★ 三重校验，任何一条不满足就弃用行号法（防止 lineStart 是 0 基/1 基/整文件这三种语义）
+        if (lineIndex >= 0) {
+          const hit = lines[lineIndex] || "";
+          const okSignifier = hit.includes(signifier);
+          const okDate = !raw || hit.includes(raw);
+          // 同一行里这个标记的位置，必须正好对应 raw（防止「同一行两个日期但点错了」）
+          const okLineHas = okSignifier && okDate;
+          if (!okLineHas) lineIndex = -1;
+        }
+      }
+      // 行号法失败才退回标题
+      const wantTitle = this.taskTitleOf(span.dataset.taskTitle || "");
+      const isTaskLine = (s) => /^\s*[-*+]\s+\[[^\]]\]/.test(s);
+      const rangeStart = Number(span.dataset.lineStart);
+      const rangeEnd = Number(span.dataset.lineEnd);
+      const hasRange = Number.isFinite(rangeStart) && Number.isFinite(rangeEnd) && rangeEnd >= rangeStart;
+
+      // ① 标题完全一致（行号法失败时的退路）
+      if (lineIndex < 0 && wantTitle) {
+        for (let i = 0; i < lines.length; i += 1) {
+          if (!isTaskLine(lines[i])) continue;
+          if (this.taskTitleOf(lines[i]) === wantTitle) { lineIndex = i; break; }
+        }
+      }
+      // ② 标题 + 该日期都出现（标题被截断时的退路）
+      if (lineIndex < 0 && wantTitle) {
+        for (let i = 0; i < lines.length; i += 1) {
+          if (!isTaskLine(lines[i])) continue;
+          if (this.taskTitleOf(lines[i]).startsWith(wantTitle) && sameLine.test(lines[i])) { lineIndex = i; break; }
+        }
+      }
+      // ③ section 范围里找该日期
+      if (lineIndex < 0 && hasRange) {
+        for (let i = Math.max(0, rangeStart); i <= Math.min(lines.length - 1, rangeEnd); i += 1) {
+          if (isTaskLine(lines[i]) && sameLine.test(lines[i])) { lineIndex = i; break; }
+        }
+      }
+      // ④ 全文兜底
+      if (lineIndex < 0) {
+        for (let i = 0; i < lines.length; i += 1) {
+          if (!isTaskLine(lines[i])) continue;
+          if (sameLine.test(lines[i])) { lineIndex = i; break; }
+        }
+      }
+      if (lineIndex < 0) {
+        new Notice(`${PLUGIN_NAME}: ${this.uiText("找不到对应行", "source line not found")}`);
+        return;
+      }
+      const line = lines[lineIndex];
+      const parsed = line.match(new RegExp(`${signifier}\\s*(\\d{4})-(\\d{2})-(\\d{2})(?:[\\sT　](\\d{1,2}:\\d{2}))?`, "u"));
+      if (!parsed) return;
+      const currentDue = this.parseLocalDateTime(parsed[1], parsed[2], parsed[3], parsed[4] || this.settings.defaultTime || "08:00");
+      const reminder = {
+        filePath: path,
+        lineNumber: lineIndex + 1,
+        text: line,
+        signifier,
+      };
+      // v1.9.0: 用 Modal，不往正文里塞 input（原来那版会把原生日历控件长在笔记里）
+      const currentText = currentDue instanceof Date && !Number.isNaN(currentDue.getTime())
+        ? this.formatDateTimeLocal(currentDue)
+        : this.formatDateTimeLocal(new Date());
+      new NtfyReadingDateModal(this.app, (zh, en) => this.uiText(zh, en), currentText, async (value, targetSignifier) => {
+        const next = this.parseDateTimeLocal(value);
+        if (!next) {
+          new Notice(`${PLUGIN_NAME}: ${this.uiText("日期或时间无效", "invalid date/time")}`);
+          return;
+        }
+        await this.updateSourceReminderDue(
+          Object.assign({}, reminder, { signifier: targetSignifier || signifier, retagFrom: signifier }),
+          next
+        );
+        this.bumpVaultScanRevision();
+        await this.scanAndSchedule({ showNotice: false });
+      }, signifier).open();
+    } catch (error) {
+      console.warn(`${PLUGIN_NAME}: reading date picker failed`, error);
+    }
+  }
+
   async onload() {
+    // v1.9.0: 阅读视图里让 🛫/📅/⏳ 的日期可点击修改
+    this.registerMarkdownPostProcessor((el, ctx) => this.decorateReadingDates(el, ctx));
     const storedSettings = await this.loadData();
     this.settings = this.normalizeSettings(storedSettings);
     this.localReminderTimer = null;
@@ -6409,7 +6680,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const ignored = this.settings.ignoredReminders || {};
     return reminders
       .filter((reminder) => !queueIds.has(reminder.key) && !sent[reminder.key] && !ignored[reminder.key])
-      .sort((a, b) => a.due.getTime() - b.due.getTime());
+      .sort((a, b) => this.taskSortTime(a) - this.taskSortTime(b));
   }
 
   async collectNotificationTasks() {
@@ -6418,6 +6689,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const sent = this.settings.sent || {};
     const ignored = this.settings.ignoredReminders || {};
     return reminders
+      // v1.9.0: 打了 #someday 的从「待处理」移除（它不再是「待办」，是「以后再说」）。
+      // 注意只影响待处理列表，整库待办分组保持不变。
+      .filter((reminder) => !reminder.someday)
       .map((reminder) => Object.assign({}, reminder, {
         notificationState: ignored[reminder.key]
           ? "ignored"
@@ -6429,7 +6703,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
             : "delivered"
           : "pending",
       }))
-      .sort((a, b) => a.due.getTime() - b.due.getTime());
+      .sort((a, b) => this.taskSortTime(a) - this.taskSortTime(b));
   }
 
   bumpVaultScanRevision() {
@@ -6482,7 +6756,7 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       };
       await Promise.all(Array.from({ length: workerCount }, () => readFile()));
 
-      reminders.sort((a, b) => a.due.getTime() - b.due.getTime());
+      reminders.sort((a, b) => this.taskSortTime(a) - this.taskSortTime(b));
       vaultTasks.sort((a, b) => {
         if (a.completed !== b.completed) return a.completed ? 1 : -1;
         if (a.completed && b.completed) {
@@ -6490,7 +6764,9 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
           const bDone = b.doneAt ? b.doneAt.getTime() : 0;
           if (aDone !== bDone) return bDone - aDone;
         }
-        if (a.due && b.due) return a.due.getTime() - b.due.getTime();
+        const aSort = this.taskSortTime(a);
+        const bSort = this.taskSortTime(b);
+        if (aSort !== bSort) return aSort - bSort;
         if (a.due && !b.due) return -1;
         if (!a.due && b.due) return 1;
         return a.filePath.localeCompare(b.filePath) || a.lineNumber - b.lineNumber;
@@ -6813,9 +7089,21 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const delayedLine = this.extractDelayedLine(String(currentLine).trim());
     const inlineDelay = this.extractInlineDelay(currentLine);
     let nextLine = currentLine;
+    const wantedSignifier = String(reminder.signifier || "").trim();
     if (tasksDate) {
-      const pattern = new RegExp(`(${tasksDate.signifier}\\s*)\\d{4}-\\d{2}-\\d{2}(?:[\\sT　]\\d{1,2}:\\d{2})?`, "u");
-      nextLine = currentLine.replace(pattern, `$1${dateTimeText}`);
+      // v1.9.0: 指定标记（阅读视图点 🛫 就只改 🛫），没指定则沿用原来的优先级行为
+      const preferred = wantedSignifier && new RegExp(`${wantedSignifier}\\s*\\d{4}-\\d{2}-\\d{2}`, "u").test(currentLine)
+        ? wantedSignifier
+        : tasksDate.signifier;
+      // v1.9.0: 目标标记和原标记不同 = 换语义（🛫 ↔ 📅）
+      const targetSignifier = String(reminder.signifier || preferred).trim() || preferred;
+      const pattern = new RegExp(`(${preferred}\\s*)\\d{4}-\\d{2}-\\d{2}(?:[\\sT　]\\d{1,2}:\\d{2})?`, "u");
+      const keep = targetSignifier === preferred ? preferred : targetSignifier;
+      // prefix 是「原标记 + 空白」，换语义时只替换标记，空白保留原样
+      nextLine = currentLine.replace(pattern, (whole, prefix) => {
+        const gap = (String(prefix).match(/\s*$/) || [""])[0] || " ";
+        return `${keep}${gap}${dateTimeText}`;
+      });
     } else if (delayedLine) {
       const indent = (currentLine.match(/^\s*/) || [""])[0];
       nextLine = `${indent}ntfy:: ${dateTimeText} ${delayedLine.text || "Obsidian reminder"}`;
@@ -7110,6 +7398,14 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const taskStatus = taskMatch ? taskMatch[1] : "";
     const uncheckedTask = isTaskLine && taskStatus !== "x" && taskStatus !== "X";
     const tasksDate = this.settings.includeTasksPluginDates ? this.extractTasksDate(raw) : null;
+    // v1.9.0: 待处理列表也要拿到 🛫 起始，否则起始时间永远显示不出来
+    const allDates = this.settings.includeTasksPluginDates ? this.extractTasksDates(raw) : { start: null, due: null, scheduled: null };
+    const startInfo = allDates.start || null;
+    const startDate = startInfo
+      ? this.parseLocalDateTime(startInfo.dateText.slice(0, 4), startInfo.dateText.slice(5, 7), startInfo.dateText.slice(8, 10), startInfo.timeText)
+      : null;
+    const somedayTagName = String(this.settings.somedayTag || "someday").replace(/^#/, "");
+    const isSomeday = new RegExp(`#${somedayTagName}(?![\\p{L}\\p{N}_-])`, "iu").test(raw);
     const delayedLine = this.extractDelayedLine(raw);
     const inlineDelay = isTaskLine ? this.extractInlineDelay(raw) : null;
     const delay = delayedLine || inlineDelay;
@@ -7197,6 +7493,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       lineNumber,
       source: delay ? "ntfy:delay" : tasksDate ? `tasks:${tasksDate.label}` : diaryDate ? "diary-task" : "obsidian-ntfy",
       isDelay: Boolean(delay),
+      start: startDate,
+      hasStartTime: Boolean(startInfo && startInfo.hasTime),
+      startDateText: startInfo ? startInfo.dateText : "",
+      someday: isSomeday,
       hasExplicitTime,
     };
   }
@@ -7209,6 +7509,13 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     const completed = status === "x" || status === "X";
     const body = String(taskMatch[2] || "").trim();
     const tasksDate = this.settings.includeTasksPluginDates ? this.extractTasksDate(body) : null;
+    const allTaskDates = this.settings.includeTasksPluginDates ? this.extractTasksDates(body) : { start: null, due: null, scheduled: null };
+    const startInfo = allTaskDates.start || null;
+    const startDate = startInfo
+      ? this.parseLocalDateTime(startInfo.dateText.slice(0, 4), startInfo.dateText.slice(5, 7), startInfo.dateText.slice(8, 10), startInfo.timeText)
+      : null;
+    const somedayTagName = String(this.settings.somedayTag || "someday").replace(/^#/, "");
+    const isSomeday = new RegExp(`#${somedayTagName}(?![\\p{L}\\p{N}_-])`, "iu").test(body);
     const doneDate = this.extractTasksDateByLabel(body, "done");
     const explicitDateMatch = body.match(DATE_TIME_RE);
     const timePrefix = body.match(TIME_PREFIX_RE);
@@ -7244,6 +7551,10 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
       text: cleanedText || body || "Task",
       filePath,
       lineNumber,
+      start: startDate,
+      hasStartTime: Boolean(startInfo && startInfo.hasTime),
+      startDateText: startInfo ? startInfo.dateText : "",
+      someday: isSomeday,
       source: tasksDate ? `tasks:${tasksDate.label}` : diaryDate ? "diary-task" : explicitDateMatch ? "task-date" : "task",
       hasExplicitTime: Boolean((tasksDate && tasksDate.hasTime) || (explicitDateMatch && explicitDateMatch[4]) || (diaryDate && timePrefix)),
     };
@@ -7294,6 +7605,89 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
     if (suffix === "h" || suffix === "hr" || suffix === "hour" || suffix === "hours" || suffix === "小时" || suffix === "时") return amount * 3600;
     if (suffix === "d" || suffix === "day" || suffix === "days" || suffix === "天") return amount * 86400;
     return null;
+  }
+
+  // v1.9.0: 排序基准。按起始时没起始的用截止参与排序，反之亦然 —— 全部照常列出。
+  // 注意：这几个方法必须留在插件主类 —— 排序发生在上面的 collect*/scan* 里，
+  // 而 someday / 标签渠道由视图通过 this.plugin 调用。放视图里会 this 不匹配。
+  taskSortTime(task) {
+    if (!task) return Number.MAX_SAFE_INTEGER;
+    const basis = this.settings && this.settings.taskSortBasis === "due" ? "due" : "start";
+    const primary = basis === "due" ? task.due : task.start || task.due;
+    const fallback = basis === "due" ? task.start || task.due : task.due;
+    const value = primary || fallback;
+    const time = value instanceof Date ? value.getTime() : value ? new Date(value).getTime() : NaN;
+    return Number.isNaN(time) ? Number.MAX_SAFE_INTEGER : time;
+  }
+
+  // v1.9.0: someday 标签开合（幂等）。加了 #someday 的待办会从「有时间」移到「整库待办」。
+  async toggleSomedayTask(filePath, lineNumber) {
+    const path = String(filePath || "").replace(/\\/g, "/");
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!file) throw new Error("source not found");
+    const content = await this.app.vault.read(file);
+    const lines = content.split(/\r?\n/);
+    const index = Math.max(0, Number(lineNumber || 1) - 1);
+    const line = lines[index];
+    if (line === undefined) throw new Error("line not found");
+    const tag = String(this.settings.somedayTag || "someday").replace(/^#/, "");
+    const re = new RegExp(`\\s*#${tag}(?![\\p{L}\\p{N}_-])`, "giu");
+    const wasSomeday = re.test(line);
+    re.lastIndex = 0;
+    const next = wasSomeday
+      ? line.replace(re, "").replace(/\s{2,}/g, " ").trimEnd()
+      : `${line.trimEnd()} #${tag}`;
+    if (next === line) return { changed: false, someday: wasSomeday };
+    lines[index] = next;
+    await this.app.vault.modify(file, lines.join("\n"));
+    this.bumpVaultScanRevision();
+    await this.scanAndSchedule({ showNotice: false });
+    return { changed: true, someday: !wasSomeday };
+  }
+
+  // v1.9.0: 标签 → 渠道规则解析（每行 "标签=渠道[,渠道]"）
+  parseTagChannelRules() {
+    const out = [];
+    for (const line of String(this.settings.tagChannelRules || "").split(/\r?\n/)) {
+      const m = line.match(/^\s*([^=\s][^=]*?)\s*=\s*(.+?)\s*$/);
+      if (!m) continue;
+      const tag = m[1].replace(/^#/, "").trim();
+      const channels = m[2].split(/[,，\s]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
+      if (tag && channels.length) out.push({ tag, channels });
+    }
+    return out;
+  }
+
+  // v1.9.0: 命中的标签取并集；一条都没命中返回 []（调用方回退默认渠道）
+  resolveTagChannelIds(text) {
+    const rules = this.parseTagChannelRules();
+    if (!rules.length) return [];
+    const tags = (String(text || "").match(/#[^\s#,，。:：]+/gu) || []).map((t) => t.slice(1).toLowerCase());
+    const ids = [];
+    for (const rule of rules) {
+      if (!tags.includes(rule.tag.toLowerCase())) continue;
+      for (const id of rule.channels) if (!ids.includes(id)) ids.push(id);
+    }
+    return ids;
+  }
+
+  // v1.9.0: 一次拿到全部日期标记（start/due/scheduled），不再只挑一个。
+  // 原来的 extractTasksDate 保持不动，所有既有调用点行为不变。
+  extractTasksDates(raw) {
+    const out = { start: null, due: null, scheduled: null };
+    const body = String(raw || "");
+    for (const match of body.matchAll(TASKS_DATE_RE)) {
+      const signifier = match[1];
+      const key = signifier === "🛫" ? "start" : signifier === "📅" ? "due" : signifier === "⏳" ? "scheduled" : null;
+      if (!key || out[key]) continue;
+      out[key] = {
+        signifier,
+        dateText: `${match[2]}-${match[3]}-${match[4]}`,
+        timeText: match[5] || this.settings.defaultTime || "08:00",
+        hasTime: Boolean(match[5]),
+      };
+    }
+    return out;
   }
 
   extractTasksDate(raw) {
@@ -7370,7 +7764,13 @@ module.exports = class AndroidNtfyNotifierPlugin extends Plugin {
 
   async publishReminder(reminder, scheduleFuture, previousEntry = null) {
     const pendingChannelIds = previousEntry ? this.pendingDeliveryChannelIds(previousEntry) : [];
-    const channelIds = pendingChannelIds.length ? pendingChannelIds : this.resolveChannelIds({});
+    // v1.9.0: 标签命中就走对应渠道（并集），没命中保持原来的默认渠道行为
+    const tagChannelIds = pendingChannelIds.length ? [] : this.resolveTagChannelIds(reminder.text);
+    const channelIds = pendingChannelIds.length
+      ? pendingChannelIds
+      : tagChannelIds.length
+        ? tagChannelIds
+        : this.resolveChannelIds({});
     const notification = this.normalizeHubNotification({
       id: reminder.key,
       source: reminder.source || "obsidian-ntfy",
@@ -10036,52 +10436,42 @@ class NtfyManagerView extends ItemView {
     return "obsidian-ntfy-task-time-future";
   }
 
-  renderTaskTime(containerEl, dueText, dueDate, onClick) {
-    if (!dueText) return;
-    const className = `obsidian-ntfy-task-time ${this.timeClass(dueDate)}${typeof onClick === "function" ? " is-editable" : ""}`;
-    if (typeof onClick !== "function") return containerEl.createSpan({ cls: className, text: dueText });
-
-    // Keep the native datetime control in the document flow. Chromium/Electron
-    // only exposes its calendar/time picker for a real, visible input; hidden
-    // or screen-positioned inputs silently ignore showPicker(). Selecting a
-    // value commits immediately, so there is no extra Save/Cancel panel.
-    const timeEl = containerEl.createEl("input", {
-      cls: `${className} obsidian-ntfy-date-time-input`,
-      attr: { type: "datetime-local", title: "修改时间", "aria-label": `修改时间 ${dueText}` },
-    });
-    const due = dueDate instanceof Date ? dueDate : new Date(dueDate || 0);
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-    if (!Number.isNaN(due.getTime())) timeEl.value = this.plugin.formatDateTimeLocal(due);
-    timeEl.min = this.plugin.formatDateTimeLocal(todayStart);
-    let previousValue = timeEl.value;
-    const openPicker = (event) => {
+  // v1.9.0: 起始时间用小号 inline 文字，不要跟截止那个可编辑胶囊一样大。
+  // 点击同样能改（还是走插件自带的 picker）。
+  renderStartBadge(containerEl, text, date, onClick) {
+    if (!text) return;
+    // v1.9.0: 起始时间统一标绿（它本身就是「开始」语义），不再只在按截止排序时绿
+    const cls = "obsidian-ntfy-task-start is-green";
+    if (typeof onClick !== "function") return containerEl.createSpan({ cls, text });
+    const span = containerEl.createSpan({ cls: `${cls} is-editable`, text });
+    span.setAttribute("role", "button");
+    span.setAttribute("aria-label", `修改起始时间 ${text}`);
+    span.addEventListener("click", (event) => {
+      event.preventDefault();
       event.stopPropagation();
-      try {
-        if (typeof timeEl.showPicker === "function") timeEl.showPicker();
-      } catch (_) {
-        // The native control may already be opening from the same gesture.
-      }
-    };
-    timeEl.addEventListener("pointerdown", openPicker);
-    timeEl.addEventListener("click", openPicker);
-    timeEl.addEventListener("change", async (event) => {
-      const parsedDue = this.plugin.parseDateTimeLocal(timeEl.value);
-      if (!parsedDue) {
-        timeEl.value = previousValue;
-        new Notice(`${PLUGIN_NAME}: ${this.uiText("日期或时间无效", "invalid date/time")}`);
-        return;
-      }
-      try {
-        await onClick(event, timeEl, parsedDue);
-        previousValue = timeEl.value;
-      } catch (error) {
-        timeEl.value = previousValue;
-        new Notice(`${PLUGIN_NAME}: ${this.uiText("时间更新失败", "time update failed")}`);
-        console.error(error);
-      }
+      onClick(event, span);
     });
-    return timeEl;
+    return span;
+  }
+
+  renderTaskTime(containerEl, dueText, dueDate, onClick, kind = "") {
+    if (!dueText) return;
+    const kindClass = kind === "start" ? " obsidian-ntfy-time-start" : kind === "due" ? " obsidian-ntfy-time-due" : "";
+    const className = `obsidian-ntfy-task-time ${this.timeClass(dueDate)}${kindClass}${typeof onClick === "function" ? " is-editable" : ""}`;
+    // v1.9.0: 平时渲染紧凑文本（原生 input 常驻太宽，会把铃铛/月亮挤到下一行），
+    // 点击时才临时换成 input。
+    const displaySpan = containerEl.createSpan({ cls: className, text: dueText });
+    if (typeof onClick !== "function") return displaySpan;
+
+    displaySpan.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const due = dueDate instanceof Date ? dueDate : new Date(dueDate || 0);
+      this.openDateTimePicker(due, async (nextDue) => {
+        await onClick(event, displaySpan, nextDue);
+      }, displaySpan);
+    });
+    return displaySpan;
   }
 
   renderCompletedTaskTime(containerEl, doneText) {
@@ -10145,9 +10535,11 @@ class NtfyManagerView extends ItemView {
       if (taskLike.completed && options.completedText) {
         this.renderCompletedTaskTime(actions, options.completedText);
       } else {
-        this.renderTaskTime(actions, options.dueText, options.dueDate, options.onDueClick);
+        if (options.startText) this.renderStartBadge(actions, options.startText, options.startDate, typeof options.onStartClick === "function" ? options.onStartClick : null);
+        this.renderTaskTime(actions, options.dueText, options.dueDate, options.onDueClick, "due");
       }
       if (typeof options.renderActions === "function") options.renderActions(actions);
+      if (typeof options.renderSomeday === "function") options.renderSomeday(actions);
     }
   }
 
@@ -10355,6 +10747,26 @@ class NtfyManagerView extends ItemView {
       loading.createSpan({ text: "正在加载提醒…" });
       return;
     }
+    // v1.9.0: 排序基准切换（默认按起始）。这是「待处理」页自己的控件，
+    // 和整库待办无关 —— 用户指的是这个模块。
+    const sortBar = group.createDiv({ cls: "obsidian-ntfy-sortbar" });
+    const currentBasis = this.plugin.settings.taskSortBasis === "due" ? "due" : "start";
+    for (const option of [
+      { id: "start", label: this.uiText("按起始 🛫", "By start 🛫") },
+      { id: "due", label: this.uiText("按截止 📅", "By due 📅") },
+    ]) {
+      const button = sortBar.createEl("button", {
+        cls: `obsidian-ntfy-sortbtn${currentBasis === option.id ? " is-active" : ""}`,
+        text: option.label,
+      });
+      button.addEventListener("click", async () => {
+        if (this.plugin.settings.taskSortBasis === option.id) return;
+        this.plugin.settings.taskSortBasis = option.id;
+        await this.plugin.saveSettings();
+        await this.refreshTaskCaches();
+        await this.render();
+      });
+    }
     if (!this.notificationTasks.length) {
       group.createEl("p", { cls: "obsidian-ntfy-muted", text: "暂无带时间的待办提醒。" });
       return;
@@ -10363,10 +10775,14 @@ class NtfyManagerView extends ItemView {
   }
 
   renderReminderItem(containerEl, reminder) {
+    const sortBasis = this.plugin.settings.taskSortBasis === "due" ? "due" : "start";
     const row = containerEl.createDiv({
-      cls: this.itemClass(reminder.notificationState || "pending", reminder.source || "task"),
+      cls: `${this.itemClass(reminder.notificationState || "pending", reminder.source || "task")} ${sortBasis === "due" ? "sort-by-due" : "sort-by-start"}`,
     });
     const meta = row.createDiv({ cls: "obsidian-ntfy-item-meta" });
+    // v1.9.0: 待处理页同样显示 🛫 起始，并挂 someday 按钮
+    const startMoment = reminder.start instanceof Date && !Number.isNaN(reminder.start.getTime()) ? reminder.start : null;
+    const showStart = Boolean(startMoment) && Boolean(reminder.due) && startMoment.getTime() !== reminder.due.getTime();
     this.renderTaskLine(meta, {
       completed: false,
       filePath: reminder.filePath,
@@ -10374,10 +10790,29 @@ class NtfyManagerView extends ItemView {
       text: reminder.text || "Obsidian reminder",
     }, {
       dueDate: reminder.due,
+      startDate: startMoment,
+      startText: showStart ? this.plugin.formatLocalDateTime(startMoment) : "",
       dueText: this.plugin.formatLocalDateTime(reminder.due),
+      onStartClick: showStart ? (_event, _anchorEl, parsedDue) => this.openSourceTimePicker(Object.assign({}, reminder, { signifier: "🛫" }), null, parsedDue) : null,
       onDueClick: (_event, _anchorEl, parsedDue) => this.openSourceTimePicker(reminder, null, parsedDue),
       renderActions: (actions) => {
         this.renderNotificationToggle(actions, reminder, reminder.notificationState !== "ignored");
+      },
+      renderSomeday: (actions) => {
+        const tag = String(this.plugin.settings.somedayTag || "someday").replace(/^#/, "");
+        const active = Boolean(reminder.someday);
+        this.iconButton(actions, active ? "moon" : "moon-star",
+          active ? this.uiText(`取消 #${tag}`, `Remove #${tag}`) : this.uiText(`标记 #${tag}（移到整库待办）`, `Mark #${tag} (move to vault tasks)`),
+          active ? "primary" : "secondary", async () => {
+            try {
+              await this.plugin.toggleSomedayTask(reminder.filePath, reminder.lineNumber);
+              await this.refreshTaskCaches();
+              await this.render();
+            } catch (error) {
+              new Notice(`${PLUGIN_NAME}: ${this.uiText("someday 更新失败", "someday update failed")}`);
+              console.error(error);
+            }
+          });
       },
     });
   }
@@ -10548,12 +10983,17 @@ class NtfyManagerView extends ItemView {
     this.renderRowsBatched(block, visibleTasks, (task) => {
       const state = task.completed ? "done" : (task.due ? "pending" : "untimed");
       const displayDate = task.completed ? task.doneAt : task.due;
+      const sortBasis = this.plugin.settings.taskSortBasis === "due" ? "due" : "start";
       const row = block.createDiv({
-        cls: `${this.itemClass(state, task.source || "task", "obsidian-ntfy-item-compact")}${task.completed ? " is-done" : ""}`,
+        cls: `${this.itemClass(state, task.source || "task", "obsidian-ntfy-item-compact")}${task.completed ? " is-done" : ""} ${sortBasis === "due" ? "sort-by-due" : "sort-by-start"}`,
       });
       const meta = row.createDiv({ cls: "obsidian-ntfy-item-meta" });
+      const startMoment = !task.completed && task.start instanceof Date && !Number.isNaN(task.start.getTime()) ? task.start : null;
+      const showStart = Boolean(startMoment) && Boolean(displayDate) && startMoment.getTime() !== displayDate.getTime();
       this.renderTaskLine(meta, task, {
         dueDate: displayDate,
+        startDate: startMoment,
+        startText: showStart ? this.plugin.formatLocalDateTime(startMoment) : "",
         dueText: !task.completed && displayDate ? this.plugin.formatLocalDateTime(displayDate) : "无时间",
         completedText: task.completed && displayDate ? this.plugin.formatDoneDateTime(displayDate) : "无完成时间",
         onDueClick: !task.completed && displayDate ? (_event, _anchorEl, parsedDue) => this.openSourceTimePicker(task, null, parsedDue) : null,
@@ -10567,6 +11007,20 @@ class NtfyManagerView extends ItemView {
             source: task.source || "task",
           }, true);
         } : null,
+        renderSomeday: task.completed ? null : (actions) => {
+          const tag = String(this.plugin.settings.somedayTag || "someday").replace(/^#/, "");
+          const active = Boolean(task.someday);
+          this.iconButton(actions, active ? "moon" : "moon-star", active ? this.uiText(`取消 #${tag}`, `Remove #${tag}`) : this.uiText(`标记 #${tag}（移到整库待办）`, `Mark #${tag} (move to vault tasks)`), active ? "primary" : "secondary", async () => {
+            try {
+              await this.plugin.toggleSomedayTask(task.filePath, task.lineNumber);
+              await this.refreshTaskCaches();
+              await this.render();
+            } catch (error) {
+              new Notice(`${PLUGIN_NAME}: ${this.uiText("someday 更新失败", "someday update failed")}`);
+              console.error(error);
+            }
+          });
+        },
       });
     }, batchState, { initialCount: 20, batchSize: 24, onComplete: () => {
       if (tasks.length > limit && block.isConnected !== false) block.createEl("p", { cls: "obsidian-ntfy-muted", text: `还有 ${tasks.length - limit} 条未显示。` });
@@ -12255,6 +12709,33 @@ class AndroidNtfyNotifierSettingTab extends PluginSettingTab {
           this.plugin.settings.includeTasksPluginDates = value;
           await this.plugin.saveSettings();
         })
+      );
+
+    new Setting(contentGroup)
+      .setName(this.uiText("待办排序基准", "Task sort basis"))
+      .setDesc(this.uiText("默认按起始（🛫）排序；没有起始的用截止日期参与排序。切到按截止时反之。", "Sort by start (🛫) by default, falling back to the due date when a task has no start (and the other way round)."))
+      .addDropdown((drop) =>
+        drop
+          .addOption("start", this.uiText("按起始 🛫", "Start 🛫"))
+          .addOption("due", this.uiText("按截止 📅", "Due 📅"))
+          .setValue(this.plugin.settings.taskSortBasis === "due" ? "due" : "start")
+          .onChange(async (value) => {
+            this.plugin.settings.taskSortBasis = value === "due" ? "due" : "start";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(contentGroup)
+      .setName(this.uiText("标签 → 通知渠道", "Tag → channels"))
+      .setDesc(this.uiText("每行一条：标签=渠道，多个渠道用逗号分开。命中多个标签时取并集；一条都没命中就用默认渠道（保持原行为）。", "One rule per line: tag=channel[,channel]. Multiple matching tags are unioned; no match keeps the default channel."))
+      .addTextArea((area) =>
+        area
+          .setValue(String(this.plugin.settings.tagChannelRules || ""))
+          .setPlaceholder("someday=telegram\n考试=ntfy,telegram")
+          .onChange(async (value) => {
+            this.plugin.settings.tagChannelRules = value || "";
+            await this.plugin.saveSettings();
+          })
       );
 
     new Setting(contentGroup)

@@ -15,6 +15,15 @@ This is a lightweight Obsidian plugin for ntfy notifications and optional AI web
 
 Why ntfy: Obsidian mobile plugins cannot directly create Android system notifications. This plugin sends reminders to an ntfy topic, and the Android ntfy app shows the notification in the system notification shade.
 
+## 1.9.0
+
+- **🛫 起始时间与 📅 截止时间平行统计**：待办同时携带两端日期，不再只挑一个。
+- **排序基准可切换**：默认按起始（🛫）排序，可切按截止（📅）；缺少一端时用另一端参与排序，不会漏项。
+- **语义配色**：截止时间文字统一白色，底色按 过期 / 临近 / 未来 区分；起始时间常绿。
+- **阅读视图直接改时间**：只把 🛫/📅 图标做成可点按钮，日期文字保持纯文本（留给 virtual-linker 等插件）；点击弹出选择框，可在「起始 / 截止」之间转换。按源码行号定位，同一天多条待办也不会改错。
+- **someday 标签**：待办行新增月亮按钮，一键加/删 `#someday`；打了标记的待办从「待处理」列表移除（不影响整库待办分组）。
+- **按标签选择通知渠道**：设置里每行写 `标签=渠道[,渠道]`，命中多个标签时取并集，未命中走默认渠道（保持原行为）。
+
 ## 1.5.0
 
 - 待办管理器首屏优先显示缓存，完整扫描在后台执行；状态栏和工具栏入口直接打开“待处理”。

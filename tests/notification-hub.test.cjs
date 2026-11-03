@@ -231,8 +231,35 @@ async function run() {
   assert.doesNotMatch(source, /new Modal\(this\.app\)/);
   assert.doesNotMatch(source, /obsidian-ntfy-date-time-modal/);
   assert.match(source, /pointerEvents: "auto"/);
-  assert.match(source, /obsidian-ntfy-date-time-input/);
-  assert.match(source, /timeEl\.addEventListener\("pointerdown", openPicker\)/);
+  // 1.9.0：时间胶囊改成「平时是紧凑 span，点击才弹 picker」，不再常驻 input
+  assert.match(source, /const displaySpan = containerEl\.createSpan\(\{ cls: className, text: dueText \}\)/);
+
+  // ===== 1.9.0 新增能力 =====
+  // 1) 🛫 与 📅 平行统计
+  assert.match(source, /extractTasksDates\(raw\) \{/);
+  assert.match(source, /start: startDate,/);
+  assert.match(source, /someday: isSomeday,/);
+  // 2) 排序基准可切（默认按起始）
+  assert.match(source, /taskSortBasis: "start"/);
+  assert.match(source, /taskSortTime\(task\) \{/);
+  assert.match(source, /obsidian-ntfy-sortbtn/);
+  // 3) 起始时间常绿、截止文字一律白色（用户口径）
+  assert.match(styles, /color: #fff !important/);
+  assert.match(styles, /\.obsidian-ntfy-task-start/);
+  // 4) 阅读视图：只包图标 + Modal 改时间
+  assert.match(source, /class NtfyReadingDateModal extends Modal \{/);
+  assert.match(source, /registerMarkdownPostProcessor/);
+  assert.match(source, /decorateReadingDates\(el, ctx\) \{/);
+  // 5) someday 从待处理移除（不动整库待办）
+  assert.match(source, /filter\(\(reminder\) => !reminder\.someday\)/);
+  assert.match(source, /openTimed: tasks\.filter\(\(task\) => !task\.completed && task\.due\),/);
+  // 6) 标签 → 渠道（并集，空规则回退默认）
+  assert.match(source, /resolveTagChannelIds\(text\) \{/);
+  assert.match(source, /parseTagChannelRules\(\) \{/);
+  // 7) 行号定位（DOM 文字和源码不一致，必须靠序号）
+  assert.match(source, /span\.dataset\.ordinal/);
+  assert.match(source, /span\.dataset\.sectionStart/);
+  assert.match(source, /displaySpan\.addEventListener\("click"[\s\S]*?this\.openDateTimePicker\(due/);
   assert.match(source, /input\.showPicker\(\)/);
   assert.match(source, /input\.min = this\.plugin\.formatDateTimeLocal\(todayStart\)/);
   assert.match(source, /openSourceTimePicker\(reminder, anchorEl = null, parsedDue = null\)/);
@@ -250,8 +277,9 @@ async function run() {
   const dateTimeInputStyleEnd = styles.indexOf("}\n", dateTimeInputStyleStart);
   assert.ok(dateTimeInputStyleStart >= 0 && dateTimeInputStyleEnd > dateTimeInputStyleStart, "date/time input style should remain discoverable");
   const dateTimeInputStyle = styles.slice(dateTimeInputStyleStart, dateTimeInputStyleEnd);
-  assert.match(dateTimeInputStyle, /flex:\s*0 1 200px/);
-  assert.match(dateTimeInputStyle, /width:\s*min\(100%,\s*200px\)/);
+  // 1.9.0：改成内容自适应，不再写死 200px
+  assert.match(dateTimeInputStyle, /flex:\s*0 0 auto/);
+  assert.match(dateTimeInputStyle, /width:\s*auto/);
   assert.match(dateTimeInputStyle, /text-indent:\s*0/);
   assert.match(dateTimeInputStyle, /background-color:\s*var\(--background-primary\)\s*!important/);
   assert.match(dateTimeInputStyle, /border:\s*1px solid color-mix\([\s\S]*?\)\s*!important/);
