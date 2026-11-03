@@ -2083,25 +2083,58 @@
   color: #fff !important;
 }
 
-/* ★ v1.9.0 修复：面板里点日期进入编辑态时，input 的 className 是从锚点复制过来的，
-   会带上 obsidian-ntfy-time-due，于是被「截止文字一律白色」的规则打成白底白字 → 看着是空白框。
-   这里用更高优先级把编辑态强制改回深色字。 */
+/* ★ 编辑态：和胶囊「长得一模一样」，只把内容换成可编辑控件。
+   - 尺寸/圆角/字号/padding 全部对齐 .obsidian-ntfy-task-time
+   - 字色按底色走：实心红/绿用白字，琥珀用深字（跟非编辑态完全一致）
+   - 不再设固定 min-width：用 field-sizing: content 跟着内容收，避免变一个大白框 */
 input.obsidian-ntfy-date-time-editor,
 input.obsidian-ntfy-task-time.obsidian-ntfy-date-time-editor,
 input.obsidian-ntfy-date-time-editor.obsidian-ntfy-time-due {
+  box-sizing: border-box !important;
+  height: 22px !important;
+  min-height: 22px !important;
+  max-height: 22px !important;
+  min-width: 0 !important;
+  width: auto !important;
+  max-width: 100% !important;
+  padding: 2px 6px !important;
+  border-radius: 999px !important;
+  font-size: 0.76em !important;
+  font-weight: 600 !important;
+  line-height: 1 !important;
+  font-family: inherit !important;
+  field-sizing: content;
+  cursor: pointer;
+}
+
+/* 底色跟胶囊保持同一套：过期红 / 临近琥珀 / 未来绿 */
+input.obsidian-ntfy-date-time-editor.obsidian-ntfy-task-time-past {
+  background-color: #dc2626 !important;
+  border: 1px solid #dc2626 !important;
+  color: #fff !important;
+  -webkit-text-fill-color: #fff !important;
+}
+input.obsidian-ntfy-date-time-editor.obsidian-ntfy-task-time-soon {
+  background-color: #d99e00 !important;
+  border: 1px solid #d99e00 !important;
+  color: #fff !important;
+  -webkit-text-fill-color: #fff !important;
+}
+input.obsidian-ntfy-date-time-editor.obsidian-ntfy-task-time-future {
+  background-color: #16a34a !important;
+  border: 1px solid #16a34a !important;
+  color: #fff !important;
+  -webkit-text-fill-color: #fff !important;
+}
+/* 没有状态类时退回中性样式 */
+input.obsidian-ntfy-date-time-editor {
+  background-color: var(--background-secondary) !important;
+  border: 1px solid var(--background-modifier-border) !important;
   color: var(--text-normal) !important;
   -webkit-text-fill-color: var(--text-normal) !important;
-  background-color: var(--background-primary) !important;
-  border-color: var(--interactive-accent) !important;
-  min-width: 168px !important;
-  width: auto !important;
-  max-width: min(100%, 22rem) !important;
-  height: 30px !important;
-  min-height: 30px !important;
-  font-size: 0.82em !important;
-  padding: 3px 8px !important;
-  field-sizing: content;
 }
+
+/* 原生控件内部的日期/时间分段：颜色跟随上面设的值 */
 input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit,
 input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-fields-wrapper,
 input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-text,
@@ -2110,7 +2143,17 @@ input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-month-field,
 input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-day-field,
 input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-hour-field,
 input.obsidian-ntfy-date-time-editor::-webkit-datetime-edit-minute-field {
-  color: var(--text-normal) !important;
-  -webkit-text-fill-color: var(--text-normal) !important;
+  color: inherit !important;
+  -webkit-text-fill-color: inherit !important;
   opacity: 1 !important;
+  font-weight: 600 !important;
 }
+/* 日历图标跟着字色反白，避免在实心底色上变成一块黑点 */
+input.obsidian-ntfy-date-time-editor::-webkit-calendar-picker-indicator {
+  filter: brightness(0) invert(1);
+  opacity: 0.8;
+  padding: 0;
+  margin-left: -4px;
+  width: 11px;
+}
+

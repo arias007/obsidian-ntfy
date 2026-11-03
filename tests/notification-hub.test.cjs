@@ -247,6 +247,10 @@ async function run() {
   assert.match(styles, /color: #fff !important/);
   // 1.9.1：编辑态 input 会继承 time-due 类，必须强制回深色字，否则白底白字变空白框
   assert.match(styles, /input\.obsidian-ntfy-date-time-editor/);
+  // 1.9.2：编辑态要和胶囊完全一致（同高度 22px / 同圆角 / 同底色 / 白字）
+  assert.match(styles, /input\.obsidian-ntfy-date-time-editor\.obsidian-ntfy-task-time-past \{[\s\S]*?background-color: #dc2626 !important[\s\S]*?color: #fff !important/);
+  assert.match(styles, /input\.obsidian-ntfy-date-time-editor\.obsidian-ntfy-task-time-future \{[\s\S]*?background-color: #16a34a !important/);
+  assert.match(styles, /height: 22px !important/);
   assert.match(styles, /-webkit-text-fill-color:\s*var\(--text-normal\)\s*!important/);
   assert.match(styles, /\.obsidian-ntfy-task-start/);
   // 4) 阅读视图：只包图标 + Modal 改时间

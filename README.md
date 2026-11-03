@@ -15,6 +15,10 @@ This is a lightweight Obsidian plugin for ntfy notifications and optional AI web
 
 Why ntfy: Obsidian mobile plugins cannot directly create Android system notifications. This plugin sends reminders to an ntfy topic, and the Android ntfy app shows the notification in the system notification shade.
 
+## 1.9.2
+
+- **修复**：面板里点日期的编辑框外观与旁边的胶囊统一 —— 同样的 22px 高度、999px 圆角、以及按状态来的红/琥珀/绿底色配白字，不再是一个突兀的白底大框。
+
 ## 1.9.1
 
 - **修复**：面板里点日期进入编辑态时，输入框继承了截止时间的白字样式，在白色背景上变成「空白框」（只剩系统日历图标）。编辑态现已强制深色字。
